@@ -1,0 +1,10 @@
+# Found by our own analysis and headless runs.
+sha256 = "760ebac4e5f0351edb39015eba89e729b14eaf95afdabb529a447ff8f8e11cd1"
+
+[hooks]
+# Hands a finished frame to the display (calls the swap).
+frame_present = 0x82a467d8
+# The title's GPU interrupt handler (vertical blank and command interrupts).
+gpu_interrupt = 0x82a487b8
+# Waits until the GPU has caught up with the frames already queued.
+frames_in_flight_wait = 0x828bf420
