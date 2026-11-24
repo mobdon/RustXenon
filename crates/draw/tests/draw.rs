@@ -180,6 +180,47 @@ fn textured_quad_samples_tiled_texture() {
     }
 }
 
+/// A texture slot without a texture fetch constant, or with a format that
+/// cannot be decoded, samples zeros (Xenia's null image) and the draw still
+/// happens, with one warning per kind.
+#[test]
+fn unusable_texture_slots_sample_zeros() {
+    let Some(mut d) = drawer() else { return };
+    let mut mem = memory();
+    let q = 32.0;
+    let verts: Vec<u32> = [(0.0, 0.0), (q, 0.0), (q, q), (0.0, q)]
+        .iter()
+        .flat_map(|&(x, y)| [f(x), f(y), f(0.0), f(0.5), f(0.5)])
+        .collect();
+    mem.write_words(VERTS, &verts);
+    const CTX1: u32 = 60;
+    let fetch = [2 | (1 << 22), CTX1 | TEXTURE, 0, 0, 0, 1 << 9];
+    let mut s = Stream::default();
+    s.setup()
+        .resolve(&mut mem, W, H, false, Some((rgba(CLEAR), 0)))
+        .shader(false, &vs_uv())
+        .shader(true, &ps_texture(1))
+        .vertex_fetch(0, VERTS, 20)
+        .draw_auto(PRIM_QUAD_LIST, 4)
+        .draw_auto(PRIM_QUAD_LIST, 4)
+        .regs(SHADER_CONSTANT_FETCH + 6, &fetch)
+        .draw_auto(PRIM_QUAD_LIST, 4);
+    let report = run(&mut d, &s, &mut mem);
+    assert_eq!(report.draws, 3, "{report:?}");
+    assert!(report.unsupported.is_empty(), "{report:?}");
+    assert_eq!(
+        report.warnings,
+        [
+            "texture slot without a texture fetch constant drawn with zeros",
+            "unsupported texture format Ctx1; drawn with zeros",
+        ],
+        "{report:?}"
+    );
+    let img = d.read_render_target(COLOR_KEY, 0, 0, W, H).unwrap();
+    assert_eq!(px(&img, W, 4, 4), [0; 4]);
+    assert_eq!(px(&img, W, 40, 40), CLEAR);
+}
+
 /// The pixel shader's colour comes from its float constant c0.
 #[test]
 fn pixel_shader_float_constant() {
