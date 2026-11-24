@@ -65,6 +65,11 @@ pub fn new_context(rt: &Runtime, stack_size: u32) -> (Context, u32) {
         rt.mem.write_bytes(tls, &b);
     }
     let top = stack + size;
+    if std::env::var_os("XENON_TRACE_STACKS").is_some() {
+        crate::log(&format!(
+            "[thread] stack {stack:#x}..{top:#x} reused {reused}"
+        ));
+    }
     rt.mem.write_u32(pcr, tls);
     rt.mem.write_u32(pcr + 0x30, pcr);
     rt.mem.write_u32(pcr + 0x70, top);
