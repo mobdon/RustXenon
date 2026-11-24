@@ -13,6 +13,10 @@
 !/games/README.md
 !/games/*/
 !/games/*/hooks.toml
+# Regression test definitions (no pixels); see games/README.md.
+!/games/*/tests/
+!/games/*/tests/*/
+!/games/*/tests/*/test.toml
 
 # --- Player's game files, wherever they are put -------------------------
 /game-data/
@@ -64,6 +68,8 @@
 /saves/
 *.png
 !/docs/**/*.png
+# Expected frames of regression tests are game pixels, wherever a test lives.
+**/expected/
 *.log
 *.trace
 

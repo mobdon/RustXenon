@@ -36,6 +36,8 @@ See [DATA-RULES.md](DATA-RULES.md).
 | `crates/cpu-tests` | Per-instruction tests: hand-assembled words, reference results as text, no game bytes |
 | `tools/ppc-oracle` | Regenerates the reference results on a CPU emulator (needs LLVM and QEMU; CI does not) |
 | `crates/host` | `xenon-host`: loads the player's files, runs recompiled code, replaces system calls; later graphics, input and audio |
+| `crates/compare` | `xenon-compare`: diff two frames with a tolerance (side-by-side sheet) and make a blink image. No window or GPU |
+| `crates/regress` | `xenon-regress`: runs game-level regression tests headless and reports pass or fail per frame with pictures. See `games/README.md` |
 | `games/<sha256>/hooks.toml` | Per-game hook addresses with role names. The only per-game file in git |
 | `third_party/licenses` | Licence texts for credited sources |
 
