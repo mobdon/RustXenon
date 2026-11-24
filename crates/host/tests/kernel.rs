@@ -1,0 +1,463 @@
+//! System-call replacements, checked with synthetic guest state: no game
+//! bytes. One kernel per process, shared by every test here (tests that
+//! need their own guest scratch memory use separate addresses).
+
+use std::sync::{Arc, OnceLock};
+use xenon_host::kernel::{self, files, gpu::Gpu, memory, objects, rtl, threads, Setup};
+use xenon_recomp::xex::Image;
+use xenon_rt::{Context, GuestMemory, Runtime};
+
+const STATUS_TIMEOUT: u64 = 0x102;
+
+/// A minimal executable header: magic, sizes, one optional header (the
+/// default stack size).
+fn header() -> Vec<u8> {
+    let mut h = vec![0u8; 0x200];
+    h[..4].copy_from_slice(b"XEX2");
+    h[8..12].copy_from_slice(&0x200u32.to_be_bytes());
+    h[0x10..0x14].copy_from_slice(&0x100u32.to_be_bytes());
+    h[0x14..0x18].copy_from_slice(&1u32.to_be_bytes());
+    h[0x18..0x1C].copy_from_slice(&0x0002_0200u32.to_be_bytes());
+    h[0x1C..0x20].copy_from_slice(&0x4_0000u32.to_be_bytes());
+    h
+}
+
+/// Guest entry point used by the thread test: sets the event whose handle
+/// is in r3, uses a TLS slot, and exits with 7.
+const THREAD_ENTRY: u32 = 0x8200_0000;
+fn thread_entry(rt: &Runtime, c: &mut Context) {
+    let event = c.r[3];
+    threads::ke_tls_alloc(rt, c);
+    let slot = c.r[3];
+    c.r[4] = 0x1234;
+    threads::ke_tls_set_value(rt, c);
+    c.r[3] = slot;
+    threads::ke_tls_get_value(rt, c);
+    rt.mem.write_u32(0x5000, c.r[3] as u32);
+    c.r[3] = event;
+    c.r[4] = 0;
+    objects::nt_set_event(rt, c);
+    c.r[3] = 7;
+}
+
+struct Env {
+    rt: Arc<Runtime>,
+    game: std::path::PathBuf,
+}
+
+fn env() -> &'static Env {
+    static E: OnceLock<Env> = OnceLock::new();
+    E.get_or_init(|| {
+        let root = std::env::temp_dir().join(format!("xenon-kernel-{}", std::process::id()));
+        let game = root.join("game");
+        std::fs::create_dir_all(game.join("dir")).unwrap();
+        std::fs::write(game.join("a.txt"), b"hello").unwrap();
+        std::fs::write(game.join("dir").join("b.bin"), [0u8; 10]).unwrap();
+        let file = header();
+        let image = Image {
+            base: 0x8200_0000,
+            entry: THREAD_ENTRY,
+            title_id: None,
+            version: None,
+            data: vec![0; 0x1000],
+            sections: vec![],
+            imports: vec![],
+            exception_table: vec![],
+        };
+        let mut rt = Runtime::new(GuestMemory::new(xenon_host::GUEST_MEMORY));
+        rt.set_override(THREAD_ENTRY, thread_entry);
+        kernel::install(
+            &mut rt,
+            &Setup {
+                file: &file,
+                image: &image,
+                game_dir: game.clone(),
+                data_dir: root.join("data"),
+                update_dir: None,
+            },
+        );
+        let rt = rt.share();
+        xenon_host::set_runtime(rt.clone());
+        Env { rt, game }
+    })
+}
+
+/// A context with a guest stack of its own at `stack`.
+fn ctx(stack: u32) -> Context {
+    let mut c = Context::new();
+    c.r[1] = stack as u64;
+    c
+}
+
+fn call(rt: &Runtime, c: &mut Context, f: fn(&Runtime, &mut Context), args: &[u64]) -> u64 {
+    for (i, a) in args.iter().enumerate() {
+        c.r[3 + i] = *a;
+    }
+    f(rt, c);
+    c.r[3]
+}
+
+#[test]
+fn failure_statuses_are_negative_in_the_full_register() {
+    let e = env();
+    let mut c = ctx(0x1_8000);
+    // NtClose of a handle that does not exist: STATUS_INVALID_HANDLE.
+    let r = call(&e.rt, &mut c, objects::nt_close, &[0xDEAD]);
+    assert_eq!(r, 0xFFFF_FFFF_C000_0008);
+    assert!((r as i64) < 0);
+}
+
+#[test]
+fn virtual_and_physical_memory_with_headroom() {
+    let e = env();
+    let rt = &e.rt;
+    let mut c = ctx(0x1_9000);
+    let (base, size) = (0x1_0000, 0x1_0004);
+    rt.mem.write_u32(base, 0);
+    rt.mem.write_u32(size, 0x2_0000);
+    assert_eq!(
+        call(
+            rt,
+            &mut c,
+            memory::nt_allocate_virtual_memory,
+            &[base as u64, size as u64, 0x3000, 4]
+        ),
+        0
+    );
+    let a = rt.mem.read_u32(base);
+    assert!((0x4000_0000..0x7F00_0000).contains(&a));
+    assert_eq!(
+        call(rt, &mut c, memory::mm_query_allocation_size, &[a as u64]),
+        0x2_0000
+    );
+    // Freed memory comes back zeroed.
+    rt.mem.write_u32(a, 0xFFFF_FFFF);
+    assert_eq!(
+        call(
+            rt,
+            &mut c,
+            memory::nt_free_virtual_memory,
+            &[base as u64, size as u64, 0x8000]
+        ),
+        0
+    );
+    rt.mem.write_u32(base, 0);
+    rt.mem.write_u32(size, 0x2_0000);
+    call(
+        rt,
+        &mut c,
+        memory::nt_allocate_virtual_memory,
+        &[base as u64, size as u64, 0x3000, 4],
+    );
+    assert_eq!(rt.mem.read_u32(rt.mem.read_u32(base)), 0);
+    // Headroom: asking for more than the region holds fails cleanly.
+    rt.mem.write_u32(base, 0);
+    rt.mem.write_u32(size, 0x7FFF_0000);
+    let r = call(
+        rt,
+        &mut c,
+        memory::nt_allocate_virtual_memory,
+        &[base as u64, size as u64, 0x3000, 4],
+    );
+    assert_eq!(r as u32, 0xC000_0017);
+    // Physical memory honours alignment and sits in the 0xA0000000 view.
+    let p = call(
+        rt,
+        &mut c,
+        memory::mm_allocate_physical_memory_ex,
+        &[0, 0x3000, 4, 0, u32::MAX as u64, 0x1_0000],
+    ) as u32;
+    assert_eq!(p & 0xFFFF, 0);
+    assert_eq!(p >> 29, 5);
+    assert_eq!(
+        call(rt, &mut c, memory::mm_get_physical_address, &[p as u64]) as u32,
+        p & 0x1FFF_FFFF
+    );
+}
+
+#[test]
+fn threads_events_and_tls() {
+    let e = env();
+    let rt = &e.rt;
+    let mut c = ctx(0x1_A000);
+    // Synchronization event, not signalled.
+    call(rt, &mut c, objects::nt_create_event, &[0x6000, 0, 1, 0]);
+    let ev = rt.mem.read_u32(0x6000) as u64;
+    // A 1 ms relative timeout runs out.
+    rt.mem.write_u64(0x6010, (-10_000i64) as u64);
+    assert_eq!(
+        call(
+            rt,
+            &mut c,
+            objects::nt_wait_for_single_object_ex,
+            &[ev, 1, 0, 0x6010]
+        ),
+        STATUS_TIMEOUT
+    );
+    // ExCreateThread(handle out, stack, id out, startup, start, context, flags)
+    let r = call(
+        rt,
+        &mut c,
+        threads::ex_create_thread,
+        &[0x6020, 0, 0x6024, 0, THREAD_ENTRY as u64, ev, 0],
+    );
+    assert_eq!(r, 0);
+    let th = rt.mem.read_u32(0x6020) as u64;
+    rt.mem.write_u64(0x6010, (-50_000_000i64) as u64); // 5 s
+    assert_eq!(
+        call(
+            rt,
+            &mut c,
+            objects::nt_wait_for_single_object_ex,
+            &[ev, 1, 0, 0x6010]
+        ),
+        0
+    );
+    assert_eq!(
+        call(
+            rt,
+            &mut c,
+            objects::nt_wait_for_single_object_ex,
+            &[th, 1, 0, 0x6010]
+        ),
+        0
+    );
+    assert_eq!(
+        rt.mem.read_u32(0x5000),
+        0x1234,
+        "TLS value read back in the thread"
+    );
+}
+
+#[test]
+fn semaphores_respect_their_limit_and_wait_any() {
+    let e = env();
+    let rt = &e.rt;
+    let mut c = ctx(0x1_B000);
+    call(rt, &mut c, objects::nt_create_semaphore, &[0x7000, 0, 0, 1]);
+    call(rt, &mut c, objects::nt_create_semaphore, &[0x7004, 0, 1, 1]);
+    let (a, b) = (
+        rt.mem.read_u32(0x7000) as u64,
+        rt.mem.read_u32(0x7004) as u64,
+    );
+    assert_eq!(
+        call(rt, &mut c, objects::nt_release_semaphore, &[b, 1, 0]) as u32,
+        0xC000_0047
+    );
+    // Wait for any of (a, b): b is signalled, so index 1.
+    rt.mem.write_u32(0x7010, a as u32);
+    rt.mem.write_u32(0x7014, b as u32);
+    rt.mem.write_u64(0x7020, (-10_000_000i64) as u64);
+    assert_eq!(
+        call(
+            rt,
+            &mut c,
+            objects::nt_wait_for_multiple_objects_ex,
+            &[2, 0x7010, 1, 1, 0, 0x7020]
+        ),
+        1
+    );
+    assert_eq!(
+        call(
+            rt,
+            &mut c,
+            objects::nt_wait_for_multiple_objects_ex,
+            &[2, 0x7010, 1, 1, 0, 0x7020]
+        ),
+        STATUS_TIMEOUT
+    );
+}
+
+#[test]
+fn critical_sections_are_recursive_and_record_the_owner() {
+    let e = env();
+    let rt = &e.rt;
+    let mut c = ctx(0x1_C000);
+    let (_, kthread) = threads::new_context(rt, 64 << 10);
+    // The owner is the thread object the control region (r13) names.
+    c.r[13] = 0x8000;
+    rt.mem.write_u32(0x8000 + 0x100, kthread);
+    let cs = 0x8400;
+    call(rt, &mut c, objects::rtl_initialize_critical_section, &[cs]);
+    call(rt, &mut c, objects::rtl_enter_critical_section, &[cs]);
+    assert_eq!(
+        call(rt, &mut c, objects::rtl_try_enter_critical_section, &[cs]),
+        1
+    );
+    assert_eq!(rt.mem.read_u32(cs as u32 + 0x14), 2);
+    assert_eq!(rt.mem.read_u32(cs as u32 + 0x18), kthread);
+    call(rt, &mut c, objects::rtl_leave_critical_section, &[cs]);
+    call(rt, &mut c, objects::rtl_leave_critical_section, &[cs]);
+    assert_eq!(rt.mem.read_u32(cs as u32 + 0x18), 0);
+}
+
+/// Writes an ANSI_STRING and OBJECT_ATTRIBUTES for `name` at `at`.
+fn attrs(rt: &Runtime, at: u32, name: &str) -> u64 {
+    rt.mem.write_bytes(at + 0x40, name.as_bytes());
+    rt.mem.write_u16(at, name.len() as u16);
+    rt.mem.write_u16(at + 2, name.len() as u16);
+    rt.mem.write_u32(at + 4, at + 0x40);
+    rt.mem.write_u32(at + 0x10, 0);
+    rt.mem.write_u32(at + 0x14, at);
+    rt.mem.write_u32(at + 0x18, 0);
+    (at + 0x10) as u64
+}
+
+#[test]
+fn files_on_the_game_folder() {
+    let e = env();
+    let rt = &e.rt;
+    assert!(e.game.join("a.txt").exists());
+    let mut c = ctx(0x2_0000);
+    rt.mem.write_u32(0x2_0054, 0); // create options (ninth argument, on the stack)
+    let a = attrs(rt, 0x9000, "game:\\a.txt");
+    // NtCreateFile(out, access, attrs, iosb, allocation, attributes, share, disposition = open)
+    assert_eq!(
+        call(
+            rt,
+            &mut c,
+            files::nt_create_file,
+            &[0x9100, 0x8000_0000, a, 0x9110, 0, 0, 1, 1]
+        ),
+        0
+    );
+    let h = rt.mem.read_u32(0x9100) as u64;
+    // NtReadFile(handle, event, apc, apc context, iosb, buffer, length, offset)
+    rt.mem.write_u64(0x9120, 1);
+    assert_eq!(
+        call(
+            rt,
+            &mut c,
+            files::nt_read_file,
+            &[h, 0, 0, 0, 0x9110, 0x9200, 16, 0x9120]
+        ),
+        0
+    );
+    assert_eq!(rt.mem.read_u32(0x9114), 4);
+    let mut b = [0u8; 4];
+    rt.mem.read_bytes(0x9200, &mut b);
+    assert_eq!(&b, b"ello");
+    // Past the end.
+    assert_eq!(
+        call(
+            rt,
+            &mut c,
+            files::nt_read_file,
+            &[h, 0, 0, 0, 0x9110, 0x9200, 16, 0]
+        ) as u32,
+        0xC000_0011
+    );
+    // Standard information: end of file at +8.
+    assert_eq!(
+        call(
+            rt,
+            &mut c,
+            files::nt_query_information_file,
+            &[h, 0x9110, 0x9300, 24, 5]
+        ),
+        0
+    );
+    assert_eq!(rt.mem.read_u64(0x9308), 5);
+    // The game folder is read only; a missing file is "not found".
+    let w = attrs(rt, 0x9400, "game:\\new.txt");
+    assert_eq!(
+        call(
+            rt,
+            &mut c,
+            files::nt_create_file,
+            &[0x9100, 0x4000_0000, w, 0x9110, 0, 0, 0, 2]
+        ) as u32,
+        0xC000_0022
+    );
+    let m = attrs(rt, 0x9500, "d:\\missing.txt");
+    assert_eq!(
+        call(
+            rt,
+            &mut c,
+            files::nt_create_file,
+            &[0x9100, 0x8000_0000, m, 0x9110, 0, 0, 1, 1]
+        ) as u32,
+        0xC000_0034
+    );
+    // Directory listing with a pattern.
+    let d = attrs(rt, 0x9600, "game:\\dir");
+    assert_eq!(
+        call(
+            rt,
+            &mut c,
+            files::nt_open_file,
+            &[0x9100, 0x8000_0000, d, 0x9110, 1]
+        ),
+        0
+    );
+    let dh = rt.mem.read_u32(0x9100) as u64;
+    let pat = attrs(rt, 0x9700, "*.bin") - 0x10;
+    rt.mem.write_u32(0x2_0054, 1); // restart scan (ninth argument)
+    assert_eq!(
+        call(
+            rt,
+            &mut c,
+            files::nt_query_directory_file,
+            &[dh, 0, 0, 0, 0x9110, 0x9800, 0x100, pat]
+        ),
+        0
+    );
+    assert_eq!(rt.mem.read_u32(0x9800 + 60), 5);
+    assert_eq!(rt.mem.read_u64(0x9800 + 40), 10);
+}
+
+#[test]
+fn printf_formatting() {
+    let e = env();
+    let rt = &e.rt;
+    let c = ctx(0x2_1000);
+    rt.mem.write_bytes(0xA000, b"str\0");
+    for (i, v) in [42u64, (-3i64) as u64, 0xBEEF, 0xA000, 1.5f64.to_bits()]
+        .into_iter()
+        .enumerate()
+    {
+        rt.mem.write_u64(0xA100 + 8 * i as u32, v);
+    }
+    let s = rtl::format(rt, &c, "%d|%5d|%08X|%s|%.2f|%%", rtl::Args::List(0xA100));
+    assert_eq!(s, "42|   -3|0000BEEF|str|1.50|%");
+}
+
+#[test]
+fn command_processor_writes_fences_and_waits() {
+    let e = env();
+    let rt = &e.rt;
+    let mut gpu = Gpu::default();
+    let mut idle = |_: &mut Gpu| {};
+    let words = |v: Vec<u32>| move |k: u32| v[k as usize];
+    let type3 = |op: u32, n: u32| 0xC000_0000 | (n - 1) << 16 | op << 8;
+    // MEM_WRITE of two words at physical 0x100, guest byte order (endian 2).
+    let n = gpu.packet(
+        rt,
+        words(vec![type3(0x3D, 3), 0x100 | 2, 0x1111, 0x2222]),
+        4,
+        0,
+        &mut idle,
+    );
+    assert_eq!(n, 4);
+    assert_eq!(
+        (rt.mem.read_u32(0xA000_0100), rt.mem.read_u32(0xA000_0104)),
+        (0x1111, 0x2222)
+    );
+    // EVENT_WRITE_SHD with a plain value.
+    gpu.packet(
+        rt,
+        words(vec![type3(0x58, 3), 3, 0x200 | 2, 9]),
+        4,
+        0,
+        &mut idle,
+    );
+    assert_eq!(rt.mem.read_u32(0xA000_0200), 9);
+    // WAIT_REG_MEM on memory == 1: not yet (0 words), then it holds.
+    let wait = vec![type3(0x3C, 5), 0x13, 0x300 | 2, 1, 0xFFFF_FFFF, 0x100];
+    assert_eq!(gpu.packet(rt, words(wait.clone()), 6, 0, &mut idle), 0);
+    rt.mem.write_u32(0xA000_0300, 1);
+    assert_eq!(gpu.packet(rt, words(wait), 6, 0, &mut idle), 6);
+    // INTERRUPT is queued for the caller with its processor mask.
+    gpu.packet(rt, words(vec![type3(0x54, 1), 4]), 2, 0, &mut idle);
+    assert_eq!(gpu.interrupts, vec![4]);
+}
