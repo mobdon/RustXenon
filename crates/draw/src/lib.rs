@@ -186,6 +186,40 @@ pub struct Report {
     pub unsupported: Vec<String>,
     /// Things done approximately or ignored, each once.
     pub warnings: Vec<String>,
+    /// Where this replay's wall-clock time went.
+    pub timings: Timings,
+}
+
+/// Wall-clock time per replay phase, to find what dominates a frame. With a
+/// software driver (lavapipe) the GPU phases are CPU time too.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Timings {
+    /// Shader translation, WGSL modules and pipeline creation (cache misses
+    /// only cost here), plus fixed-function state decode.
+    pub shaders: Duration,
+    /// Guest vertex window, constants and index buffers: reading guest
+    /// memory and uploading it, per draw.
+    pub guest_data: Duration,
+    /// Texture decode (detile and convert) and upload, per draw.
+    pub textures: Duration,
+    /// Encoding and submitting draws (the GPU runs them asynchronously).
+    pub submit: Duration,
+    /// Waiting for queued GPU work before a resolve readback: where the
+    /// rendering itself shows up.
+    pub gpu_wait: Duration,
+    /// Copying resolve sources back from the GPU.
+    pub readback: Duration,
+    /// Resolve pixel conversion and tiling into guest memory, on the CPU.
+    pub resolve_cpu: Duration,
+    /// Clears.
+    pub clears: Duration,
+    /// Reading, swapping and detiling the front buffer at each swap.
+    pub swap: Duration,
+    /// Counts: pipelines and shader modules created, textures uploaded.
+    pub pipelines_created: u32,
+    pub textures_uploaded: u32,
+    pub texture_bytes: u64,
+    pub guest_bytes: u64,
 }
 
 impl Report {
@@ -385,9 +419,18 @@ pub struct Drawer {
     /// Destination endian of the last 32bpp resolve to each guest address,
     /// so a swap reads its front buffer in the byte order it was written.
     resolved_endian: HashMap<u32, u32>,
+    timings: Timings,
     uncaptured: Arc<Mutex<Vec<String>>>,
     max_dim: u32,
     max_storage: u64,
+}
+
+/// Time since `t`, restarting `t`.
+fn lap(t: &mut Instant) -> Duration {
+    let now = Instant::now();
+    let d = now - *t;
+    *t = now;
+    d
 }
 
 fn block_on<F: std::future::Future>(f: F) -> F::Output {
@@ -643,6 +686,7 @@ impl Drawer {
             clear_pipelines: HashMap::new(),
             targets: HashMap::new(),
             resolved_endian: HashMap::new(),
+            timings: Timings::default(),
             uncaptured,
             max_dim: limits.max_texture_dimension_2d,
             max_storage: limits.max_storage_buffer_binding_size,
@@ -668,6 +712,7 @@ impl Drawer {
         mem: &mut dyn GuestMemory,
     ) -> Result<Report, Error> {
         let mut report = Report::default();
+        self.timings = Timings::default();
         for c in commands {
             let done = match c {
                 Command::WriteRegisters { base, values } => {
@@ -712,7 +757,10 @@ impl Drawer {
                     if !signature_ok {
                         report.warn("swap packet without the SWAP signature");
                     }
-                    match self.front_buffer(*frontbuffer, *width, *height, mem) {
+                    let t = Instant::now();
+                    let frame = self.front_buffer(*frontbuffer, *width, *height, mem);
+                    self.timings.swap += t.elapsed();
+                    match frame {
                         Ok(f) => report.frames.push(f),
                         Err(e) => report.warn(e),
                     }
@@ -740,6 +788,16 @@ impl Drawer {
             }
             self.check_uncaptured()?;
         }
+        // Counts made where only the report is mutable.
+        let t = &report.timings;
+        let (uploaded, tex_bytes, guest_bytes) =
+            (t.textures_uploaded, t.texture_bytes, t.guest_bytes);
+        report.timings = Timings {
+            textures_uploaded: uploaded,
+            texture_bytes: tex_bytes,
+            guest_bytes,
+            ..std::mem::take(&mut self.timings)
+        };
         Ok(report)
     }
 
@@ -792,6 +850,18 @@ impl Drawer {
         }
         let tex = self.targets.get(&key).ok_or(Error::NoRenderTarget(key))?;
         self.read_texture(tex, x, y, w, h)
+    }
+
+    /// Waits for all submitted GPU work, bounded by the drawer's timeout.
+    fn wait_idle(&self) -> Result<(), Error> {
+        match self.device.poll(wgpu::PollType::Wait {
+            submission_index: None,
+            timeout: Some(self.timeout),
+        }) {
+            Ok(_) => Ok(()),
+            Err(wgpu::PollError::Timeout) => Err(Error::Timeout),
+            Err(e) => Err(Error::Gpu(e.to_string())),
+        }
     }
 
     fn read_texture(
@@ -1034,6 +1104,7 @@ impl Drawer {
             lo = lo.min(a);
             hi = hi.max(a + 4 * u64::from(vf.size_dwords));
         }
+        report.timings.guest_bytes += hi.saturating_sub(lo);
         let (base, bytes) = if lo >= hi {
             (0, vec![0; 4])
         } else {
@@ -1113,6 +1184,8 @@ impl Drawer {
             height: img.height,
             depth_or_array_layers: 1,
         };
+        report.timings.textures_uploaded += 1;
+        report.timings.texture_bytes += img.rgba8.len() as u64;
         let tex = self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("guest texture"),
             size,
@@ -1179,6 +1252,7 @@ impl Drawer {
         let (Some(vs), Some(ps)) = (self.vs.clone(), self.ps.clone()) else {
             return unsupported("draw without both shaders loaded");
         };
+        let mut t = Instant::now();
         let vs_t = self.translate(&vs, ShaderStage::Vertex)?;
         let ps_t = self.translate(&ps, ShaderStage::Pixel)?;
         let surface = self.regs.get(regs::RB_SURFACE_INFO);
@@ -1333,9 +1407,11 @@ impl Drawer {
                     })
                 })?;
                 self.pipelines.insert(key, p.clone());
+                self.timings.pipelines_created += 1;
                 p
             }
         };
+        self.timings.shaders += lap(&mut t);
 
         let (window, window_base) = self.guest_window(vf_mask, mem, report)?;
         let consts = self.buffer(
@@ -1348,10 +1424,12 @@ impl Drawer {
             &to_bytes(&state::epilogue(&self.regs, w, h)),
             wgpu::BufferUsages::UNIFORM,
         );
+        self.timings.guest_data += lap(&mut t);
         let mut textures = Vec::new();
         for n in (0..32).filter(|n| tex_mask & (1 << n) != 0) {
             textures.push((n, self.texture(n, mem, report)?));
         }
+        self.timings.textures += lap(&mut t);
         // Rectangle lists read their guest indices in the vertex shader and
         // draw 6 host vertices per rectangle without an index buffer.
         let index_buf = self.buffer("indices", &to_bytes(&idx), wgpu::BufferUsages::INDEX);
@@ -1461,6 +1539,7 @@ impl Drawer {
             }
         }
         self.queue.submit([enc.finish()]);
+        self.timings.submit += lap(&mut t);
         if let Some(e) = block_on(scope.pop()) {
             return Err(Skip::Fatal(Error::Gpu(e.to_string())));
         }
@@ -1655,7 +1734,9 @@ impl Drawer {
             let key = RenderTargetKey::color(&self.regs, r.src_select as usize)
                 .map_err(|e| Skip::Unsupported(format!("resolve clear of {e}")))?;
             let value = formats::clear_value(r.color_clear, r.color_clear_lo);
+            let t = Instant::now();
             self.clear(key, rect, formats::clear_color(key.format, value), 0.0, 0)?;
+            self.timings.clears += t.elapsed();
         }
         if r.depth_clear_enable {
             let key = RenderTargetKey::depth(&self.regs);
@@ -1664,7 +1745,9 @@ impl Drawer {
                 TargetFormat::D24FS8 => float20e4(d),
                 _ => unorm24(d),
             };
+            let t = Instant::now();
             self.clear(key, rect, [0.0; 4], depth, r.depth_clear & 0xFF)?;
+            self.timings.clears += t.elapsed();
         }
         Ok(true)
     }
@@ -1715,7 +1798,11 @@ impl Drawer {
         if rect.is_empty() {
             return Ok(());
         }
+        let mut t = Instant::now();
+        self.wait_idle()?;
+        self.timings.gpu_wait += lap(&mut t);
         let px = self.read_texture(&tex, rect.x0, rect.y0, rect.width(), rect.height())?;
+        self.timings.readback += lap(&mut t);
         let src_bytes = px.len() / (rect.width() * rect.height()) as usize;
         let mut out = vec![0; px.len() / src_bytes * dest_bytes];
         for (src, dst) in px
@@ -1729,7 +1816,7 @@ impl Drawer {
             self.resolved_endian
                 .insert(r.dest_base & PHYSICAL_MASK, r.dest_endian);
         }
-        resolve::write_tiled_texels(
+        let done = resolve::write_tiled_texels(
             mem,
             r.dest_base & PHYSICAL_MASK,
             r.dest_pitch,
@@ -1738,7 +1825,9 @@ impl Drawer {
             dest_bytes.trailing_zeros(),
             r.dest_endian,
         )
-        .map_err(Skip::Unsupported)
+        .map_err(Skip::Unsupported);
+        self.timings.resolve_cpu += lap(&mut t);
+        done
     }
 
     /// Reads the front buffer: a 32x32-tiled 8_8_8_8 surface, pitch = width
