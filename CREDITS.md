@@ -208,6 +208,27 @@ Licence texts are kept in [`third_party/licenses/`](third_party/licenses/).
   - `shaders/pixel_formats.xesli`, `d3d12/d3d12_render_target_cache.cc`:
     the 8_8_8_8 EDRAM packing (red in the low byte) used for colour clears
     and resolves.
+  - `xenos.cc` (`Float7e3To32`), `spirv_shader_translator_rb.cc`
+    (`PreClampedFloat32To7e3`, `UnclampedFloat32To7e3`) and
+    `shaders/pixel_formats.xesli` (`XeUnpackR10G10B10A2Float`,
+    `XePackR8G8B8A8UNorm`, `XePackR10G10B10A2UNorm`, the
+    `16_16_16_16_FLOAT` packing): the 7e3 conversions and the resolve
+    packing; `shaders/resolve.xesli`: the exponent bias factor and the
+    red/blue swap of a resolve.
+  - `vulkan/vulkan_render_target_cache.cc`: host formats of the colour
+    render targets (`GetColorVulkanFormat`), the colour clear value per
+    format (`PerformTransfersAndResolveClears`, the 64-bit
+    `RB_COLOR_CLEAR | RB_COLOR_CLEAR_LO << 32`), the EDRAM packing of a 7e3
+    host render target (7e3 RGB, alpha to 2 bits), and the rectangle list
+    geometry shader (the corner opposite the longest edge, the fourth
+    vertex `(v1 - v0) + v2` for the position and every interpolator).
+  - `render_target_cache.cc` / `.h` (`GetPSIColorFormatInfo`,
+    `AddPSIColorFormatFlags`): the output clamp of 7e3 render targets with
+    and without blending.
+  - `draw_util.h` (`IsPrimitivePolygonal`): no face culling for rectangle
+    lists; `draw_util.cc` (`IsRasterizationPotentiallyDone`): no drawing
+    with surface pitch 0; `draw_util.cc` (`GetResolveInfo`): which copy
+    commands a resolve accepts.
 
 ## Rust crates
 

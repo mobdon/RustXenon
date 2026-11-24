@@ -13,6 +13,7 @@ const CLEAR: [u8; 4] = [10, 20, 30, 255];
 const PRIM_TRI_LIST: u32 = 4;
 const PRIM_TRI_STRIP: u32 = 6;
 const PRIM_RECT_LIST: u32 = 8;
+const PRIM_LINE_LOOP: u32 = 12;
 const PRIM_QUAD_LIST: u32 = 13;
 
 #[test]
@@ -326,9 +327,9 @@ fn unsupported_format_and_primitive_are_reported() {
         .shader(false, &vs_color())
         .shader(true, &ps_interp())
         .vertex_fetch(0, VERTS, 12)
-        .draw_auto(PRIM_RECT_LIST, 3)
-        // k_16_16_16_16_FLOAT colour target.
-        .regs(RB_COLOR_INFO, &[7 << 16])
+        .draw_auto(PRIM_LINE_LOOP, 3)
+        // k_16_16 colour target.
+        .regs(RB_COLOR_INFO, &[4 << 16])
         .draw_auto(PRIM_TRI_LIST, 3)
         .regs(RB_COLOR_INFO, &[0])
         .draw_auto(PRIM_TRI_LIST, 3);
@@ -337,8 +338,8 @@ fn unsupported_format_and_primitive_are_reported() {
     assert_eq!(
         report.unsupported,
         vec![
-            "primitive type RectangleList".to_string(),
-            "colour render target format 7".to_string()
+            "primitive type LineLoop".to_string(),
+            "colour render target format 4".to_string()
         ]
     );
     let missing = RenderTargetKey {

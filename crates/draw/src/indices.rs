@@ -20,6 +20,10 @@ pub enum Expand {
     /// Indices (a b c d ...) become triangles (b c a) (c d a) ..., the
     /// Direct3D order Xenia uses.
     Fan,
+    /// Rectangle lists: whole groups of 3 indices are kept as they are; the
+    /// drawer's vertex shader wrapper makes 6 host vertices per rectangle
+    /// from them (see `rect_list_wgsl` in lib.rs).
+    Rects,
 }
 
 /// Host topology and index expansion for a guest primitive type, or the
@@ -34,8 +38,7 @@ pub fn topology(p: PrimitiveType) -> Result<(wgpu::PrimitiveTopology, Expand), S
         PrimitiveType::TriangleStrip => (T::TriangleStrip, Expand::None),
         PrimitiveType::TriangleFan => (T::TriangleList, Expand::Fan),
         PrimitiveType::QuadList => (T::TriangleList, Expand::Quads),
-        // A rectangle's fourth corner is derived from the other three after
-        // the vertex shader, which index expansion cannot do.
+        PrimitiveType::RectangleList => (T::TriangleList, Expand::Rects),
         other => return Err(format!("primitive type {other:?}")),
     })
 }
@@ -115,6 +118,11 @@ pub fn mark_resets(indices: &mut [u32], reset_index: u32) -> bool {
 pub fn expand(indices: Vec<u32>, e: Expand) -> Vec<u32> {
     match e {
         Expand::None => indices,
+        Expand::Rects => {
+            let mut v = indices;
+            v.truncate(v.len() / 3 * 3);
+            v
+        }
         Expand::Quads => indices
             .chunks_exact(4)
             .flat_map(|q| [q[0], q[1], q[2], q[0], q[2], q[3]])
@@ -211,7 +219,12 @@ mod tests {
             expand(vec![9, 1, 2, 3], Expand::Fan),
             vec![1, 2, 9, 2, 3, 9]
         );
-        assert!(topology(PrimitiveType::RectangleList).is_err());
+        assert_eq!(
+            topology(PrimitiveType::RectangleList),
+            Ok((wgpu::PrimitiveTopology::TriangleList, Expand::Rects))
+        );
+        assert_eq!(expand(vec![1, 2, 3, 4, 5], Expand::Rects), vec![1, 2, 3]);
+        assert!(topology(PrimitiveType::LineLoop).is_err());
         let mem = SliceMemory::default();
         assert!(guest_indices(&mem, &IndexSource::Auto, 0x1_0000).is_err());
     }

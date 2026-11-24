@@ -3,8 +3,9 @@
 // half-pixel adjustment, the top-left rounding, the scissor clamp, the
 // 8-pixel alignment and the surface pitch clamp), and the destination
 // addressing follows its 2D tiled copy destination (each source pixel
-// (x, y) lands at Tiled2D(x, y) from RB_COPY_DEST_BASE)
-// (BSD 3-Clause, see CREDITS.md).
+// (x, y) lands at Tiled2D(x, y) from RB_COPY_DEST_BASE), and the
+// destination endian follows XeEndianSwap32 / XeEndianSwap64 in
+// src/xenia/gpu/shaders/endian.xesli (BSD 3-Clause, see CREDITS.md).
 
 //! EDRAM resolve helpers that do not touch the GPU.
 
@@ -121,7 +122,8 @@ pub fn rect(
 /// Writes `rgba8` (the rectangle's pixels, rows top to bottom, R in the
 /// low byte of each little-endian texel) into the 32x32-tiled 8_8_8_8
 /// surface at `dest_base` with pitch `dest_pitch` (rounded up to 32), byte
-/// swapped by `dest_endian` (0..=3, as `xenos::Endian`).
+/// swapped by `dest_endian` (`xenos::Endian128`, see
+/// [`write_tiled_texels`]).
 pub fn write_tiled(
     mem: &mut dyn crate::GuestMemory,
     dest_base: u32,
@@ -130,31 +132,64 @@ pub fn write_tiled(
     rgba8: &[u8],
     dest_endian: u32,
 ) -> Result<(), String> {
+    write_tiled_texels(mem, dest_base, dest_pitch, rect, rgba8, 2, dest_endian)
+}
+
+/// [`write_tiled`] for texels of `1 << bytes_log2` bytes (4 or 8), each
+/// already packed as little-endian words. `dest_endian` is the
+/// `xenos::Endian128` of RB_COPY_DEST_INFO, applied as Xenia's
+/// XeEndianSwap32 / XeEndianSwap64: 8in16, 8in32 and 16in32 within each
+/// 32-bit word, 8in64 swaps the two words of a 64-bit texel and then 8in32
+/// (nothing for a 32-bit texel), 8in128 and the unused values do nothing.
+pub fn write_tiled_texels(
+    mem: &mut dyn crate::GuestMemory,
+    dest_base: u32,
+    dest_pitch: u32,
+    rect: Rect,
+    texels: &[u8],
+    bytes_log2: u32,
+    dest_endian: u32,
+) -> Result<(), String> {
+    if !(2..=3).contains(&bytes_log2) {
+        return Err(format!(
+            "resolve: {}-byte texels",
+            1u64 << bytes_log2.min(63)
+        ));
+    }
+    let bytes = 1usize << bytes_log2;
     if rect.is_empty()
-        || rgba8.len() as u64 != u64::from(rect.width()) * u64::from(rect.height()) * 4
+        || texels.len() as u64 != u64::from(rect.width()) * u64::from(rect.height()) * bytes as u64
     {
         return Err(format!(
             "resolve: {} bytes for a {}x{} rectangle",
-            rgba8.len(),
+            texels.len(),
             rect.x1.saturating_sub(rect.x0),
             rect.y1.saturating_sub(rect.y0)
         ));
     }
     let pitch = tile::align_to_tile(dest_pitch);
-    let extent = tile::tiled_extent_2d(rect.x1, rect.y1, pitch, 4)
+    let extent = tile::tiled_extent_2d(rect.x1, rect.y1, pitch, bytes as u32)
         .map_err(|e| format!("resolve destination: {e}"))?;
     let mut buf = mem
         .read_bytes(dest_base, extent as usize)
         .ok_or_else(|| format!("resolve destination 0x{dest_base:08X} is not readable"))?;
-    let e = xenon_texture::Endian::from_bits(dest_endian);
+    use xenon_texture::Endian as E;
+    let (word_swap, e) = match dest_endian & 7 {
+        0..=3 => (false, E::from_bits(dest_endian)),
+        4 if bytes == 8 => (true, E::K8in32),
+        _ => (false, E::None),
+    };
     let width = rect.width() as usize;
-    for (i, px) in rgba8.chunks_exact(4).enumerate() {
+    for (i, px) in texels.chunks_exact(bytes).enumerate() {
         let x = rect.x0 + (i % width) as u32;
         let y = rect.y0 + (i / width) as u32;
-        let at = tile::tiled_offset_2d(x, y, pitch, 2) as usize;
-        let mut t = [px[0], px[1], px[2], px[3]];
-        endian::swap_in_place(&mut t, e);
-        buf[at..at + 4].copy_from_slice(&t);
+        let at = tile::tiled_offset_2d(x, y, pitch, bytes_log2) as usize;
+        let dst = &mut buf[at..at + bytes];
+        dst.copy_from_slice(px);
+        if word_swap {
+            dst.rotate_left(4);
+        }
+        endian::swap_in_place(dst, e);
     }
     if mem.write_bytes(dest_base, &buf) {
         Ok(())
@@ -246,5 +281,37 @@ mod tests {
         let mut raw = mem.data.clone();
         endian::swap_in_place(&mut raw, xenon_texture::Endian::K8in32);
         assert_eq!(tile::detile_2d(&raw, 8, 8, 32, 4).unwrap(), px);
+    }
+
+    #[test]
+    fn write_tiled_texels_endian128() {
+        let rect = Rect {
+            x0: 0,
+            y0: 0,
+            x1: 1,
+            y1: 1,
+        };
+        let texel = [0u8, 1, 2, 3, 4, 5, 6, 7];
+        let written = |bytes_log2: u32, endian: u32| {
+            let mut mem = SliceMemory {
+                base: 0,
+                data: vec![0; 32 * 32 * 8],
+            };
+            let n = 1 << bytes_log2;
+            write_tiled_texels(&mut mem, 0, 32, rect, &texel[..n], bytes_log2, endian).unwrap();
+            mem.data[..n].to_vec()
+        };
+        // k8in64: the whole 64-bit texel byte reversed; nothing for 32 bits.
+        assert_eq!(written(3, 4), [7, 6, 5, 4, 3, 2, 1, 0]);
+        assert_eq!(written(2, 4), [0, 1, 2, 3]);
+        // k8in128 and the unused 6, 7: nothing below 128 bits.
+        for e in 5..8 {
+            assert_eq!(written(3, e), texel, "{e}");
+            assert_eq!(written(2, e), [0, 1, 2, 3], "{e}");
+        }
+        assert_eq!(written(3, 2), [3, 2, 1, 0, 7, 6, 5, 4]);
+        assert_eq!(written(3, 1), [1, 0, 3, 2, 5, 4, 7, 6]);
+        let mut mem = SliceMemory::default();
+        assert!(write_tiled_texels(&mut mem, 0, 32, rect, &texel, 70, 0).is_err());
     }
 }
