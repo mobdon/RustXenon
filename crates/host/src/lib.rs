@@ -231,7 +231,9 @@ fn watch(c: &Context, addr: u32) {
                     }
                 })
                 .collect();
-            (at, format!("text at r{r} ({at:#x}) {text:?}"))
+            // Fold the text in so an edit in place at the same address still logs.
+            let v = text.bytes().fold(at, |h, b| h.rotate_left(5) ^ b as u32);
+            (v, format!("text at r{r} ({at:#x}) {text:?}"))
         }
     };
     if LAST.with(|l| l.replace(v)) != v || *every {
