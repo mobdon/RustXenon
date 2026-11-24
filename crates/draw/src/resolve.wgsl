@@ -9,9 +9,10 @@ struct Params {
     h: u32,
     // Destination pitch in texels, a multiple of 32.
     pitch: u32,
-    // 0 8_8_8_8, 1 2_10_10_10, 2 7e3 (hosted as half), 3 16_16_16_16 float.
+    // 0 8_8_8_8, 1 2_10_10_10, 2 7e3 (hosted as half), 3 16_16_16_16 float,
+    // 4 32 float.
     src_format: u32,
-    // 0 8_8_8_8, 1 2_10_10_10.
+    // 0 8_8_8_8, 1 2_10_10_10, 2 32_FLOAT.
     dest_format: u32,
     swap: u32,
     endian: u32,
@@ -109,6 +110,8 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
         }
         let a2 = u32(a * 3.0 + 0.5);
         c = vec4<f32>(q7e3(c.r), q7e3(c.g), q7e3(c.b), f32(a2) * (1.0 / 3.0));
+    } else if p.src_format == 4u {
+        c = vec4<f32>(c.r, 0.0, 0.0, 0.0);
     }
     c = c * p.scale;
     if p.swap != 0u {
@@ -118,6 +121,8 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     if p.dest_format == 0u {
         w = to_unorm(c.r, 255.0) | (to_unorm(c.g, 255.0) << 8u) | (to_unorm(c.b, 255.0) << 16u)
             | (to_unorm(c.a, 255.0) << 24u);
+    } else if p.dest_format == 2u {
+        w = bitcast<u32>(c.r);
     } else {
         w = to_unorm(c.r, 1023.0) | (to_unorm(c.g, 1023.0) << 10u) | (to_unorm(c.b, 1023.0) << 20u)
             | (to_unorm(c.a, 3.0) << 30u);

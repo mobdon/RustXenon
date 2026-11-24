@@ -8,6 +8,8 @@ mod common;
 use common::*;
 use xenon_draw::{RenderTargetKey, TargetFormat};
 use xenon_gpu::regs::*;
+use xenon_shader::asm::*;
+use xenon_shader::ucode::*;
 
 const PRIM_TRI_LIST: u32 = 4;
 const PRIM_RECT_LIST: u32 = 8;
@@ -16,6 +18,7 @@ const PRIM_RECT_LIST: u32 = 8;
 const RT_2_10_10_10: u32 = 2;
 const RT_16_16_16_16_FLOAT: u32 = 7;
 const RT_2_10_10_10_FLOAT_AS_16_16_16_16: u32 = 12;
+const RT_32_FLOAT: u32 = 14;
 
 /// `xenos::ColorFormat` destination values.
 const DEST_8_8_8_8: u32 = 6;
@@ -537,6 +540,18 @@ fn gpu_resolve_matches_cpu_reference() {
 /// linear texture of `format` (endian none, swizzle RGBA, point filter)
 /// whose guest bytes are `texel_bytes`, and returns the halves at (8, 8).
 fn sample_into_rgba16f(d: &mut xenon_draw::Drawer, format: u32, texel_bytes: &[u8]) -> [u16; 4] {
+    let t = sample_into(d, RT_16_16_16_16_FLOAT, format, texel_bytes);
+    halves(&t)
+}
+
+/// As `sample_into_rgba16f`, into a target of `rt_format` (16_16_16_16_FLOAT
+/// or 32_FLOAT), returning the raw texel at (8, 8).
+fn sample_into(
+    d: &mut xenon_draw::Drawer,
+    rt_format: u32,
+    format: u32,
+    texel_bytes: &[u8],
+) -> Vec<u8> {
     let mut mem = memory();
     mem.data[TEXTURE as usize..][..texel_bytes.len()].copy_from_slice(texel_bytes);
     let q = W as f32;
@@ -556,7 +571,7 @@ fn sample_into_rgba16f(d: &mut xenon_draw::Drawer, format: u32, texel_bytes: &[u
     ];
     let mut s = Stream::default();
     s.setup()
-        .regs(RB_COLOR_INFO, &[RT_16_16_16_16_FLOAT << 16])
+        .regs(RB_COLOR_INFO, &[rt_format << 16])
         .shader(false, &vs_uv())
         .shader(true, &ps_texture(1))
         .vertex_fetch(0, VERTS, 20)
@@ -566,10 +581,13 @@ fn sample_into_rgba16f(d: &mut xenon_draw::Drawer, format: u32, texel_bytes: &[u
     assert_eq!(report.draws, 1, "{report:?}");
     assert!(report.unsupported.is_empty(), "{report:?}");
     assert!(report.warnings.is_empty(), "{report:?}");
-    let raw = d
-        .read_render_target_raw(key(TargetFormat::Rgba16Float), 0, 0, W, H)
-        .unwrap();
-    halves(&texel(&raw, W, 8, 8, 8))
+    let (target, bytes) = if rt_format == RT_32_FLOAT {
+        (TargetFormat::Float32, 4)
+    } else {
+        (TargetFormat::Rgba16Float, 8)
+    };
+    let raw = d.read_render_target_raw(key(target), 0, 0, W, H).unwrap();
+    texel(&raw, W, bytes, 8, 8)
 }
 
 const PRIM_QUAD_LIST: u32 = 13;
@@ -591,6 +609,16 @@ fn depth_textures_sample_depth() {
         sample_into_rgba16f(&mut d, K24_8, &word(0x80_0000)),
         [0x3800; 4]
     );
+    // A k_32_FLOAT target keeps the 2^-24 a half drops, when depth
+    // textures upload as 32-bit floats.
+    if d.float32_textures() {
+        let red = sample_into(&mut d, RT_32_FLOAT, K24_8, &word(0x80_0000));
+        assert_eq!(red, (0.5 + 1.0 / (1 << 24) as f32).to_le_bytes());
+        let red = sample_into(&mut d, RT_32_FLOAT, K24_8_FLOAT, &word(1));
+        assert_eq!(red, f32::powi(2.0, -34).to_le_bytes());
+    } else {
+        println!("skip: no filterable Rgba32Float, depth textures are halves");
+    }
 }
 
 /// Half and single float textures keep values outside [0, 1].
@@ -616,4 +644,176 @@ fn hdr_textures_sample_unclamped() {
         sample_into_rgba16f(&mut d, K32_32_32_32_FLOAT, &s),
         [0x4200, 0x3400, 0x5640, 0xBC00]
     );
+}
+
+/// One draw into three render targets of different formats: oC<i> goes
+/// to RB_COLOR_INFO<i>, and a target whose RB_COLOR_MASK bits are all off
+/// is not drawn (nor created).
+#[test]
+fn multiple_render_targets() {
+    let Some(mut d) = drawer() else { return };
+    let mut mem = memory();
+    mem.write_words(VERTS, &corner_triangle(128.0));
+    let ps = assemble(
+        &[exec(0, 4, true)],
+        &(0..4)
+            .map(|i| export(i, AluSrc::constant(i, SWZ_XYZW)))
+            .collect::<Vec<_>>(),
+    );
+    let (b1, b2, b3) = (100, 200, 300);
+    let mut s = Stream::default();
+    s.setup()
+        .regs(
+            RB_COLOR_INFO_RT[1],
+            &[b1 | (RT_2_10_10_10_FLOAT_AS_16_16_16_16 << 16)],
+        )
+        .regs(RB_COLOR_INFO_RT[2], &[b2 | (RT_32_FLOAT << 16)])
+        .regs(RB_COLOR_INFO_RT[3], &[b3])
+        // Blending off (one, zero, add) on every target.
+        .regs(RB_BLENDCONTROL1, &[0x0001_0001; 3])
+        // RT0 red and alpha, RT1 and RT2 all channels, RT3 none.
+        .regs(RB_COLOR_MASK, &[0x9 | (0xF << 4) | (0xF << 8)])
+        .shader(false, &vs_color())
+        .shader(true, &ps)
+        .vertex_fetch(0, VERTS, 12)
+        .regs(
+            SHADER_CONSTANT_FLOAT + 256 * 4,
+            &[
+                [0.5, 0.25, 0.75, 1.0],
+                [2.5, 0.5, 40.0, 0.5],
+                [-3.25, 9.0, 9.0, 9.0],
+                [1.0, 1.0, 1.0, 1.0],
+            ]
+            .concat()
+            .into_iter()
+            .map(f)
+            .collect::<Vec<_>>(),
+        )
+        .draw_auto(PRIM_TRI_LIST, 3);
+    let report = run(&mut d, &s, &mut mem);
+    assert_eq!(report.draws, 1, "{report:?}");
+    assert!(report.unsupported.is_empty(), "{report:?}");
+    let at = |base, format| RenderTargetKey {
+        base_tiles: base,
+        pitch: W,
+        format,
+    };
+    let rt0 = d
+        .read_render_target(key(TargetFormat::Rgba8), 0, 0, W, H)
+        .unwrap();
+    // Green and blue masked off: they keep the zero the target starts with.
+    assert_eq!(px(&rt0, W, 4, 4), [128, 0, 0, 255]);
+    let rt1 = d
+        .read_render_target_raw(at(b1, TargetFormat::Float7e3), 0, 0, W, H)
+        .unwrap();
+    // 7e3 output clamp (blending off): 40 to 31.875.
+    assert_eq!(
+        halves(&texel(&rt1, W, 8, 4, 4)),
+        [0x4100, 0x3800, 0x4FF8, 0x3800]
+    );
+    let rt2 = d
+        .read_render_target_raw(at(b2, TargetFormat::Float32), 0, 0, W, H)
+        .unwrap();
+    assert_eq!(texel(&rt2, W, 4, 4, 4), (-3.25f32).to_le_bytes());
+    assert!(!d.render_targets().iter().any(|k| k.base_tiles == b3));
+}
+
+/// MSAA surfaces are drawn and resolved with one sample per pixel instead
+/// of skipping the draw.
+#[test]
+fn msaa_surface_draws_and_resolves_single_sampled() {
+    let Some(mut d) = drawer() else { return };
+    let mut mem = memory();
+    mem.write_words(VERTS, &corner_triangle(128.0));
+    let mut s = Stream::default();
+    s.setup()
+        // 2x MSAA.
+        .regs(RB_SURFACE_INFO, &[W | (1 << 16)])
+        .shader(false, &vs_color())
+        .shader(true, &ps_const())
+        .vertex_fetch(0, VERTS, 12);
+    c0(&mut s, [0.0, 1.0, 0.0, 1.0]).draw_auto(PRIM_TRI_LIST, 3);
+    s.resolve_with(
+        &mut mem,
+        (W, H),
+        COPY_CONVERT,
+        (DEST, W | (H << 16), dest_info(DEST_8_8_8_8, 0, false)),
+        [0; 3],
+    );
+    let report = run(&mut d, &s, &mut mem);
+    assert_eq!((report.draws, report.resolves), (1, 1), "{report:?}");
+    assert!(report.unsupported.is_empty(), "{report:?}");
+    assert!(
+        report.warnings.iter().any(|w| w.contains("MSAA")),
+        "{report:?}"
+    );
+    let img = detiled(&mem, DEST, W, H, W, 4);
+    assert_eq!(px(&img, W, 10, 10), [0, 255, 0, 255]);
+}
+
+/// A k_32_FLOAT render target resolved to k_32_FLOAT keeps the red
+/// channel's float bits, scaled by the exponent bias and not saturated,
+/// on the GPU and the CPU reference alike; a clear writes the clear word's
+/// float.
+#[test]
+fn float32_target_clear_draw_and_resolve() {
+    use xenon_draw::formats;
+    let Some(mut d) = drawer() else { return };
+    let mut mem = memory();
+    mem.write_words(VERTS, &corner_triangle(16.0));
+    let dest2 = DEST + 0x1_0000;
+    let mut s = Stream::default();
+    s.setup()
+        .regs(RB_COLOR_INFO, &[RT_32_FLOAT << 16])
+        .resolve_with(
+            &mut mem,
+            (W, H),
+            COPY_NULL | CLEAR_COLOR,
+            (DEST, W | (H << 16), 0),
+            [0, 0.125f32.to_bits(), 0],
+        )
+        .shader(false, &vs_color())
+        .shader(true, &ps_const())
+        .vertex_fetch(0, VERTS, 12);
+    c0(&mut s, [6.5, 2.0, 3.0, 4.0]).draw_auto(PRIM_TRI_LIST, 3);
+    s.resolve_with(
+        &mut mem,
+        (W, H),
+        COPY_CONVERT,
+        (
+            DEST,
+            W | (H << 16),
+            dest_info(formats::DEST_32_FLOAT, 0, false),
+        ),
+        [0; 3],
+    )
+    .resolve_with(
+        &mut mem,
+        (W, H),
+        COPY_CONVERT,
+        (
+            dest2,
+            W | (H << 16),
+            dest_info(formats::DEST_32_FLOAT, -1, false),
+        ),
+        [0; 3],
+    );
+    let report = run(&mut d, &s, &mut mem);
+    assert_eq!((report.draws, report.resolves), (1, 3), "{report:?}");
+    assert!(report.unsupported.is_empty(), "{report:?}");
+    let word =
+        |img: &[u8], x: u32, y: u32| f32::from_le_bytes(texel(img, W, 4, x, y).try_into().unwrap());
+    let img = detiled(&mem, DEST, W, H, W, 4);
+    assert_eq!((word(&img, 2, 2), word(&img, 40, 40)), (6.5, 0.125));
+    let img = detiled(&mem, dest2, W, H, W, 4);
+    assert_eq!((word(&img, 2, 2), word(&img, 40, 40)), (3.25, 0.0625));
+    let mut out = [0; 4];
+    formats::resolve_pixel(
+        formats::edram_rgba(TargetFormat::Float32, &6.5f32.to_le_bytes()),
+        -1,
+        false,
+        formats::DEST_32_FLOAT,
+        &mut out,
+    );
+    assert_eq!(out, 3.25f32.to_le_bytes());
 }
