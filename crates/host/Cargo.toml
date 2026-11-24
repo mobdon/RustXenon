@@ -1,0 +1,10 @@
+[package]
+name = "xenon-host"
+description = "Host program: loads the player's own game files, runs recompiled code on xenon-rt, provides system call replacements."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+xenon-rt = { path = "../rt" }

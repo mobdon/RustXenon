@@ -1,0 +1,78 @@
+# ---------------------------------------------------------------------------
+# RustXenon ignore rules. See DATA-RULES.md.
+# Game data, generated code, extracted assets and built games NEVER go in git.
+# ---------------------------------------------------------------------------
+
+# Rust build output (this repo's own tools)
+/target/
+**/target/
+
+# --- Per-game folder: only README.md and <hash>/hooks.toml are allowed ------
+/games/**
+!/games/
+!/games/README.md
+!/games/*/
+!/games/*/hooks.toml
+
+# --- Player's game files, wherever they are put -------------------------
+/game-data/
+/gamedata/
+/input/
+*.xex
+*.xexp
+*.iso
+*.xiso
+*.god
+*.stfs
+*.svod
+*.xcp
+*.xbe
+*.data
+*.img
+*.rpf
+*.zip
+*.7z
+*.rar
+
+# Packages (title updates, downloads) often have no extension; keep them in
+# /game-data/ or /input/ above.
+
+# --- Generated Rust and its workspace -------------------------------------
+/generated/
+/gen/
+/out/
+**/generated/
+*.gen.rs
+
+# --- Extracted assets ------------------------------------------------------
+/extracted/
+/assets/
+*.xpr
+*.xma
+*.wma
+*.dds
+*.bik
+*.wav
+*.ogg
+
+# --- Built games and run output ---------------------------------------------
+/build-game/
+/dist/
+/captures/
+/runs/
+/recordings/
+/saves/
+*.png
+!/docs/**/*.png
+*.log
+*.trace
+
+# --- Local tooling -------------------------------------------------------
+/.local/
+.env
+.env.*
+*.local.toml
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

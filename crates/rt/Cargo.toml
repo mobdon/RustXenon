@@ -1,0 +1,9 @@
+[package]
+name = "xenon-rt"
+description = "Runtime that recompiled Xbox 360 code links against: guest CPU state, guest memory, call dispatch."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]

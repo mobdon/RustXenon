@@ -1,0 +1,9 @@
+[package]
+name = "xenon-recomp"
+description = "Reads Xbox 360 executables (64-bit PowerPC) and writes Rust source that links against xenon-rt."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
