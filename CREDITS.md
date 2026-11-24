@@ -47,7 +47,8 @@ Licence texts are kept in [`third_party/licenses/`](third_party/licenses/).
 - Licence: BSD 3-Clause, Copyright (c) Ben Vanik and Xenia project
   contributors. Its notice is part of
   [`third_party/licenses/ReXGlue-LICENSE.txt`](third_party/licenses/ReXGlue-LICENSE.txt).
-- Use: ideas only, no code. Much of what ReXGlue does for guest memory
+- Use: ideas, and ported code in the GPU crates listed in the
+  sections below. Much of what ReXGlue does for guest memory
   layout, kernel objects, the GPU command processor and audio decoding comes
   from Xenia, so what we learned there traces back to Xenia too.
 - Use in the loader (through XenonRecomp's port, see above): the order of
@@ -58,6 +59,33 @@ Licence texts are kept in [`third_party/licenses/`](third_party/licenses/).
   and the whole-quadword behaviour of the element loads. We checked our own
   decoder against the VMX128 encodings published in Xenia's instruction
   tests; none of its test data is copied into this repository.
+
+## Xenia: ported code in `xenon-gpu`
+
+- Licence: BSD 3-Clause, Copyright (c) 2015 Ben Vanik and Xenia project
+  contributors. Full text:
+  [`third_party/licenses/Xenia-LICENSE.txt`](third_party/licenses/Xenia-LICENSE.txt)
+- Studied at commit `95a5c3ee250f80c3b9d139658649d9ffb6db3eec`. Logic and
+  tables are rewritten in Rust; each file names its sources at the top.
+- From `src/xenia/gpu/`:
+  - `command_processor.cc`: PM4 packet decoding for types 0 to 3, the
+    type-3 opcode handlers (field layouts, address and endian masks,
+    `SET_CONSTANT` type bases, `REG_RMW`, `LOAD_ALU_CONSTANT`, `IM_LOAD`,
+    draw initiator and index DMA, predication with bin mask and select, the
+    indirect buffer length mask), ring buffer read semantics, and the guest
+    byte order of GPU memory writes and polls.
+  - `packet_disassembler.cc`: header fields and the `DRAW_INDX` layouts.
+  - `xenos.h`: PM4 opcode values, primitive, index format, endian, copy
+    command, fetch constant, EDRAM mode and event values, the vertex fetch
+    constant layout, `CpuToGpu`.
+  - `registers.h` and `register_table.inc`: register addresses and the
+    bitfields of the draw, surface, colour, depth, copy and window registers.
+  - `register_file.h`: the register file size.
+  - `draw_util.cc` (`GetResolveInfo`) and `d3d12/d3d12_command_processor.cc`
+    (`IssueDraw`): which registers a resolve reads, and that a draw in EDRAM
+    copy mode is a resolve.
+  - `graphics_system.cc`: the `CP_RB_WPTR` address.
+- From `src/xenia/memory.h` (`TranslatePhysical`): the physical address mask.
 
 ## LZX format description (Microsoft)
 

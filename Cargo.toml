@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/recomp", "crates/rt", "crates/host", "crates/cpu-tests", "crates/gpu"]
+members = ["crates/*"]
 
 [workspace.package]
 version = "0.0.0"

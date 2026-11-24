@@ -224,6 +224,40 @@ fn indirect_depth_limit_stops_self_reference() {
 }
 
 #[test]
+fn indirect_budget_bounds_fan_out() {
+    // A buffer that calls itself three times: without a total budget the
+    // work grows as 3^depth.
+    let call = type3(PM4_INDIRECT_BUFFER, &[DATA, 11]);
+    let ib = cat(&[
+        type3(PM4_INTERRUPT, &[1]),
+        call.clone(),
+        call.clone(),
+        call.clone(),
+    ]);
+    assert_eq!(ib.len(), 11);
+    let stream = type3(PM4_INDIRECT_BUFFER, &[DATA, 11]);
+    let mut mem = mem_with(&stream);
+    mem.write_words(DATA, &ib);
+    let mut rec = Recorder::new();
+    rec.max_indirect_depth = 100;
+    rec.max_indirect_dwords = 11 * 5;
+    rec.record_buffer(&mem, BUF, stream.len() as u32).unwrap();
+    // Five buffers fit the budget; each records one interrupt.
+    assert_eq!(rec.commands.len(), 5);
+    assert!(matches!(
+        rec.warnings.last(),
+        Some(Warning::IndirectBudgetExceeded {
+            addr: DATA,
+            dwords: 11
+        })
+    ));
+    // The budget is per record call.
+    rec.commands.clear();
+    rec.record_buffer(&mem, BUF, stream.len() as u32).unwrap();
+    assert_eq!(rec.commands.len(), 5);
+}
+
+#[test]
 fn unreadable_indirect_buffer_warns_and_continues() {
     let stream = cat(&[
         type3(PM4_INDIRECT_BUFFER, &[0x0F00_0000, 4]),

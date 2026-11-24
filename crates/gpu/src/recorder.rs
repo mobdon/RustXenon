@@ -18,6 +18,8 @@ use crate::xenos::{Endian, IndexFormat, PrimitiveType};
 /// uses one level below the ring; this leaves room without letting a
 /// self-referencing buffer recurse forever.
 pub const DEFAULT_MAX_INDIRECT_DEPTH: u32 = 4;
+/// Default total of indirect-buffer dwords followed per record call (64 MiB).
+pub const DEFAULT_MAX_INDIRECT_DWORDS: u64 = 16 << 20;
 
 /// Fatal problems with the buffer the caller handed in.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -59,6 +61,10 @@ pub enum Warning {
     PacketTooShort { opcode: u32, count: u32 },
     /// An indirect buffer nested deeper than the limit; not followed.
     IndirectDepthExceeded { addr: u32, dwords: u32 },
+    /// Indirect buffers in one record call added up to more than
+    /// `max_indirect_dwords`; this one is not followed. Bounds the work a
+    /// buffer that calls itself many times can cause.
+    IndirectBudgetExceeded { addr: u32, dwords: u32 },
     /// Guest memory a packet points at is not readable; packet skipped.
     Unreadable { addr: u32, dwords: u32 },
     /// Register writes from this index on fell past the register file.
@@ -82,6 +88,9 @@ pub struct Recorder {
     /// Non-fatal problems in stream order.
     pub warnings: Vec<Warning>,
     pub max_indirect_depth: u32,
+    /// Indirect-buffer dwords one record call may follow in total.
+    pub max_indirect_dwords: u64,
+    indirect_left: u64,
     // Predication state for type-3 packets with the predicate bit, as Xenia.
     bin_mask: u64,
     bin_select: u64,
@@ -94,6 +103,8 @@ impl Default for Recorder {
             commands: Vec::new(),
             warnings: Vec::new(),
             max_indirect_depth: DEFAULT_MAX_INDIRECT_DEPTH,
+            max_indirect_dwords: DEFAULT_MAX_INDIRECT_DWORDS,
+            indirect_left: 0,
             bin_mask: 0xFFFF_FFFF,
             bin_select: 0xFFFF_FFFF,
         }
@@ -140,6 +151,7 @@ impl Recorder {
             words.extend(read_span(0, write_ptr)?);
             words
         };
+        self.indirect_left = self.max_indirect_dwords;
         self.run(mem, &words, 0);
         Ok(write_ptr)
     }
@@ -156,6 +168,7 @@ impl Recorder {
             addr,
             dwords: dword_count,
         })?;
+        self.indirect_left = self.max_indirect_dwords;
         self.run(mem, &words, 0);
         Ok(())
     }
@@ -163,6 +176,7 @@ impl Recorder {
     /// Records packets already copied out of guest memory. `mem` is still
     /// needed for packets that point into memory.
     pub fn record_words(&mut self, mem: &dyn GuestRead, words: &[u32]) {
+        self.indirect_left = self.max_indirect_dwords;
         self.run(mem, words, 0);
     }
 
@@ -273,7 +287,11 @@ impl Recorder {
                     if depth >= self.max_indirect_depth {
                         self.warnings
                             .push(Warning::IndirectDepthExceeded { addr, dwords });
+                    } else if u64::from(dwords) > self.indirect_left {
+                        self.warnings
+                            .push(Warning::IndirectBudgetExceeded { addr, dwords });
                     } else if let Some(words) = read_words(mem, addr, dwords) {
+                        self.indirect_left -= u64::from(dwords);
                         self.run(mem, &words, depth + 1);
                     } else {
                         self.warnings.push(Warning::Unreadable { addr, dwords });
