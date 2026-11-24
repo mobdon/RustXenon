@@ -1,0 +1,13 @@
+[package]
+name = "xenon-shader"
+description = "Translates console GPU shader microcode (vertex and pixel programs) into WGSL, ahead of time or at run time."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[dependencies]
+
+[dev-dependencies]
+naga = { version = "30", features = ["wgsl-in"] }
