@@ -940,7 +940,8 @@ impl Gen {
             self.line("{");
         }
         if !f.mini {
-            let mut addr = format!("i32({} >> 2u)", fetch_dword(fc * 2));
+            // Physical dword address, as Xenia masks fetch addresses (0x1FFFFFFF bytes).
+            let mut addr = format!("i32(({} >> 2u) & 0x07FFFFFFu)", fetch_dword(fc * 2));
             if f.stride != 0 {
                 let round = if f.index_rounded { " + 0.5" } else { "" };
                 let src = temp_ref(f.src, f.src_relative);
@@ -1100,7 +1101,7 @@ fn cnst(i: i32) -> vec4<f32> {{
                 }
                 ret.push_str("    return out;\n");
                 let entry = "@vertex\nfn vs_main(@builtin(vertex_index) vertex_index: u32) -> VsOut {\n    \
-                     r[0].x = f32(bitcast<i32>(vertex_index + consts.vertex_base));\n"
+                     r[0].x = f32((vertex_index + consts.vertex_base) & 0xFFFFFFu);\n"
                     .to_string();
                 (entry, ret)
             }

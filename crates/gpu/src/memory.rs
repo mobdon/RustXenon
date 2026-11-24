@@ -49,6 +49,7 @@ impl SliceMemory {
 
     /// Overwrites `words` at `addr` (big-endian), growing the block if needed.
     pub fn write_words(&mut self, addr: u32, words: &[u32]) {
+        assert!(addr >= self.base, "write_words below the block's base");
         let start = (addr - self.base) as usize;
         let end = start + words.len() * 4;
         if self.data.len() < end {
