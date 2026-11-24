@@ -24,13 +24,20 @@ impl WavWriter<io::BufWriter<std::fs::File>> {
 
 impl<W: Write + Seek> WavWriter<W> {
     pub fn new(mut out: W, rate: u32, channels: u16) -> io::Result<Self> {
-        let align = channels * 2;
+        let bad = || {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "wav rate or channel count too large",
+            )
+        };
+        let align = channels.checked_mul(2).filter(|&a| a > 0).ok_or_else(bad)?;
+        let byte_rate = rate.checked_mul(align as u32).ok_or_else(bad)?;
         out.write_all(b"RIFF\0\0\0\0WAVEfmt ")?;
         out.write_all(&16u32.to_le_bytes())?;
         out.write_all(&1u16.to_le_bytes())?; // PCM
         out.write_all(&channels.to_le_bytes())?;
         out.write_all(&rate.to_le_bytes())?;
-        out.write_all(&(rate * align as u32).to_le_bytes())?;
+        out.write_all(&byte_rate.to_le_bytes())?;
         out.write_all(&align.to_le_bytes())?;
         out.write_all(&16u16.to_le_bytes())?;
         out.write_all(b"data\0\0\0\0")?;
@@ -76,6 +83,12 @@ impl<W: Write + Seek> WavWriter<W> {
 
 impl<W: Write + Seek> crate::Sink for WavWriter<W> {
     fn write(&mut self, stereo: &[f32]) -> io::Result<()> {
+        if self.channels != 2 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "a mixer sink must be a 2-channel wav",
+            ));
+        }
         self.write_samples(stereo)
     }
 }
@@ -167,6 +180,16 @@ mod tests {
             u32::from_le_bytes(bytes[4..8].try_into().unwrap()),
             u32::MAX
         );
+    }
+
+    #[test]
+    fn refuses_bad_formats() {
+        use crate::Sink;
+        let new = |rate, ch| WavWriter::new(io::Cursor::new(Vec::new()), rate, ch);
+        assert!(new(u32::MAX, 2).is_err());
+        assert!(new(48_000, 0).is_err());
+        assert!(new(48_000, u16::MAX).is_err());
+        assert!(new(48_000, 1).unwrap().write(&[0.0; 2]).is_err());
     }
 
     #[test]
