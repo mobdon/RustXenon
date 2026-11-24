@@ -470,6 +470,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "xenon-gpu"
+version = "0.0.0"
+
+[[package]]
 name = "xenon-host"
 version = "0.0.0"
 dependencies = [
@@ -498,6 +502,10 @@ version = "0.0.0"
 dependencies = [
  "naga",
 ]
+
+[[package]]
+name = "xenon-texture"
+version = "0.0.0"
 
 [[package]]
 name = "zerocopy"
