@@ -47,6 +47,8 @@ fn random_state_never_panics() {
         RB_COPY_DEST_PITCH,
         RB_COPY_DEST_BASE,
         RB_DEPTH_CLEAR,
+        RB_COLOR_CLEAR,
+        RB_COLOR_CLEAR_LO,
         SHADER_CONSTANT_FETCH,
         SHADER_CONSTANT_FETCH + 1,
         SHADER_CONSTANT_FETCH + 6,
@@ -79,8 +81,9 @@ fn random_state_never_panics() {
             };
             s.regs(reg, &[v]);
         }
-        let prims = [1, 2, 3, 4, 5, 6, 13, rng.next() % 64];
-        let prim = prims[(rng.next() % 8) as usize];
+        // Rectangle lists (8) included: counts not a multiple of 3 too.
+        let prims = [1, 2, 3, 4, 5, 6, 8, 13, rng.next() % 64];
+        let prim = prims[(rng.next() % 9) as usize];
         let count = rng.next() % 300;
         match rng.next() % 3 {
             0 => s.draw_auto(prim, count),

@@ -389,4 +389,17 @@ fn synthetic_frame_float7e3_to_front_buffer() {
     for (x, y) in [(100, 100), (150, 150), (298, 100), (100, 298)] {
         assert_eq!(px(&frame.rgba8, fw, x, y), red, "({x}, {y})");
     }
+    // Every pixel: the clear quad leaves no gap (its diagonal included),
+    // the triangle covers its pixel centres (centres on its hypotenuse,
+    // x + y = 399, are left out).
+    for y in 0..fh {
+        for x in 0..fw {
+            if x + y == 399 {
+                continue;
+            }
+            let inside = x >= 100 && y >= 100 && x + y < 399;
+            let want = if inside { red } else { back };
+            assert_eq!(px(&frame.rgba8, fw, x, y), want, "({x}, {y})");
+        }
+    }
 }

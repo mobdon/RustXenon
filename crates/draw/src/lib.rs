@@ -426,8 +426,8 @@ fn patch_vertex_wgsl(wgsl: &str, extra: u16) -> Result<String, String> {
 /// rectangle list shader. Host vertex `6r + k` belongs to rectangle `r`,
 /// whose three guest indices are `xe_rect_indices[3r..3r + 3]`
 /// (`@group(0) @binding(3)`). Corners 0..2 are the guest vertices in their
-/// order (the first triangle). For the second triangle the translated body
-/// runs for all three guest vertices; the corner opposite the longest edge
+/// order (the first triangle). The translated body runs for all three
+/// guest vertices at every host vertex; the corner opposite the longest edge
 /// (squared clip-space XY lengths, ties as Xenia's geometry shader) is the
 /// right angle `a`, its successors are `b` and `c`, and the second triangle
 /// is `(c, b, d)` with the fourth vertex `d = (b - a) + c` for the position
@@ -474,9 +474,9 @@ fn xe_len2(v: vec2<f32>) -> f32 {{
 fn vs_main(@builtin(vertex_index) host_index: u32) -> VsOut {{
     let first = (host_index / 6u) * 3u;
     let corner = host_index % 6u;
-    if (corner < 3u) {{
-        return xe_vs_body(xe_rect_indices[first + corner]);
-    }}
+    // Every host vertex runs the body for all three guest vertices, so the
+    // shared diagonal's two corners are bit-identical in both triangles
+    // (no crack from the compiler optimising two call sites differently).
     var v = array<VsOut, 3>(
         xe_vs_body(xe_rect_indices[first]),
         xe_vs_body(xe_rect_indices[first + 1u]),
@@ -495,6 +495,9 @@ fn vs_main(@builtin(vertex_index) host_index: u32) -> VsOut {{
     let a = v[s];
     let b = v[(s + 1u) % 3u];
     let c = v[(s + 2u) % 3u];
+    if (corner < 3u) {{
+        return v[corner];
+    }}
     if (corner == 3u) {{
         return c;
     }}

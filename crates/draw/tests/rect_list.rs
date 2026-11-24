@@ -80,6 +80,15 @@ fn check_rect(img: &[u8]) {
         let p = px(img, W, x, y);
         assert!(near(p, c, 1), "({x}, {y}): {p:?}, want {c:?}");
     }
+    // Every pixel of both triangles, the shared diagonal included (a crack
+    // there would leave the clear colour).
+    let unorm = |v: u32| (((v as f32 + 0.5 - 16.0) / 32.0) * 255.0).round() as u8;
+    for y in 16..48 {
+        for x in 16..48 {
+            let (p, c) = (px(img, W, x, y), [unorm(x), unorm(y), 0, 255]);
+            assert!(near(p, c, 1), "({x}, {y}): {p:?}, want {c:?}");
+        }
+    }
     for (x, y) in [
         (15, 16),
         (48, 16),
