@@ -901,3 +901,25 @@ fn replaying_register_writes_rebuilds_the_file() {
     }
     assert_eq!(rec.regs.get(SCRATCH_REG0), 0x99);
 }
+
+#[test]
+fn huge_ring_pointers_do_not_overflow() {
+    // read_ptr * 4 overflows u32; this panicked in debug builds before.
+    let mem = SliceMemory::from_words(BUF, &[0; 4]);
+    let mut rec = Recorder::new();
+    for (size, read, write) in [
+        (u32::MAX, 0x8000_0000, 0x8000_0004),
+        (u32::MAX, 0xFFFF_FFF0, 2),
+        (0x4000_0001, 0x4000_0000, 0x4000_0000),
+    ] {
+        let _ = rec.record_ring(&mem, BUF, size, read, write);
+    }
+    assert!(rec.commands.is_empty());
+}
+
+#[test]
+fn out_of_range_fetch_constant_reads_zero() {
+    let rec = Recorder::new();
+    assert_eq!(rec.regs.fetch_constant(u32::MAX), [0; 6]);
+    assert_eq!(rec.regs.vertex_fetch(u32::MAX).address, 0);
+}

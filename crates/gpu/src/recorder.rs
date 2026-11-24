@@ -54,6 +54,8 @@ pub enum Warning {
     /// that buffer is dropped (Xenia stops the buffer here too).
     Truncated { header: u32, available: u32 },
     /// A type-3 packet is too short for its opcode; the packet is skipped.
+    /// Xenia instead reads past the packet (most opcodes) or stops the
+    /// buffer (DRAW_INDX, a DMA draw without base and size).
     PacketTooShort { opcode: u32, count: u32 },
     /// An indirect buffer nested deeper than the limit; not followed.
     IndirectDepthExceeded { addr: u32, dwords: u32 },
@@ -124,7 +126,8 @@ impl Recorder {
         }
         let base = ring_base & PHYSICAL_MASK;
         let read_span = |from: u32, to: u32| {
-            let addr = base.wrapping_add(from * 4) & PHYSICAL_MASK;
+            // wrapping_mul: a hostile ring size above 2^30 dwords must not panic.
+            let addr = base.wrapping_add(from.wrapping_mul(4)) & PHYSICAL_MASK;
             read_words(mem, addr, to - from).ok_or(Error::Unreadable {
                 addr,
                 dwords: to - from,

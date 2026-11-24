@@ -172,13 +172,14 @@ impl RegisterFile {
     /// The six dwords of fetch constant `n` (0..32): a texture fetch
     /// constant, or three two-dword vertex fetch constants.
     pub fn fetch_constant(&self, n: u32) -> [u32; 6] {
-        let base = SHADER_CONSTANT_FETCH + 6 * n;
-        std::array::from_fn(|i| self.get(base + i as u32))
+        // Saturating: an out-of-range `n` reads zeros instead of panicking.
+        let base = SHADER_CONSTANT_FETCH.saturating_add(n.saturating_mul(6));
+        std::array::from_fn(|i| self.get(base.saturating_add(i as u32)))
     }
 
     /// The two dwords of vertex fetch constant `n` (0..96).
     pub fn vertex_fetch(&self, n: u32) -> crate::VertexFetch {
-        let base = SHADER_CONSTANT_FETCH + 2 * n;
-        crate::VertexFetch::decode([self.get(base), self.get(base + 1)])
+        let base = SHADER_CONSTANT_FETCH.saturating_add(n.saturating_mul(2));
+        crate::VertexFetch::decode([self.get(base), self.get(base.saturating_add(1))])
     }
 }
