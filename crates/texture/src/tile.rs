@@ -32,6 +32,12 @@ fn tiled_combine(outer_inner_bytes: u64, bank: u64, pipe: u64, y_lsb: u64) -> u6
 /// Byte offset of block (x, y) in a tiled 2D surface. `pitch_aligned` is in
 /// blocks and must be a multiple of 32.
 pub fn tiled_offset_2d(x: u32, y: u32, pitch_aligned: u32, bytes_per_block_log2: u32) -> u32 {
+    tiled_offset_2d_wide(x, y, pitch_aligned, bytes_per_block_log2) as u32
+}
+
+/// [`tiled_offset_2d`] without the final truncation, so callers can detect
+/// surfaces whose offsets do not fit in 32 bits.
+fn tiled_offset_2d_wide(x: u32, y: u32, pitch_aligned: u32, bytes_per_block_log2: u32) -> u64 {
     debug_assert_eq!(pitch_aligned % TILE_BLOCKS, 0);
     let (x, y) = (x as u64, y as u64);
     let outer_blocks = (((y >> 5) * (pitch_aligned as u64 >> 5)) + (x >> 5)) << 6;
@@ -39,7 +45,7 @@ pub fn tiled_offset_2d(x: u32, y: u32, pitch_aligned: u32, bytes_per_block_log2:
     let outer_inner_bytes = (outer_blocks | inner_blocks) << bytes_per_block_log2;
     let bank = (y >> 4) & 0b1;
     let pipe = ((x >> 3) & 0b11) ^ (((y >> 3) & 0b1) << 1);
-    tiled_combine(outer_inner_bytes, bank, pipe, y & 1) as u32
+    tiled_combine(outer_inner_bytes, bank, pipe, y & 1)
 }
 
 /// Byte offset of block (x, y, z) in a tiled 3D surface. `pitch_aligned` and
@@ -55,9 +61,13 @@ pub fn tiled_offset_3d(
     debug_assert_eq!(pitch_aligned % TILE_BLOCKS, 0);
     debug_assert_eq!(height_aligned % TILE_BLOCKS, 0);
     let (x, y, z) = (x as u64, y as u64, z as u64);
-    let outer_blocks = ((((z >> 2) * (height_aligned as u64 >> 4)) + (y >> 4))
-        * (pitch_aligned as u64 >> 5)
-        + (x >> 5))
+    // Wrapping: in-range sizes stay below 2^31 (see Tiled3D); out-of-range
+    // ones give a meaningless offset instead of an overflow panic.
+    let outer_blocks = (z >> 2)
+        .wrapping_mul(height_aligned as u64 >> 4)
+        .wrapping_add(y >> 4)
+        .wrapping_mul(pitch_aligned as u64 >> 5)
+        .wrapping_add(x >> 5)
         << 7;
     let inner_blocks = ((z & 0b11) << 5) | (((y >> 1) & 0b11) << 3) | (x & 0b111);
     let outer_inner_bytes = (outer_blocks | inner_blocks) << bytes_per_block_log2;
@@ -86,28 +96,31 @@ pub fn tiled_extent_2d(
     bytes_per_block: u32,
 ) -> Result<u32, Error> {
     let log2 = block_log2(bytes_per_block)?;
+    let pitch = aligned_pitch(pitch_blocks)?;
     if width == 0 || height == 0 {
         return Ok(0);
     }
     let last_tile = |v: u32| (v - 1) & !(TILE_BLOCKS - 1);
-    let origin = tiled_offset_2d(
-        last_tile(width),
-        last_tile(height),
-        align_to_tile(pitch_blocks),
-        log2,
-    );
+    let origin = tiled_offset_2d_wide(last_tile(width), last_tile(height), pitch, log2);
     // Within the last 32x32 tile, addressing repeats every 128x128 (1 byte
     // blocks) or 64x64 (2 byte blocks), so the tile does not end at 32x32.
-    Ok(origin
+    let end = origin
         + match log2 {
             0 => 0xA00,
             1 => 0xC00,
             _ => 0x400 << log2,
-        })
+        };
+    u32::try_from(end).map_err(|_| Error::BadLayout("tiled surface larger than 4 GiB"))
+}
+
+fn aligned_pitch(pitch_blocks: u32) -> Result<u32, Error> {
+    pitch_blocks
+        .checked_next_multiple_of(TILE_BLOCKS)
+        .ok_or(Error::BadLayout("pitch too large"))
 }
 
 fn check_pitch(width: u32, pitch_blocks: u32) -> Result<u32, Error> {
-    let pitch = align_to_tile(pitch_blocks);
+    let pitch = aligned_pitch(pitch_blocks)?;
     if pitch < width {
         return Err(Error::BadLayout("pitch smaller than width"));
     }
@@ -123,6 +136,7 @@ pub fn detile_2d(
     pitch_blocks: u32,
     bytes_per_block: u32,
 ) -> Result<Vec<u8>, Error> {
+    let pitch = check_pitch(width, pitch_blocks)?;
     let needed = tiled_extent_2d(width, height, pitch_blocks, bytes_per_block)? as usize;
     if src.len() < needed {
         return Err(Error::TooShort {
@@ -130,7 +144,6 @@ pub fn detile_2d(
             got: src.len(),
         });
     }
-    let pitch = check_pitch(width, pitch_blocks)?;
     let log2 = bytes_per_block.trailing_zeros();
     let bpb = bytes_per_block as usize;
     let mut out = Vec::with_capacity(width as usize * height as usize * bpb);
@@ -154,6 +167,9 @@ pub fn tile_2d_into(
     pitch_blocks: u32,
     bytes_per_block: u32,
 ) -> Result<(), Error> {
+    // Pitch first: with pitch >= width, every block lies inside the extent, so
+    // a 32-bit extent also bounds `width * height * bytes_per_block`.
+    let pitch = check_pitch(width, pitch_blocks)?;
     let needed = tiled_extent_2d(width, height, pitch_blocks, bytes_per_block)? as usize;
     if dst.len() < needed {
         return Err(Error::TooShort {
@@ -169,7 +185,6 @@ pub fn tile_2d_into(
             got: linear.len(),
         });
     }
-    let pitch = check_pitch(width, pitch_blocks)?;
     let log2 = bytes_per_block.trailing_zeros();
     for (i, block) in linear[..linear_needed].chunks_exact(bpb).enumerate() {
         let (x, y) = (i as u32 % width, i as u32 / width);
@@ -188,6 +203,7 @@ pub fn tile_2d(
     pitch_blocks: u32,
     bytes_per_block: u32,
 ) -> Result<Vec<u8>, Error> {
+    check_pitch(width, pitch_blocks)?;
     let mut dst = vec![0; tiled_extent_2d(width, height, pitch_blocks, bytes_per_block)? as usize];
     tile_2d_into(
         &mut dst,
@@ -327,5 +343,22 @@ mod tests {
             detile_2d(&[0; 8192], 40, 1, 32, 4),
             Err(Error::BadLayout("pitch smaller than width"))
         );
+    }
+
+    #[test]
+    fn hostile_sizes_are_errors_not_panics() {
+        assert_eq!(
+            tiled_extent_2d(1, 1, u32::MAX, 4),
+            Err(Error::BadLayout("pitch too large"))
+        );
+        // Offsets past 4 GiB used to be truncated to 32 bits, giving a small
+        // extent and then an out-of-bounds index while detiling.
+        assert_eq!(
+            tiled_extent_2d(1 << 20, 1 << 20, 1 << 20, 16),
+            Err(Error::BadLayout("tiled surface larger than 4 GiB"))
+        );
+        assert!(detile_2d(&[0; 64], u32::MAX, u32::MAX, u32::MAX - 64, 16).is_err());
+        assert!(tile_2d(&[0; 64], u32::MAX, 2, 32, 4).is_err());
+        let _ = tiled_offset_3d(u32::MAX, u32::MAX, u32::MAX, 0xFFFF_FFE0, 0xFFFF_FFE0, 4);
     }
 }

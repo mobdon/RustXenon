@@ -91,7 +91,9 @@ fn base_layout(fetch: &TextureFetch) -> Result<BaseLayout, Error> {
     let width_blocks = width.div_ceil(info.block_width);
     let height_blocks = height.div_ceil(info.block_height);
     let pitch_blocks = tile::align_to_tile(fetch.pitch_texels().div_ceil(info.block_width));
-    if pitch_blocks < width_blocks {
+    // A single linear row never steps by the pitch (Xenia's extent ignores it
+    // then too), so only multi-row or tiled layouts need a pitch that fits.
+    if pitch_blocks < width_blocks && (fetch.tiled || height_blocks > 1) {
         return Err(Error::BadLayout("pitch smaller than width"));
     }
     let row_pitch_bytes = pitch_blocks as usize * bytes_per_block as usize;
@@ -153,8 +155,8 @@ pub fn decode_base_level(fetch: &TextureFetch, guest_bytes: &[u8]) -> Result<Ima
     } else {
         let pitch_bytes = (layout.pitch_blocks * layout.bytes_per_block) as usize;
         let mut out = Vec::with_capacity(row_bytes * layout.height_blocks as usize);
-        for row in raw.chunks(pitch_bytes).take(layout.height_blocks as usize) {
-            out.extend_from_slice(&row[..row_bytes]);
+        for row in 0..layout.height_blocks as usize {
+            out.extend_from_slice(&raw[row * pitch_bytes..][..row_bytes]);
         }
         out
     };
@@ -335,5 +337,50 @@ mod tests {
         let fetch = TextureFetch::decode(words);
         assert_eq!(fetch.depth(), 3);
         assert_eq!(bytes_needed(&fetch).unwrap(), 2 * 4096 + 15 * 128 + 64);
+    }
+
+    #[test]
+    fn linear_1d_ignores_pitch() {
+        // A 1D texture is one row, so its pitch field is never stepped by;
+        // pitch 0 must still decode (Xenia's extent for one row ignores it).
+        let words = [
+            2,
+            TextureFormat::K8 as u32,
+            47, // width 48
+            (RGBA as u32) << 1,
+            0,
+            0, // dimension 1D
+        ];
+        let fetch = TextureFetch::decode(words);
+        assert_eq!(fetch.dimension, Dimension::D1);
+        assert_eq!(bytes_needed(&fetch).unwrap(), 48);
+        let guest: Vec<u8> = (0..48).collect();
+        let img = decode_base_level(&fetch, &guest).unwrap();
+        assert_eq!((img.width, img.height), (48, 1));
+        assert_eq!(&img.rgba8[47 * 4..], &[47; 4]);
+    }
+
+    #[test]
+    fn random_fetch_words_do_not_panic() {
+        // xorshift32; half the cases get small sizes so decoding really runs.
+        let mut state = 0x1234_5678u32;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state
+        };
+        let guest = vec![0xA5u8; 1 << 16];
+        for i in 0..20_000 {
+            let mut words = [next(), next(), next(), next(), next(), next()];
+            if i % 2 == 0 {
+                words[2] &= 0x000F_E01F; // width, height up to 32, depth up to 1
+                words[0] &= !(0x1FF << 22);
+                words[0] |= (next() & 3) << 22; // pitch 0..96
+            }
+            let fetch = TextureFetch::decode(words);
+            let _ = bytes_needed(&fetch);
+            let _ = decode_base_level(&fetch, &guest);
+        }
     }
 }

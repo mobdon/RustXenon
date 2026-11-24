@@ -156,18 +156,31 @@ fn block4x4(format: TextureFormat, b: &[u8]) -> [[u8; 4]; 16] {
     }
 }
 
-fn check_len(format: TextureFormat, data: &[u8], width: u32, height: u32) -> Result<(), Error> {
+/// Checks the format is decodable and `data` holds every block; returns the
+/// output texel count.
+/// Checked arithmetic: sizes come from guest registers or callers and must
+/// not overflow into a small allocation.
+fn check_len(format: TextureFormat, data: &[u8], width: u32, height: u32) -> Result<usize, Error> {
+    if !format.can_convert() {
+        return Err(Error::UnsupportedFormat(format));
+    }
     let info = format.info();
-    let needed = width.div_ceil(info.block_width) as usize
-        * height.div_ceil(info.block_height) as usize
-        * info.bytes_per_block() as usize;
+    let too_big = Error::BadLayout("texture size overflows");
+    let needed = (width.div_ceil(info.block_width) as usize)
+        .checked_mul(height.div_ceil(info.block_height) as usize)
+        .and_then(|n| n.checked_mul(info.bytes_per_block() as usize))
+        .ok_or(too_big.clone())?;
+    let texels = (width as usize)
+        .checked_mul(height as usize)
+        .filter(|n| n.checked_mul(4).is_some())
+        .ok_or(too_big)?;
     if data.len() < needed {
         return Err(Error::TooShort {
             needed,
             got: data.len(),
         });
     }
-    Ok(())
+    Ok(texels)
 }
 
 /// A decoded texel: block-compressed formats decode to bytes, which stay
@@ -184,9 +197,6 @@ fn decode(
     height: u32,
     mut put: impl FnMut(usize, Texel),
 ) -> Result<(), Error> {
-    if !format.can_convert() {
-        return Err(Error::UnsupportedFormat(format));
-    }
     check_len(format, data, width, height)?;
     let format = format.data_format();
     let info = format.info();
@@ -223,7 +233,7 @@ pub fn to_rgba_f32(
     width: u32,
     height: u32,
 ) -> Result<Vec<f32>, Error> {
-    let mut out = vec![0.0; width as usize * height as usize * 4];
+    let mut out = vec![0.0; check_len(format, data, width, height)? * 4];
     decode(format, data, width, height, |i, t| {
         let t = match t {
             Texel::U8(t) => t.map(|c| c as f32 / 255.0),
@@ -243,7 +253,7 @@ pub fn to_rgba8(
     width: u32,
     height: u32,
 ) -> Result<Vec<u8>, Error> {
-    let mut out = vec![0; width as usize * height as usize * 4];
+    let mut out = vec![0; check_len(format, data, width, height)? * 4];
     decode(format, data, width, height, |i, t| {
         let t = match t {
             Texel::U8(t) => t,
@@ -256,8 +266,8 @@ pub fn to_rgba8(
 
 /// Applies the fetch constant's 12-bit destination swizzle to XYZW bytes in
 /// place. Per output channel (3 bits, X first): 0-3 select X Y Z W, 4 is
-/// constant 0, 5 constant 1. 6 and 7 are not defined by the references;
-/// they are treated as 0 and 1 (by the low bit).
+/// constant 0, 5 constant 1. 6 and 7 are undefined; like Xenia's
+/// `TextureCache::GuestToHostSwizzle` (texture_cache.cc) they become 0 and 1.
 pub fn apply_swizzle(rgba8: &mut [u8], swizzle: u16) {
     let sel: [u16; 4] = std::array::from_fn(|i| (swizzle >> (3 * i)) & 7);
     if sel == [0, 1, 2, 3] {
@@ -543,5 +553,26 @@ mod tests {
         let mut px = vec![7, 8, 9, 10];
         apply_swizzle(&mut px, swz([0, 4, 5, 0]));
         assert_eq!(px, [7, 0, 255, 7]);
+    }
+
+    #[test]
+    fn hostile_sizes_are_errors_not_panics() {
+        // u32::MAX squared overflows usize; must be an error before any
+        // allocation.
+        assert!(to_rgba8(F::K8, &[0; 4], u32::MAX, u32::MAX).is_err());
+        assert!(to_rgba_f32(F::Dxt1, &[0; 8], u32::MAX, u32::MAX).is_err());
+        // Unsupported format wins over a short buffer.
+        assert_eq!(
+            to_rgba8(F::Ctx1, &[], 4, 4),
+            Err(Error::UnsupportedFormat(F::Ctx1))
+        );
+    }
+
+    #[test]
+    fn swizzle_6_and_7_are_constants() {
+        // Xenia texture_cache.cc GuestToHostSwizzle: 6 -> 0, 7 -> 1.
+        let mut px = vec![9, 9, 9, 9];
+        apply_swizzle(&mut px, swz([6, 7, 6, 7]));
+        assert_eq!(px, [0, 255, 0, 255]);
     }
 }
