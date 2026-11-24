@@ -16,7 +16,7 @@ cd "$WORK/src"
   --disable-swresample --disable-avfilter --disable-network \
   --disable-autodetect --disable-x86asm \
   --enable-decoder=xma1,xma2,pcm_s16be
+grep -q 'define CONFIG_GPL 0' config.h  # refuse a GPL build before installing
 make -j"$(nproc)" install
-grep -q 'define CONFIG_GPL 0' config.h  # refuse to ship a GPL build
 rm -rf "$WORK"
 echo "FFmpeg $VERSION (LGPL) installed in $OUT/lib"
