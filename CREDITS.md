@@ -16,6 +16,18 @@ Licence texts are kept in [`third_party/licenses/`](third_party/licenses/).
   (`f32_to_half` in `crates/rt/src/vmx.rs`), rewritten in Rust from
   XenonRecomp's recompiler. Its operand order for the VMX128 multiply-add
   forms was also our reference.
+- Ported code (step 2, rewritten in Rust with bounds checks, marked at the
+  top of each file):
+  - `crates/recomp/src/xex.rs`: executable header layout and load steps,
+    from `XenonUtils/xex.h` and `xex.cpp`.
+  - `crates/recomp/src/patch.rs`: title-update application steps, from
+    `XenonUtils/xex_patcher.cpp`. That file says it was referenced from
+    Xenia's `xex_module.cc` (BSD 3-Clause, see the Xenia section).
+  - `crates/recomp/src/analysis.rs`: the function extent walk
+    (`XenonAnalyse/function.cpp`), the four jump-table shapes
+    (`XenonAnalyse/main.cpp`) and the register save/restore helper sizes
+    (`XenonRecomp/recompiler.cpp`).
+  Studied at commit `ddd128bcca99fe8bfbb99bea583c972351fa6ace`.
 
 ## ReXGlue SDK
 
@@ -38,12 +50,21 @@ Licence texts are kept in [`third_party/licenses/`](third_party/licenses/).
 - Use: ideas only, no code. Much of what ReXGlue does for guest memory
   layout, kernel objects, the GPU command processor and audio decoding comes
   from Xenia, so what we learned there traces back to Xenia too.
+- Use in the loader (through XenonRecomp's port, see above): the order of
+  steps for applying a title-update delta patch.
 - Use in the instruction translator (facts about the hardware, no code):
   the VMX128 opcode values and register field layout, the D3D pack and
   unpack formats of `vpkd3d128`/`vupkd3d128` and where the packed words land,
   and the whole-quadword behaviour of the element loads. We checked our own
   decoder against the VMX128 encodings published in Xenia's instruction
   tests; none of its test data is copied into this repository.
+
+## LZX format description (Microsoft)
+
+- Source: Microsoft's published LZX descriptions (the cabinet LZX format and
+  the LZX DELTA section of the MS-PATCH open specification).
+- Use: `crates/recomp/src/lzx.rs` is written from these format descriptions.
+  No decoder code from any other project (libmspack, Xenia, lzxd) is used.
 
 ## XenosRecomp
 

@@ -9,8 +9,9 @@ owns runs as a native program.
 
 > **Status:** step 1, instruction translation. Every user-mode instruction
 > group of the console CPU translates to Rust and is checked per instruction
-> (about 4,000 cases). There is no executable loader yet, so no program can be
-> recompiled end to end.
+> (about 4,000 cases). Step 2 has started: the executable loader, title-update
+> patching and function/jump-table analysis work on synthetic test files
+> (`xenon-recomp scan`). Code generation for a whole executable is next.
 
 ## You need your own copy
 
