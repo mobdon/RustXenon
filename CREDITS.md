@@ -172,6 +172,71 @@ Licence texts are kept in [`third_party/licenses/`](third_party/licenses/).
 - From `src/xenia/base/math.h`: a cross-check of the console's half-float
   range.
 
+## Xenia: ported code in `xenon-draw`
+
+- Licence: BSD 3-Clause, Copyright (c) 2015 Ben Vanik and Xenia project
+  contributors. Full text:
+  [`third_party/licenses/Xenia-LICENSE.txt`](third_party/licenses/Xenia-LICENSE.txt)
+- Studied at commit `95a5c3ee250f80c3b9d139658649d9ffb6db3eec`. Logic is
+  rewritten in Rust; each file names its sources at the top.
+- From `src/xenia/gpu/`:
+  - `registers.h`: the bitfields of `PA_SU_SC_MODE_CNTL`, `PA_SU_VTX_CNTL`,
+    `PA_CL_VTE_CNTL`, the window and screen scissors,
+    `RB_COLOR_MASK`, `RB_BLENDCONTROL`, `RB_DEPTHCONTROL`, `RB_COLOR_INFO`,
+    `RB_DEPTH_INFO` and `RB_SURFACE_INFO`.
+  - `xenos.h`: blend factor, blend operation, compare function, colour and
+    depth render target format and pixel centre values.
+  - `xenos.cc` (`Float20e4To32`) and `xenos.h` (`UNorm24To32`): the 20e4
+    and 24-bit unorm depth clear values.
+  - `d3d12/pipeline_cache.cc`: depth writes only while the depth test is
+    enabled; `draw_util.h` (`IsClearingColor`): depth resolves do not clear
+    colour; `registers.h` (`VGT_DRAW_INITIATOR`, `VGT_INDX_OFFSET`,
+    `VGT_MULTI_PRIM_IB_RESET_INDX`): 16-bit index counts, 24-bit indices and
+    primitive reset.
+  - `draw_util.cc`: the scissor (`GetScissor`), the window offset and
+    half-pixel offset of the viewport (`GetHostViewportInfo`), and the
+    resolve rectangle and destination addressing (`GetResolveInfo`: three
+    vertices in vertex fetch constant 0, 16.8 rounding, scissor clamp,
+    8-pixel alignment, pitch clamp, `Tiled2D` destination offsets).
+  - `spirv_shader_translator.cc` and `vulkan/vulkan_command_processor.cc`:
+    the vertex position epilogue (`PA_CL_VTE_CNTL` W, XY and Z formats, then
+    NDC scale and offset).
+  - `primitive_processor.cc` and `primitive_processor.h`: guest index byte
+    order (including the 32-bit swap modes on 16-bit indices), the 24-bit
+    index mask and reset compare, and the triangle fan and quad list to
+    triangle list orders.
+  - `shaders/pixel_formats.xesli`, `d3d12/d3d12_render_target_cache.cc`:
+    the 8_8_8_8 EDRAM packing (red in the low byte) used for colour clears
+    and resolves.
+  - `xenos.cc` (`Float7e3To32`), `spirv_shader_translator_rb.cc`
+    (`PreClampedFloat32To7e3`, `UnclampedFloat32To7e3`) and
+    `shaders/pixel_formats.xesli` (`XeUnpackR10G10B10A2Float`,
+    `XePackR8G8B8A8UNorm`, `XePackR10G10B10A2UNorm`, the
+    `16_16_16_16_FLOAT` packing): the 7e3 conversions and the resolve
+    packing; `shaders/resolve.xesli`: the exponent bias factor and the
+    red/blue swap of a resolve.
+  - `vulkan/vulkan_render_target_cache.cc`: host formats of the colour
+    render targets (`GetColorVulkanFormat`), the colour clear value per
+    format (`PerformTransfersAndResolveClears`, the 64-bit
+    `RB_COLOR_CLEAR | RB_COLOR_CLEAR_LO << 32`), the EDRAM packing of a 7e3
+    host render target (7e3 RGB, alpha to 2 bits), and the rectangle list
+    geometry shader (the corner opposite the longest edge, the fourth
+    vertex `(v1 - v0) + v2` for the position and every interpolator).
+  - `render_target_cache.cc` / `.h` (`GetPSIColorFormatInfo`,
+    `AddPSIColorFormatFlags`): the output clamp of 7e3 render targets with
+    and without blending.
+  - `draw_util.h` (`IsPrimitivePolygonal`): no face culling for rectangle
+    lists; `draw_util.cc` (`IsRasterizationPotentiallyDone`): no drawing
+    with surface pitch 0; `draw_util.cc` (`GetResolveInfo`): which copy
+    commands a resolve accepts.
+
+## Rust crates
+
+Dependencies from crates.io keep their own licences and are not copied into
+this repository, so no licence files are added for them. `xenon-draw` uses
+`wgpu` and its `naga` shader compiler (MIT or Apache-2.0), `png` (MIT or
+Apache-2.0) and `pollster` (MIT or Apache-2.0).
+
 ## LibertyRecomp, LibertyRecompAndroid and XHYN-IV-recomp
 
 - Projects: https://github.com/OZORDI/LibertyRecomp,

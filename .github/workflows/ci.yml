@@ -12,4 +12,8 @@ jobs:
           components: rustfmt, clippy
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
+      # Software Vulkan (lavapipe) for the headless xenon-draw tests.
+      - run: sudo apt-get update && sudo apt-get install -y mesa-vulkan-drivers
       - run: cargo test
+        env:
+          XENON_REQUIRE_GPU: "1"

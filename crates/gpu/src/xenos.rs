@@ -156,7 +156,8 @@ pub enum FetchConstantType {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct VertexFetch {
     pub fetch_type: FetchConstantType,
-    /// Guest physical byte address (the field is stored in dwords).
+    /// Guest byte address as stored (the field is in dwords), not masked
+    /// to physical; mask with `PHYSICAL_MASK` before reading memory.
     pub address: u32,
     pub endian: Endian,
     /// Buffer size in dwords.
