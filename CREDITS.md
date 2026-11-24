@@ -25,6 +25,16 @@ Licence texts are kept in [`third_party/licenses/`](third_party/licenses/).
   the jump-table patterns it recognises, and lessons from its host/guest call
   bridge and title-update decoder.
 
+## Xenia
+
+- Project: https://github.com/xenia-project/xenia
+- Licence: BSD 3-Clause, Copyright (c) Ben Vanik and Xenia project
+  contributors. Its notice is part of
+  [`third_party/licenses/ReXGlue-LICENSE.txt`](third_party/licenses/ReXGlue-LICENSE.txt).
+- Use: ideas only, no code. Much of what ReXGlue does for guest memory
+  layout, kernel objects, the GPU command processor and audio decoding comes
+  from Xenia, so what we learned there traces back to Xenia too.
+
 ## XenosRecomp
 
 - Project: https://github.com/hedge-dev/XenosRecomp
