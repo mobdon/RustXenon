@@ -136,6 +136,27 @@ semaphore limits and waits on several objects, recursive critical
 sections, files in a temporary folder, `printf` formatting, and command
 packets.
 
+#### First headless run
+
+On the first target (2.42 million instructions in
+38,536 functions, `games/760ebac4e5f0351edb39015eba89e729b14eaf95afdabb529a447ff8f8e11cd1/hooks.toml`), built on a 32 GB, 24-thread
+PC, the title boots headless with no window or sound: it starts 25 threads,
+opens its archives from the unpacked disc and title update, uses 89 of its
+246 imports, and its frame loop presents a steady 60 frames a second.
+Three runs of two minutes each presented 7,186, 7,164 and 7,156 frames with
+no stop. Physical memory in use is 450 of 512 MB (62 MB of headroom),
+virtual memory 4 MB. File reads stop after the first 712: the title waits
+on its front end with no controller connected and nobody signed in.
+
+Fixes the run needed (in the system-call layer above): kernel results
+sign-extended to 64 bits (a failed open read as success), the debugger's
+thread-naming exception allowed to continue, file information classes for
+sectors, alignment and mode, GPU memory byte order (the GPU reads memory
+little-endian, then applies the packet's swap), waits in the command ring
+honoured, the display interrupt status and line counter registers kept
+current, and the video lock released before the guest interrupt handler
+runs.
+
 Not covered yet: structured exception handling, asynchronous I/O completion
 routines and APCs, alertable waits, physical memory mirrors at `0xC0000000`
 and `0xE0000000`, timer completion routines, the audio render callback, and
