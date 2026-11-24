@@ -26,6 +26,7 @@ pub fn correlation(a: &[f32], b: &[f32], max_lag: usize) -> (f64, usize) {
                     / (ea * eb).sqrt()
             }
         };
+        let c = if c.is_nan() { 0.0 } else { c }; // non-finite samples match nothing
         if c > best.0 {
             best = (c, lag);
         }
@@ -51,6 +52,9 @@ mod tests {
         assert!(correlation(&a, &neg, 0).0 < -0.9999);
         assert_eq!(correlation(&a, &[0.0; 2000], 0).0, 0.0);
         assert_eq!(correlation(&[], &a, 0).0, 0.0);
+        let mut bad = a.clone();
+        bad[5] = f32::NAN;
+        assert_eq!(correlation(&a, &bad, 3).0, 0.0);
         assert_eq!(correlation(&a, &[], 5).0, 0.0);
         // Half of the stream missing must not score as a match.
         assert!(correlation(&a, &a[..1000], 0).0 < 0.8);

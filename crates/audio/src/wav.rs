@@ -47,11 +47,14 @@ impl<W: Write + Seek> WavWriter<W> {
         for &x in s {
             b.extend(((x.clamp(-1.0, 1.0) * 32767.0).round() as i16).to_le_bytes());
         }
-        self.out.write_all(&b)?;
-        self.data_bytes = self
-            .data_bytes
-            .checked_add(b.len() as u32)
+        // The RIFF size (36 + data) must fit in 32 bits; refuse before writing.
+        let n = u32::try_from(b.len())
+            .ok()
+            .and_then(|n| self.data_bytes.checked_add(n))
+            .filter(|&n| n <= u32::MAX - 36)
             .ok_or_else(|| io::Error::other("wav file over 4 GiB"))?;
+        self.out.write_all(&b)?;
+        self.data_bytes = n;
         Ok(())
     }
 
@@ -150,6 +153,20 @@ mod tests {
             .iter()
             .zip(&back.samples)
             .all(|(a, b)| (a - b).abs() < 1e-4));
+    }
+
+    #[test]
+    fn refuses_past_the_size_limit() {
+        let mut w = WavWriter::new(io::Cursor::new(Vec::new()), 48_000, 2).unwrap();
+        w.data_bytes = u32::MAX - 36 - 2;
+        w.write_samples(&[0.5]).unwrap(); // exactly at the limit
+        assert!(w.write_samples(&[0.5]).is_err());
+        let bytes = w.finish().unwrap().into_inner();
+        assert_eq!(bytes.len(), 44 + 2, "the refused sample was not written");
+        assert_eq!(
+            u32::from_le_bytes(bytes[4..8].try_into().unwrap()),
+            u32::MAX
+        );
     }
 
     #[test]
