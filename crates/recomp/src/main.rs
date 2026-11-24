@@ -66,6 +66,10 @@ fn parse_key(hex: &str) -> Result<[u8; 16], String> {
     if hex.len() != 32 {
         return Err("console key must be 32 hex digits".into());
     }
+    // Checked before slicing: a multibyte character would split a byte slice and panic.
+    if !hex.bytes().all(|c| c.is_ascii_hexdigit()) {
+        return Err("console key is not hex".into());
+    }
     let mut k = [0u8; 16];
     for (i, b) in k.iter_mut().enumerate() {
         *b =
@@ -185,4 +189,20 @@ fn scan(exe: &str, args: &[String]) -> Result<(), String> {
         std::fs::write(out, s).map_err(|e| format!("{out}: {e}"))?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_key;
+
+    #[test]
+    fn parse_key_rejects_bad_input_without_panicking() {
+        // Ten 3-byte characters plus two ASCII digits: 32 bytes, not on char boundaries.
+        let multibyte = format!("{}aa", "\u{20ac}".repeat(10));
+        assert_eq!(multibyte.len(), 32);
+        assert!(parse_key(&multibyte).is_err());
+        assert!(parse_key(&format!("+f{}", "0".repeat(30))).is_err());
+        assert!(parse_key("00").is_err());
+        assert_eq!(parse_key(&"0f".repeat(16)), Ok([0x0f; 16]));
+    }
 }
