@@ -35,7 +35,11 @@ fn run(args: Vec<String>) -> Result<ExitCode, String> {
             "--out" => out = Some(PathBuf::from(val()?)),
             "--channel" => tol.channel = val()?.parse().map_err(|_| "--channel takes 0 to 255")?,
             "--max-bad" => {
-                tol.max_bad_fraction = val()?.parse().map_err(|_| "--max-bad takes a fraction")?
+                tol.max_bad_fraction = val()?
+                    .parse()
+                    .ok()
+                    .filter(|f| (0.0..=1.0).contains(f))
+                    .ok_or("--max-bad takes a fraction from 0 to 1")?
             }
             "--ms" => ms = val()?.parse().map_err(|_| "--ms takes a number")?,
             _ if a.starts_with("--") => return Err(format!("unknown option {a}")),
