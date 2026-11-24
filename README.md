@@ -169,8 +169,7 @@ their processor number, and the audio render callback must run.
 
 Not covered yet: structured exception handling (not reached so far), asynchronous I/O completion
 routines and APCs, alertable waits, physical memory mirrors at `0xC0000000`
-and `0xE0000000`, timer completion routines, the audio render callback, and
-rendering.
+and `0xE0000000`, timer completion routines, and rendering.
 
 ### Design notes
 
