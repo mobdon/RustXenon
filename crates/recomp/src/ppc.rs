@@ -24,7 +24,7 @@ pub struct Func {
 }
 
 impl Func {
-    fn local(&self, t: u32) -> bool {
+    pub(crate) fn local(&self, t: u32) -> bool {
         (self.start..self.end).contains(&t)
     }
 }
@@ -635,11 +635,13 @@ pub fn translate(w: u32, pc: u32, func: &Func) -> Ins {
     let res: Option<(&'static str, String)> = match op {
         2 => Some((
             "tdi",
-            format!("if ops::trap_cond({d}, c.r[{a}] as i64, {si}) {{ rt.trap(c, pc); }}"),
+            format!("if ops::trap_cond({d}, c.r[{a}] as i64, {si}) {{ rt.trap(c, {pc:#x}); }}"),
         )),
         3 => Some((
             "twi",
-            format!("if ops::trap_cond({d}, c.r[{a}] as i32 as i64, {si}) {{ rt.trap(c, pc); }}"),
+            format!(
+                "if ops::trap_cond({d}, c.r[{a}] as i32 as i64, {si}) {{ rt.trap(c, {pc:#x}); }}"
+            ),
         )),
         4 => op4(w),
         5 => op5(w),
@@ -714,7 +716,7 @@ pub fn translate(w: u32, pc: u32, func: &Func) -> Ins {
             };
             Some((if w & 1 != 0 { "bcl" } else { "bc" }, code))
         }
-        17 => Some(("sc", "rt.syscall(c, pc);".to_string())),
+        17 => Some(("sc", format!("rt.syscall(c, {pc:#x});"))),
         18 => {
             let li = ((w & 0x03FF_FFFC) << 6) as i32 >> 6;
             let t = if w & 2 != 0 {
@@ -777,7 +779,7 @@ pub fn translate(w: u32, pc: u32, func: &Func) -> Ins {
             format!("c.r[{a}] = c.r[{d}] & {:#x}; c.rec(c.r[{a}]);", ui << 16),
         )),
         30 => op30(w, d, a, b, &rec_a),
-        31 => op31(w, d, a, b, xo10, &rec_a, &rec_d),
+        31 => op31(w, pc, d, a, b, xo10, &rec_a, &rec_d),
         32..=55 => load_store_d(op, d, a, si),
         58 => {
             let ds = (w & 0xFFFC) as u16 as i16 as i64;
@@ -1095,6 +1097,7 @@ fn arith(x9: u32) -> Option<&'static str> {
 #[allow(clippy::too_many_arguments)]
 fn op31(
     w: u32,
+    pc: u32,
     d: u32,
     a: u32,
     b: u32,
@@ -1190,9 +1193,9 @@ fn op31(
         }
         4 => Some((
             "tw",
-            format!("if ops::trap_cond({d}, {ra} as i32 as i64, {rb} as i32 as i64) {{ rt.trap(c, pc); }}"),
+            format!("if ops::trap_cond({d}, {ra} as i32 as i64, {rb} as i32 as i64) {{ rt.trap(c, {pc:#x}); }}"),
         )),
-        68 => Some(("td", format!("if ops::trap_cond({d}, {ra} as i64, {rb} as i64) {{ rt.trap(c, pc); }}"))),
+        68 => Some(("td", format!("if ops::trap_cond({d}, {ra} as i64, {rb} as i64) {{ rt.trap(c, {pc:#x}); }}"))),
         9 => hi("mulhdu", "mulhdu"),
         11 => hi("mulhwu", "mulhwu"),
         73 => hi("mulhd", "mulhd"),

@@ -16,7 +16,7 @@
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use xenon_recomp::{analysis, hooks::Hooks, patch, xex};
+use xenon_recomp::{analysis, codegen, disc, hooks::Hooks, patch, stfs, xex};
 
 const USAGE: &str = "\
 xenon-recomp: Xbox 360 executable to Rust recompiler
@@ -24,11 +24,26 @@ xenon-recomp: Xbox 360 executable to Rust recompiler
 USAGE:
     xenon-recomp scan <executable> [--patch <title update>] [--key <32 hex digits>]
                       [--hooks <hooks.toml>] [--games <dir>] [--list <file>]
+    xenon-recomp build <executable> --out <dir> [scan options]
+                      [--range <bytes>] [--max-part <instructions>] [--mem-gb <n>]
+    xenon-recomp unpack <disc image or package> <dir>
 
 scan    Loads the executable (applying the title update in memory), finds
         functions and jump tables, and prints a summary. --list writes every
         function and table to a local file; it is derived from the game, so
         never commit it.
+
+build   Writes the executable as a Cargo workspace under --out (one crate
+        per --range bytes of guest code, default 0x40000; functions longer
+        than --max-part instructions, default 4000, are split; parallel
+        jobs capped at --mem-gb / 3, default from 16). Files are rewritten
+        only when their text changes. Then build with `cargo build` in --out.
+        The output is derived from the game: keep it local, never commit it.
+
+unpack  Copies every file of the player's own disc image into <dir> (the
+        game folder the host reads), or of a content package such as a title
+        update (into its own folder, which the host reads as update:).
+        Files already there with the right size are skipped.
 
 The console key for encrypted executables comes from --key or the
 XENON_CONSOLE_KEY environment variable; it is never stored in this repository.
@@ -37,7 +52,8 @@ used when it exists. The SHA-256 is of the executable as loaded (patched).";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    if args.first().map(String::as_str) != Some("scan") || args.len() < 2 {
+    let cmd = args.first().map(String::as_str);
+    if !matches!(cmd, Some("scan" | "build" | "unpack")) || args.len() < 2 {
         println!("{USAGE}");
         return if args.iter().any(|a| a == "-h" || a == "--help") {
             ExitCode::SUCCESS
@@ -45,7 +61,12 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         };
     }
-    match scan(&args[1], &args[2..]) {
+    let r = match cmd {
+        Some("scan") => scan(&args[1], &args[2..]),
+        Some("build") => build(&args[1], &args[2..]),
+        _ => unpack(&args[1], args.get(2).map_or("", String::as_str)),
+    };
+    match r {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("xenon-recomp: {e}");
@@ -82,7 +103,107 @@ fn read(path: &str) -> Result<Vec<u8>, String> {
     std::fs::read(path).map_err(|e| format!("{path}: {e}"))
 }
 
-fn scan(exe: &str, args: &[String]) -> Result<(), String> {
+fn unpack(image: &str, out: &str) -> Result<(), String> {
+    if out.is_empty() {
+        return Err("unpack needs <disc image> <dir>".into());
+    }
+    let mut magic = [0u8; 4];
+    std::io::Read::read_exact(
+        &mut std::fs::File::open(image).map_err(|e| format!("{image}: {e}"))?,
+        &mut magic,
+    )
+    .map_err(|e| format!("{image}: {e}"))?;
+    if stfs::is_package(&magic) {
+        let p = read(image)?;
+        let entries = stfs::entries(&p).map_err(|e| e.to_string())?;
+        for e in &entries {
+            let path = Path::new(out).join(&e.path);
+            if e.dir {
+                std::fs::create_dir_all(&path).map_err(|x| format!("{}: {x}", path.display()))?;
+            } else {
+                if let Some(d) = path.parent() {
+                    std::fs::create_dir_all(d).map_err(|x| format!("{}: {x}", d.display()))?;
+                }
+                std::fs::write(&path, &e.data).map_err(|x| format!("{}: {x}", path.display()))?;
+            }
+        }
+        println!("unpacked    {} package entries", entries.len());
+        return Ok(());
+    }
+    let f = std::fs::File::open(image).map_err(|e| format!("{image}: {e}"))?;
+    let mut d = disc::Disc::open(std::io::BufReader::new(f)).map_err(|e| e.to_string())?;
+    let entries = d.entries().map_err(|e| e.to_string())?;
+    let (mut copied, mut skipped, mut bytes) = (0, 0, 0u64);
+    for e in &entries {
+        let p = Path::new(out).join(&e.path);
+        if e.dir {
+            std::fs::create_dir_all(&p).map_err(|x| format!("{}: {x}", p.display()))?;
+            continue;
+        }
+        if std::fs::metadata(&p).is_ok_and(|m| m.len() == e.size) {
+            skipped += 1;
+            continue;
+        }
+        if let Some(parent) = p.parent() {
+            std::fs::create_dir_all(parent).map_err(|x| format!("{}: {x}", parent.display()))?;
+        }
+        let mut w = std::io::BufWriter::new(
+            std::fs::File::create(&p).map_err(|x| format!("{}: {x}", p.display()))?,
+        );
+        d.copy(e, &mut w).map_err(|x| x.to_string())?;
+        copied += 1;
+        bytes += e.size;
+    }
+    println!(
+        "unpacked    {copied} files ({} MB), {skipped} already there",
+        bytes >> 20
+    );
+    Ok(())
+}
+
+fn num(args: &[String], name: &str, default: u64) -> Result<u64, String> {
+    match opt(args, name) {
+        None => Ok(default),
+        Some(v) => match v.strip_prefix("0x") {
+            Some(h) => u64::from_str_radix(h, 16),
+            None => v.parse(),
+        }
+        .map_err(|_| format!("{name}: not a number: {v}")),
+    }
+}
+
+fn build(exe: &str, args: &[String]) -> Result<(), String> {
+    let out = opt(args, "--out").ok_or("build needs --out <dir>")?;
+    let (sha, img, _, a) = load(exe, args)?;
+    let cpus = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let range = num(args, "--range", 0x40000)? as u32;
+    if range == 0 || range % 4 != 0 {
+        return Err("--range must be a positive multiple of 4".into());
+    }
+    let o = codegen::Options {
+        range,
+        max_part: num(args, "--max-part", 4000)?.max(1) as usize,
+        jobs: codegen::jobs_for(num(args, "--mem-gb", 16)? as usize, cpus),
+        crates: Path::new(env!("CARGO_MANIFEST_DIR")).join(".."),
+        sha256: sha.clone(),
+    };
+    let st = codegen::write(&img, &a, Path::new(out), &o).map_err(|e| format!("{out}: {e}"))?;
+    println!("sha256      {sha}");
+    println!(
+        "generated   {} crates, {} functions ({} split), {} instructions",
+        st.crates, st.functions, st.split, st.instructions
+    );
+    println!(
+        "files       {} written, {} unchanged; {} jobs",
+        st.written, st.unchanged, o.jobs
+    );
+    Ok(())
+}
+
+fn load(
+    exe: &str,
+    args: &[String],
+) -> Result<(String, xex::Image, Option<PathBuf>, analysis::Analysis), String> {
     let env_key = std::env::var("XENON_CONSOLE_KEY").ok();
     let keys = match opt(args, "--key").or(env_key.as_deref()) {
         Some(k) => vec![parse_key(k)?],
@@ -114,7 +235,11 @@ fn scan(exe: &str, args: &[String]) -> Result<(), String> {
         None => Hooks::default(),
     };
     let a = analysis::analyze(&img, &hooks);
+    Ok((sha, img, hooks_path, a))
+}
 
+fn scan(exe: &str, args: &[String]) -> Result<(), String> {
+    let (sha, img, hooks_path, a) = load(exe, args)?;
     println!("sha256      {sha}");
     println!(
         "hooks       {}",
@@ -181,6 +306,14 @@ fn scan(exe: &str, args: &[String]) -> Result<(), String> {
                 t.bctr,
                 t.kind,
                 targets.join(" ")
+            );
+        }
+        for i in &img.imports {
+            let kind = if i.thunk { "thunk" } else { "slot" };
+            let _ = writeln!(
+                s,
+                "import {} {} {:#010x} {kind}",
+                i.library, i.ordinal, i.address
             );
         }
         for p in &a.problems {

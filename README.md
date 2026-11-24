@@ -100,6 +100,41 @@ compare-and-swap succeeds where the console would fail a store whose word was
 written back with the same value in between; locks and counters do not
 depend on that.
 
+### Whole-executable build (step 2)
+
+```sh
+xenon-recomp unpack <your disc image> <game folder>
+xenon-recomp unpack <your title update package> <update folder>
+xenon-recomp build <executable> --out <build folder> [--mem-gb 16]
+cd <build folder> && cargo build
+```
+
+`unpack` reads the console's disc file system (at any of the disc
+generations' partition offsets) or a content package (the read-only
+layout, with its interleaved hash tables), refusing unsafe names.
+`build` writes a local Cargo workspace:
+
+- one crate per fixed guest address range (`--range`, default 256 KB of
+  code), so ranges compile in parallel and a change rebuilds one crate;
+- each function as one Rust function with one match arm per basic block
+  (branch targets, jump-table targets and the instruction after an
+  unconditional branch start a block). Falling off the end calls the next
+  function;
+- functions longer than `--max-part` instructions (default 4,000) split
+  into parts over consecutive blocks with a small dispatcher, so the
+  compiler never sees one enormous function;
+- files rewritten only when their text changes, so Cargo leaves unchanged
+  ranges alone;
+- parallel compile jobs capped by a memory budget (`--mem-gb`, about 3 GB
+  a job) in the workspace's `.cargo/config.toml`, and a profile without
+  debug info or incremental state.
+
+The game crate calls `xenon_host::run` with the executable's SHA-256; the
+host refuses any other executable. Everything under the build folder is
+derived from the game and stays local.
+
+Jump tables now also match when a `nop` sits between `mtctr` and `bctr`.
+
 ### Design notes
 
 - **One choke point for calls.** Every guest call goes through
