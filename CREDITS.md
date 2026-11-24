@@ -198,20 +198,38 @@ Licence texts are kept in [`third_party/licenses/`](third_party/licenses/).
   `dcbz`, its inexact `vexptefp`/`vlogefp`, `fres` of zero) the case is a
   hand-written value instead.
 
-## FFmpeg (planned, not used yet)
+## FFmpeg
 
 - Project: https://ffmpeg.org
 - Licence: GNU Lesser General Public License (LGPL) v2.1 or later, for a
-  build without the GPL-only parts.
-- Planned use: decoding the console's compressed audio in the host.
-- Conditions we will follow when it is added:
-  1. Link FFmpeg as a separate dynamic library, never statically, so users
-     can replace it.
-  2. Use an FFmpeg build configured **without** `--enable-gpl` and
-     **without** `--enable-nonfree`.
-  3. Add the LGPL licence text to `third_party/licenses/` and a credit
-     here, naming the FFmpeg version and its configure options.
-  4. State where the matching FFmpeg source can be obtained.
+  build without the GPL-only parts. Text in
+  `third_party/licenses/FFmpeg-LGPL-2.1.txt`.
+- Use: `crates/audio` (`xenon-audio::ffmpeg`) decodes the console's
+  compressed audio (XMA2) with FFmpeg's `xma2` decoder.
+- How we keep to the LGPL conditions:
+  1. **Separate library.** FFmpeg is not linked into any of our binaries,
+     statically or at build time. `xenon-audio` opens the user's
+     `avutil`/`avcodec` shared libraries at run time (`libloading`), so
+     anyone can swap in their own FFmpeg build.
+  2. **No GPL-only parts.** At load time we read `avcodec_license()` and
+     refuse any build whose licence is not LGPL (a `--enable-gpl` or
+     `--enable-nonfree` build reports GPL or non-free).
+  3. **Version and options.** We build and test against FFmpeg **n7.1**
+     configured by `tools/ffmpeg-lgpl/build.sh`:
+     `--enable-shared --disable-static --disable-everything
+     --disable-programs --disable-doc --disable-avdevice --disable-avformat
+     --disable-swscale --disable-swresample --disable-avfilter
+     --disable-network --disable-autodetect --disable-x86asm
+     --enable-decoder=xma1,xma2,pcm_s16be`. Any LGPL build from FFmpeg 4
+     to 8 with the `xma2` decoder also works (on Windows, an "lgpl-shared"
+     build).
+  4. **Source.** The matching source is the `n7.1` tag of
+     https://github.com/FFmpeg/FFmpeg (also https://ffmpeg.org/download.html).
+  5. No FFmpeg code or binaries are in this repository.
+- The XMA packet header layout and the hand-built silent test frame follow
+  FFmpeg's `libavcodec/wmaprodec.c` (read for format facts, no code copied).
+  The 5.1 frame layout of render clients (6 channels x 256 big-endian
+  floats) is from Xenia's audio system (facts only).
 
 ## Disc and content package formats
 

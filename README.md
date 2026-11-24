@@ -35,6 +35,7 @@ See [DATA-RULES.md](DATA-RULES.md).
 | `crates/rt` | `xenon-rt`: guest CPU state, big-endian guest memory, call dispatch and overrides. Kept tiny so generated code rebuilds rarely |
 | `crates/cpu-tests` | Per-instruction tests: hand-assembled words, reference results as text, no game bytes |
 | `tools/ppc-oracle` | Regenerates the reference results on a CPU emulator (needs LLVM and QEMU; CI does not) |
+| `crates/audio` | `xenon-audio`: mixes render-client frames to stereo, writes .wav files, decodes the console's compressed audio through a run-time loaded LGPL FFmpeg. Never plays sound |
 | `crates/host` | `xenon-host`: loads the player's files, runs recompiled code, replaces system calls; later graphics, input and audio |
 | `games/<sha256>/hooks.toml` | Per-game hook addresses with role names. The only per-game file in git |
 | `third_party/licenses` | Licence texts for credited sources |

@@ -13,3 +13,15 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
+  ffmpeg:
+    # Runs the audio tests against a freshly built LGPL-only FFmpeg, so the
+    # decoder path is tested rather than skipped.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: tools/ffmpeg-lgpl/build.sh "$RUNNER_TEMP/ffmpeg"
+      - run: cargo test -p xenon-audio
+        env:
+          XENON_FFMPEG_DIR: ${{ runner.temp }}/ffmpeg/lib
+          XENON_REQUIRE_FFMPEG: "1"
