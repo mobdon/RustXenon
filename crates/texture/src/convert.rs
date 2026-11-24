@@ -1,0 +1,578 @@
+// Channel bit layouts, component replication and DXT/DXN decoding rules ported
+// from Xenia src/xenia/gpu/shaders/pixel_formats.xesli, the texture_load_*.xesl
+// shaders and the host format table in
+// src/xenia/gpu/d3d12/d3d12_texture_cache.cc; swizzle encoding from
+// src/xenia/gpu/xenos.h (XE_GPU_TEXTURE_SWIZZLE) (BSD 3-Clause, see
+// CREDITS.md).
+
+//! Format conversion of linear, endian-swapped texture data.
+//!
+//! Input is rows of blocks, tightly packed, after the fetch constant's endian
+//! swap: every element then reads little-endian with component X in the
+//! lowest bits. For example `k_8_8_8_8` is bytes X Y Z W in memory order;
+//! a guest big-endian `0xAARRGGBB` word with `k8in32` therefore gives
+//! X = B, Y = G, Z = R, W = A, and the fetch constant's swizzle (ZYXW for
+//! that case) puts the channels in RGBA order.
+//!
+//! Output is the four components X Y Z W **before** the swizzle. As on the
+//! console, formats with fewer components repeat the last one into the
+//! missing ones (`k_8` gives XXXX, `k_8_8` XYYY, `k_5_6_5` XYZZ).
+
+use crate::format::TextureFormat as F;
+use crate::{Error, TextureFormat};
+
+fn unorm(v: u64, bits: u32) -> f32 {
+    v as f32 / ((1u64 << bits) - 1) as f32
+}
+
+fn field(v: u64, shift: u32, bits: u32) -> u64 {
+    (v >> shift) & ((1 << bits) - 1)
+}
+
+/// IEEE 754 half to single.
+fn half_to_f32(h: u16) -> f32 {
+    let sign = if h & 0x8000 != 0 { -1.0 } else { 1.0 };
+    let exp = ((h >> 10) & 0x1F) as i32;
+    let mant = (h & 0x3FF) as f32;
+    match exp {
+        0 => sign * mant * f32::powi(2.0, -24),
+        31 if mant == 0.0 => sign * f32::INFINITY,
+        31 => f32::NAN,
+        _ => sign * (1.0 + mant / 1024.0) * f32::powi(2.0, exp - 15),
+    }
+}
+
+fn read_le(data: &[u8]) -> u64 {
+    data.iter().rev().fold(0, |acc, &b| (acc << 8) | b as u64)
+}
+
+/// One uncompressed texel to XYZW.
+fn texel(format: TextureFormat, d: &[u8]) -> [f32; 4] {
+    let v = read_le(&d[..d.len().min(8)]);
+    let f16 = |i: usize| half_to_f32(u16::from_le_bytes([d[2 * i], d[2 * i + 1]]));
+    let f32_at =
+        |i: usize| f32::from_le_bytes([d[4 * i], d[4 * i + 1], d[4 * i + 2], d[4 * i + 3]]);
+    let u = |shift, bits| unorm(field(v, shift, bits), bits);
+    match format {
+        F::K8 => [u(0, 8); 4],
+        F::K8_8 => [u(0, 8), u(8, 8), u(8, 8), u(8, 8)],
+        F::K8_8_8_8 => [u(0, 8), u(8, 8), u(16, 8), u(24, 8)],
+        F::K5_6_5 => [u(0, 5), u(5, 6), u(11, 5), u(11, 5)],
+        // Named 6_5_5 but laid out 5:5:6 from the low bits (Xenia).
+        F::K6_5_5 => [u(0, 5), u(5, 5), u(10, 6), u(10, 6)],
+        F::K1_5_5_5 => [u(0, 5), u(5, 5), u(10, 5), u(15, 1)],
+        F::K4_4_4_4 => [u(0, 4), u(4, 4), u(8, 4), u(12, 4)],
+        F::K2_10_10_10 => [u(0, 10), u(10, 10), u(20, 10), u(30, 2)],
+        // Xenia loads k_10_11_11 as R11G11B10 and k_11_11_10 as R10G11B11.
+        F::K10_11_11 => [u(0, 11), u(11, 11), u(22, 10), u(22, 10)],
+        F::K11_11_10 => [u(0, 10), u(10, 11), u(21, 11), u(21, 11)],
+        F::K16 => [u(0, 16); 4],
+        F::K16_16 => [u(0, 16), u(16, 16), u(16, 16), u(16, 16)],
+        F::K16_16_16_16 => [u(0, 16), u(16, 16), u(32, 16), u(48, 16)],
+        F::K16Float => [f16(0); 4],
+        F::K16_16Float => [f16(0), f16(1), f16(1), f16(1)],
+        F::K16_16_16_16Float => [f16(0), f16(1), f16(2), f16(3)],
+        F::K32Float => [f32_at(0); 4],
+        F::K32_32Float => [f32_at(0), f32_at(1), f32_at(1), f32_at(1)],
+        F::K32_32_32Float => [f32_at(0), f32_at(1), f32_at(2), f32_at(2)],
+        F::K32_32_32_32Float => [f32_at(0), f32_at(1), f32_at(2), f32_at(3)],
+        _ => unreachable!("not an uncompressed convertible format"),
+    }
+}
+
+fn expand_565(c: u16) -> [u32; 3] {
+    let (r, g, b) = ((c >> 11) as u32, ((c >> 5) & 63) as u32, (c & 31) as u32);
+    [
+        (r << 3) | (r >> 2),
+        (g << 2) | (g >> 4),
+        (b << 3) | (b >> 2),
+    ]
+}
+
+/// The 8-byte DXT colour half-block. `four_color` forces the opaque
+/// four-colour mode, as DXT2/3 and DXT4/5 always use it.
+fn dxt_color(block: &[u8], four_color: bool) -> [[u8; 4]; 16] {
+    let c0 = u16::from_le_bytes([block[0], block[1]]);
+    let c1 = u16::from_le_bytes([block[2], block[3]]);
+    let codes = u32::from_le_bytes([block[4], block[5], block[6], block[7]]);
+    let (e0, e1) = (expand_565(c0), expand_565(c1));
+    let mix = |w0: u32, w1: u32, div: u32| -> [u8; 4] {
+        let c = |i: usize| ((e0[i] * w0 + e1[i] * w1) / div) as u8;
+        [c(0), c(1), c(2), 255]
+    };
+    let palette = if four_color || c0 > c1 {
+        [mix(1, 0, 1), mix(0, 1, 1), mix(2, 1, 3), mix(1, 2, 3)]
+    } else {
+        [mix(1, 0, 1), mix(0, 1, 1), mix(1, 1, 2), [0, 0, 0, 0]]
+    };
+    std::array::from_fn(|i| palette[((codes >> (2 * i)) & 3) as usize])
+}
+
+/// The 8-byte DXT5 alpha half-block (also DXT5A and each DXN channel).
+fn dxt5_alpha(block: &[u8]) -> [u8; 16] {
+    let (a0, a1) = (block[0] as u32, block[1] as u32);
+    let codes = read_le(&block[2..8]);
+    std::array::from_fn(|i| {
+        let code = ((codes >> (3 * i)) & 7) as u32;
+        let a = match code {
+            0 => a0,
+            1 => a1,
+            _ if a0 > a1 => ((8 - code) * a0 + (code - 1) * a1) / 7,
+            6 => 0,
+            7 => 255,
+            _ => ((6 - code) * a0 + (code - 1) * a1) / 5,
+        };
+        a as u8
+    })
+}
+
+/// The 8-byte DXT3 explicit 4-bit alpha half-block (also DXT3A).
+fn dxt3_alpha(block: &[u8]) -> [u8; 16] {
+    let bits = read_le(&block[..8]);
+    std::array::from_fn(|i| (((bits >> (4 * i)) & 0xF) * 17) as u8)
+}
+
+/// One 4x4 block to XYZW bytes, row-major.
+fn block4x4(format: TextureFormat, b: &[u8]) -> [[u8; 4]; 16] {
+    match format {
+        F::Dxt1 => dxt_color(b, false),
+        F::Dxt2_3 => {
+            let (alpha, mut texels) = (dxt3_alpha(&b[..8]), dxt_color(&b[8..], true));
+            texels.iter_mut().zip(alpha).for_each(|(t, a)| t[3] = a);
+            texels
+        }
+        F::Dxt4_5 => {
+            let (alpha, mut texels) = (dxt5_alpha(&b[..8]), dxt_color(&b[8..], true));
+            texels.iter_mut().zip(alpha).for_each(|(t, a)| t[3] = a);
+            texels
+        }
+        F::Dxn => {
+            let (x, y) = (dxt5_alpha(&b[..8]), dxt5_alpha(&b[8..]));
+            std::array::from_fn(|i| [x[i], y[i], y[i], y[i]])
+        }
+        F::Dxt5A => dxt5_alpha(b).map(|a| [a; 4]),
+        F::Dxt3A => dxt3_alpha(b).map(|a| [a; 4]),
+        _ => unreachable!("not a 4x4 block format"),
+    }
+}
+
+/// Checks the format is decodable and `data` holds every block; returns the
+/// output texel count.
+/// Checked arithmetic: sizes come from guest registers or callers and must
+/// not overflow into a small allocation.
+fn check_len(format: TextureFormat, data: &[u8], width: u32, height: u32) -> Result<usize, Error> {
+    if !format.can_convert() {
+        return Err(Error::UnsupportedFormat(format));
+    }
+    let info = format.info();
+    let too_big = Error::BadLayout("texture size overflows");
+    let needed = (width.div_ceil(info.block_width) as usize)
+        .checked_mul(height.div_ceil(info.block_height) as usize)
+        .and_then(|n| n.checked_mul(info.bytes_per_block() as usize))
+        .ok_or(too_big.clone())?;
+    let texels = (width as usize)
+        .checked_mul(height as usize)
+        .filter(|n| n.checked_mul(4).is_some())
+        .ok_or(too_big)?;
+    if data.len() < needed {
+        return Err(Error::TooShort {
+            needed,
+            got: data.len(),
+        });
+    }
+    Ok(texels)
+}
+
+/// A decoded texel: block-compressed formats decode to bytes, which stay
+/// exact; the rest decode to floats.
+enum Texel {
+    U8([u8; 4]),
+    F32([f32; 4]),
+}
+
+fn decode(
+    format: TextureFormat,
+    data: &[u8],
+    width: u32,
+    height: u32,
+    mut put: impl FnMut(usize, Texel),
+) -> Result<(), Error> {
+    check_len(format, data, width, height)?;
+    let format = format.data_format();
+    let info = format.info();
+    let bpb = info.bytes_per_block() as usize;
+    let (w, h) = (width as usize, height as usize);
+    if info.block_width == 1 {
+        for (i, d) in data.chunks_exact(bpb).take(w * h).enumerate() {
+            put(i, Texel::F32(texel(format, d)));
+        }
+        return Ok(());
+    }
+    let blocks_x = w.div_ceil(4);
+    for (bi, b) in data
+        .chunks_exact(bpb)
+        .take(blocks_x * h.div_ceil(4))
+        .enumerate()
+    {
+        let (bx, by) = (bi % blocks_x * 4, bi / blocks_x * 4);
+        for (i, t) in block4x4(format, b).into_iter().enumerate() {
+            let (x, y) = (bx + i % 4, by + i / 4);
+            if x < w && y < h {
+                put(y * w + x, Texel::U8(t));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Decodes `width` x `height` texels to XYZW floats (`width * height * 4`).
+/// Normalized formats give 0..1; float formats are passed through unclamped.
+pub fn to_rgba_f32(
+    format: TextureFormat,
+    data: &[u8],
+    width: u32,
+    height: u32,
+) -> Result<Vec<f32>, Error> {
+    let mut out = vec![0.0; check_len(format, data, width, height)? * 4];
+    decode(format, data, width, height, |i, t| {
+        let t = match t {
+            Texel::U8(t) => t.map(|c| c as f32 / 255.0),
+            Texel::F32(t) => t,
+        };
+        out[i * 4..i * 4 + 4].copy_from_slice(&t);
+    })?;
+    Ok(out)
+}
+
+/// Decodes `width` x `height` texels to XYZW bytes (`width * height * 4`).
+/// Values are clamped to 0..1 and rounded to the nearest 8-bit step; NaN
+/// becomes 0.
+pub fn to_rgba8(
+    format: TextureFormat,
+    data: &[u8],
+    width: u32,
+    height: u32,
+) -> Result<Vec<u8>, Error> {
+    let mut out = vec![0; check_len(format, data, width, height)? * 4];
+    decode(format, data, width, height, |i, t| {
+        let t = match t {
+            Texel::U8(t) => t,
+            Texel::F32(t) => t.map(|c| (c.clamp(0.0, 1.0) * 255.0).round() as u8),
+        };
+        out[i * 4..i * 4 + 4].copy_from_slice(&t);
+    })?;
+    Ok(out)
+}
+
+/// Applies the fetch constant's 12-bit destination swizzle to XYZW bytes in
+/// place. Per output channel (3 bits, X first): 0-3 select X Y Z W, 4 is
+/// constant 0, 5 constant 1. 6 and 7 are undefined; like Xenia's
+/// `TextureCache::GuestToHostSwizzle` (texture_cache.cc) they become 0 and 1.
+pub fn apply_swizzle(rgba8: &mut [u8], swizzle: u16) {
+    let sel: [u16; 4] = std::array::from_fn(|i| (swizzle >> (3 * i)) & 7);
+    if sel == [0, 1, 2, 3] {
+        return;
+    }
+    for t in rgba8.chunks_exact_mut(4) {
+        let src = [t[0], t[1], t[2], t[3]];
+        for (dst, &s) in t.iter_mut().zip(&sel) {
+            *dst = match s {
+                0..=3 => src[s as usize],
+                _ if s & 1 == 0 => 0,
+                _ => 255,
+            };
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn swz(sel: [u16; 4]) -> u16 {
+        sel[0] | (sel[1] << 3) | (sel[2] << 6) | (sel[3] << 9)
+    }
+
+    fn one(format: TextureFormat, bytes: &[u8]) -> [u8; 4] {
+        let v = to_rgba8(format, bytes, 1, 1).unwrap();
+        [v[0], v[1], v[2], v[3]]
+    }
+
+    #[test]
+    fn k8_and_8_8_replicate() {
+        assert_eq!(one(F::K8, &[0x5A]), [0x5A; 4]);
+        assert_eq!(one(F::K8A, &[0x11]), [0x11; 4]);
+        assert_eq!(one(F::K8_8, &[0x12, 0x34]), [0x12, 0x34, 0x34, 0x34]);
+    }
+
+    #[test]
+    fn k8_8_8_8_and_variants() {
+        let px = [0x01, 0x02, 0x03, 0x04];
+        assert_eq!(one(F::K8_8_8_8, &px), px);
+        assert_eq!(one(F::K8_8_8_8A, &px), px);
+        assert_eq!(one(F::K8_8_8_8As16_16_16_16, &px), px);
+    }
+
+    #[test]
+    fn k5_6_5() {
+        // X = 31, Y = 0, Z = 16: 0b10000_000000_11111 = 0x801F.
+        assert_eq!(one(F::K5_6_5, &0x801Fu16.to_le_bytes()), [255, 0, 132, 132]);
+        // Y = 63 only: 0x07E0.
+        assert_eq!(one(F::K5_6_5, &0x07E0u16.to_le_bytes()), [0, 255, 0, 0]);
+    }
+
+    #[test]
+    fn k6_5_5_is_5_5_6_from_low_bits() {
+        // X = 0, Y = 31, Z = 0: 0b11111 << 5 = 0x03E0.
+        assert_eq!(one(F::K6_5_5, &0x03E0u16.to_le_bytes()), [0, 255, 0, 0]);
+        // Z = 63: 0xFC00.
+        assert_eq!(one(F::K6_5_5, &0xFC00u16.to_le_bytes()), [0, 0, 255, 255]);
+    }
+
+    #[test]
+    fn k1_5_5_5_and_4_4_4_4() {
+        // A = 1, Z = 31, others 0: 0xFC00.
+        assert_eq!(one(F::K1_5_5_5, &0xFC00u16.to_le_bytes()), [0, 0, 255, 255]);
+        // X = 1 only: alpha 0.
+        assert_eq!(one(F::K1_5_5_5, &0x0001u16.to_le_bytes()), [8, 0, 0, 0]);
+        // 4_4_4_4: X=0xF, Y=0x0, Z=0x5, W=0xA -> 0xA50F.
+        assert_eq!(
+            one(F::K4_4_4_4, &0xA50Fu16.to_le_bytes()),
+            [255, 0, 85, 170]
+        );
+    }
+
+    #[test]
+    fn k2_10_10_10() {
+        // X = 1023, Y = 0, Z = 512, W = 2.
+        let v: u32 = 1023 | (512 << 20) | (2 << 30);
+        assert_eq!(one(F::K2_10_10_10, &v.to_le_bytes()), [255, 0, 128, 170]);
+    }
+
+    #[test]
+    fn k10_11_11_and_11_11_10() {
+        // k_10_11_11: X 11 bits, Y 11 bits, Z 10 bits from the low end.
+        let v: u32 = 2047 | (1023 << 22);
+        assert_eq!(one(F::K10_11_11, &v.to_le_bytes()), [255, 0, 255, 255]);
+        // k_11_11_10: X 10 bits, Y 11, Z 11.
+        let v: u32 = (1023 << 10) | (2047 << 21);
+        // 1023 / 2047 * 255 = 127.44.
+        assert_eq!(one(F::K11_11_10, &v.to_le_bytes()), [0, 127, 255, 255]);
+    }
+
+    #[test]
+    fn k16_unorm() {
+        assert_eq!(one(F::K16, &0xFFFFu16.to_le_bytes()), [255; 4]);
+        let v: u32 = 0x8000 << 16;
+        assert_eq!(one(F::K16_16, &v.to_le_bytes()), [0, 128, 128, 128]);
+        let v: u64 = 0xFFFF | (0x0101 << 32) | (0xFFFF << 48);
+        assert_eq!(one(F::K16_16_16_16, &v.to_le_bytes()), [255, 0, 1, 255]);
+    }
+
+    #[test]
+    fn half_floats() {
+        assert_eq!(half_to_f32(0x3C00), 1.0);
+        assert_eq!(half_to_f32(0x3800), 0.5);
+        assert_eq!(half_to_f32(0xC000), -2.0);
+        assert_eq!(half_to_f32(0x0001), f32::powi(2.0, -24));
+        assert_eq!(half_to_f32(0x8001), -f32::powi(2.0, -24));
+        assert_eq!(half_to_f32(0x7C00), f32::INFINITY);
+        // 16_16_16_16_FLOAT: 1.0, 0.5, -2.0 (clamped to 0), 2.0 (clamped).
+        let mut d = Vec::new();
+        for h in [0x3C00u16, 0x3800, 0xC000, 0x4000] {
+            d.extend_from_slice(&h.to_le_bytes());
+        }
+        assert_eq!(one(F::K16_16_16_16Float, &d), [255, 128, 0, 255]);
+        let f = to_rgba_f32(F::K16_16_16_16Float, &d, 1, 1).unwrap();
+        assert_eq!(f, [1.0, 0.5, -2.0, 2.0]);
+        assert_eq!(
+            one(F::K16_16Float, &[0x00, 0x38, 0x00, 0x3C]),
+            [128, 255, 255, 255]
+        );
+        assert_eq!(one(F::K16Expand, &[0x00, 0x3C]), [255; 4]);
+    }
+
+    #[test]
+    fn single_floats() {
+        let mut d = Vec::new();
+        for f in [0.25f32, 1.5, -1.0, 1.0] {
+            d.extend_from_slice(&f.to_le_bytes());
+        }
+        assert_eq!(one(F::K32_32_32_32Float, &d), [64, 255, 0, 255]);
+        assert_eq!(one(F::K32_32_32Float, &d[..12]), [64, 255, 0, 0]);
+        assert_eq!(one(F::K32_32Float, &d[..8]), [64, 255, 255, 255]);
+        assert_eq!(one(F::K32Float, &d[..4]), [64; 4]);
+        assert_eq!(to_rgba_f32(F::K32Float, &d[4..8], 1, 1).unwrap(), [1.5; 4]);
+    }
+
+    /// Builds a DXT1 block: color0, color1, 2-bit codes row-major.
+    fn dxt1_block(c0: u16, c1: u16, codes: [u32; 16]) -> Vec<u8> {
+        let mut b = Vec::new();
+        b.extend_from_slice(&c0.to_le_bytes());
+        b.extend_from_slice(&c1.to_le_bytes());
+        let bits = codes
+            .iter()
+            .enumerate()
+            .fold(0u32, |acc, (i, &c)| acc | (c << (2 * i)));
+        b.extend_from_slice(&bits.to_le_bytes());
+        b
+    }
+
+    #[test]
+    fn dxt1_four_color() {
+        // c0 = pure red 0xF800, c1 = pure blue 0x001F (c0 > c1). Codes 0..3
+        // across the first row.
+        let mut codes = [0; 16];
+        codes[..4].copy_from_slice(&[0, 1, 2, 3]);
+        let v = to_rgba8(F::Dxt1, &dxt1_block(0xF800, 0x001F, codes), 4, 4).unwrap();
+        assert_eq!(&v[0..4], &[255, 0, 0, 255]);
+        assert_eq!(&v[4..8], &[0, 0, 255, 255]);
+        // (2*255 + 0) / 3 = 170, (0 + 255) / 3 = 85.
+        assert_eq!(&v[8..12], &[170, 0, 85, 255]);
+        assert_eq!(&v[12..16], &[85, 0, 170, 255]);
+        assert_eq!(&v[60..64], &[255, 0, 0, 255]);
+    }
+
+    #[test]
+    fn dxt1_punch_through() {
+        // c0 = 0x001F (blue) <= c1 = 0x07E0 (green): code 2 is the average,
+        // code 3 transparent black.
+        let mut codes = [3; 16];
+        codes[0] = 2;
+        let v = to_rgba8(F::Dxt1, &dxt1_block(0x001F, 0x07E0, codes), 4, 4).unwrap();
+        assert_eq!(&v[0..4], &[0, 127, 127, 255]);
+        assert_eq!(&v[4..8], &[0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn dxt1_partial_block_size() {
+        // 2x3 texture from one block: only the covered texels are written.
+        let codes = std::array::from_fn(|i| (i % 4) as u32);
+        let v = to_rgba8(F::Dxt1, &dxt1_block(0xFFFF, 0x0000, codes), 2, 3).unwrap();
+        assert_eq!(v.len(), 2 * 3 * 4);
+        assert_eq!(&v[0..8], &[255, 255, 255, 255, 0, 0, 0, 255]);
+        assert_eq!(&v[16..20], &[255, 255, 255, 255]); // (0, 2): code 0
+    }
+
+    #[test]
+    fn dxt2_3_explicit_alpha_and_forced_four_color() {
+        // Alpha nibbles 0..15 row-major; color block with c0 < c1 still in
+        // four-colour mode (code 3 is not transparent).
+        let alpha: u64 = (0..16).fold(0, |acc, i| acc | ((i as u64) << (4 * i)));
+        let mut b = alpha.to_le_bytes().to_vec();
+        b.extend(dxt1_block(0x0000, 0xFFFF, [3; 16]));
+        let v = to_rgba8(F::Dxt2_3, &b, 4, 4).unwrap();
+        // Code 3 = (c0 + 2*c1)/3 = 170.
+        assert_eq!(&v[0..4], &[170, 170, 170, 0]);
+        assert_eq!(&v[4..8], &[170, 170, 170, 17]);
+        assert_eq!(&v[60..64], &[170, 170, 170, 255]);
+    }
+
+    /// Builds a DXT5-style alpha block: two endpoints, 3-bit codes.
+    fn alpha_block(a0: u8, a1: u8, codes: [u64; 16]) -> Vec<u8> {
+        let bits = codes
+            .iter()
+            .enumerate()
+            .fold(0u64, |acc, (i, &c)| acc | (c << (3 * i)));
+        let mut b = vec![a0, a1];
+        b.extend_from_slice(&bits.to_le_bytes()[..6]);
+        b
+    }
+
+    #[test]
+    fn dxt4_5_interpolated_alpha() {
+        // a0 = 255 > a1 = 0: 8-step. Code 2 = 6*255/7 = 218, code 7 = 255/7 = 36.
+        let mut codes = [0; 16];
+        codes[1] = 1;
+        codes[2] = 2;
+        codes[3] = 7;
+        let mut b = alpha_block(255, 0, codes);
+        b.extend(dxt1_block(0xF800, 0xF800, [0; 16]));
+        let v = to_rgba8(F::Dxt4_5, &b, 4, 4).unwrap();
+        let alphas: Vec<u8> = v.chunks(4).take(4).map(|t| t[3]).collect();
+        assert_eq!(alphas, [255, 0, 218, 36]);
+        assert_eq!(&v[0..3], &[255, 0, 0]);
+    }
+
+    #[test]
+    fn dxt5a_six_step_and_constants() {
+        // a0 = 0 <= a1 = 250: 6-step. Code 2 = (4*0 + 250)/5 = 50, code 5 =
+        // (0 + 4*250)/5 = 200, 6 = 0, 7 = 255.
+        let mut codes = [0; 16];
+        codes[..6].copy_from_slice(&[1, 2, 5, 6, 7, 0]);
+        let v = to_rgba8(F::Dxt5A, &alpha_block(0, 250, codes), 4, 4).unwrap();
+        let x: Vec<u8> = v.chunks(4).take(6).map(|t| t[0]).collect();
+        assert_eq!(x, [250, 50, 200, 0, 255, 0]);
+        assert_eq!(&v[4..8], &[50; 4]);
+    }
+
+    #[test]
+    fn dxn_two_channels() {
+        // X block: all code 0 (a0 = 10). Y block: all code 1 (a1 = 200).
+        let mut b = alpha_block(10, 20, [0; 16]);
+        b.extend(alpha_block(100, 200, [1; 16]));
+        let v = to_rgba8(F::Dxn, &b, 4, 4).unwrap();
+        assert!(v.chunks(4).all(|t| t == [10, 200, 200, 200]));
+    }
+
+    #[test]
+    fn dxt3a_nibbles() {
+        let bits: u64 = 0xF | (0x8 << 4);
+        let v = to_rgba8(F::Dxt3A, &bits.to_le_bytes(), 4, 4).unwrap();
+        assert_eq!(&v[0..8], &[255, 255, 255, 255, 136, 136, 136, 136]);
+        assert_eq!(&v[8..12], &[0; 4]);
+    }
+
+    #[test]
+    fn errors() {
+        assert_eq!(
+            to_rgba8(F::Ctx1, &[0; 8], 4, 4),
+            Err(Error::UnsupportedFormat(F::Ctx1))
+        );
+        assert_eq!(
+            to_rgba8(F::K8_8_8_8, &[0; 7], 2, 1),
+            Err(Error::TooShort { needed: 8, got: 7 })
+        );
+        assert_eq!(
+            to_rgba8(F::Dxt1, &[0; 8], 5, 4),
+            Err(Error::TooShort { needed: 16, got: 8 })
+        );
+    }
+
+    #[test]
+    fn swizzle_selects_and_constants() {
+        let mut px = vec![1, 2, 3, 4, 5, 6, 7, 8];
+        // W Z Y X.
+        apply_swizzle(&mut px, swz([3, 2, 1, 0]));
+        assert_eq!(px, [4, 3, 2, 1, 8, 7, 6, 5]);
+        // 1 1 1 W, as used for alpha-only text textures.
+        let mut px = vec![9, 9, 9, 42];
+        apply_swizzle(&mut px, swz([5, 5, 5, 3]));
+        assert_eq!(px, [255, 255, 255, 42]);
+        // X 0 1 X.
+        let mut px = vec![7, 8, 9, 10];
+        apply_swizzle(&mut px, swz([0, 4, 5, 0]));
+        assert_eq!(px, [7, 0, 255, 7]);
+    }
+
+    #[test]
+    fn hostile_sizes_are_errors_not_panics() {
+        // u32::MAX squared overflows usize; must be an error before any
+        // allocation.
+        assert!(to_rgba8(F::K8, &[0; 4], u32::MAX, u32::MAX).is_err());
+        assert!(to_rgba_f32(F::Dxt1, &[0; 8], u32::MAX, u32::MAX).is_err());
+        // Unsupported format wins over a short buffer.
+        assert_eq!(
+            to_rgba8(F::Ctx1, &[], 4, 4),
+            Err(Error::UnsupportedFormat(F::Ctx1))
+        );
+    }
+
+    #[test]
+    fn swizzle_6_and_7_are_constants() {
+        // Xenia texture_cache.cc GuestToHostSwizzle: 6 -> 0, 7 -> 1.
+        let mut px = vec![9, 9, 9, 9];
+        apply_swizzle(&mut px, swz([6, 7, 6, 7]));
+        assert_eq!(px, [0, 255, 0, 255]);
+    }
+}
