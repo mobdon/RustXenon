@@ -66,6 +66,29 @@ Licence texts are kept in [`third_party/licenses/`](third_party/licenses/).
 - Use: `crates/recomp/src/lzx.rs` is written from these format descriptions.
   No decoder code from any other project (libmspack, Xenia, lzxd) is used.
 
+## Xenia: ported code in `xenon-texture`
+
+- Licence: BSD 3-Clause, Copyright (c) 2015 Ben Vanik and Xenia project
+  contributors. Full text:
+  [`third_party/licenses/Xenia-LICENSE.txt`](third_party/licenses/Xenia-LICENSE.txt)
+- Studied at commit `95a5c3ee250f80c3b9d139658649d9ffb6db3eec`. Logic is
+  rewritten in Rust; each file names its sources at the top.
+- From `src/xenia/gpu/`:
+  - `xenos.h`: the texture fetch constant layout, texture formats, endian
+    modes, dimensions, `GpuSwap`, the swizzle encoding.
+  - `texture_address.h`: the 2D and 3D tiled address formulas.
+  - `texture_util.cc`: the tiled address upper bound, the base level part of
+    the guest texture layout (32-block pitch and height alignment, linear and
+    tiled extents, array slice stride), size selection from a fetch constant.
+  - `texture_info_formats.cc`: block size and bits per pixel of each format.
+  - `texture_cache.cc`: how swizzle values 6 and 7 are treated.
+  - `shaders/endian.xesli`: endian swap rules.
+  - `shaders/pixel_formats.xesli` and `shaders/texture_load_*.xesl`: channel
+    layouts of packed formats, DXT endpoint expansion and interpolation, DXT1
+    punch-through, DXT3, DXT5, DXN, DXT3A and DXT5A decoding.
+  - `d3d12/d3d12_texture_cache.cc` (host format table): which formats share
+    a data layout, component replication, `16_EXPAND` as half float.
+
 ## XenosRecomp
 
 - Project: https://github.com/hedge-dev/XenosRecomp
