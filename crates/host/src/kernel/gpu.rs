@@ -1,11 +1,13 @@
-//! Headless command processor: consumes the command ring as fast as the
-//! title writes it. Register writes, memory writes, fence and event writes,
-//! conditional writes and interrupts run; draws and render state are
-//! skipped, so nothing is rendered. Packet layouts follow the GPU's
-//! published PM4 format (facts checked against Xenia, BSD-3, no code).
+//! Headless command processor on top of `xenon-gpu`'s recorder: the
+//! recorder parses the command ring, and this module applies what the host
+//! must do itself (register side effects, memory and fence writes,
+//! conditional writes, waits and interrupts). Draws are not rendered here;
+//! the commands of one frame can be kept for a drawer or for the texture
+//! dump in [`capture`].
 
 use super::video::GPU_REGS;
 use super::*;
+use xenon_gpu::{Command, Endian, EventKind, GuestRead, Recorder, WaitRegMem};
 
 pub const CP_RB_RPTR: u32 = 0x01C4;
 pub const CP_RB_WPTR: u32 = 0x01C5;
@@ -13,255 +15,358 @@ const SCRATCH_UMSK: u32 = 0x01DC;
 const SCRATCH_ADDR: u32 = 0x01DD;
 const SCRATCH_REG0: u32 = 0x0578;
 const COHER_STATUS_HOST: u32 = 0x0A31;
-const REGS: usize = 0x6000;
-
-/// GPU (physical) address to guest address, in the 0xA0000000 view.
-pub fn gpu_to_cpu(a: u32) -> u32 {
-    0xA000_0000 | (a & 0x1FFF_FFFF)
-}
-
-/// Byte order of a GPU memory access: the low two address bits. The GPU
-/// reads memory little-endian, then applies this swap; [`load`] and
-/// [`store`] give the value as the guest's big-endian word.
-pub fn swap(v: u32, endian: u32) -> u32 {
-    match endian & 3 {
-        1 => (v << 8 & 0xFF00_FF00) | (v >> 8 & 0x00FF_00FF),
-        2 => v.swap_bytes(),
-        3 => v.rotate_left(16),
-        _ => v,
-    }
-}
-
-/// A GPU read of the word at physical `addr` (endian in the low bits).
-fn load(rt: &Runtime, addr: u32) -> u32 {
-    swap(rt.mem.read_u32(gpu_to_cpu(addr & !3)).swap_bytes(), addr)
-}
-
-/// A GPU write of `v` to physical `addr` (endian in the low bits).
-fn store(rt: &Runtime, addr: u32, v: u32) {
-    rt.mem
-        .write_u32(gpu_to_cpu(addr & !3), swap(v, addr).swap_bytes());
-}
-
-fn compare(info: u32, v: u32, r: u32) -> bool {
-    match info & 7 {
-        1 => v < r,
-        2 => v <= r,
-        3 => v == r,
-        4 => v != r,
-        5 => v >= r,
-        6 => v > r,
-        7 => true,
-        _ => false,
-    }
-}
 
 /// What the command processor is doing, for stall reports: 0 idle, 1 in
-/// the ring, 2 waiting in an indirect buffer, 3 in an interrupt handler;
-/// and the address of the last wait that did not hold.
+/// the ring, 2 waiting, 3 in an interrupt handler; and the address of the
+/// last wait that did not hold.
 pub static STATE: AtomicU32 = AtomicU32::new(0);
 pub static WAIT_ON: AtomicU32 = AtomicU32::new(0);
 /// Rounds of the processor loop and interrupts raised.
 pub static ROUNDS: AtomicU32 = AtomicU32::new(0);
 pub static RAISED: AtomicU32 = AtomicU32::new(0);
 
+/// GPU (physical) address to guest address, in the 0xA0000000 view.
+pub fn gpu_to_cpu(a: u32) -> u32 {
+    0xA000_0000 | (a & 0x1FFF_FFFF)
+}
+
+/// Guest memory as the GPU reads it (physical addresses).
+pub struct Physical<'a>(pub &'a Runtime);
+
+impl GuestRead for Physical<'_> {
+    fn read_u32(&self, addr: u32) -> Option<u32> {
+        Some(self.0.mem.read_u32(gpu_to_cpu(addr)))
+    }
+    fn read_bytes(&self, addr: u32, len: usize) -> Option<Vec<u8>> {
+        let a = gpu_to_cpu(addr);
+        if a as u64 + len as u64 > 0xC000_0000 {
+            return None;
+        }
+        let mut b = vec![0; len];
+        self.0.mem.read_bytes(a, &mut b);
+        Some(b)
+    }
+}
+
+/// A GPU write of `v` at physical `addr` in byte order `e`.
+fn store(rt: &Runtime, addr: u32, e: Endian, v: u32) {
+    rt.mem
+        .write_bytes(gpu_to_cpu(addr & !3), &e.to_guest_bytes(v));
+}
+
+fn load(rt: &Runtime, addr: u32, e: Endian) -> u32 {
+    let mut b = [0u8; 4];
+    rt.mem.read_bytes(gpu_to_cpu(addr & !3), &mut b);
+    e.from_guest_bytes(b)
+}
+
+#[derive(Default)]
 pub struct Gpu {
-    regs: Vec<u32>,
-    /// Processor masks of interrupt packets seen, for the caller to raise.
+    rec: Recorder,
+    /// Processor masks of interrupt packets applied, for the caller to raise.
     pub interrupts: Vec<u32>,
     /// Vertical blanks so far: the value counter fences write.
     pub vblanks: u32,
-}
-
-impl Default for Gpu {
-    fn default() -> Self {
-        Gpu {
-            regs: vec![0; REGS],
-            interrupts: Vec::new(),
-            vblanks: 0,
-        }
-    }
+    /// When set, applied commands are also kept here (see [`capture`]).
+    pub keep: Option<Vec<Command>>,
 }
 
 impl Gpu {
     fn write_reg(&mut self, rt: &Runtime, i: u32, v: u32) {
-        let Some(r) = self.regs.get_mut(i as usize) else {
-            return;
-        };
-        *r = v;
+        let mut v = v;
         if (SCRATCH_REG0..SCRATCH_REG0 + 8).contains(&i) {
             let n = i - SCRATCH_REG0;
-            if self.regs[SCRATCH_UMSK as usize] >> n & 1 != 0 {
+            if self.rec.regs.get(SCRATCH_UMSK) >> n & 1 != 0 {
                 rt.mem
-                    .write_u32(gpu_to_cpu(self.regs[SCRATCH_ADDR as usize] + 4 * n), v);
+                    .write_u32(gpu_to_cpu(self.rec.regs.get(SCRATCH_ADDR) + 4 * n), v);
             }
         }
         // Cache flushes finish at once: the busy bit reads back clear.
         if i == COHER_STATUS_HOST {
-            self.regs[i as usize] = v & 0x7FFF_FFFF;
+            v &= 0x7FFF_FFFF;
+            self.rec.regs.set(i, v);
         }
-        rt.mem.write_u32(GPU_REGS + 4 * i, self.regs[i as usize]);
+        if i < 0x6000 {
+            rt.mem.write_u32(GPU_REGS + 4 * i, v);
+        }
     }
 
-    fn value(&self, rt: &Runtime, memory: bool, addr: u32) -> u32 {
-        if memory {
-            load(rt, addr)
+    fn holds(&self, rt: &Runtime, w: &WaitRegMem) -> bool {
+        let v = if w.memory {
+            load(rt, w.poll_addr, w.endian)
         } else {
-            self.regs.get(addr as usize).copied().unwrap_or(0)
-        }
+            self.rec.regs.get(w.poll_addr)
+        };
+        w.matches(v)
     }
 
-    /// Executes `n` words at guest address `p` (an indirect buffer). A wait
-    /// inside one blocks, calling `idle` between checks.
-    pub fn run(
+    /// Runs the ring from `rptr` to `wptr`; returns the new read pointer.
+    /// A wait blocks, calling `idle` between checks.
+    pub fn run_ring(
         &mut self,
         rt: &Runtime,
-        p: u32,
-        n: u32,
-        depth: u32,
+        ring: u32,
+        words: u32,
+        rptr: u32,
+        wptr: u32,
         idle: &mut dyn FnMut(&mut Gpu),
-    ) {
-        let mut i = 0;
-        while i < n {
-            let at = i;
-            match self.packet(
-                rt,
-                |k| rt.mem.read_u32(p + 4 * (at + k)),
-                n - i,
-                depth,
-                idle,
-            ) {
-                0 => {
+    ) -> u32 {
+        let r = self
+            .rec
+            .record_ring(&Physical(rt), ring, words, rptr, wptr)
+            .unwrap_or(wptr);
+        let cmds = std::mem::take(&mut self.rec.commands);
+        self.rec.warnings.clear();
+        for c in &cmds {
+            self.apply(rt, c, idle);
+        }
+        if let Some(k) = self.keep.as_mut() {
+            k.extend(cmds);
+        }
+        r
+    }
+
+    fn apply(&mut self, rt: &Runtime, c: &Command, idle: &mut dyn FnMut(&mut Gpu)) {
+        match c {
+            Command::WriteRegisters { base, values } => {
+                for (i, v) in values.iter().enumerate() {
+                    self.write_reg(rt, base + i as u32, *v);
+                }
+            }
+            Command::MemWrite {
+                addr,
+                endian,
+                values,
+            } => {
+                for (i, v) in values.iter().enumerate() {
+                    store(rt, addr + 4 * i as u32, *endian, *v);
+                }
+            }
+            Command::RegToMem {
+                register,
+                addr,
+                endian,
+            } => store(rt, *addr, *endian, self.rec.regs.get(*register)),
+            Command::EventWrite(e) => match (e.kind, e.address) {
+                (EventKind::Shader, Some(a)) => {
+                    let v = if e.use_counter {
+                        self.vblanks
+                    } else {
+                        e.value.unwrap_or(0)
+                    };
+                    store(rt, a, e.endian, v);
+                }
+                // Screen extents: min/max x, y, z as 16-bit values.
+                (EventKind::ScreenExtent, Some(a)) => {
+                    for (k, v) in [0u16, 8192 >> 3, 0, 8192 >> 3, 0, 1]
+                        .into_iter()
+                        .enumerate()
+                    {
+                        rt.mem.write_u16(gpu_to_cpu(a) + 2 * k as u32, v);
+                    }
+                }
+                _ => {}
+            },
+            Command::CondWrite {
+                wait,
+                write_memory,
+                write_addr,
+                write_endian,
+                write_data,
+            } => {
+                if self.holds(rt, wait) {
+                    if *write_memory {
+                        store(rt, *write_addr, *write_endian, *write_data);
+                    } else {
+                        self.rec.regs.set(*write_addr, *write_data);
+                        self.write_reg(rt, *write_addr, *write_data);
+                    }
+                }
+            }
+            Command::WaitRegMem(w) => {
+                while !self.holds(rt, w) {
+                    WAIT_ON.store(w.poll_addr, Ordering::Relaxed);
                     STATE.store(2, Ordering::Relaxed);
                     idle(self);
                     std::thread::sleep(std::time::Duration::from_micros(100));
                 }
-                len => i += len,
+                STATE.store(1, Ordering::Relaxed);
             }
+            Command::Interrupt { cpu_mask } => self.interrupts.push(*cpu_mask),
+            _ => {}
+        }
+    }
+}
+
+/// The packets `VdSwap` leaves in the ring: the front buffer's fetch
+/// constant (with its physical address) as a register write, then the swap
+/// with the front buffer, width and height.
+pub fn swap_packets(fetch: [u32; 6], frontbuffer: u32, width: u32, height: u32) -> Vec<u32> {
+    let mut f = fetch;
+    f[1] = (f[1] & 0xFFF) | (frontbuffer & 0x1FFF_F000);
+    let mut v = vec![(6 - 1) << 16 | 0x4800];
+    v.extend(f);
+    v.extend([
+        0xC000_0000 | (4 - 1) << 16 | 0x64 << 8,
+        u32::from_be_bytes(*b"SWAP"),
+        frontbuffer & 0x1FFF_FFFF,
+        width,
+        height,
+    ]);
+    v
+}
+
+pub mod capture {
+    //! Writes what one frame used, to find out which screen a title shows
+    //! before frames are rendered: every texture bound at a draw, decoded
+    //! to a BMP, and a list of the draws. Local files only: they are
+    //! derived from the game.
+
+    use super::*;
+    use std::collections::BTreeSet;
+    use std::fmt::Write as _;
+    use std::path::Path;
+    use xenon_gpu::RegisterFile;
+    use xenon_texture::{bytes_needed, decode_base_level, TextureFetch};
+
+    /// When to keep a frame: `--capture <dir>` with `--capture-at <s>,<s>...`
+    /// (seconds since start; default 20).
+    pub static SETTINGS: std::sync::OnceLock<(std::path::PathBuf, Vec<u32>)> =
+        std::sync::OnceLock::new();
+
+    /// The capture schedule, run by the GPU thread after each ring span.
+    pub struct Plan {
+        dir: Option<std::path::PathBuf>,
+        /// Capture times left, in milliseconds since start.
+        at: Vec<u32>,
+    }
+
+    impl Plan {
+        pub fn from_settings() -> Self {
+            match SETTINGS.get() {
+                Some((d, at)) => Plan {
+                    dir: Some(d.clone()),
+                    at: at.iter().rev().map(|s| s * 1000).collect(),
+                },
+                None => Plan {
+                    dir: None,
+                    at: vec![],
+                },
+            }
+        }
+
+        /// Starts keeping commands when a capture time has come, and once a
+        /// whole frame (swap to swap) is kept, writes it out.
+        pub fn after_ring(&mut self, rt: &Runtime, g: &mut Gpu) {
+            let Some(dir) = &self.dir else { return };
+            let Some(&t) = self.at.last() else { return };
+            if g.keep.is_none() {
+                if crate::ms() >= t {
+                    g.keep = Some(Vec::new());
+                }
+                return;
+            }
+            let kept = g.keep.as_ref().unwrap();
+            let swaps: Vec<usize> = kept
+                .iter()
+                .enumerate()
+                .filter(|(_, c)| matches!(c, Command::Swap { .. }))
+                .map(|(i, _)| i)
+                .collect();
+            if swaps.len() < 2 {
+                return;
+            }
+            let frame = &kept[swaps[0] + 1..=swaps[1]];
+            let out = dir.join(format!("t{}", t / 1000));
+            match dump(rt, frame, &out) {
+                Ok((d, n)) => crate::log(&format!(
+                    "[capture] frame at {} s: {d} draws, {n} textures in {}",
+                    t / 1000,
+                    out.display()
+                )),
+                Err(e) => crate::log(&format!("[capture] {}: {e}", out.display())),
+            }
+            g.keep = None;
+            self.at.pop();
         }
     }
 
-    /// One packet; `word(k)` reads the k-th word from its header and `left`
-    /// is how many words are there. Returns the packet length in words, or
-    /// 0 for a wait whose condition does not hold yet (run it again later).
-    pub fn packet(
-        &mut self,
-        rt: &Runtime,
-        word: impl Fn(u32) -> u32,
-        left: u32,
-        depth: u32,
-        idle: &mut dyn FnMut(&mut Gpu),
-    ) -> u32 {
-        let h = word(0);
-        let count = (h >> 16 & 0x3FFF) + 1;
-        if 1 + count > left && h >> 30 != 2 && h != 0 {
-            return left; // truncated packet: drop the rest
-        }
-        match h >> 30 {
-            0 if h == 0 => 1,
-            0 => {
-                let (base, one) = (h & 0x7FFF, h >> 15 & 1 != 0);
-                for m in 0..count {
-                    self.write_reg(rt, if one { base } else { base + m }, word(1 + m));
+    /// Returns (draws, textures written).
+    pub fn dump(rt: &Runtime, cmds: &[Command], dir: &Path) -> std::io::Result<(usize, usize)> {
+        std::fs::create_dir_all(dir)?;
+        let mut regs = RegisterFile::default();
+        let mut seen = BTreeSet::new();
+        let mut list = String::new();
+        let (mut draws, mut written) = (0, 0);
+        for c in cmds {
+            match c {
+                Command::WriteRegisters { base, values } => {
+                    for (i, v) in values.iter().enumerate() {
+                        regs.set(base + i as u32, *v);
+                    }
                 }
-                1 + count
-            }
-            1 => {
-                self.write_reg(rt, h & 0x7FF, word(1));
-                self.write_reg(rt, h >> 11 & 0x7FF, word(2));
-                3
-            }
-            2 => 1,
-            _ => {
-                let d = |k: u32| word(1 + k);
-                if std::env::var_os("XENON_TRACE_GPU").is_some() {
-                    let words: Vec<String> =
-                        (0..count.min(6)).map(|k| format!("{:x}", d(k))).collect();
-                    crate::log(&format!(
-                        "[gpu] op {:#04x} x{count} {}",
-                        h >> 8 & 0x7F,
-                        words.join(" ")
-                    ));
-                }
-                match h >> 8 & 0x7F {
-                    // INDIRECT_BUFFER, INDIRECT_BUFFER_PFD
-                    0x3F | 0x37 if depth < 4 => {
-                        self.run(rt, gpu_to_cpu(d(0)), d(1) & 0xF_FFFF, depth + 1, idle)
-                    }
-                    // WAIT_REG_MEM: until a register or memory word compares
-                    // true against the reference.
-                    0x3C => {
-                        let (info, poll, rf, mask) = (d(0), d(1), d(2), d(3));
-                        if !compare(info, self.value(rt, info & 0x10 != 0, poll) & mask, rf) {
-                            WAIT_ON.store(poll, Ordering::Relaxed);
-                            return 0;
+                Command::Draw(d) => {
+                    draws += 1;
+                    let mut used = Vec::new();
+                    for n in 0..32 {
+                        let f = TextureFetch::decode(regs.fetch_constant(n));
+                        if f.fetch_type != 2 || f.base_address == 0 {
+                            continue;
                         }
-                    }
-                    // MEM_WRITE
-                    0x3D => {
-                        let a = d(0);
-                        for k in 0..count - 1 {
-                            store(rt, ((a & !3) + 4 * k) | (a & 3), d(1 + k));
+                        used.push(format!("t{n}={:08x}", f.base_address));
+                        if !seen.insert((f.base_address, f.width(), f.height())) {
+                            continue;
                         }
-                    }
-                    // COND_WRITE
-                    0x45 => {
-                        let (info, poll, rf, mask, dst, data) =
-                            (d(0), d(1), d(2), d(3), d(4), d(5));
-                        if compare(info, self.value(rt, info & 0x10 != 0, poll) & mask, rf) {
-                            if info & 0x100 != 0 {
-                                store(rt, dst, data);
-                            } else {
-                                self.write_reg(rt, dst, data);
-                            }
-                        }
-                    }
-                    // EVENT_WRITE_SHD: a fence value, or the frame counter.
-                    0x58 => {
-                        let (init, a, v) = (d(0), d(1), d(2));
-                        let v = if init >> 31 != 0 { self.vblanks } else { v };
-                        store(rt, a, v);
-                    }
-                    // EVENT_WRITE_EXT: screen extents (min/max x, y, z).
-                    0x59 => {
-                        let a = gpu_to_cpu(d(1) & !3);
-                        for (k, v) in [0u16, 8192 >> 3, 0, 8192 >> 3, 0, 1]
-                            .into_iter()
-                            .enumerate()
-                        {
-                            rt.mem.write_u16(a + 2 * k as u32, v);
-                        }
-                    }
-                    // REG_RMW
-                    0x21 => {
-                        let (info, and, or) = (d(0), d(1), d(2));
-                        let r = info & 0x1FFF;
-                        let mut v = self.value(rt, false, r);
-                        v &= if info >> 31 != 0 {
-                            self.value(rt, false, and & 0x1FFF)
-                        } else {
-                            and
+                        let Ok(need) = bytes_needed(&f) else { continue };
+                        let Some(bytes) = Physical(rt).read_bytes(f.base_address, need) else {
+                            continue;
                         };
-                        v |= if info >> 30 & 1 != 0 {
-                            self.value(rt, false, or & 0x1FFF)
-                        } else {
-                            or
-                        };
-                        self.write_reg(rt, r, v);
+                        if let Ok(img) = decode_base_level(&f, &bytes) {
+                            let name = format!(
+                                "tex_{:08x}_{}x{}_{:?}.bmp",
+                                f.base_address, img.width, img.height, f.format
+                            );
+                            write_bmp(&dir.join(name), img.width, img.height, &img.rgba8)?;
+                            written += 1;
+                        }
                     }
-                    // REG_TO_MEM
-                    0x3E => {
-                        let v = self.value(rt, false, d(0));
-                        store(rt, d(1), v);
-                    }
-                    // INTERRUPT
-                    0x54 => self.interrupts.push(d(0)),
-                    // Draws and render state.
-                    _ => {}
+                    let _ = writeln!(
+                        list,
+                        "draw {draws}: {:?} x{} {}",
+                        d.primitive,
+                        d.index_count,
+                        used.join(" ")
+                    );
                 }
-                1 + count
+                Command::Resolve(_) => list.push_str("resolve\n"),
+                Command::Swap { width, height, .. } => {
+                    let _ = writeln!(list, "swap {width}x{height}");
+                }
+                _ => {}
             }
         }
+        std::fs::write(dir.join("draws.txt"), list)?;
+        Ok((draws, written))
+    }
+
+    /// An uncompressed 32-bit BMP, rows top to bottom.
+    pub fn write_bmp(path: &Path, w: u32, h: u32, rgba: &[u8]) -> std::io::Result<()> {
+        let size = 54 + 4 * w * h;
+        let mut b = Vec::with_capacity(size as usize);
+        b.extend(b"BM");
+        b.extend(size.to_le_bytes());
+        b.extend([0; 4]);
+        b.extend(54u32.to_le_bytes());
+        b.extend(40u32.to_le_bytes());
+        b.extend((w as i32).to_le_bytes());
+        b.extend((-(h as i32)).to_le_bytes());
+        b.extend(1u16.to_le_bytes());
+        b.extend(32u16.to_le_bytes());
+        b.extend([0; 24]);
+        for p in rgba.chunks_exact(4) {
+            b.extend([p[2], p[1], p[0], p[3]]);
+        }
+        std::fs::write(path, b)
     }
 }
 
@@ -270,18 +375,30 @@ mod tests {
     use super::*;
 
     #[test]
-    fn endian_swaps() {
-        assert_eq!(swap(0x1122_3344, 0), 0x1122_3344);
-        assert_eq!(swap(0x1122_3344, 1), 0x2211_4433);
-        assert_eq!(swap(0x1122_3344, 2), 0x4433_2211);
-        assert_eq!(swap(0x1122_3344, 3), 0x3344_1122);
-        assert_eq!(gpu_to_cpu(0x0012_3000), 0xA012_3000);
-        assert_eq!(gpu_to_cpu(0xA012_3000), 0xA012_3000);
-        // Endian mode 2 (8 in 32) is the guest's own byte order.
-        let rt = Runtime::new(xenon_rt::GuestMemory::new(1 << 32));
-        store(&rt, 0x10 | 2, 0x1234_5678);
-        assert_eq!(rt.mem.read_u32(0xA000_0010), 0x1234_5678);
-        assert_eq!(load(&rt, 0x10 | 2), 0x1234_5678);
-        assert_eq!(load(&rt, 0x10), 0x7856_3412);
+    fn swap_packets_are_what_the_recorder_reads() {
+        let words = swap_packets([2, 0x1234_5000 | 0x86, 0, 0, 0, 0], 0xA012_3000, 1280, 720);
+        let mut r = Recorder::new();
+        r.record_words(&xenon_gpu::SliceMemory::default(), &words);
+        assert!(r.commands.iter().any(|c| matches!(
+            c,
+            Command::Swap {
+                signature_ok: true,
+                frontbuffer: 0x0012_3000,
+                width: 1280,
+                height: 720
+            }
+        )));
+        assert_eq!(r.regs.fetch_constant(0)[1], 0x0012_3086);
+    }
+
+    #[test]
+    fn bmp_header_and_pixel_order() {
+        let p = std::env::temp_dir().join(format!("xenon-bmp-{}.bmp", std::process::id()));
+        capture::write_bmp(&p, 2, 1, &[1, 2, 3, 4, 5, 6, 7, 8]).unwrap();
+        let b = std::fs::read(&p).unwrap();
+        assert_eq!(&b[..2], b"BM");
+        assert_eq!(b.len(), 54 + 8);
+        assert_eq!(&b[54..58], &[3, 2, 1, 4]);
+        std::fs::remove_file(p).unwrap();
     }
 }
