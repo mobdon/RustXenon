@@ -47,7 +47,8 @@ Licence texts are kept in [`third_party/licenses/`](third_party/licenses/).
 - Licence: BSD 3-Clause, Copyright (c) Ben Vanik and Xenia project
   contributors. Its notice is part of
   [`third_party/licenses/ReXGlue-LICENSE.txt`](third_party/licenses/ReXGlue-LICENSE.txt).
-- Use: ideas only, no code. Much of what ReXGlue does for guest memory
+- Use: ideas, and ported code in the GPU crates listed in the
+  sections below. Much of what ReXGlue does for guest memory
   layout, kernel objects, the GPU command processor and audio decoding comes
   from Xenia, so what we learned there traces back to Xenia too.
 - Use in the loader (through XenonRecomp's port, see above): the order of
@@ -68,6 +69,33 @@ Licence texts are kept in [`third_party/licenses/`](third_party/licenses/).
   interrupt runs as processor 2. Studied at Xenia's `master` branch on
   2026-11-24 (`src/xenia/kernel`, `src/xenia/gpu`).
 
+## Xenia: ported code in `xenon-gpu`
+
+- Licence: BSD 3-Clause, Copyright (c) 2015 Ben Vanik and Xenia project
+  contributors. Full text:
+  [`third_party/licenses/Xenia-LICENSE.txt`](third_party/licenses/Xenia-LICENSE.txt)
+- Studied at commit `95a5c3ee250f80c3b9d139658649d9ffb6db3eec`. Logic and
+  tables are rewritten in Rust; each file names its sources at the top.
+- From `src/xenia/gpu/`:
+  - `command_processor.cc`: PM4 packet decoding for types 0 to 3, the
+    type-3 opcode handlers (field layouts, address and endian masks,
+    `SET_CONSTANT` type bases, `REG_RMW`, `LOAD_ALU_CONSTANT`, `IM_LOAD`,
+    draw initiator and index DMA, predication with bin mask and select, the
+    indirect buffer length mask), ring buffer read semantics, and the guest
+    byte order of GPU memory writes and polls.
+  - `packet_disassembler.cc`: header fields and the `DRAW_INDX` layouts.
+  - `xenos.h`: PM4 opcode values, primitive, index format, endian, copy
+    command, fetch constant, EDRAM mode and event values, the vertex fetch
+    constant layout, `CpuToGpu`.
+  - `registers.h` and `register_table.inc`: register addresses and the
+    bitfields of the draw, surface, colour, depth, copy and window registers.
+  - `register_file.h`: the register file size.
+  - `draw_util.cc` (`GetResolveInfo`) and `d3d12/d3d12_command_processor.cc`
+    (`IssueDraw`): which registers a resolve reads, and that a draw in EDRAM
+    copy mode is a resolve.
+  - `graphics_system.cc`: the `CP_RB_WPTR` address.
+- From `src/xenia/memory.h` (`TranslatePhysical`): the physical address mask.
+
 ## Calendar arithmetic
 
 - Howard Hinnant's `days_from_civil` / `civil_from_days` algorithms
@@ -81,13 +109,68 @@ Licence texts are kept in [`third_party/licenses/`](third_party/licenses/).
 - Use: `crates/recomp/src/lzx.rs` is written from these format descriptions.
   No decoder code from any other project (libmspack, Xenia, lzxd) is used.
 
+## Xenia: ported code in `xenon-texture`
+
+- Licence: BSD 3-Clause, Copyright (c) 2015 Ben Vanik and Xenia project
+  contributors. Full text:
+  [`third_party/licenses/Xenia-LICENSE.txt`](third_party/licenses/Xenia-LICENSE.txt)
+- Studied at commit `95a5c3ee250f80c3b9d139658649d9ffb6db3eec`. Logic is
+  rewritten in Rust; each file names its sources at the top.
+- From `src/xenia/gpu/`:
+  - `xenos.h`: the texture fetch constant layout, texture formats, endian
+    modes, dimensions, `GpuSwap`, the swizzle encoding.
+  - `texture_address.h`: the 2D and 3D tiled address formulas.
+  - `texture_util.cc`: the tiled address upper bound, the base level part of
+    the guest texture layout (32-block pitch and height alignment, linear and
+    tiled extents, array slice stride), size selection from a fetch constant.
+  - `texture_info_formats.cc`: block size and bits per pixel of each format.
+  - `texture_cache.cc`: how swizzle values 6 and 7 are treated.
+  - `shaders/endian.xesli`: endian swap rules.
+  - `shaders/pixel_formats.xesli` and `shaders/texture_load_*.xesl`: channel
+    layouts of packed formats, DXT endpoint expansion and interpolation, DXT1
+    punch-through, DXT3, DXT5, DXN, DXT3A and DXT5A decoding.
+  - `d3d12/d3d12_texture_cache.cc` (host format table): which formats share
+    a data layout, component replication, `16_EXPAND` as half float.
+
 ## XenosRecomp
 
 - Project: https://github.com/hedge-dev/XenosRecomp
 - Licence: MIT, Copyright (c) 2025 hedge-dev and contributors.
   Full text: [`third_party/licenses/XenosRecomp-LICENSE.md`](third_party/licenses/XenosRecomp-LICENSE.md)
-- Use: ideas only, no code. Reference for translating the console's GPU
-  shader microcode ahead of time.
+- Use: reference for translating the console's GPU shader microcode ahead
+  of time. `crates/shader` follows its approach to non-structured control
+  flow (a program-counter switch inside a loop) and was cross-checked
+  against its instruction layouts (`XenosRecomp/shader_code.h`) and its ALU
+  and export translation (`XenosRecomp/shader_recompiler.cpp`), studied at
+  commit `70a084c2392378818a4da4086e8e3420b4c3ea8d`. No code is copied.
+
+## Xenia: ported code in `xenon-shader`
+
+- Licence: BSD 3-Clause, Copyright (c) 2015 Ben Vanik and Xenia project
+  contributors. Full text:
+  [`third_party/licenses/Xenia-LICENSE.txt`](third_party/licenses/Xenia-LICENSE.txt)
+- Studied at commit `95a5c3ee250f80c3b9d139658649d9ffb6db3eec`. Logic and
+  tables are rewritten in Rust; each file names its sources at the top.
+- From `src/xenia/gpu/`:
+  - `ucode.h`, `ucode.cc`: control-flow, ALU and fetch instruction layouts,
+    opcode tables, operand rules (scalar operand slots, the constant-op temp
+    register, const0/const1 relative addressing, export write masks).
+  - `xenos.h`, `registers.h`: vertex formats and component counts, endian
+    modes, loop and vertex fetch constant layouts, the texture fetch constant
+    LOD bias field, the vertex/pixel float constant split.
+  - `shader_translator.cc`: the control-flow area bound, exec walking, fetch
+    and ALU operand parsing, mini vertex fetch reuse.
+  - `spirv_shader_translator.cc`, `spirv_shader_translator_alu.cc`,
+    `spirv_shader_translator_fetch.cc`: ALU semantics (Shader Model 3
+    multiply by zero, max/min, cube, predicate set, kill, the clamped
+    reciprocal, square root and log forms, `mul_prev2`), loop stack and
+    `aL`, vertex fetch addressing, endian swap and format decoding, texture
+    LOD bias.
+  - `shader_interpreter.cc`, `shader_interpreter.h`: the call stack,
+    conditional exec, jump and call checks, temp register wrap, `aL` clamp.
+  - `d3d12/d3d12_command_processor.cc`: the float constant bases.
+- From `src/xenia/base/math.h`: a cross-check of the console's half-float
+  range.
 
 ## LibertyRecomp, LibertyRecompAndroid and XHYN-IV-recomp
 

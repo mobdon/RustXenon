@@ -1,0 +1,10 @@
+[package]
+name = "xenon-gpu"
+description = "Xenos GPU command recorder: parses PM4 packet streams from guest memory into a typed command list."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[dependencies]
