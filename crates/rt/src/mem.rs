@@ -37,11 +37,18 @@ macro_rules! access {
         #[inline]
         pub fn $read(&self, addr: u32) -> $t {
             const N: usize = size_of::<$t>();
-            let p = self.at(addr, N);
             if addr as usize % N == 0 {
+                let p = self.at(addr, N);
                 // SAFETY: in bounds and aligned (the base is 16-byte aligned).
                 <$t>::from_be(unsafe { <$atomic>::from_ptr(p.cast()) }.load(Relaxed))
+            } else if crosses_view(addr, N) {
+                let mut b = [0u8; N];
+                for (i, x) in b.iter_mut().enumerate() {
+                    *x = self.read_u8(addr.wrapping_add(i as u32));
+                }
+                <$t>::from_be_bytes(b)
             } else {
+                let p = self.at(addr, N);
                 let mut b = [0u8; N];
                 for (i, x) in b.iter_mut().enumerate() {
                     *x = byte(p, i).load(Relaxed);
@@ -53,17 +60,44 @@ macro_rules! access {
         #[inline]
         pub fn $write(&self, addr: u32, v: $t) {
             const N: usize = size_of::<$t>();
-            let p = self.at(addr, N);
             if addr as usize % N == 0 {
+                let p = self.at(addr, N);
                 // SAFETY: in bounds and aligned.
                 unsafe { <$atomic>::from_ptr(p.cast()) }.store(v.to_be(), Relaxed);
+            } else if crosses_view(addr, N) {
+                for (i, x) in v.to_be_bytes().into_iter().enumerate() {
+                    self.write_u8(addr.wrapping_add(i as u32), x);
+                }
             } else {
+                let p = self.at(addr, N);
                 for (i, x) in v.to_be_bytes().into_iter().enumerate() {
                     byte(p, i).store(x, Relaxed);
                 }
             }
         }
     };
+}
+
+/// The console maps its 512 MB of physical memory three times: at
+/// 0xA0000000 (64 KB pages), 0xC0000000 (16 MB pages) and 0xE0000000 (4 KB
+/// pages, offset by 4 KB). The upper two views are folded onto the first, so
+/// a buffer written through one view reads back through another.
+#[inline]
+fn alias(addr: u32) -> u32 {
+    if addr < 0xC000_0000 {
+        return addr;
+    }
+    let off = if addr >= 0xE000_0000 { 0x1000 } else { 0 };
+    0xA000_0000 | ((addr & 0x1FFF_FFFF) + off) & 0x1FFF_FFFF
+}
+
+/// An access (unaligned scalar or byte range; aligned scalars never cross)
+/// whose bytes are not contiguous after `alias`: it runs
+/// off the end of a mirrored view and wraps, so it goes byte by byte.
+#[inline]
+fn crosses_view(addr: u32, n: usize) -> bool {
+    let last = n as u32 - 1;
+    alias(addr.wrapping_add(last)) != alias(addr).wrapping_add(last)
 }
 
 /// Byte `i` after `p`, which `at` has bounds checked.
@@ -96,7 +130,7 @@ impl GuestMemory {
     /// math sound).
     #[inline]
     fn at(&self, addr: u32, n: usize) -> *mut u8 {
-        let a = addr as usize;
+        let a = alias(addr) as usize;
         if a + n > self.len {
             out_of_range(addr, n, self.len);
         }
@@ -172,6 +206,12 @@ impl GuestMemory {
 
     /// Copies guest bytes at `addr` into `out`.
     pub fn read_bytes(&self, addr: u32, out: &mut [u8]) {
+        if !out.is_empty() && crosses_view(addr, out.len()) {
+            for (i, x) in out.iter_mut().enumerate() {
+                *x = self.read_u8(addr.wrapping_add(i as u32));
+            }
+            return;
+        }
         let p = self.at(addr, out.len());
         for (i, x) in out.iter_mut().enumerate() {
             *x = byte(p, i).load(Relaxed);
@@ -180,6 +220,12 @@ impl GuestMemory {
 
     /// Copies `data` into guest memory at `addr`.
     pub fn write_bytes(&self, addr: u32, data: &[u8]) {
+        if !data.is_empty() && crosses_view(addr, data.len()) {
+            for (i, &x) in data.iter().enumerate() {
+                self.write_u8(addr.wrapping_add(i as u32), x);
+            }
+            return;
+        }
         let p = self.at(addr, data.len());
         for (i, &x) in data.iter().enumerate() {
             byte(p, i).store(x, Relaxed);
@@ -256,5 +302,29 @@ mod tests {
     #[should_panic(expected = "at 0x0000003e is outside the 64-byte guest memory")]
     fn out_of_range_reports_the_address() {
         GuestMemory::new(64).read_u32(62);
+    }
+
+    #[test]
+    fn unaligned_access_wraps_at_the_end_of_a_view() {
+        let m = GuestMemory::new(0xC000_0000);
+        // 0xFFFFEFFE is the last physical bytes; the next ones wrap to 0.
+        m.write_u32(0xFFFF_EFFE, 0x1122_3344);
+        assert_eq!(m.read_u16(0xBFFF_FFFE), 0x1122);
+        assert_eq!(m.read_u16(0xA000_0000), 0x3344);
+        assert_eq!(m.read_u32(0xFFFF_EFFE), 0x1122_3344);
+        m.write_bytes(0xFFFF_EFFC, &[1, 2, 3, 4, 5, 6]);
+        assert_eq!(m.read_u16(0xA000_0000), 0x0506);
+        let mut b = [0; 6];
+        m.read_bytes(0xFFFF_EFFC, &mut b);
+        assert_eq!(b, [1, 2, 3, 4, 5, 6]);
+    }
+
+    #[test]
+    fn physical_views_alias() {
+        assert_eq!(alias(0x8200_0000), 0x8200_0000);
+        assert_eq!(alias(0xA123_4560), 0xA123_4560);
+        assert_eq!(alias(0xC123_4560), 0xA123_4560);
+        assert_eq!(alias(0xE123_3560), 0xA123_4560);
+        assert_eq!(alias(0xFFFF_F000), 0xA000_0000);
     }
 }
