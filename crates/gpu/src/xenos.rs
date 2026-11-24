@@ -107,6 +107,20 @@ impl Endian {
             Endian::E16in32 => v.rotate_left(16),
         }
     }
+
+    /// Bytes the GPU stores in guest memory for `v` (MEM_WRITE, REG_TO_MEM,
+    /// EVENT_WRITE_SHD, COND_WRITE). Xenia's handlers store `GpuSwap(v)` in
+    /// little-endian order (`xe::store`), so only `E8in32` gives the
+    /// big-endian bytes the guest CPU reads back as `v`.
+    pub fn to_guest_bytes(self, v: u32) -> [u8; 4] {
+        self.swap(v).to_le_bytes()
+    }
+
+    /// The value the GPU sees in `bytes` of guest memory (WAIT_REG_MEM and
+    /// COND_WRITE polls): a little-endian load, then the swap.
+    pub fn from_guest_bytes(self, bytes: [u8; 4]) -> u32 {
+        self.swap(u32::from_le_bytes(bytes))
+    }
 }
 
 /// `RB_COPY_CONTROL::copy_command`.
@@ -182,6 +196,31 @@ mod tests {
         assert_eq!(Endian::E8in16.swap(0x1122_3344), 0x2211_4433);
         assert_eq!(Endian::E8in32.swap(0x1122_3344), 0x4433_2211);
         assert_eq!(Endian::E16in32.swap(0x1122_3344), 0x3344_1122);
+    }
+
+    #[test]
+    fn guest_bytes_follow_xenia_store_order() {
+        // command_processor.cc stores GpuSwap(v) with the host's little-endian
+        // xe::store; k8in32 therefore lands big-endian, as the guest expects.
+        assert_eq!(
+            Endian::E8in32.to_guest_bytes(0x1122_3344),
+            [0x11, 0x22, 0x33, 0x44]
+        );
+        assert_eq!(
+            Endian::None.to_guest_bytes(0x1122_3344),
+            [0x44, 0x33, 0x22, 0x11]
+        );
+        for e in [
+            Endian::None,
+            Endian::E8in16,
+            Endian::E8in32,
+            Endian::E16in32,
+        ] {
+            assert_eq!(
+                e.from_guest_bytes(e.to_guest_bytes(0xA1B2_C3D4)),
+                0xA1B2_C3D4
+            );
+        }
     }
 
     #[test]

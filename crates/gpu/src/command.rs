@@ -41,13 +41,15 @@ pub enum Command {
     },
     EventWrite(EventWrite),
     /// Memory writes the host must apply itself; the recorder does not
-    /// write guest memory. Each value is swapped by `endian` before storing.
+    /// write guest memory. Value `i` goes to `addr + 4 * i` as
+    /// `endian.to_guest_bytes(value)` (little-endian after the swap, as Xenia).
     MemWrite {
         addr: u32,
         endian: Endian,
         values: Vec<u32>,
     },
-    /// REG_TO_MEM: store register `register` (swapped by `endian`) at `addr`.
+    /// REG_TO_MEM: store register `register` at `addr` as
+    /// `endian.to_guest_bytes(value)`.
     RegToMem {
         register: u32,
         addr: u32,
@@ -57,7 +59,8 @@ pub enum Command {
     WaitRegMem(WaitRegMem),
     /// COND_WRITE: if the condition holds at execution time, write
     /// `write_data` to register `write_addr` or, with `write_memory`, to
-    /// guest memory. Not applied by the recorder.
+    /// guest memory as `write_endian.to_guest_bytes(write_data)`. Not applied
+    /// by the recorder.
     CondWrite {
         wait: WaitRegMem,
         write_memory: bool,
@@ -137,7 +140,8 @@ pub enum IndexSource {
 pub enum EventKind {
     /// EVENT_WRITE.
     Plain,
-    /// EVENT_WRITE_SHD: write `value` (or the swap counter) to `address`.
+    /// EVENT_WRITE_SHD: write `value` (or the swap counter) to `address` as
+    /// `endian.to_guest_bytes(..)`.
     Shader,
     /// EVENT_WRITE_EXT: write screen extents to `address`.
     ScreenExtent,
@@ -175,7 +179,8 @@ pub struct WaitRegMem {
 }
 
 impl WaitRegMem {
-    /// Evaluates the compare function against `value`.
+    /// Evaluates the compare function against `value`: the register value,
+    /// or for memory polls `endian.from_guest_bytes(bytes at poll_addr)`.
     pub fn matches(&self, value: u32) -> bool {
         let v = value & self.mask;
         match self.function {
