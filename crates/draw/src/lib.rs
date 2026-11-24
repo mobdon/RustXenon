@@ -419,6 +419,10 @@ pub struct Drawer {
     /// Destination endian of the last 32bpp resolve to each guest address,
     /// so a swap reads its front buffer in the byte order it was written.
     resolved_endian: HashMap<u32, u32>,
+    /// Decoded guest textures keyed by fetch constant and a hash of the
+    /// guest bytes they read, so an unchanged texture is not decoded again.
+    texture_cache: HashMap<([u32; 6], u64), wgpu::TextureView>,
+    texture_cache_bytes: u64,
     timings: Timings,
     uncaptured: Arc<Mutex<Vec<String>>>,
     max_dim: u32,
@@ -442,6 +446,24 @@ fn hash_words(words: &[u32]) -> u64 {
     words.hash(&mut h);
     h.finish()
 }
+
+/// Fast non-cryptographic hash of guest bytes for the texture cache. A
+/// collision only shows a stale texture.
+fn hash_bytes(bytes: &[u8]) -> u64 {
+    const K: u64 = 0x517c_c1b7_2722_0a95;
+    let mut chunks = bytes.chunks_exact(8);
+    let mut h = bytes.len() as u64;
+    for c in &mut chunks {
+        h = (h.rotate_left(5) ^ u64::from_le_bytes(c.try_into().unwrap())).wrapping_mul(K);
+    }
+    for &b in chunks.remainder() {
+        h = (h.rotate_left(5) ^ u64::from(b)).wrapping_mul(K);
+    }
+    h
+}
+
+/// Cached textures are dropped wholesale past this many bytes.
+const TEXTURE_CACHE_LIMIT: u64 = 256 << 20;
 
 fn to_bytes(words: &[u32]) -> Vec<u8> {
     words.iter().flat_map(|w| w.to_le_bytes()).collect()
@@ -686,6 +708,8 @@ impl Drawer {
             clear_pipelines: HashMap::new(),
             targets: HashMap::new(),
             resolved_endian: HashMap::new(),
+            texture_cache: HashMap::new(),
+            texture_cache_bytes: 0,
             timings: Timings::default(),
             uncaptured,
             max_dim: limits.max_texture_dimension_2d,
@@ -1156,7 +1180,7 @@ impl Drawer {
 
     /// Texture and sampler for fetch constant slot `n`.
     fn texture(
-        &self,
+        &mut self,
         n: u32,
         mem: &dyn GuestMemory,
         report: &mut Report,
@@ -1166,7 +1190,7 @@ impl Drawer {
             return unsupported(format!("texture slot {n} has no texture fetch constant"));
         }
         let addr = fetch.base_address & PHYSICAL_MASK;
-        let img = xenon_texture::bytes_needed(&fetch)
+        let bytes = xenon_texture::bytes_needed(&fetch)
             .and_then(|len| {
                 mem.read_bytes(addr, len)
                     .ok_or(xenon_texture::Error::TooShort {
@@ -1174,7 +1198,13 @@ impl Drawer {
                         got: 0,
                     })
             })
-            .and_then(|bytes| xenon_texture::decode_base_level(&fetch, &bytes))
+            .map_err(|e| Skip::Unsupported(format!("texture slot {n}: {e}")))?;
+        let key = (self.regs.fetch_constant(n), hash_bytes(&bytes));
+        let sampler = self.sampler(&fetch, report);
+        if let Some(view) = self.texture_cache.get(&key) {
+            return Ok((view.clone(), sampler));
+        }
+        let img = xenon_texture::decode_base_level(&fetch, &bytes)
             .map_err(|e| Skip::Unsupported(format!("texture slot {n}: {e}")))?;
         if img.width > self.max_dim || img.height > self.max_dim {
             return unsupported(format!("texture {}x{}", img.width, img.height));
@@ -1211,6 +1241,18 @@ impl Drawer {
             },
             size,
         );
+        let view = tex.create_view(&Default::default());
+        let len = img.rgba8.len() as u64;
+        if self.texture_cache_bytes + len > TEXTURE_CACHE_LIMIT {
+            self.texture_cache.clear();
+            self.texture_cache_bytes = 0;
+        }
+        self.texture_cache_bytes += len;
+        self.texture_cache.insert(key, view.clone());
+        Ok((view, sampler))
+    }
+
+    fn sampler(&self, fetch: &xenon_texture::TextureFetch, report: &mut Report) -> wgpu::Sampler {
         let mut addr_mode = |c: u8| {
             let (m, exact) = sampler_address(c);
             if !exact {
@@ -1218,7 +1260,7 @@ impl Drawer {
             }
             m
         };
-        let sampler = self.device.create_sampler(&wgpu::SamplerDescriptor {
+        self.device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("guest sampler"),
             address_mode_u: addr_mode(fetch.clamp[0]),
             address_mode_v: addr_mode(fetch.clamp[1]),
@@ -1226,8 +1268,7 @@ impl Drawer {
             mag_filter: filter(fetch.mag_filter),
             min_filter: filter(fetch.min_filter),
             ..Default::default()
-        });
-        Ok((tex.create_view(&Default::default()), sampler))
+        })
     }
 
     /// Draws `d`; Ok(false) when the state makes it draw nothing.

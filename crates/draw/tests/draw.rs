@@ -156,6 +156,28 @@ fn textured_quad_samples_tiled_texture() {
         }
     }
     assert_eq!(px(&img, W, n, n), CLEAR);
+    assert_eq!(report.timings.textures_uploaded, 1);
+
+    // Unchanged guest bytes come from the texture cache.
+    let report = run(&mut d, &s, &mut mem);
+    assert_eq!(report.timings.textures_uploaded, 0, "{report:?}");
+    let img = d.read_render_target(COLOR_KEY, 0, 0, W, H).unwrap();
+    assert_eq!(px(&img, W, 5, 7), texel(5, 7));
+
+    // Rewritten guest bytes under the same fetch constant are decoded again.
+    let texel2 = |x: u32, y: u32| [255 - (x * 8) as u8, (y * 8) as u8, 64, 255];
+    let linear: Vec<u8> = (0..n * n).flat_map(|i| texel2(i % n, i / n)).collect();
+    let mut tiled = tile::tile_2d(&linear, n, n, n, 4).unwrap();
+    endian::swap_in_place(&mut tiled, xenon_texture::Endian::K8in32);
+    mem.data[TEXTURE as usize..][..tiled.len()].copy_from_slice(&tiled);
+    let report = run(&mut d, &s, &mut mem);
+    assert_eq!(report.timings.textures_uploaded, 1, "{report:?}");
+    let img = d.read_render_target(COLOR_KEY, 0, 0, W, H).unwrap();
+    for y in 0..n {
+        for x in 0..n {
+            assert_eq!(px(&img, W, x, y), texel2(x, y), "({x}, {y})");
+        }
+    }
 }
 
 /// The pixel shader's colour comes from its float constant c0.
