@@ -719,3 +719,51 @@ fn strip_primitive_reset_32_bit() {
         assert_eq!(px(&img, W, x, y), CLEAR, "({x}, {y})");
     }
 }
+
+/// A pixel shader with getGradients goes through the drawer's own WGSL
+/// validation (the derivatives sit inside the pc-switch dispatch) and
+/// draws the colour's screen-space derivatives: red rises 255 over 64
+/// pixels along x, so d(red)/dx is 1/64 (about 4 of 255) and d(red)/dy 0.
+#[test]
+fn get_gradients_pixel_shader_draws() {
+    use xenon_shader::asm::*;
+    use xenon_shader::ucode::*;
+    let Some(mut d) = drawer() else { return };
+    let mut mem = memory();
+    mem.write_words(
+        VERTS,
+        &color_verts(&[
+            (0.0, 0.0, 0.0, [0, 0, 0, 255]),
+            (64.0, 0.0, 0.0, [255, 0, 0, 255]),
+            (0.0, 64.0, 0.0, [0, 0, 0, 255]),
+        ]),
+    );
+    // getGradients r1, r0.xy (swizzle x, y); oC0 = (ddx r, ddy r, ddx g, 1).
+    let mut tf = TextureFetch::fetch_2d(1, 0, 0);
+    tf.op = TextureOp::GetGradients;
+    tf.src_swizzle = 0b01_00;
+    tf.dest_swizzle = fetch_dest_swz("xyz1");
+    let ps = assemble(
+        &[exec(0, 2, true)],
+        &[
+            Instr::Fetch(FetchInstr::Texture(tf)),
+            export(0, AluSrc::temp(1, SWZ_XYZW)),
+        ],
+    );
+    let mut s = Stream::default();
+    s.setup()
+        .resolve(&mut mem, W, H, false, Some((rgba(CLEAR), 0)))
+        .shader(false, &vs_color())
+        .shader(true, &ps)
+        .vertex_fetch(0, VERTS, 12)
+        .draw_auto(PRIM_TRI_LIST, 3);
+    let report = run(&mut d, &s, &mut mem);
+    assert_eq!(report.draws, 1, "{report:?}");
+    assert!(report.unsupported.is_empty(), "{report:?}");
+    let img = d.read_render_target(COLOR_KEY, 0, 0, W, H).unwrap();
+    assert!(
+        near(px(&img, W, 8, 8), [4, 0, 0, 255], 1),
+        "{:?}",
+        px(&img, W, 8, 8)
+    );
+}
