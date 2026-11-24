@@ -1371,6 +1371,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "xenon-audio"
+version = "0.0.0"
+dependencies = [
+ "libloading",
+]
+
+[[package]]
 name = "xenon-compare"
 version = "0.0.0"
 dependencies = [

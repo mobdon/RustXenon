@@ -1,0 +1,13 @@
+[package]
+name = "xenon-audio"
+description = "Headless audio: decodes the console's compressed audio through a run-time loaded LGPL FFmpeg, mixes render-client frames and writes .wav files."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[dependencies]
+# Opens FFmpeg's shared libraries at run time, so nothing of FFmpeg is linked
+# into our binaries (LGPL condition, see CREDITS.md).
+libloading = "0.8"

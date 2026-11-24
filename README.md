@@ -39,6 +39,7 @@ See [DATA-RULES.md](DATA-RULES.md).
 | `crates/rt` | `xenon-rt`: guest CPU state, big-endian guest memory, call dispatch and overrides. Kept tiny so generated code rebuilds rarely |
 | `crates/cpu-tests` | Per-instruction tests: hand-assembled words, reference results as text, no game bytes |
 | `tools/ppc-oracle` | Regenerates the reference results on a CPU emulator (needs LLVM and QEMU; CI does not) |
+| `crates/audio` | `xenon-audio`: mixes render-client frames to stereo, writes .wav files, decodes the console's compressed audio through a run-time loaded LGPL FFmpeg. Never plays sound |
 | `crates/gpu` | `xenon-gpu`: GPU command recorder: PM4 packets from guest memory to a typed command list, register file |
 | `crates/texture` | `xenon-texture`: texture fetch constants, tiling, endian swaps, texel formats to RGBA8 |
 | `crates/shader` | `xenon-shader`: GPU shader microcode decoder, assembler for tests, translation to WGSL |
