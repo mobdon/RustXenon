@@ -1,7 +1,9 @@
-// float20e4 is ported from Xenia src/xenia/gpu/xenos.cc (Float20e4To32); the
+// float20e4 is ported from Xenia src/xenia/gpu/xenos.cc (Float20e4To32) and
+// unorm24 from src/xenia/gpu/xenos.h (UNorm24To32); the
 // 8_8_8_8 colour clear packing (red in the low byte) follows
 // src/xenia/gpu/shaders/pixel_formats.xesli; render target formats and
-// RB_*_INFO fields follow src/xenia/gpu/xenos.h and registers.h
+// RB_*_INFO fields follow src/xenia/gpu/xenos.h and registers.h; resolve
+// clears follow IsClearingColor in src/xenia/gpu/draw_util.h
 // (BSD 3-Clause, see CREDITS.md).
 
 //! `xenon-draw`: a headless wgpu drawer for recorded Xenos command lists.
@@ -988,8 +990,20 @@ impl Drawer {
             state::blend(self.regs.get(regs::RB_BLENDCONTROL0)).map_err(Skip::Unsupported)?;
         let mask = state::write_mask(self.regs.get(regs::RB_COLOR_MASK), 0);
 
-        let idx =
+        let mut idx =
             indices::guest_indices(mem, &d.source, d.index_count).map_err(Skip::Unsupported)?;
+        let strip = matches!(
+            topology,
+            wgpu::PrimitiveTopology::TriangleStrip | wgpu::PrimitiveTopology::LineStrip
+        );
+        let reset_on = self.regs.get(regs::PA_SU_SC_MODE_CNTL) & (1 << 21) != 0;
+        if reset_on
+            && matches!(d.source, xenon_gpu::IndexSource::Dma { .. })
+            && indices::mark_resets(&mut idx, self.regs.get(regs::VGT_MULTI_PRIM_IB_RESET_INDX))
+            && !strip
+        {
+            return unsupported("primitive reset outside strips");
+        }
         let idx = indices::expand(idx, expand);
         if idx.is_empty() {
             return Ok(false);
@@ -1037,10 +1051,6 @@ impl Drawer {
         let pipeline = match self.pipelines.get(&key) {
             Some(p) => p.clone(),
             None => {
-                let strip = matches!(
-                    topology,
-                    wgpu::PrimitiveTopology::TriangleStrip | wgpu::PrimitiveTopology::LineStrip
-                );
                 let k = key.clone();
                 let p = self.validated("render pipeline", |dev| {
                     dev.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -1371,9 +1381,10 @@ impl Drawer {
             CopyCommand::Null => {}
             CopyCommand::ConstantOne => return unsupported("resolve copy command ConstantOne"),
         }
-        if r.color_clear_enable {
-            let rt = if r.is_depth { 0 } else { r.src_select as usize };
-            let key = RenderTargetKey::color(&self.regs, rt)
+        // A depth resolve never clears colour (Xenia draw_util.h
+        // IsClearingColor).
+        if r.color_clear_enable && !r.is_depth {
+            let key = RenderTargetKey::color(&self.regs, r.src_select as usize)
                 .map_err(|e| Skip::Unsupported(format!("resolve clear of {e}")))?;
             let c = r.color_clear;
             let color = [0, 8, 16, 24].map(|s| ((c >> s) & 0xFF) as f32 / 255.0);
@@ -1384,7 +1395,7 @@ impl Drawer {
             let d = r.depth_clear >> 8;
             let depth = match key.format {
                 TargetFormat::D24FS8 => float20e4(d),
-                _ => d as f32 / 0xFF_FFFF as f32,
+                _ => unorm24(d),
             };
             self.clear(key, rect, [0.0; 4], depth, r.depth_clear & 0xFF)?;
         }
@@ -1481,6 +1492,13 @@ impl Drawer {
     }
 }
 
+/// 24-bit unorm depth to float (Xenia xenos.h UNorm24To32): exact, unlike a
+/// division by 0xFFFFFF.
+fn unorm24(n24: u32) -> f32 {
+    let n24 = n24 & 0xFF_FFFF;
+    (n24 + (n24 >> 23)) as f32 / (1 << 24) as f32
+}
+
 /// Xenos 20e4 depth (Xenia xenos.cc Float20e4To32).
 fn float20e4(f24: u32) -> f32 {
     let f24 = f24 & 0xFF_FFFF;
@@ -1511,6 +1529,13 @@ mod tests {
         assert!(!m.write_bytes(0x13, &[1, 2]));
         assert!(!m.write_bytes(0x0F, &[1]));
         assert_eq!(m.data, vec![0, 0, 1, 2]);
+    }
+
+    #[test]
+    fn unorm24_end_points() {
+        assert_eq!(unorm24(0), 0.0);
+        assert_eq!(unorm24(0xFF_FFFF), 1.0);
+        assert_eq!(unorm24(0x80_0000), 0.5 + 1.0 / (1 << 24) as f32);
     }
 
     #[test]

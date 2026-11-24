@@ -9,7 +9,7 @@
 //! EDRAM resolve helpers that do not touch the GPU.
 
 use xenon_gpu::regs;
-use xenon_gpu::{FetchConstantType, GuestRead, RegisterFile, Resolve};
+use xenon_gpu::{FetchConstantType, GuestRead, RegisterFile, Resolve, PHYSICAL_MASK};
 use xenon_texture::{endian, tile};
 
 use crate::state;
@@ -62,7 +62,7 @@ pub fn rect(
     let (sx1, sy1) = (sx + sw, sy + sh);
     let vf = r.vertex_fetch0;
     let verts = (vf.fetch_type == FetchConstantType::Vertex && vf.size_dwords == 6)
-        .then(|| mem.read_bytes(vf.address, 24))
+        .then(|| mem.read_bytes(vf.address & PHYSICAL_MASK, 24))
         .flatten();
     let (mut x0, mut y0, mut x1, mut y1, from_vertices) = match verts {
         Some(bytes) => {
@@ -130,6 +130,16 @@ pub fn write_tiled(
     rgba8: &[u8],
     dest_endian: u32,
 ) -> Result<(), String> {
+    if rect.is_empty()
+        || rgba8.len() as u64 != u64::from(rect.width()) * u64::from(rect.height()) * 4
+    {
+        return Err(format!(
+            "resolve: {} bytes for a {}x{} rectangle",
+            rgba8.len(),
+            rect.x1.saturating_sub(rect.x0),
+            rect.y1.saturating_sub(rect.y0)
+        ));
+    }
     let pitch = tile::align_to_tile(dest_pitch);
     let extent = tile::tiled_extent_2d(rect.x1, rect.y1, pitch, 4)
         .map_err(|e| format!("resolve destination: {e}"))?;
@@ -181,6 +191,11 @@ mod tests {
         let res = Resolve::from_registers(&r);
         let (rect, from_vertices) = rect(&res, &r, &mem, 2048);
         assert!(from_vertices);
+        // The same vertices through a cached (0xA...) view of the address
+        // are read at the physical address.
+        r.set(regs::SHADER_CONSTANT_FETCH, 0xA000_1000 | 3);
+        let cached = Resolve::from_registers(&r);
+        assert_eq!(super::rect(&cached, &r, &mem, 2048), (rect, true));
         assert_eq!(
             rect,
             Rect {
@@ -224,6 +239,9 @@ mod tests {
             base: 0,
             data: vec![0; 32 * 32 * 4],
         };
+        assert!(write_tiled(&mut mem, 0, 8, rect, &px[4..], 2).is_err());
+        let empty = Rect { x1: 0, ..rect };
+        assert!(write_tiled(&mut mem, 0, 8, empty, &px, 2).is_err());
         write_tiled(&mut mem, 0, 8, rect, &px, 2).unwrap();
         let mut raw = mem.data.clone();
         endian::swap_in_place(&mut raw, xenon_texture::Endian::K8in32);

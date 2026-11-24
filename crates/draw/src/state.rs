@@ -4,7 +4,8 @@
 // src/xenia/gpu/xenos.h (BlendFactor, BlendOp, CompareFunction). The scissor
 // follows GetScissor and the viewport offsets GetHostViewportInfo in
 // src/xenia/gpu/draw_util.cc; the position epilogue follows the end of the
-// vertex shader in src/xenia/gpu/spirv_shader_translator.cc
+// vertex shader in src/xenia/gpu/spirv_shader_translator.cc; depth writes
+// need the depth test as in src/xenia/gpu/d3d12/pipeline_cache.cc
 // (BSD 3-Clause, see CREDITS.md).
 
 //! Fixed-function state decoded from the register file.
@@ -113,7 +114,10 @@ pub fn depth(reg: u32) -> Depth {
     let test = reg & 2 != 0;
     Depth {
         test,
-        write: reg & 4 != 0,
+        // z_write_enable only counts while z_enable is set: with the depth
+        // test off nothing is written (Xenia d3d12/pipeline_cache.cc, the
+        // depth/stencil state of GetCurrentStateDescription).
+        write: test && reg & 4 != 0,
         compare: if test {
             compare(reg >> 4)
         } else {
@@ -297,6 +301,8 @@ mod tests {
         assert!(d.test && d.write && !d.stencil);
         assert_eq!(d.compare, wgpu::CompareFunction::LessEqual);
         assert!(!depth(0).used());
+        // Depth writes without the depth test write nothing.
+        assert!(!depth(4).write && !depth(4).used());
         assert_eq!(cull(0), Some((wgpu::FrontFace::Ccw, None)));
         assert_eq!(
             cull(2 | 4),

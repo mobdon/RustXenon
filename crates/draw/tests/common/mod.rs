@@ -169,7 +169,7 @@ pub fn run(d: &mut Drawer, s: &Stream, mem: &mut SliceMemory) -> Report {
     d.replay(&cmds, mem as &mut dyn GuestMemory).unwrap()
 }
 
-fn exec(addr: u32, count: u32, end: bool) -> CfInstr {
+pub fn exec(addr: u32, count: u32, end: bool) -> CfInstr {
     CfInstr::Exec(Exec::new(addr, count, end))
 }
 
@@ -177,14 +177,19 @@ fn r(n: u32) -> AluSrc {
     AluSrc::temp(n, SWZ_XYZW)
 }
 
-fn export(reg: u32, src: AluSrc) -> Instr {
+pub fn export(reg: u32, src: AluSrc) -> Instr {
     Instr::Alu(AluInstr::vector(VectorOp::Max, reg, mask("xyzw"), &[src, src]).exported(reg))
 }
 
 /// Vertex shader: vertex = 4 dwords at vf0 (x, y, z float, 8_8_8_8
 /// colour); oPos = (x, y, z, 1), o0 = colour.
 pub fn vs_color() -> Vec<u32> {
-    let mut pos = VertexFetch::full(1, 0, 0, VertexFormat::F32_32_32_FLOAT, 4, 0);
+    vs_color_from(0)
+}
+
+/// `vs_color` reading its vertices through vertex fetch constant `k`.
+pub fn vs_color_from(k: u32) -> Vec<u32> {
+    let mut pos = VertexFetch::full(1, 0, k, VertexFormat::F32_32_32_FLOAT, 4, 0);
     pos.dest_swizzle = fetch_dest_swz("xyz1");
     let mut col = VertexFetch::full(2, 0, 0, VertexFormat::F8_8_8_8, 4, 3);
     col.mini = true;

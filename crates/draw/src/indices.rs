@@ -1,6 +1,8 @@
 // Index byte swapping follows Xenia src/xenia/gpu/primitive_processor.cc
 // (guest indices are read as little-endian words after the GpuSwap of the
-// index endian), and the quad list / triangle fan conversions follow the
+// index endian, 32-bit swap modes on 16-bit indices normalised, 32-bit
+// indices masked to 24 bits as in primitive_processor.h's To24 transforms),
+// and the quad list / triangle fan conversions follow the
 // conversions in primitive_processor.h (QuadListToTriangleList,
 // TriangleFanToList) (BSD 3-Clause, see CREDITS.md).
 
@@ -44,6 +46,12 @@ pub fn guest_indices(
     source: &IndexSource,
     count: u32,
 ) -> Result<Vec<u32>, String> {
+    // VGT_DRAW_INITIATOR::num_indices is 16 bits (Xenia registers.h); a
+    // larger count can only come from a hand-made command and would make
+    // the drawer allocate without bound.
+    if count > 0xFFFF {
+        return Err(format!("index count {count}"));
+    }
     match source {
         IndexSource::Auto => Ok((0..count).collect()),
         IndexSource::Dma {
@@ -52,40 +60,49 @@ pub fn guest_indices(
             endian,
             ..
         } => {
+            use xenon_gpu::Endian as E;
             let size = format.bytes() as usize;
-            let mut bytes = mem
+            let bytes = mem
                 .read_bytes(*address, count as usize * size)
                 .ok_or_else(|| format!("index buffer at 0x{address:08X} is not readable"))?;
-            let e = xenon_texture::Endian::from_bits(match endian {
-                xenon_gpu::Endian::None => 0,
-                xenon_gpu::Endian::E8in16 => 1,
-                xenon_gpu::Endian::E8in32 => 2,
-                xenon_gpu::Endian::E16in32 => 3,
-            });
-            // The swap works on whole 32-bit words, so a 16-bit buffer with
-            // an odd count needs the word's other half present.
-            if size == 2 && bytes.len() % 4 != 0 {
-                if let Some(pad) = mem.read_bytes(*address + bytes.len() as u32, 2) {
-                    bytes.extend(pad);
-                } else {
-                    bytes.extend([0, 0]);
-                }
-            }
-            xenon_texture::endian::swap_in_place(&mut bytes, e);
             Ok(match format {
+                // 32-bit swap modes on 16-bit indices: Xenia treats 8in32 as
+                // 8in16 and 16in32 as none rather than swapping across
+                // adjacent indices.
                 IndexFormat::Int16 => bytes
                     .chunks_exact(2)
-                    .take(count as usize)
-                    .map(|c| u32::from(u16::from_le_bytes([c[0], c[1]])))
+                    .map(|c| {
+                        let v = u16::from_le_bytes([c[0], c[1]]);
+                        u32::from(match endian {
+                            E::E8in16 | E::E8in32 => v.swap_bytes(),
+                            E::None | E::E16in32 => v,
+                        })
+                    })
                     .collect(),
+                // Vertex indices are 24-bit (Xenia's To24 index transforms),
+                // which also keeps 0xFFFFFFFF from restarting host strips.
                 IndexFormat::Int32 => bytes
                     .chunks_exact(4)
-                    .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                    .map(|c| endian.from_guest_bytes([c[0], c[1], c[2], c[3]]) & 0xFF_FFFF)
                     .collect(),
             })
         }
         IndexSource::Immediate { .. } => Err("immediate index source".into()),
     }
+}
+
+/// Primitive reset (PA_SU_SC_MODE_CNTL::multi_prim_ib_ena with
+/// VGT_MULTI_PRIM_IB_RESET_INDX, both 24-bit after the swap, as Xenia's
+/// ReplaceResetIndex32To24): matching indices become the host strip restart
+/// value `u32::MAX`. Returns whether any index matched.
+pub fn mark_resets(indices: &mut [u32], reset_index: u32) -> bool {
+    let reset_index = reset_index & 0xFF_FFFF;
+    let mut any = false;
+    for i in indices.iter_mut().filter(|i| **i == reset_index) {
+        *i = u32::MAX;
+        any = true;
+    }
+    any
 }
 
 /// Applies the topology conversion.
@@ -135,8 +152,38 @@ mod tests {
             format: IndexFormat::Int32,
             endian: xenon_gpu::Endian::E8in32,
         };
-        assert_eq!(guest_indices(&mem, &src, 2), Ok(vec![5, 0x0102_0304]));
+        assert_eq!(guest_indices(&mem, &src, 2), Ok(vec![5, 0x02_0304]));
         assert!(guest_indices(&mem, &src, 3).is_err());
+    }
+
+    #[test]
+    fn dma_16_bit_with_32_bit_swap_modes() {
+        // An odd count, and swaps that must not cross adjacent indices.
+        let mem = SliceMemory {
+            base: 0x100,
+            data: vec![0x00, 0x03, 0x01, 0x02, 0x00, 0x07],
+        };
+        let src = |endian| IndexSource::Dma {
+            address: 0x100,
+            buffer_indices: 3,
+            format: IndexFormat::Int16,
+            endian,
+        };
+        let e8in32 = src(xenon_gpu::Endian::E8in32);
+        assert_eq!(guest_indices(&mem, &e8in32, 3), Ok(vec![3, 0x102, 7]));
+        let e16in32 = src(xenon_gpu::Endian::E16in32);
+        assert_eq!(
+            guest_indices(&mem, &e16in32, 3),
+            Ok(vec![0x300, 0x201, 0x700])
+        );
+    }
+
+    #[test]
+    fn reset_indices_are_marked() {
+        let mut v = vec![1, 0xFF_FFFF, 2];
+        assert!(mark_resets(&mut v, 0xFFFF_FFFF));
+        assert_eq!(v, vec![1, u32::MAX, 2]);
+        assert!(!mark_resets(&mut v, 7));
     }
 
     #[test]
@@ -150,5 +197,7 @@ mod tests {
             vec![1, 2, 9, 2, 3, 9]
         );
         assert!(topology(PrimitiveType::RectangleList).is_err());
+        let mem = SliceMemory::default();
+        assert!(guest_indices(&mem, &IndexSource::Auto, 0x1_0000).is_err());
     }
 }
