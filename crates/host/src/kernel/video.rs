@@ -83,10 +83,21 @@ pub fn vd_get_system_command_buffer(rt: &Runtime, c: &mut Context) {
 
 /// The title leaves 64 words in the ring for the swap; fill them with
 /// type-2 no-op packets.
+/// (ring buffer space, front buffer fetch constant, ..., front buffer
+/// address pointer, format, color space, width, height). The title leaves
+/// 64 words in the ring; they get the swap packets (see
+/// [`super::gpu::swap_packets`]) and type-2 no-ops after them.
 pub fn vd_swap(rt: &Runtime, c: &mut Context) {
-    let buf = arg(rt, c, 0);
+    let (buf, fetch_p, fb_p) = (arg(rt, c, 0), arg(rt, c, 1), arg(rt, c, 5));
+    let (w_p, h_p) = (arg(rt, c, 8), arg(rt, c, 9));
+    let fetch: [u32; 6] = std::array::from_fn(|i| rt.mem.read_u32(fetch_p + 4 * i as u32));
+    let read = |p: u32| if p != 0 { rt.mem.read_u32(p) } else { 0 };
+    let words = super::gpu::swap_packets(fetch, read(fb_p), read(w_p), read(h_p));
     for i in 0..64 {
-        rt.mem.write_u32(buf + 4 * i, 0x8000_0000);
+        rt.mem.write_u32(
+            buf + 4 * i,
+            words.get(i as usize).copied().unwrap_or(0x8000_0000),
+        );
     }
     k().swaps.fetch_add(1, Ordering::Relaxed);
     ret(c, 0);
@@ -139,6 +150,7 @@ pub fn vd_initialize_scaler_command_buffer(rt: &Runtime, c: &mut Context) {
 /// as source 0) on a context of its own. Runs until the process ends.
 pub fn start(rt: std::sync::Arc<Runtime>) {
     use super::gpu::{gpu_to_cpu, Gpu, CP_RB_RPTR, CP_RB_WPTR};
+    let _ = gpu_to_cpu;
     std::thread::Builder::new()
         .name("gpu".into())
         .spawn(move || {
@@ -185,6 +197,7 @@ pub fn start(rt: std::sync::Arc<Runtime>) {
                 (0x1961, 0x0500_02D0),
             ];
             let mut rptr = 0u32;
+            let mut capture = super::gpu::capture::Plan::from_settings();
             loop {
                 let (ring, log2, wb) = {
                     let v = k().video.lock().unwrap();
@@ -192,18 +205,11 @@ pub fn start(rt: std::sync::Arc<Runtime>) {
                 };
                 if ring != 0 {
                     let words = ((1u32 << (log2 + 3)) / 4).max(1);
-                    let at_ring = gpu_to_cpu(ring);
                     let w = rt.mem.read_u32(GPU_REGS + 4 * CP_RB_WPTR) % words;
                     super::gpu::STATE.store(1, Ordering::Relaxed);
-                    while rptr != w {
-                        let left = if w > rptr { w - rptr } else { words - rptr + w };
-                        let at = rptr;
-                        let read = |i| rt.mem.read_u32(at_ring + 4 * ((at + i) % words));
-                        match gpu.packet(&rt, read, left, 0, &mut idle) {
-                            0 => break, // waiting: try again next round
-                            n => rptr = (rptr + n.min(left)) % words,
-                        }
-                        idle(&mut gpu);
+                    if rptr != w {
+                        rptr = gpu.run_ring(&rt, ring, words, rptr, w, &mut idle);
+                        capture.after_ring(&rt, &mut gpu);
                     }
                     rt.mem.write_u32(GPU_REGS + 4 * CP_RB_RPTR, rptr);
                     if wb != 0 {

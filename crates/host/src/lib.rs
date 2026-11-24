@@ -178,14 +178,16 @@ const USAGE: &str = "\
 USAGE: game --exe <patched executable> --game <unpacked game folder>
             [--update <unpacked title update>] [--data <writable folder>]
             [--seconds <n>] [--press <ms>:<button>[+<button>],...]
-            [--no-controller]
+            [--no-controller] [--capture <dir> [--capture-at <s>,<s>...]]
 
 Runs the title headless for --seconds (default 30) and reports how far it
 got: frames presented, threads, imports called, memory in use. A
 virtual controller on port 0 presses Start, then A, every four seconds
 (from the fifth second) unless --press gives a script or --no-controller
 unplugs it. Buttons: up down left right start back lthumb rthumb lb rb a b
-x y.";
+x y. --capture writes, for one frame at each given second (default 20),
+the textures bound at its draws and a list of the draws: local files,
+derived from the game.";
 
 fn opt(args: &[String], name: &str) -> Option<String> {
     args.iter()
@@ -209,6 +211,14 @@ pub fn run(sha256: &str, regs: &[fn(&mut Runtime)]) -> ExitCode {
     let seconds: u64 = opt(&args, "--seconds")
         .and_then(|s| s.parse().ok())
         .unwrap_or(30);
+    if let Some(d) = opt(&args, "--capture") {
+        let at = opt(&args, "--capture-at").unwrap_or_else(|| "20".into());
+        let at: Vec<u32> = at
+            .split(',')
+            .filter_map(|x| x.trim().parse().ok())
+            .collect();
+        let _ = kernel::gpu::capture::SETTINGS.set((PathBuf::from(d), at));
+    }
     if args.iter().any(|a| a == "--no-controller") {
         kernel::input::set_script(kernel::input::Script::Unplugged);
     } else if let Some(p) = opt(&args, "--press") {
