@@ -15,10 +15,15 @@ owns runs as a native program.
 > Step 3 is in: guest threads run at the same time on host threads, reserved
 > stores are host compare-and-swap, and the runtime has the locks, events and
 > semaphores that guest kernel objects map onto (checked with synthetic
-> multi-thread programs). Step 5 groundwork has started: the GPU command
-> recorder, texture decoding, shader translation to WGSL and a headless wgpu
-> drawer work on synthetic command streams (unit tested, run on a software
-> Vulkan driver; nothing has run in a game yet).
+> multi-thread programs). Step 4 has started: the host replaces every
+> kernel and system-library call a title imports (memory, threads, kernel
+> objects, files on the player's unpacked game folder, content and profile
+> stubs, input and network stubs), with a headless GPU command processor,
+> checked with synthetic tests.
+> Step 5 groundwork has started: the GPU command recorder, texture
+> decoding, shader translation to WGSL and a headless wgpu drawer work on
+> synthetic command streams (unit tested, run on a software Vulkan driver;
+> nothing has run in a game yet).
 
 ## You need your own copy
 
@@ -106,6 +111,108 @@ full 4 GB guest address range needs reserving rather than allocating). A
 compare-and-swap succeeds where the console would fail a store whose word was
 written back with the same value in between; locks and counters do not
 depend on that.
+
+### Whole-executable build (step 2)
+
+```sh
+xenon-recomp unpack <your disc image> <game folder>
+xenon-recomp unpack <your title update package> <update folder>
+xenon-recomp build <executable> --out <build folder> [--mem-gb 16]
+cd <build folder> && cargo build
+```
+
+`unpack` reads the console's disc file system (at any of the disc
+generations' partition offsets) or a content package (the read-only
+layout, with its interleaved hash tables), refusing unsafe names.
+`build` writes a local Cargo workspace:
+
+- one crate per fixed guest address range (`--range`, default 256 KB of
+  code), so ranges compile in parallel and a change rebuilds one crate;
+- each function as one Rust function with one match arm per basic block
+  (branch targets, jump-table targets and the instruction after an
+  unconditional branch start a block). Falling off the end calls the next
+  function;
+- functions longer than `--max-part` instructions (default 4,000) split
+  into parts over consecutive blocks with a small dispatcher, so the
+  compiler never sees one enormous function;
+- files rewritten only when their text changes, so Cargo leaves unchanged
+  ranges alone;
+- parallel compile jobs capped by a memory budget (`--mem-gb`, about 3 GB
+  a job) in the workspace's `.cargo/config.toml`, and a profile without
+  debug info or incremental state.
+
+The game crate calls `xenon_host::run` with the executable's SHA-256; the
+host refuses any other executable. Everything under the build folder is
+derived from the game and stays local.
+
+Jump tables now also match when a `nop` sits between `mtctr` and `bctr`.
+
+### System calls (step 4)
+
+`xenon-host` installs a host function on every import thunk of the
+executable (`crates/host/src/kernel/table.rs` maps export numbers to them)
+and writes the imported variables. An import it does not know stops with
+its name. Results are sign-extended to 64 bits as on the console, because
+titles test them with 64-bit record compares.
+
+| Area | What the host does |
+|---|---|
+| Memory | Virtual memory (64 KB granularity), physical memory (handed out in the `0xA0000000` view), kernel pool; first fit, freed ranges zeroed on reuse, usage and peak reported |
+| Threads | Stack, processor control region (r13), thread object and thread-local storage per thread; the hardware thread (0 to 5) from the creation flags and affinity calls, where titles read it; suspend and resume; dynamic TLS slots; a thread object is signalled when its thread ends |
+| Kernel objects | Events, semaphores, mutants, timers and threads on the step-3 objects, by handle or by the guest's own dispatcher header; waits for one or several objects with timeouts; critical sections keep their owner fields current; spin locks |
+| Files | `game:`, `d:` and the disc device map to the player's unpacked game folder (read only), `update:` to an unpacked title update, cache, hard disk and content packages to a local data folder; open, read, scatter read, write, information classes, directory listing with wildcards, volume information |
+| Controller | A scripted virtual pad on port 0 (`--press <ms>:<button>,...`, default Start then A every four seconds from the fifth second, `--no-controller` to unplug): state, keystroke events and capabilities; ports 1 to 3 unplugged |
+| Profile | One local profile signed in on port 0: user id, name, sign-in information, profile settings with console defaults, title settings stored in the data folder, no online privileges |
+| System library | Content packages as local folders, empty enumerators (saves, downloads, achievements), the start-up notifications a console sends, system screens closed at once, no headset |
+| Network | The stack starts with no link; socket calls fail with "network down" |
+| Video | Display mode 1280x720 at 60 Hz. A minimal command processor runs the command ring: register and memory writes, fence and event writes, conditional writes, waits and interrupts; draws are skipped. The vertical-blank interrupt runs at 60 Hz. Each `VdSwap` counts as a presented frame |
+| Audio | Render clients are asked for a frame every 5.33 ms (48 kHz, 256 samples), as the console's audio hardware does; the frames are dropped |
+| Stops | Bug checks, exceptions other than the debugger's thread-naming one, structured exception unwinding, reboot and title launch stop with their arguments |
+
+When the title stops, the host prints the panic, the newest call targets,
+the guest return addresses (walked from the stack back chain), frames
+presented, memory in use and the imports called. When no frame arrives for
+three seconds it prints each thread's last import and return addresses, so
+a wait shows up apart from running out of memory.
+
+Tests in `crates/host/tests/kernel.rs` drive the calls with synthetic guest
+state (no game bytes): memory headroom, thread start and exit with TLS,
+semaphore limits and waits on several objects, recursive critical
+sections, files in a temporary folder, `printf` formatting, and command
+packets.
+
+#### First headless run
+
+On the first target (2.42 million instructions in
+38,536 functions, `games/760ebac4e5f0351edb39015eba89e729b14eaf95afdabb529a447ff8f8e11cd1/hooks.toml`), built on a 32 GB, 24-thread
+PC, the title boots headless with no window or sound: it starts 25 threads,
+opens its archives from the unpacked disc and title update, uses 89 of its
+246 imports, and its frame loop presents a steady 60 frames a second.
+Three runs of two minutes each presented 7,186, 7,164 and 7,156 frames with
+no stop. Physical memory in use is 450 of 512 MB (62 MB of headroom),
+virtual memory 4 MB. File reads stop after the first 712: the title waits
+on its front end with no controller connected and nobody signed in.
+
+Fixes the run needed (in the system-call layer above): kernel results
+sign-extended to 64 bits (a failed open read as success), the debugger's
+thread-naming exception allowed to continue, file information classes for
+sectors, alignment and mode, GPU memory byte order (the GPU reads memory
+little-endian, then applies the packet's swap), waits in the command ring
+honoured, the display interrupt status and line counter registers kept
+current, and the video lock released before the guest interrupt handler
+runs.
+
+With the controller and profile in, the front end answers: after the
+scripted Start (about 17 s in) the title reads the profile, lists saves,
+downloads and achievements, and keeps presenting 60 frames a second. It
+does not load into the world yet. Which screen it waits on cannot be seen
+until frames are rendered (step 5). Two fixes this needed: the audio
+mixer's threads meet at a per-processor barrier, so threads must carry
+their processor number, and the audio render callback must run.
+
+Not covered yet: structured exception handling (not reached so far), asynchronous I/O completion
+routines and APCs, alertable waits, physical memory mirrors at `0xC0000000`
+and `0xE0000000`, timer completion routines, and rendering.
 
 ### GPU (step 5)
 
