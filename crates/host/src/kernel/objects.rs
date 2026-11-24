@@ -236,10 +236,8 @@ pub fn nt_release_mutant(rt: &Runtime, c: &mut Context) {
         return ret(c, STATUS_INVALID_HANDLE);
     };
     match &*get(rt, a) {
-        KObj::Mutant(m) => {
-            m.leave();
-            ret(c, STATUS_SUCCESS)
-        }
+        // The console returns this status when the caller does not own it.
+        KObj::Mutant(m) if m.try_leave() => ret(c, STATUS_SUCCESS),
         _ => ret(c, STATUS_MUTANT_NOT_OWNED),
     }
 }
