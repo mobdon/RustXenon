@@ -381,6 +381,7 @@ pub fn run(sha256: &str, regs: &[fn(&mut Runtime)]) -> ExitCode {
     }));
 
     start_clock(rt.clone());
+    start_memwatch(rt.clone());
     kernel::video::start(rt.clone());
     kernel::threads::register_main(&rt, image.entry);
     log(&format!("started at {:#010x}", image.entry));
@@ -445,6 +446,46 @@ fn report() {
     for (n, c) in calls.iter().take(40) {
         log(&format!("  {c:>10} {n}"));
     }
+}
+
+/// `XENON_MEMWATCH=<hex addr>:<hex len>`: polls a guest range every
+/// millisecond and logs each word that changes, with every thread's last
+/// call target (to find who fills a structure).
+fn start_memwatch(rt: Arc<Runtime>) {
+    let Some((a, n)) = std::env::var("XENON_MEMWATCH").ok().and_then(|v| {
+        let (a, n) = v.split_once(':')?;
+        Some((
+            u32::from_str_radix(a, 16).ok()?,
+            u32::from_str_radix(n, 16).ok()?,
+        ))
+    }) else {
+        return;
+    };
+    std::thread::spawn(move || {
+        let read = |i: u32| rt.mem.read_u32(a + 4 * i);
+        let mut old: Vec<u32> = (0..n / 4).map(read).collect();
+        loop {
+            std::thread::sleep(Duration::from_millis(1));
+            for (i, o) in old.iter_mut().enumerate() {
+                let v = read(i as u32);
+                if v != *o {
+                    let who: Vec<String> = ACTIVITY
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .map(|(t, x)| format!("{t}:{:#x}", x.call.load(Ordering::Relaxed)))
+                        .collect();
+                    log(&format!(
+                        "[memwatch] {:#x}: {:#x} -> {v:#x}; {}",
+                        a + 4 * i as u32,
+                        *o,
+                        who.join(" ")
+                    ));
+                    *o = v;
+                }
+            }
+        }
+    });
 }
 
 /// Keeps the time stamp bundle (interrupt time, system time, tick count in
