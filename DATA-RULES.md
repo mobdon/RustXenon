@@ -39,6 +39,11 @@ Tests in git use no game bytes. CPU tests use hand-assembled instructions and
 compare against a CPU emulator or hand-written reference values. Tests run
 headless: no window, no focus change, no sound.
 
+Game-level regression tests keep only `test.toml` (input script, frame
+numbers, tolerance) in git. Their expected frames and every captured frame
+are game output and stay local; the runner's own tests use a fake program
+that draws synthetic frames.
+
 ## Credits
 
 Every source we learn from or use is credited in `CREDITS.md`, with its licence
