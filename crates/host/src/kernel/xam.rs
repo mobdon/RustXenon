@@ -12,6 +12,14 @@ pub fn complete(rt: &Runtime, c: &Context, ov: u32, result: u32, length: u32) {
     if ov == 0 {
         return;
     }
+    if std::env::var_os("XENON_TRACE_PROFILE").is_some() {
+        crate::log(&format!(
+            "[xam] complete {ov:#x}: result {result:#x}, event {:#x}, routine {:#x}, context {:#x}",
+            rt.mem.read_u32(ov + 0xC),
+            rt.mem.read_u32(ov + 0x10),
+            rt.mem.read_u32(ov + 0x14)
+        ));
+    }
     rt.mem.write_u32(ov, result);
     rt.mem.write_u32(ov + 4, length);
     rt.mem.write_u32(ov + 0x18, result);

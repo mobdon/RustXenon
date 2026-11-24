@@ -124,6 +124,12 @@ pub fn xam_user_read_profile_settings(rt: &Runtime, c: &mut Context) {
         return ret(c, ERROR_INVALID_PARAMETER);
     }
     let ids: Vec<u32> = (0..n).map(|i| rt.mem.read_u32(ids + 4 * i)).collect();
+    if std::env::var_os("XENON_TRACE_PROFILE").is_some() {
+        crate::log(&format!(
+            "[profile] read {ids:x?} size {} buffer {buf:#x} request {ov:#x}",
+            rt.mem.read_u32(size_p)
+        ));
+    }
     let copies = xuids_n.max(1);
     let data: u32 = ids
         .iter()

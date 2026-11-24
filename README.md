@@ -44,6 +44,8 @@ See [DATA-RULES.md](DATA-RULES.md).
 | `crates/shader` | `xenon-shader`: GPU shader microcode decoder, assembler for tests, translation to WGSL |
 | `crates/draw` | `xenon-draw`: headless wgpu drawer: replays recorded commands into offscreen render targets, resolves, PNG frames |
 | `crates/host` | `xenon-host`: loads the player's files, runs recompiled code, replaces system calls; later graphics, input and audio |
+| `crates/compare` | `xenon-compare`: diff two frames with a tolerance (side-by-side sheet) and make a blink image. No window or GPU |
+| `crates/regress` | `xenon-regress`: runs game-level regression tests headless and reports pass or fail per frame with pictures. See `games/README.md` |
 | `games/<sha256>/hooks.toml` | Per-game hook addresses with role names. The only per-game file in git |
 | `third_party/licenses` | Licence texts for credited sources |
 
@@ -165,8 +167,8 @@ titles test them with 64-bit record compares.
 | Profile | One local profile signed in on port 0: user id, name, sign-in information, profile settings with console defaults, title settings stored in the data folder, no online privileges |
 | System library | Content packages as local folders, empty enumerators (saves, downloads, achievements), the start-up notifications a console sends, system screens closed at once, no headset |
 | Network | The stack starts with no link; socket calls fail with "network down" |
-| Video | Display mode 1280x720 at 60 Hz. A minimal command processor runs the command ring: register and memory writes, fence and event writes, conditional writes, waits and interrupts; draws are skipped. The vertical-blank interrupt runs at 60 Hz. Each `VdSwap` counts as a presented frame |
-| Audio | Render clients are asked for a frame every 5.33 ms (48 kHz, 256 samples), as the console's audio hardware does; the frames are dropped |
+| Video | Display mode 1280x720 at 60 Hz. The command ring is parsed by `xenon-gpu`'s recorder; the host applies register side effects, memory, fence and event writes, conditional writes, waits and interrupts. Draws are not rendered yet. `VdSwap` leaves the real swap packets (front buffer fetch constant, then the swap) in the ring. The vertical-blank interrupt runs at 60 Hz |
+| Audio | Render clients are asked for a frame every 5.33 ms (48 kHz, 256 samples), as the console's audio hardware does; the frames are dropped. Decoder contexts live in physical memory; a silent stand-in drains their input buffers and fills their output rings with silence |
 | Stops | Bug checks, exceptions other than the debugger's thread-naming one, structured exception unwinding, reboot and title launch stop with their arguments |
 
 When the title stops, the host prints the panic, the newest call targets,
@@ -209,6 +211,14 @@ does not load into the world yet. Which screen it waits on cannot be seen
 until frames are rendered (step 5). Two fixes this needed: the audio
 mixer's threads meet at a per-processor barrier, so threads must carry
 their processor number, and the audio render callback must run.
+
+`--capture <dir> --capture-at <s>,<s>...` writes, for one frame at each
+time, every texture bound at its draws (as BMP, through `xenon-texture`)
+and a list of the draws. Local files only: they come from the game. On the
+first target the frames show, in order, a full screen of text (about 960
+textured quads from a font, 2 to 6 s), two logo screens (8 to 15 s), then
+from about 17 s a frame with only a clear and no file reads. A still frame
+of that screen waits for the drawer.
 
 Not covered yet: structured exception handling (not reached so far), asynchronous I/O completion
 routines and APCs, alertable waits, physical memory mirrors at `0xC0000000`

@@ -1,0 +1,13 @@
+[package]
+name = "xenon-regress"
+description = "Game-level regression tests: run a program headless, capture frames, compare with expected frames within a tolerance."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+xenon-compare = { path = "../compare" }
