@@ -419,6 +419,12 @@ pub struct Drawer {
     /// Destination endian of the last 32bpp resolve to each guest address,
     /// so a swap reads its front buffer in the byte order it was written.
     resolved_endian: HashMap<u32, u32>,
+    /// Decoded guest textures keyed by fetch constant and a hash of the
+    /// guest bytes they read, so an unchanged texture is not decoded again.
+    texture_cache: HashMap<([u32; 6], u64), wgpu::TextureView>,
+    texture_cache_bytes: u64,
+    /// Compute pipeline of resolve.wgsl, made on the first 32bpp resolve.
+    resolve_pipeline: Option<wgpu::ComputePipeline>,
     timings: Timings,
     uncaptured: Arc<Mutex<Vec<String>>>,
     max_dim: u32,
@@ -442,6 +448,24 @@ fn hash_words(words: &[u32]) -> u64 {
     words.hash(&mut h);
     h.finish()
 }
+
+/// Fast non-cryptographic hash of guest bytes for the texture cache. A
+/// collision only shows a stale texture.
+fn hash_bytes(bytes: &[u8]) -> u64 {
+    const K: u64 = 0x517c_c1b7_2722_0a95;
+    let mut chunks = bytes.chunks_exact(8);
+    let mut h = bytes.len() as u64;
+    for c in &mut chunks {
+        h = (h.rotate_left(5) ^ u64::from_le_bytes(c.try_into().unwrap())).wrapping_mul(K);
+    }
+    for &b in chunks.remainder() {
+        h = (h.rotate_left(5) ^ u64::from(b)).wrapping_mul(K);
+    }
+    h
+}
+
+/// Cached textures are dropped wholesale past this many bytes.
+const TEXTURE_CACHE_LIMIT: u64 = 256 << 20;
 
 fn to_bytes(words: &[u32]) -> Vec<u8> {
     words.iter().flat_map(|w| w.to_le_bytes()).collect()
@@ -686,6 +710,9 @@ impl Drawer {
             clear_pipelines: HashMap::new(),
             targets: HashMap::new(),
             resolved_endian: HashMap::new(),
+            texture_cache: HashMap::new(),
+            texture_cache_bytes: 0,
+            resolve_pipeline: None,
             timings: Timings::default(),
             uncaptured,
             max_dim: limits.max_texture_dimension_2d,
@@ -914,6 +941,16 @@ impl Drawer {
             },
         );
         let index = self.queue.submit([enc.finish()]);
+        let data = self.map_read(&buf, index)?;
+        let mut out = Vec::with_capacity((row * h) as usize);
+        for r in 0..h as usize {
+            out.extend_from_slice(&data[r * padded as usize..][..row as usize]);
+        }
+        Ok(out)
+    }
+
+    /// Waits for submission `index` and copies out the mapped `buf`.
+    fn map_read(&self, buf: &wgpu::Buffer, index: wgpu::SubmissionIndex) -> Result<Vec<u8>, Error> {
         let slot = Arc::new(Mutex::new(None));
         let sink = slot.clone();
         buf.slice(..).map_async(wgpu::MapMode::Read, move |r| {
@@ -944,10 +981,7 @@ impl Drawer {
             .slice(..)
             .get_mapped_range()
             .map_err(|e| Error::Gpu(e.to_string()))?;
-        let mut out = Vec::with_capacity((row * h) as usize);
-        for r in 0..h as usize {
-            out.extend_from_slice(&data[r * padded as usize..][..row as usize]);
-        }
+        let out = data.to_vec();
         drop(data);
         buf.unmap();
         self.check_uncaptured()?;
@@ -1156,7 +1190,7 @@ impl Drawer {
 
     /// Texture and sampler for fetch constant slot `n`.
     fn texture(
-        &self,
+        &mut self,
         n: u32,
         mem: &dyn GuestMemory,
         report: &mut Report,
@@ -1166,7 +1200,7 @@ impl Drawer {
             return unsupported(format!("texture slot {n} has no texture fetch constant"));
         }
         let addr = fetch.base_address & PHYSICAL_MASK;
-        let img = xenon_texture::bytes_needed(&fetch)
+        let bytes = xenon_texture::bytes_needed(&fetch)
             .and_then(|len| {
                 mem.read_bytes(addr, len)
                     .ok_or(xenon_texture::Error::TooShort {
@@ -1174,7 +1208,13 @@ impl Drawer {
                         got: 0,
                     })
             })
-            .and_then(|bytes| xenon_texture::decode_base_level(&fetch, &bytes))
+            .map_err(|e| Skip::Unsupported(format!("texture slot {n}: {e}")))?;
+        let key = (self.regs.fetch_constant(n), hash_bytes(&bytes));
+        let sampler = self.sampler(&fetch, report);
+        if let Some(view) = self.texture_cache.get(&key) {
+            return Ok((view.clone(), sampler));
+        }
+        let img = xenon_texture::decode_base_level(&fetch, &bytes)
             .map_err(|e| Skip::Unsupported(format!("texture slot {n}: {e}")))?;
         if img.width > self.max_dim || img.height > self.max_dim {
             return unsupported(format!("texture {}x{}", img.width, img.height));
@@ -1211,6 +1251,18 @@ impl Drawer {
             },
             size,
         );
+        let view = tex.create_view(&Default::default());
+        let len = img.rgba8.len() as u64;
+        if self.texture_cache_bytes + len > TEXTURE_CACHE_LIMIT {
+            self.texture_cache.clear();
+            self.texture_cache_bytes = 0;
+        }
+        self.texture_cache_bytes += len;
+        self.texture_cache.insert(key, view.clone());
+        Ok((view, sampler))
+    }
+
+    fn sampler(&self, fetch: &xenon_texture::TextureFetch, report: &mut Report) -> wgpu::Sampler {
         let mut addr_mode = |c: u8| {
             let (m, exact) = sampler_address(c);
             if !exact {
@@ -1218,7 +1270,7 @@ impl Drawer {
             }
             m
         };
-        let sampler = self.device.create_sampler(&wgpu::SamplerDescriptor {
+        self.device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("guest sampler"),
             address_mode_u: addr_mode(fetch.clamp[0]),
             address_mode_v: addr_mode(fetch.clamp[1]),
@@ -1226,8 +1278,7 @@ impl Drawer {
             mag_filter: filter(fetch.mag_filter),
             min_filter: filter(fetch.min_filter),
             ..Default::default()
-        });
-        Ok((tex.create_view(&Default::default()), sampler))
+        })
     }
 
     /// Draws `d`; Ok(false) when the state makes it draw nothing.
@@ -1812,6 +1863,12 @@ impl Drawer {
         if rect.is_empty() {
             return Ok(());
         }
+        if dest_bytes == 4 {
+            self.resolve_gpu(r, rect, format, &tex, mem)?;
+            self.resolved_endian
+                .insert(r.dest_base & PHYSICAL_MASK, r.dest_endian);
+            return Ok(());
+        }
         let mut t = Instant::now();
         self.wait_idle()?;
         self.timings.gpu_wait += lap(&mut t);
@@ -1843,6 +1900,137 @@ impl Drawer {
         }
         self.timings.resolve_cpu += lap(&mut t);
         done
+    }
+
+    /// 32bpp colour copy on the GPU: resolve.wgsl converts, tiles and
+    /// swaps each pixel into a copy of the destination's guest bytes, which
+    /// is read back once and written to guest memory. Same result as the CPU
+    /// path in [`Self::resolve_copy`].
+    fn resolve_gpu(
+        &mut self,
+        r: &Resolve,
+        rect: resolve::Rect,
+        format: TargetFormat,
+        tex: &wgpu::Texture,
+        mem: &mut dyn GuestMemory,
+    ) -> Result<(), Skip> {
+        if rect.y1 > tex.height() {
+            return Err(Error::Unsupported(format!(
+                "readback {}x{} at ({}, {}) outside the {}x{} target",
+                rect.width(),
+                rect.height(),
+                rect.x0,
+                rect.y0,
+                tex.width(),
+                tex.height()
+            ))
+            .into());
+        }
+        let mut t = Instant::now();
+        let base = r.dest_base & PHYSICAL_MASK;
+        let pitch = xenon_texture::tile::align_to_tile(r.dest_pitch);
+        let extent = xenon_texture::tile::tiled_extent_2d(rect.x1, rect.y1, pitch, 4)
+            .map_err(|e| Skip::Unsupported(format!("resolve destination: {e}")))?;
+        if u64::from(extent) > self.max_storage {
+            return unsupported(format!("resolve destination of {extent} bytes"));
+        }
+        let Some(guest) = mem.read_bytes(base, extent as usize) else {
+            return unsupported(format!("resolve destination 0x{base:08X} is not readable"));
+        };
+        let src_format = match format {
+            TargetFormat::Rgba8 => 0,
+            TargetFormat::Rgb10a2 => 1,
+            TargetFormat::Float7e3 => 2,
+            TargetFormat::Rgba16Float => 3,
+            TargetFormat::D24S8 | TargetFormat::D24FS8 => {
+                return unsupported("GPU resolve from a depth format")
+            }
+        };
+        let params = [
+            rect.x0,
+            rect.y0,
+            rect.width(),
+            rect.height(),
+            pitch,
+            src_format,
+            u32::from(r.dest_format != formats::DEST_8_8_8_8),
+            u32::from(r.dest_swap),
+            r.dest_endian,
+            2f32.powi(r.dest_exp_bias).to_bits(),
+            0,
+            0,
+        ];
+        let dest = self.buffer(
+            "resolve destination",
+            &guest,
+            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        );
+        let uniform = self.buffer(
+            "resolve params",
+            &to_bytes(&params),
+            wgpu::BufferUsages::UNIFORM,
+        );
+        let readback = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("resolve readback"),
+            size: dest.size(),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let scope = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let device = &self.device;
+        let pipeline = self.resolve_pipeline.get_or_insert_with(|| {
+            let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("resolve"),
+                source: wgpu::ShaderSource::Wgsl(include_str!("resolve.wgsl").into()),
+            });
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("resolve"),
+                layout: None,
+                module: &module,
+                entry_point: Some("main"),
+                compilation_options: Default::default(),
+                cache: None,
+            })
+        });
+        let view = tex.create_view(&Default::default());
+        let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("resolve"),
+            layout: &pipeline.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: dest.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: uniform.as_entire_binding(),
+                },
+            ],
+        });
+        let mut enc = self.device.create_command_encoder(&Default::default());
+        {
+            let mut pass = enc.begin_compute_pass(&Default::default());
+            pass.set_pipeline(pipeline);
+            pass.set_bind_group(0, &bg, &[]);
+            pass.dispatch_workgroups(rect.width().div_ceil(8), rect.height().div_ceil(8), 1);
+        }
+        enc.copy_buffer_to_buffer(&dest, 0, &readback, 0, dest.size());
+        let index = self.queue.submit([enc.finish()]);
+        if let Some(e) = block_on(scope.pop()) {
+            return Err(Skip::Fatal(Error::Gpu(e.to_string())));
+        }
+        let mut out = self.map_read(&readback, index)?;
+        self.timings.readback += lap(&mut t);
+        out.truncate(extent as usize);
+        if !mem.write_bytes(base, &out) {
+            return unsupported(format!("resolve destination 0x{base:08X} is not writable"));
+        }
+        self.timings.resolve_cpu += lap(&mut t);
+        Ok(())
     }
 
     /// Reads the front buffer: a 32x32-tiled 8_8_8_8 surface, pitch = width
