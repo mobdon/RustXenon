@@ -64,3 +64,8 @@ cargo run -p xenon-host -- --probe
 
 RustXenon is modelled on [XenonRecomp](https://github.com/hedge-dev/XenonRecomp)
 (MIT). See [CREDITS.md](CREDITS.md) for all sources and licences.
+
+## Licence
+
+RustXenon is licensed under the [MIT licence](LICENSE). Third-party sources
+keep their own licences; see [CREDITS.md](CREDITS.md) and `third_party/licenses`.
