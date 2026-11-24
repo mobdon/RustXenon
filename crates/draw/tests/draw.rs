@@ -683,10 +683,7 @@ fn strip_primitive_reset_32_bit() {
 /// stencil, draw a triangle at z = 0.25 with depth always passing, resolve
 /// the depth surface raw to k_8_8_8_8 and return the words at (2, 2) (in
 /// the triangle) and (40, 40) (cleared).
-fn depth_resolve_words(depth_info: u32, clear: u32) -> (u32, u32) {
-    let Some(mut d) = drawer() else {
-        return (0, 0);
-    };
+fn depth_resolve_words(d: &mut xenon_draw::Drawer, depth_info: u32, clear: u32) -> (u32, u32) {
     let mut mem = memory();
     let z = 0.25;
     mem.write_words(
@@ -721,7 +718,7 @@ fn depth_resolve_words(depth_info: u32, clear: u32) -> (u32, u32) {
             (DEST, W | (H << 16), dest_info(6, 0, false)),
             [0; 3],
         );
-    let report = run(&mut d, &s, &mut mem);
+    let report = run(d, &s, &mut mem);
     assert_eq!((report.draws, report.resolves), (1, 2), "{report:?}");
     assert!(report.unsupported.is_empty(), "{report:?}");
     let img = detiled(&mem, DEST, W, H, W, 4);
@@ -733,25 +730,83 @@ fn depth_resolve_words(depth_info: u32, clear: u32) -> (u32, u32) {
 /// bits 8..31, stencil in 0..7, as Xenia's fast resolve copies it.
 #[test]
 fn depth_resolve_d24s8_words() {
-    if drawer().is_none() {
-        return;
-    }
+    let Some(mut d) = drawer() else { return };
     assert_eq!(
-        depth_resolve_words(DEPTH_BASE, 0x1234_5678),
+        depth_resolve_words(&mut d, DEPTH_BASE, 0x1234_5678),
         ((0x40_0000 << 8) | 0x78, 0x1234_5678)
     );
 }
 
-/// A D24FS8 depth resolve writes 20e4 depth in bits 8..31; the host
-/// surface has no stencil, so bits 0..7 are 0.
+/// A D24FS8 depth resolve writes 20e4 depth in bits 8..31 and the
+/// stencil in 0..7 (0 where the host has no float depth with stencil).
 #[test]
 fn depth_resolve_d24fs8_words() {
-    if drawer().is_none() {
-        return;
-    }
+    let Some(mut d) = drawer() else { return };
+    let stencil = if d.float_stencil() { 0x78 } else { 0 };
     // 0.25 is 20e4 exponent 13, 0.5 exponent 14.
     assert_eq!(
-        depth_resolve_words(DEPTH_BASE | (1 << 16), (14 << 28) | 0x78),
-        (13 << 28, 14 << 28)
+        depth_resolve_words(&mut d, DEPTH_BASE | (1 << 16), (14 << 28) | 0x78),
+        ((13 << 28) | stencil, (14 << 28) | stencil)
     );
+}
+
+/// Stencil on depth surface `depth_info`: a corner triangle writes
+/// reference 5 (always, replace) with colour off, then a full-window
+/// triangle drawn only where the stencil equals 5 colours the corner red
+/// and leaves the rest at the clear colour.
+fn stencil_masks_draw(depth_info: u32) {
+    let Some(mut d) = drawer() else { return };
+    let mut mem = memory();
+    mem.write_words(
+        VERTS,
+        &color_verts(&[
+            (0.0, 0.0, 0.0, WHITE),
+            (16.0, 0.0, 0.0, WHITE),
+            (0.0, 16.0, 0.0, WHITE),
+            (0.0, 0.0, 0.0, RED),
+            (128.0, 0.0, 0.0, RED),
+            (0.0, 128.0, 0.0, RED),
+        ]),
+    );
+    let always_replace = 1 | (7 << 8) | (2 << 11) | (2 << 14) | (2 << 17);
+    let equal_keep = 1 | (2 << 8);
+    let mut s = Stream::default();
+    s.setup()
+        .regs(RB_DEPTH_INFO, &[depth_info])
+        .resolve(&mut mem, W, H, false, Some((rgba(CLEAR), 0)))
+        .shader(false, &vs_color())
+        .shader(true, &ps_interp())
+        .vertex_fetch(0, VERTS, 24)
+        // Reference 5, read mask 0xFF, write mask 0xFF.
+        .regs(RB_STENCILREFMASK, &[5 | (0xFF << 8) | (0xFF << 16)])
+        .regs(RB_DEPTHCONTROL, &[always_replace])
+        .regs(RB_COLOR_MASK, &[0])
+        .draw_auto(PRIM_TRI_LIST, 3)
+        .regs(RB_COLOR_MASK, &[0xF])
+        .regs(RB_DEPTHCONTROL, &[equal_keep])
+        .vertex_fetch(0, VERTS + 48, 12)
+        .draw_auto(PRIM_TRI_LIST, 3);
+    let report = run(&mut d, &s, &mut mem);
+    if !d.float_stencil() && depth_info & (1 << 16) != 0 {
+        assert!(
+            report.warnings.iter().any(|w| w.contains("stencil")),
+            "{report:?}"
+        );
+        return;
+    }
+    assert_eq!(report.draws, 2, "{report:?}");
+    assert!(report.warnings.is_empty(), "{report:?}");
+    let img = d.read_render_target(COLOR_KEY, 0, 0, W, H).unwrap();
+    assert_eq!(px(&img, W, 2, 2), RED);
+    assert_eq!(px(&img, W, 30, 30), CLEAR);
+}
+
+#[test]
+fn stencil_masks_draw_d24s8() {
+    stencil_masks_draw(DEPTH_BASE);
+}
+
+#[test]
+fn stencil_masks_draw_d24fs8() {
+    stencil_masks_draw(DEPTH_BASE | (1 << 16));
 }

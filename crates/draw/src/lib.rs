@@ -54,7 +54,8 @@
 //! Resolve clears decode the 64-bit value `RB_COLOR_CLEAR |
 //! RB_COLOR_CLEAR_LO << 32` per format ([`formats::clear_color`]).
 //! Depth targets: `kD24S8` as `Depth24PlusStencil8` and `kD24FS8` as
-//! `Depth32Float` (the 20e4 float is stored at f32 precision). Anything
+//! `Depth32FloatStencil8` where the host has it, else `Depth32Float` without
+//! stencil (the 20e4 float is stored at f32 precision). Anything
 //! else (`k_16_16`, `k_16_16_16_16`, `k_16_16_FLOAT`, `k_32_32_FLOAT`) is
 //! reported in [`Report::unsupported`].
 //!
@@ -73,7 +74,7 @@
 //! A depth copy (to any 32bpp destination format) writes the raw EDRAM word,
 //! as Xenia's fast resolve does: depth in bits 8..31 (`kD24S8` as 24-bit
 //! unorm, rounded; `kD24FS8` as 20e4, rounded to nearest even) and stencil in
-//! bits 0..7 (0 for `kD24FS8`, hosted without stencil), with the destination
+//! bits 0..7 (0 for a `kD24FS8` hosted without stencil), with the destination
 //! endian and no bias or swap.
 //!
 //! # Draws
@@ -385,7 +386,11 @@ struct PipelineKey {
         Option<wgpu::BlendState>,
         wgpu::ColorWrites,
     )>; 4],
-    depth: Option<(wgpu::TextureFormat, state::Depth)>,
+    depth: Option<(
+        wgpu::TextureFormat,
+        state::Depth,
+        Option<wgpu::StencilState>,
+    )>,
     cull: (wgpu::FrontFace, Option<wgpu::Face>),
     textures: u32,
 }
@@ -446,6 +451,8 @@ pub struct Drawer {
     /// Compute pipeline of resolve.wgsl, made on the first 32bpp resolve.
     /// Colour, depth and depth + stencil entry points of resolve.wgsl.
     resolve_pipelines: [Option<wgpu::ComputePipeline>; 3],
+    /// kD24FS8 is hosted as `Depth32FloatStencil8` (else `Depth32Float`).
+    float_stencil: bool,
     timings: Timings,
     uncaptured: Arc<Mutex<Vec<String>>>,
     max_dim: u32,
@@ -666,8 +673,18 @@ impl Drawer {
         }
         let info = adapter.get_info();
         let limits = adapter.limits();
+        // kD24FS8 keeps its stencil only where the host has a float depth
+        // format with stencil.
+        let float_stencil = adapter
+            .features()
+            .contains(wgpu::Features::DEPTH32FLOAT_STENCIL8);
         let (device, queue) = block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("xenon-draw"),
+            required_features: if float_stencil {
+                wgpu::Features::DEPTH32FLOAT_STENCIL8
+            } else {
+                wgpu::Features::empty()
+            },
             required_limits: limits.clone(),
             ..Default::default()
         }))
@@ -734,6 +751,7 @@ impl Drawer {
             texture_cache: HashMap::new(),
             texture_cache_bytes: 0,
             resolve_pipelines: [None, None, None],
+            float_stencil,
             timings: Timings::default(),
             uncaptured,
             max_dim: limits.max_texture_dimension_2d,
@@ -1013,6 +1031,7 @@ impl Drawer {
         if key.pitch == 0 || key.pitch > self.max_dim {
             return unsupported(format!("surface pitch {}", key.pitch));
         }
+        let host_format = self.host_format(key.format);
         let (device, height) = (&self.device, RENDER_TARGET_HEIGHT.min(self.max_dim));
         Ok(self
             .targets
@@ -1028,7 +1047,7 @@ impl Drawer {
                     mip_level_count: 1,
                     sample_count: 1,
                     dimension: wgpu::TextureDimension::D2,
-                    format: key.format.wgpu(),
+                    format: host_format,
                     usage: wgpu::TextureUsages::RENDER_ATTACHMENT
                         | wgpu::TextureUsages::COPY_SRC
                         | wgpu::TextureUsages::COPY_DST
@@ -1037,6 +1056,21 @@ impl Drawer {
                 })
             })
             .clone())
+    }
+
+    /// Whether `kD24FS8` keeps its stencil (the host has
+    /// `Depth32FloatStencil8`); without it the stencil test on such a
+    /// target is skipped with a warning and resolves write stencil 0.
+    pub fn float_stencil(&self) -> bool {
+        self.float_stencil
+    }
+
+    /// The host texture format of a render target.
+    fn host_format(&self, format: TargetFormat) -> wgpu::TextureFormat {
+        match format {
+            TargetFormat::D24FS8 if self.float_stencil => wgpu::TextureFormat::Depth32FloatStencil8,
+            f => f.wgpu(),
+        }
     }
 
     fn translate(&mut self, p: &Program, stage: ShaderStage) -> Result<Translated, Skip> {
@@ -1361,10 +1395,8 @@ impl Drawer {
             }
             color[rt] = Some(key);
         }
-        let depth = state::depth(self.regs.get(regs::RB_DEPTHCONTROL));
-        if depth.stencil {
-            report.warn("stencil test ignored");
-        }
+        let depth_control = self.regs.get(regs::RB_DEPTHCONTROL);
+        let depth = state::depth(depth_control);
         let depth_key = depth.used().then(|| RenderTargetKey::depth(&self.regs));
         if color.iter().all(Option::is_none) && depth_key.is_none() {
             return Ok(false);
@@ -1383,6 +1415,20 @@ impl Drawer {
             None if polygonal => return Ok(false),
             None => (wgpu::FrontFace::Ccw, None),
         };
+        let mut stencil = state::stencil(
+            depth_control,
+            self.regs.get(regs::RB_STENCILREFMASK),
+            self.regs.get(regs::RB_STENCILREFMASK_BF),
+            polygonal,
+            cull.1 == Some(wgpu::Face::Front),
+        );
+        let depth_format = depth_key.map(|k| self.host_format(k.format));
+        if stencil.is_some() && !depth_format.is_some_and(|f| f.has_stencil_aspect()) {
+            // shortcut: no host float depth format with stencil; needs
+            // DEPTH32FLOAT_STENCIL8 or a separate stencil emulation.
+            report.warn("stencil test on a 20e4 depth target without host stencil ignored");
+            stencil = None;
+        }
         let mut blends = [None; 4];
         for rt in (0..4).filter(|&rt| color[rt].is_some()) {
             blends[rt] = state::blend(self.regs.get(regs::RB_BLENDCONTROL_RT[rt]))
@@ -1492,7 +1538,7 @@ impl Drawer {
                     )
                 })
             }),
-            depth: depth_key.map(|k| (k.format.wgpu(), depth)),
+            depth: depth_format.map(|f| (f, depth, stencil.as_ref().map(|s| s.0.clone()))),
             cull,
             textures: tex_mask,
         };
@@ -1517,11 +1563,11 @@ impl Drawer {
                             cull_mode: k.cull.1,
                             ..Default::default()
                         },
-                        depth_stencil: k.depth.map(|(format, d)| wgpu::DepthStencilState {
+                        depth_stencil: k.depth.map(|(format, d, st)| wgpu::DepthStencilState {
                             format,
                             depth_write_enabled: Some(d.write),
                             depth_compare: Some(d.compare),
-                            stencil: Default::default(),
+                            stencil: st.unwrap_or_default(),
                             bias: Default::default(),
                         }),
                         multisample: Default::default(),
@@ -1645,7 +1691,8 @@ impl Drawer {
                             load: wgpu::LoadOp::Load,
                             store: wgpu::StoreOp::Store,
                         }),
-                        stencil_ops: (depth_key.map(|k| k.format) == Some(TargetFormat::D24S8))
+                        stencil_ops: depth_format
+                            .is_some_and(|f| f.has_stencil_aspect())
                             .then_some(wgpu::Operations {
                                 load: wgpu::LoadOp::Load,
                                 store: wgpu::StoreOp::Store,
@@ -1660,6 +1707,9 @@ impl Drawer {
             pass.set_index_buffer(index_buf.slice(..), wgpu::IndexFormat::Uint32);
             pass.set_viewport(0.0, 0.0, w as f32, h as f32, 0.0, 1.0);
             pass.set_scissor_rect(sx, sy, sw, sh);
+            if let Some((_, reference)) = &stencil {
+                pass.set_stencil_reference(*reference);
+            }
             pass.set_blend_constant(wgpu::Color {
                 r: f64::from(blend_rgba[0]),
                 g: f64::from(blend_rgba[1]),
@@ -1770,7 +1820,7 @@ impl Drawer {
         if rect.is_empty() {
             return Ok(());
         }
-        let format = key.format.wgpu();
+        let format = self.host_format(key.format);
         let pipeline = self.clear_pipeline(format)?;
         let mut v: Vec<u32> = color.iter().map(|c| c.to_bits()).collect();
         v.extend([depth.to_bits(), 0, 0, 0]);
@@ -2030,9 +2080,9 @@ impl Drawer {
             TargetFormat::D24FS8 => 6,
         };
         let entry = match format {
-            TargetFormat::D24S8 => 2,
-            TargetFormat::D24FS8 => 1,
-            _ => 0,
+            _ if !format.is_depth() => 0,
+            _ if self.host_format(format).has_stencil_aspect() => 2,
+            _ => 1,
         };
         let params = [
             rect.x0,
