@@ -68,14 +68,17 @@ fn passthrough_vertex_shader() {
     );
     has(
         &t,
-        "r[0].x = f32(bitcast<i32>(vertex_index + consts.vertex_base));",
+        "r[0].x = f32((vertex_index + consts.vertex_base) & 0xFFFFFFu);",
     );
     has(
         &t,
         "@group(0) @binding(0) var<storage, read> guest: array<u32>;",
     );
     has(&t, "let idx = i32(floor(r[0].x));");
-    has(&t, "vf_addr = i32(consts.fetch[0u][0u] >> 2u) + idx * 4;");
+    has(
+        &t,
+        "vf_addr = i32((consts.fetch[0u][0u] >> 2u) & 0x07FFFFFFu) + idx * 4;",
+    );
     has(&t, "let e = consts.fetch[0u][1u] & 3u;");
     has(&t, "r[1].w = 1.0;");
     has(&t, "let w0 = vword(vf_addr + 3, e);");
@@ -672,7 +675,10 @@ fn every_vertex_format() {
     let f = VertexFetch::full(1, 0, 0, VertexFormat::F32_FLOAT, 0, 0);
     let t = fetch_one(f).unwrap();
     assert!(!t.wgsl.contains("let idx"));
-    has(&t, "vf_addr = i32(consts.fetch[0u][0u] >> 2u);");
+    has(
+        &t,
+        "vf_addr = i32((consts.fetch[0u][0u] >> 2u) & 0x07FFFFFFu);",
+    );
 }
 
 #[test]

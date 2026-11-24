@@ -810,9 +810,8 @@ impl Drawer {
             if vf.fetch_type != FetchConstantType::Vertex {
                 report.warn(format!("vertex fetch constant {k} is not a vertex fetch"));
             }
-            // Unmasked, as the translated shader addresses the window with
-            // the raw fetch constant; memory is read at the physical address.
-            let a = u64::from(vf.address);
+            // Physical, as the translated shader masks fetch addresses.
+            let a = u64::from(vf.address & PHYSICAL_MASK);
             lo = lo.min(a);
             hi = hi.max(a + 4 * u64::from(vf.size_dwords));
         }
@@ -825,7 +824,7 @@ impl Drawer {
                     hi - lo
                 ));
             }
-            let Some(b) = mem.read_bytes(lo as u32 & PHYSICAL_MASK, (hi - lo) as usize) else {
+            let Some(b) = mem.read_bytes(lo as u32, (hi - lo) as usize) else {
                 return unsupported(format!(
                     "vertex data at 0x{lo:08X}..0x{hi:08X} not readable"
                 ));
