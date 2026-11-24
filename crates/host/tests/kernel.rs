@@ -423,42 +423,54 @@ fn printf_formatting() {
 }
 
 #[test]
-fn command_processor_writes_fences_and_waits() {
+fn command_processor_applies_writes_waits_and_interrupts() {
     let e = env();
     let rt = &e.rt;
-    let mut gpu = Gpu::default();
-    let mut idle = |_: &mut Gpu| {};
-    let words = |v: Vec<u32>| move |k: u32| v[k as usize];
+    // A 64-word ring at physical 0x1000.
+    let ring = 0x1000;
     let type3 = |op: u32, n: u32| 0xC000_0000 | (n - 1) << 16 | op << 8;
-    // MEM_WRITE of two words at physical 0x100, guest byte order (endian 2).
-    let n = gpu.packet(
-        rt,
-        words(vec![type3(0x3D, 3), 0x100 | 2, 0x1111, 0x2222]),
+    let words = [
+        // MEM_WRITE two words at 0x100, guest byte order (endian 2).
+        type3(0x3D, 3),
+        0x100 | 2,
+        0x1111,
+        0x2222,
+        // EVENT_WRITE_SHD of 9 at 0x200.
+        type3(0x58, 3),
+        3,
+        0x200 | 2,
+        9,
+        // WAIT_REG_MEM until the word at 0x300 equals 1.
+        type3(0x3C, 5),
+        0x13,
+        0x300 | 2,
+        1,
+        0xFFFF_FFFF,
+        0x100,
+        // INTERRUPT for processor 2.
+        type3(0x54, 1),
         4,
-        0,
-        &mut idle,
-    );
-    assert_eq!(n, 4);
+    ];
+    for (i, w) in words.iter().enumerate() {
+        rt.mem.write_u32(0xA000_0000 + ring + 4 * i as u32, *w);
+    }
+    let mut gpu = Gpu::default();
+    // The wait releases once the test writes the word it polls.
+    let mut waited = 0;
+    let mut idle = |_: &mut Gpu| {
+        waited += 1;
+        if waited == 3 {
+            rt.mem.write_u32(0xA000_0300, 1);
+        }
+    };
+    let r = gpu.run_ring(rt, ring, 64, 0, words.len() as u32, &mut idle);
+    assert_eq!(r, words.len() as u32);
     assert_eq!(
         (rt.mem.read_u32(0xA000_0100), rt.mem.read_u32(0xA000_0104)),
         (0x1111, 0x2222)
     );
-    // EVENT_WRITE_SHD with a plain value.
-    gpu.packet(
-        rt,
-        words(vec![type3(0x58, 3), 3, 0x200 | 2, 9]),
-        4,
-        0,
-        &mut idle,
-    );
     assert_eq!(rt.mem.read_u32(0xA000_0200), 9);
-    // WAIT_REG_MEM on memory == 1: not yet (0 words), then it holds.
-    let wait = vec![type3(0x3C, 5), 0x13, 0x300 | 2, 1, 0xFFFF_FFFF, 0x100];
-    assert_eq!(gpu.packet(rt, words(wait.clone()), 6, 0, &mut idle), 0);
-    rt.mem.write_u32(0xA000_0300, 1);
-    assert_eq!(gpu.packet(rt, words(wait), 6, 0, &mut idle), 6);
-    // INTERRUPT is queued for the caller with its processor mask.
-    gpu.packet(rt, words(vec![type3(0x54, 1), 4]), 2, 0, &mut idle);
+    assert!(waited >= 3, "the wait blocked until its word was written");
     assert_eq!(gpu.interrupts, vec![4]);
 }
 

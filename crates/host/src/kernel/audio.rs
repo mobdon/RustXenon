@@ -56,11 +56,106 @@ pub fn x_audio_get_speaker_config(rt: &Runtime, c: &mut Context) {
     rt.mem.write_u32(arg(rt, c, 0), 0x0001_0001);
     ret(c, STATUS_SUCCESS);
 }
+
+// ---- audio decoder contexts ------------------------------------------------
+
+/// Decoder contexts: 64-byte records in physical memory that the title
+/// fills (input buffers, output ring) and the decoder hardware drains.
+const CONTEXTS: u32 = 320;
+static XMA: Mutex<Option<(u32, Vec<bool>)>> = Mutex::new(None);
+
+/// Context words (each a big-endian word; bit numbers from the low end):
+/// word 0: input buffer 0 valid (bit 20) and 1 valid (21), output block
+/// count (22..27) and write offset (27..32); word 1: output valid (31);
+/// word 2: input read offset (0..26); word 4: current input buffer (31);
+/// word 7: output buffer; word 9: output read offset (0..5).
+///
+/// shortcut: no audio is decoded. Each round consumes the current input
+/// buffer at once and fills the output ring with silence, so streams move
+/// on as if played; upgrade when the decoder lands (step 6).
+fn drain(rt: &Runtime, ctx: u32) {
+    let w0 = rt.mem.read_u32(ctx);
+    let w1 = rt.mem.read_u32(ctx + 4);
+    if w1 >> 31 == 0 {
+        return;
+    }
+    let mut w0n = w0;
+    let w4 = rt.mem.read_u32(ctx + 16);
+    let cur = w4 >> 31;
+    if w0 >> (20 + cur) & 1 != 0 {
+        w0n &= !(1 << (20 + cur));
+        rt.mem.write_u32(ctx + 16, w4 ^ 1 << 31);
+        rt.mem
+            .write_u32(ctx + 8, rt.mem.read_u32(ctx + 8) & !0x03FF_FFFF);
+    }
+    let blocks = w0 >> 22 & 31;
+    if blocks > 0 {
+        let read = rt.mem.read_u32(ctx + 36) & 31;
+        let full = (read + blocks - 1) % blocks;
+        let out = super::gpu::gpu_to_cpu(rt.mem.read_u32(ctx + 28));
+        let mut wr = w0 >> 27 & 31;
+        while wr != full {
+            fill(rt, out + 256 * wr, 256, 0);
+            wr = (wr + 1) % blocks;
+        }
+        w0n = (w0n & !(31 << 27)) | wr << 27;
+    }
+    if w0n != w0 {
+        rt.mem.write_u32(ctx, w0n);
+    }
+}
+
+fn start_decoder(rt: std::sync::Arc<Runtime>, base: u32) {
+    std::thread::Builder::new()
+        .name("audio-decoder".into())
+        .spawn(move || loop {
+            let used: Vec<u32> = match &*XMA.lock().unwrap() {
+                Some((_, u)) => u
+                    .iter()
+                    .enumerate()
+                    .filter(|x| *x.1)
+                    .map(|x| base + 64 * x.0 as u32)
+                    .collect(),
+                None => vec![],
+            };
+            for c in used {
+                drain(&rt, c);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        })
+        .expect("cannot start a host thread");
+}
+
+/// (context out): a free context, zeroed.
 pub fn xma_create_context(rt: &Runtime, c: &mut Context) {
-    let a = k().pool_alloc(rt, 64);
-    rt.mem.write_u32(arg(rt, c, 0), a);
+    let out = arg(rt, c, 0);
+    let mut x = XMA.lock().unwrap();
+    if x.is_none() {
+        let base = super::memory::physical(rt, CONTEXTS * 64, 256);
+        *x = Some((base, vec![false; CONTEXTS as usize]));
+        start_decoder(crate::runtime(), base);
+    }
+    let (base, used) = x.as_mut().unwrap();
+    let Some(i) = used.iter().position(|u| !u) else {
+        return ret(c, STATUS_NO_MEMORY);
+    };
+    used[i] = true;
+    let a = *base + 64 * i as u32;
+    fill(rt, a, 64, 0);
+    rt.mem.write_u32(out, a);
     ret(c, STATUS_SUCCESS);
 }
-pub fn xma_release_context(_: &Runtime, c: &mut Context) {
+
+pub fn xma_release_context(rt: &Runtime, c: &mut Context) {
+    let a = arg(rt, c, 0);
+    if let Some((base, used)) = XMA.lock().unwrap().as_mut() {
+        if let Some(u) = a
+            .checked_sub(*base)
+            .map(|o| o / 64)
+            .and_then(|i| used.get_mut(i as usize))
+        {
+            *u = false;
+        }
+    }
     ret(c, STATUS_SUCCESS);
 }

@@ -131,3 +131,9 @@ pub fn ex_allocate_pool_type_with_tag(rt: &Runtime, c: &mut Context) {
 pub fn ex_free_pool(rt: &Runtime, c: &mut Context) {
     k().pool.lock().unwrap().free(arg(rt, c, 0));
 }
+
+/// A physical allocation for the host's own use (zeroed); panics when
+/// physical memory is exhausted.
+pub fn physical(rt: &Runtime, size: u32, align: u32) -> u32 {
+    take(rt, &k().phys, size, align).expect("physical memory exhausted")
+}

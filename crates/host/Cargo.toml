@@ -10,5 +10,7 @@ license.workspace = true
 [dependencies]
 sha1 = { version = "0.10", features = ["compress"] }
 sha2 = "0.10"
+xenon-gpu = { path = "../gpu" }
 xenon-recomp = { path = "../recomp" }
 xenon-rt = { path = "../rt" }
+xenon-texture = { path = "../texture" }
