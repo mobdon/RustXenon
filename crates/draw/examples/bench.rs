@@ -19,7 +19,12 @@ const TEX: u32 = 256;
 
 fn main() {
     let mut args = std::env::args().skip(1);
-    let frames: u32 = args.next().and_then(|a| a.parse().ok()).unwrap_or(10);
+    // One cold frame plus at least one warm frame to average.
+    let frames: u32 = args
+        .next()
+        .and_then(|a| a.parse().ok())
+        .unwrap_or(10)
+        .max(2);
     let draws: u32 = args.next().and_then(|a| a.parse().ok()).unwrap_or(100);
     let mut d = match xenon_draw::Drawer::new() {
         Ok(d) => d,
@@ -128,7 +133,7 @@ fn main() {
         total.textures_uploaded += t.textures_uploaded;
         total.pipelines_created += t.pipelines_created;
     }
-    let n = (frames - 1).max(1);
+    let n = frames - 1;
     println!(
         "warm frames: {} x {draws} draws, mean {:?} per frame",
         n,
