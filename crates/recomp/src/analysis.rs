@@ -8,7 +8,9 @@
 //!    register save/restore helpers (by byte pattern), import thunks, the
 //!    exception table, `mflr r12` prologues after a return, the entry point.
 //! 2. Jump tables: `mtctr`/`bctr` sequences of four known shapes, with the
-//!    case count from the bounds check before them.
+//!    case count from the bounds check before them, or, for an absolute table
+//!    stored right after its `bctr` with no check, from the entries up to the
+//!    first case.
 //! 3. Every `bl` target in code is a function start; a plain `b` is not.
 //! 4. Each start without a size is walked block by block up to the next
 //!    start; the function ends at the end of its contiguous blocks.
@@ -70,6 +72,8 @@ pub struct JumpTable {
     pub index_reg: Option<u8>,
     pub default: Option<u32>,
     pub targets: Vec<u32>,
+    /// Where the table's bytes are, when read from the image.
+    pub data: Option<std::ops::Range<u32>>,
 }
 
 #[derive(Debug, Default)]
@@ -141,58 +145,93 @@ fn is_mtctr(w: u32) -> bool {
 
 struct HelperShape {
     name: &'static str,
-    /// Words for register 14+i.
+    /// First register and how many the helper family covers.
+    first: u32,
+    count: u32,
+    /// Words for register `first + i`.
     body: fn(u32) -> Vec<u32>,
     tail: &'static [u32],
 }
 
-fn ds(base: u32, reg: u32, disp: i32) -> u32 {
-    base | reg << 21 | 1 << 16 | (disp as u32 & 0xFFFF)
+fn ds(base: u32, reg: u32, ra: u32, disp: i32) -> u32 {
+    base | reg << 21 | ra << 16 | (disp as u32 & 0xFFFF)
 }
 
-const HELPERS: [HelperShape; 6] = [
+/// `li r11, disp` then the vector store/load `op` of `vr` at `r11 + r12`.
+fn vmx(op: u32, vr: u32, disp: i32) -> Vec<u32> {
+    vec![
+        0x3960_0000 | (disp as u32 & 0xFFFF),
+        op | vr << 21 | 11 << 16 | 12 << 11,
+    ]
+}
+
+/// `li r11, disp` then `stvx128`/`lvx128` (`op`) of v64+i at `r11 + r12`.
+fn vmx128(op: u32, i: u32) -> Vec<u32> {
+    let r = 64 + i;
+    vec![
+        0x3960_0000 | ((-0x400 + 16 * i as i32) as u32 & 0xFFFF),
+        op | (r & 31) << 21 | (r >> 5) << 2 | 11 << 16 | 12 << 11,
+    ]
+}
+
+const HELPERS: [HelperShape; 8] = [
     HelperShape {
         name: "savegprlr",
-        body: |i| vec![ds(0xF800_0000, 14 + i, -0x98 + 8 * i as i32)],
+        first: 14,
+        count: 18,
+        body: |i| vec![ds(0xF800_0000, 14 + i, 1, -0x98 + 8 * i as i32)],
         tail: &[0x9181_FFF8, BLR],
     },
     HelperShape {
         name: "restgprlr",
-        body: |i| vec![ds(0xE800_0000, 14 + i, -0x98 + 8 * i as i32)],
+        first: 14,
+        count: 18,
+        body: |i| vec![ds(0xE800_0000, 14 + i, 1, -0x98 + 8 * i as i32)],
         tail: &[0x8181_FFF8, 0x7D88_03A6, BLR],
     },
     HelperShape {
         name: "savefpr",
-        body: |i| vec![ds(0xD800_0000, 14 + i, -0x90 + 8 * i as i32)],
+        first: 14,
+        count: 18,
+        body: |i| vec![ds(0xD800_0000, 14 + i, 12, -0x90 + 8 * i as i32)],
         tail: &[BLR],
     },
     HelperShape {
         name: "restfpr",
-        body: |i| vec![ds(0xC800_0000, 14 + i, -0x90 + 8 * i as i32)],
+        first: 14,
+        count: 18,
+        body: |i| vec![ds(0xC800_0000, 14 + i, 12, -0x90 + 8 * i as i32)],
         tail: &[BLR],
     },
     HelperShape {
         name: "savevmx",
-        body: |i| {
-            vec![
-                0x3960_0000 | ((-0x120 + 16 * i as i32) as u32 & 0xFFFF),
-                0x7C0B_09CE | (14 + i) << 21,
-            ]
-        },
+        first: 14,
+        count: 18,
+        body: |i| vmx(0x7C00_01CE, 14 + i, -0x120 + 16 * i as i32),
         tail: &[BLR],
     },
     HelperShape {
         name: "restvmx",
-        body: |i| {
-            vec![
-                0x3960_0000 | ((-0x120 + 16 * i as i32) as u32 & 0xFFFF),
-                0x7C0B_08CE | (14 + i) << 21,
-            ]
-        },
+        first: 14,
+        count: 18,
+        body: |i| vmx(0x7C00_00CE, 14 + i, -0x120 + 16 * i as i32),
+        tail: &[BLR],
+    },
+    HelperShape {
+        name: "savevmx",
+        first: 64,
+        count: 64,
+        body: |i| vmx128(0x1000_01C3, i),
+        tail: &[BLR],
+    },
+    HelperShape {
+        name: "restvmx",
+        first: 64,
+        count: 64,
+        body: |i| vmx128(0x1000_00C3, i),
         tail: &[BLR],
     },
 ];
-// shortcut: the VMX128 save/restore helpers (registers 64..127) are not matched; list them in hooks.toml until a real file shows their layout.
 
 fn code_words(img: &Image) -> impl Iterator<Item = (u32, u32)> + '_ {
     img.sections.iter().filter(|s| s.code).flat_map(move |s| {
@@ -204,20 +243,21 @@ fn code_words(img: &Image) -> impl Iterator<Item = (u32, u32)> + '_ {
 
 fn find_helpers(img: &Image, out: &mut BTreeMap<u32, Function>) {
     for shape in &HELPERS {
-        let mut seq: Vec<u32> = (0..18).flat_map(shape.body).collect();
+        let n = shape.count;
+        let mut seq: Vec<u32> = (0..n).flat_map(shape.body).collect();
         seq.extend(shape.tail);
         let stride = 4 * (shape.body)(0).len() as u32;
         for (a, w) in code_words(img) {
             if w != seq[0] || !img.bytes(a, seq.len() * 4).is_some_and(|b| words(b) == seq) {
                 continue;
             }
-            for i in 0..18u32 {
+            for i in 0..n {
                 let start = a + i * stride;
                 out.entry(start).or_insert(Function {
                     start,
-                    size: (18 - i) * stride + 4 * shape.tail.len() as u32,
+                    size: (n - i) * stride + 4 * shape.tail.len() as u32,
                     source: Source::Helper,
-                    name: Some(format!("{}_{}", shape.name, 14 + i)),
+                    name: Some(format!("{}_{}", shape.name, shape.first + i)),
                 });
             }
         }
@@ -285,6 +325,36 @@ fn bounds(img: &Image, pattern: u32) -> Option<(usize, u8, Option<u32>)> {
     None
 }
 
+/// Address of the table bytes and the size of one entry.
+fn table_data(img: &Image, kind: TableKind, start: u32) -> Option<(u32, u32)> {
+    let entry = match kind {
+        TableKind::Absolute => 4,
+        TableKind::ShortOffset => 2,
+        _ => 1,
+    };
+    Some((lis_addi(img, start)?, entry))
+}
+
+/// Case count of an absolute table stored right after its `bctr` with no
+/// bounds check: entries run while they are code addresses and the table has
+/// not reached the first case.
+fn inline_count(img: &Image, bctr: u32) -> Option<usize> {
+    let sec = img.section_at(bctr)?;
+    let mut first = u32::MAX;
+    let mut a = bctr + 4;
+    while a < first {
+        match img.u32(a) {
+            Some(t) if t & 3 == 0 && t > bctr && (sec.start..sec.end()).contains(&t) => {
+                first = first.min(t)
+            }
+            _ => break,
+        }
+        a += 4;
+    }
+    let n = ((a - bctr - 4) / 4) as usize;
+    (n > 0).then_some(n)
+}
+
 fn read_table(img: &Image, kind: TableKind, start: u32, count: usize) -> Option<Vec<u32>> {
     let table = lis_addi(img, start)?;
     let (rest, base) = match kind {
@@ -318,10 +388,20 @@ fn find_tables(img: &Image, hooks: &Hooks, a: &mut Analysis) {
         let Some((kind, start)) = match_table(img, mtctr) else {
             continue;
         };
-        let Some((count, index_reg, default)) = bounds(img, start) else {
-            a.problems
-                .push(format!("{pc:#x}: jump table without a bounds check"));
-            continue;
+        let data = table_data(img, kind, start);
+        let (count, index_reg, default) = match bounds(img, start) {
+            Some((c, r, d)) => (c, Some(r), d),
+            None => match data
+                .filter(|&(t, _)| kind == TableKind::Absolute && t == pc + 4)
+                .and_then(|_| inline_count(img, pc))
+            {
+                Some(c) => (c, None, None),
+                None => {
+                    a.problems
+                        .push(format!("{pc:#x}: jump table without a bounds check"));
+                    continue;
+                }
+            },
         };
         match read_table(img, kind, start, count) {
             Some(targets) => {
@@ -330,9 +410,10 @@ fn find_tables(img: &Image, hooks: &Hooks, a: &mut Analysis) {
                     JumpTable {
                         bctr: pc,
                         kind,
-                        index_reg: Some(index_reg),
+                        index_reg,
                         default,
                         targets,
+                        data: data.map(|(t, e)| t..t + e * count as u32),
                     },
                 );
             }
@@ -350,6 +431,7 @@ fn find_tables(img: &Image, hooks: &Hooks, a: &mut Analysis) {
                 index_reg: None,
                 default: t.default,
                 targets: t.targets.clone(),
+                data: None,
             },
         );
     }
@@ -395,12 +477,21 @@ fn extent(img: &Image, start: u32, limit: u32, tables: &BTreeMap<u32, JumpTable>
         }
     }
     // Keep the contiguous run from the start; later islands are dropped.
+    // Table bytes stored in code right after one of our `bctr`s are part of the run.
+    let inline: Vec<_> = tables
+        .values()
+        .filter(|t| seen.contains(&t.bctr))
+        .filter_map(|t| t.data.clone())
+        .collect();
     let mut end = start;
-    for &a in &seen {
-        if a != end {
+    loop {
+        if seen.contains(&end) {
+            end += 4;
+        } else if let Some(r) = inline.iter().find(|r| r.contains(&end)) {
+            end = (r.end + 3) & !3;
+        } else {
             break;
         }
-        end += 4;
     }
     (end - start).max(4)
 }
@@ -674,7 +765,7 @@ mod tests {
         let mut code = vec![MFLR_R12, NOP, BLR, MFLR_R12, BLR];
         let helper = code.len();
         for i in 0..18 {
-            code.push(ds(0xF800_0000, 14 + i, -0x98 + 8 * i as i32));
+            code.push(ds(0xF800_0000, 14 + i, 1, -0x98 + 8 * i as i32));
         }
         code.extend([0x9181_FFF8, BLR]);
         let thunk = code.len();
@@ -848,5 +939,96 @@ mod tests {
             a.function_at(at(n - 7)).is_none(),
             "data range not gap-filled"
         );
+    }
+
+    /// A switch whose absolute table sits in code right after the `bctr`,
+    /// optionally with no bounds check; returns (code, bctr index, case indices).
+    fn inline_switch(prefix: &[u32], checked: bool) -> (Vec<u32>, usize, Vec<usize>) {
+        let mut code = prefix.to_vec();
+        if checked {
+            code.extend([cmplwi(6, 11, 2), 0x4D99_0020]); // bgtlr cr6
+        }
+        let table = code.len() + 6;
+        code.extend([
+            lis(12, at(table)),
+            addi(12, at(table)),
+            rlwinm(0, 11, 2),
+            x(23, 0, 12, 0),
+            MTCTR_R0,
+            BCTR,
+        ]);
+        let bctr = code.len() - 1;
+        let cases: Vec<usize> = (0..3).map(|i| table + 3 + i * 2).collect();
+        code.extend(cases.iter().map(|&c| at(c)));
+        for _ in 0..3 {
+            code.extend([NOP, BLR]);
+        }
+        (code, bctr, cases)
+    }
+
+    #[test]
+    fn inline_tables_stay_inside_their_function() {
+        // Reached by a call, then by gap fill (no call, no prologue).
+        for prefix in [vec![b(0, 2, true), BLR], vec![BLR, 0]] {
+            let (code, bctr, cases) = inline_switch(&prefix, true);
+            let img = image(&code, &[]);
+            let a = analyze(&img, &Hooks::default());
+            let t = &a.jump_tables[&at(bctr)];
+            assert_eq!(t.targets, cases.iter().map(|&c| at(c)).collect::<Vec<_>>());
+            let f = a.function_at(at(bctr)).unwrap();
+            assert_eq!((f.start, f.end()), (at(2), at(code.len())), "{prefix:x?}");
+            assert_eq!(a.functions.len(), 2, "no functions in the table or cases");
+            assert!(a.problems.is_empty(), "{:?}", a.problems);
+        }
+    }
+
+    #[test]
+    fn inline_table_without_bounds_check() {
+        let (code, bctr, cases) = inline_switch(&[], false);
+        let img = image(&code, &[]);
+        let a = analyze(&img, &Hooks::default());
+        let t = &a.jump_tables[&at(bctr)];
+        assert_eq!(t.targets, cases.iter().map(|&c| at(c)).collect::<Vec<_>>());
+        assert_eq!((t.index_reg, t.default), (None, None));
+        assert_eq!(
+            starts(&a),
+            vec![(at(0), code.len() as u32 * 4, Source::Entry)]
+        );
+        assert!(a.problems.is_empty(), "{:?}", a.problems);
+    }
+
+    #[test]
+    fn float_and_vector_helpers_use_r12() {
+        let mut code = vec![BLR];
+        let fpr = code.len();
+        code.extend((0..18).map(|i| ds(0xD800_0000, 14 + i, 12, -0x90 + 8 * i as i32)));
+        code.push(BLR);
+        let v128 = code.len();
+        for i in 0..64 {
+            code.extend(vmx128(0x1000_00C3, i));
+        }
+        code.push(BLR);
+        let caller = code.len();
+        code.extend([
+            b(caller, fpr + 6, true),
+            b(caller + 1, v128 + 2 * 40, true),
+            BLR,
+        ]);
+        let mut img = image(&code, &[]);
+        // The exception table often lists the helper block as one function.
+        img.exception_table = vec![RuntimeFunction {
+            start: at(fpr),
+            size: 19 * 4,
+            prolog_words: 0,
+        }];
+        let a = analyze(&img, &Hooks::default());
+        let f = |i| a.functions[&at(i)].clone();
+        assert_eq!(f(fpr + 6).name.as_deref(), Some("savefpr_20"));
+        assert_eq!((f(fpr).source, f(fpr).size), (Source::Helper, 19 * 4));
+        assert_eq!(f(v128).name.as_deref(), Some("restvmx_64"));
+        assert_eq!(f(v128 + 2 * 63).name.as_deref(), Some("restvmx_127"));
+        assert_eq!(f(v128 + 2 * 40).size, 24 * 8 + 4);
+        assert_eq!(code[v128 + 2 * 32 + 1], 0x100B_60CF, "lvx128 v96, r11, r12");
+        assert!(a.problems.is_empty(), "{:?}", a.problems);
     }
 }
