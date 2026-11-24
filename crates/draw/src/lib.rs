@@ -1826,10 +1826,6 @@ impl Drawer {
             let rgba = formats::edram_rgba(format, src);
             formats::resolve_pixel(rgba, r.dest_exp_bias, r.dest_swap, r.dest_format, dst);
         }
-        if dest_bytes == 4 {
-            self.resolved_endian
-                .insert(r.dest_base & PHYSICAL_MASK, r.dest_endian);
-        }
         let done = resolve::write_tiled_texels(
             mem,
             r.dest_base & PHYSICAL_MASK,
@@ -1840,6 +1836,11 @@ impl Drawer {
             r.dest_endian,
         )
         .map_err(Skip::Unsupported);
+        // Only a resolve that wrote its texels sets the byte order a swap reads.
+        if done.is_ok() && dest_bytes == 4 {
+            self.resolved_endian
+                .insert(r.dest_base & PHYSICAL_MASK, r.dest_endian);
+        }
         self.timings.resolve_cpu += lap(&mut t);
         done
     }
