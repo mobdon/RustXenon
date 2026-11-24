@@ -33,7 +33,28 @@ start_in_world       = 0x82000200
 [functions]
 # Function starts that analysis missed.
 extra = [0x82000300]
+# Functions whose end analysis gets wrong: [start, end).
+bounds = [{ start = 0x82000400, end = 0x82000440 }]
+
+# A jump table analysis missed or read wrongly, keyed by its bctr.
+[[jump_tables]]
+bctr = 0x82000500
+targets = [0x82000510, 0x82000520]
+default = 0x82000530
+
+# Data inside a code section: never treated as instructions.
+[[not_code]]
+start = 0x82000600
+end = 0x82000700
 ```
+
+Every hook address is also registered as a function start. Unknown keys are
+an error, so a typo is caught. `xenon-recomp scan` prints the SHA-256 and
+picks this file up from `games/<sha256>/hooks.toml` by itself.
+
+The SHA-256 is of the executable **as loaded**: when a title update is
+applied, that is the patched executable (plain header plus decoded image),
+not the file on disc.
 
 Role names describe what a function does (`file_open`, `frame_end`), never
 what it is called in a particular game.
