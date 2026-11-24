@@ -360,6 +360,17 @@ pub fn nt_read_file(rt: &Runtime, c: &mut Context) {
     let mut f = f.lock().unwrap();
     let at = offset(rt, off, &f);
     let r = read_into(rt, &mut f, at, &[(buf, len)]);
+    if std::env::var_os("XENON_TRACE_READS").is_some() {
+        let name = f
+            .path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        crate::log(&format!(
+            "[read] {name} at {at:#x} len {len:#x} -> {:?} into {buf:#x}",
+            r.as_ref().ok()
+        ));
+    }
     drop(f);
     finish_read(rt, c, r, io, event, len);
 }
@@ -552,7 +563,11 @@ pub fn nt_query_full_attributes_file(rt: &Runtime, c: &mut Context) {
             network_info(rt, out, &m, w);
             ret(c, STATUS_SUCCESS)
         }
-        None => ret(c, STATUS_OBJECT_NAME_NOT_FOUND),
+        None => {
+            let name = ansi(rt, rt.mem.read_u32(attrs + 4));
+            crate::log(&format!("[files] attributes of {name:?}: not found"));
+            ret(c, STATUS_OBJECT_NAME_NOT_FOUND)
+        }
     }
 }
 

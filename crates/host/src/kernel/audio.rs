@@ -76,20 +76,44 @@ static XMA: Mutex<Option<(u32, Vec<bool>)>> = Mutex::new(None);
 fn drain(rt: &Runtime, ctx: u32) {
     let w0 = rt.mem.read_u32(ctx);
     let w1 = rt.mem.read_u32(ctx + 4);
+    if std::env::var_os("XENON_TRACE_XMA").is_some() {
+        static LAST: Mutex<Vec<(u32, [u32; 10])>> = Mutex::new(Vec::new());
+        let words: [u32; 10] = std::array::from_fn(|i| rt.mem.read_u32(ctx + 4 * i as u32));
+        let mut l = LAST.lock().unwrap();
+        let prev = l.iter_mut().find(|x| x.0 == ctx);
+        let changed = prev.as_ref().map_or(true, |p| p.1 != words);
+        if changed {
+            crate::log(&format!(
+                "[xma] {ctx:#x}: {}",
+                words
+                    .iter()
+                    .map(|w| format!("{w:08x}"))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            ));
+            match prev {
+                Some(p) => p.1 = words,
+                None => l.push((ctx, words)),
+            }
+        }
+    }
     if w1 >> 31 == 0 {
         return;
     }
     let mut w0n = w0;
     let w4 = rt.mem.read_u32(ctx + 16);
     let cur = w4 >> 31;
-    if w0 >> (20 + cur) & 1 != 0 {
+    let consumed = w0 >> (20 + cur) & 1 != 0;
+    if consumed {
         w0n &= !(1 << (20 + cur));
         rt.mem.write_u32(ctx + 16, w4 ^ 1 << 31);
         rt.mem
             .write_u32(ctx + 8, rt.mem.read_u32(ctx + 8) & !0x03FF_FFFF);
     }
+    // Output only comes from input: with no input left the stream ends,
+    // and the title sees its output ring stop filling.
     let blocks = w0 >> 22 & 31;
-    if blocks > 0 {
+    if consumed && blocks > 0 {
         let read = rt.mem.read_u32(ctx + 36) & 31;
         let full = (read + blocks - 1) % blocks;
         let out = super::gpu::gpu_to_cpu(rt.mem.read_u32(ctx + 28));

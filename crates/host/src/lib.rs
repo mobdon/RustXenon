@@ -134,7 +134,121 @@ pub fn last_call() -> u32 {
     RECENT.with(|r| r.get()[7])
 }
 
+/// `XENON_CALL_PROFILE=<thread>:<from ms>:<to ms>`: counts the guest
+/// call targets of one thread in a time window (printed in the report).
+static PROFILE: std::sync::Mutex<Option<std::collections::HashMap<u32, u64>>> =
+    std::sync::Mutex::new(None);
+
+fn profile_call(addr: u32) {
+    static CFG: OnceLock<Option<(String, u32, u32)>> = OnceLock::new();
+    let Some((who, from, to)) = CFG.get_or_init(|| {
+        let v = std::env::var("XENON_CALL_PROFILE").ok()?;
+        let mut p = v.split(':');
+        Some((
+            p.next()?.to_string(),
+            p.next()?.parse().ok()?,
+            p.next()?.parse().ok()?,
+        ))
+    }) else {
+        return;
+    };
+    let t = ms();
+    if t < *from || t >= *to || std::thread::current().name() != Some(who.as_str()) {
+        return;
+    }
+    *PROFILE
+        .lock()
+        .unwrap()
+        .get_or_insert_with(Default::default)
+        .entry(addr)
+        .or_default() += 1;
+}
+
+/// `XENON_WATCH=<hex addr>:<what>`: at each call to `addr`, logs `what`
+/// when it changes. `what` is a register number (`3`), a guest word
+/// (`m82bf99d4`), a byte at a register plus an offset (`b3+14c7`), or the
+/// text a register points at (`s3`); a leading `*` logs every call, not
+/// only changes.
+fn watch(c: &Context, addr: u32) {
+    enum What {
+        Reg(usize),
+        Word(u32),
+        Byte(usize, u32),
+        Text(usize),
+    }
+    static CFG: OnceLock<Option<(u32, What, bool)>> = OnceLock::new();
+    thread_local!(static LAST: std::cell::Cell<u32> = const { std::cell::Cell::new(0xDEAD_BEEF) });
+    let Some((a, what, every)) = CFG.get_or_init(|| {
+        let v = std::env::var("XENON_WATCH").ok()?;
+        let (a, r) = v.split_once(':')?;
+        let (every, r) = match r.strip_prefix('*') {
+            Some(r) => (true, r),
+            None => (false, r),
+        };
+        let what = if let Some(m) = r.strip_prefix('m') {
+            What::Word(u32::from_str_radix(m, 16).ok()?)
+        } else if let Some(t) = r.strip_prefix('s') {
+            What::Text(t.parse().ok()?)
+        } else if let Some(b) = r.strip_prefix('b') {
+            let (reg, off) = b.split_once('+')?;
+            What::Byte(reg.parse().ok()?, u32::from_str_radix(off, 16).ok()?)
+        } else {
+            What::Reg(r.parse().ok()?)
+        };
+        Some((
+            u32::from_str_radix(a.trim_start_matches("0x"), 16).ok()?,
+            what,
+            every,
+        ))
+    }) else {
+        return;
+    };
+    // Address 0 watches at every call, to find the call after a change.
+    if addr != *a && *a != 0 {
+        return;
+    }
+    let Some(rt) = RT.get() else { return };
+    let (v, name) = match what {
+        What::Reg(r) => (c.r[*r] as u32, format!("r{r}")),
+        What::Word(m) => (rt.mem.read_u32(*m), format!("[{m:#x}]")),
+        What::Byte(r, o) => {
+            let at = (c.r[*r] as u32).wrapping_add(*o);
+            (
+                rt.mem.read_u8(at) as u32,
+                format!("byte [r{r}+{o:#x}] ({at:#x})"),
+            )
+        }
+        What::Text(r) => {
+            let at = c.r[*r] as u32;
+            let text: String = (0..120)
+                .map(|i| rt.mem.read_u8(at + i))
+                .take_while(|&b| b != 0)
+                .map(|b| {
+                    if (0x20..0x7F).contains(&b) {
+                        b as char
+                    } else {
+                        '.'
+                    }
+                })
+                .collect();
+            // Fold the text in so an edit in place at the same address still logs.
+            let v = text.bytes().fold(at, |h, b| h.rotate_left(5) ^ b as u32);
+            (v, format!("text at r{r} ({at:#x}) {text:?}"))
+        }
+    };
+    if LAST.with(|l| l.replace(v)) != v || *every {
+        log(&format!(
+            "[watch] {name} = {v:#x} at call to {addr:#010x} from {:#010x} in {} after {:x?}",
+            c.lr as u32,
+            std::thread::current().name().unwrap_or("?"),
+            RECENT.with(|r| r.get())
+        ));
+    }
+}
+
 fn trace(c: &Context, addr: u32) {
+    profile_call(addr);
+    watch(c, addr);
     SP.with(|s| s.set(c.r[1] as u32));
     RECENT.with(|r| {
         let mut v = r.get();
@@ -178,7 +292,8 @@ const USAGE: &str = "\
 USAGE: game --exe <patched executable> --game <unpacked game folder>
             [--update <unpacked title update>] [--data <writable folder>]
             [--seconds <n>] [--press <ms>:<button>[+<button>],...]
-            [--no-controller] [--capture <dir> [--capture-at <s>,<s>...]]
+            [--no-controller] [--capture <dir> [--capture-at <s>,<s>...]] [--render]
+            [--capture-frames <n>,<n>... --capture-dir <dir>]
 
 Runs the title headless for --seconds (default 30) and reports how far it
 got: frames presented, threads, imports called, memory in use. A
@@ -187,7 +302,10 @@ virtual controller on port 0 presses Start, then A, every four seconds
 unplugs it. Buttons: up down left right start back lthumb rthumb lb rb a b
 x y. --capture writes, for one frame at each given second (default 20),
 the textures bound at its draws and a list of the draws: local files,
-derived from the game.";
+derived from the game. --render draws every frame headless on the host GPU
+and adds the frame image to each capture. --capture-frames writes the listed
+frames (counted from 1, one per swap) as <dir>/frame-<n>.png; it implies
+--render.";
 
 fn opt(args: &[String], name: &str) -> Option<String> {
     args.iter()
@@ -211,6 +329,18 @@ pub fn run(sha256: &str, regs: &[fn(&mut Runtime)]) -> ExitCode {
     let seconds: u64 = opt(&args, "--seconds")
         .and_then(|s| s.parse().ok())
         .unwrap_or(30);
+    if let Some(list) = opt(&args, "--capture-frames") {
+        let dir = opt(&args, "--capture-dir").unwrap_or_else(|| "captures".into());
+        let n: Vec<u32> = list
+            .split(',')
+            .filter_map(|x| x.trim().parse().ok())
+            .collect();
+        let _ = kernel::gpu::capture::FRAMES.set((PathBuf::from(dir), n));
+        kernel::gpu::capture::RENDER.store(true, Ordering::Relaxed);
+    }
+    if args.iter().any(|a| a == "--render") {
+        kernel::gpu::capture::RENDER.store(true, Ordering::Relaxed);
+    }
     if let Some(d) = opt(&args, "--capture") {
         let at = opt(&args, "--capture-at").unwrap_or_else(|| "20".into());
         let at: Vec<u32> = at
@@ -298,6 +428,7 @@ pub fn run(sha256: &str, regs: &[fn(&mut Runtime)]) -> ExitCode {
     }));
 
     start_clock(rt.clone());
+    start_memwatch(rt.clone());
     kernel::video::start(rt.clone());
     kernel::threads::register_main(&rt, image.entry);
     log(&format!("started at {:#010x}", image.entry));
@@ -347,6 +478,14 @@ fn report() {
         kx.threads.lock().map(|t| t.len()).unwrap_or(0)
     ));
     log(&format!("memory: {}", kx.usage_line()));
+    if let Some(p) = PROFILE.lock().unwrap().as_ref() {
+        let mut v: Vec<_> = p.iter().collect();
+        v.sort_by(|a, b| b.1.cmp(a.1));
+        log(&format!("call profile, {} targets:", v.len()));
+        for (a, n) in v.iter().take(400) {
+            log(&format!("  {n:>8} {a:#010x}"));
+        }
+    }
     log("threads:");
     activity_report();
     let calls = kernel::call_report();
@@ -354,6 +493,52 @@ fn report() {
     for (n, c) in calls.iter().take(40) {
         log(&format!("  {c:>10} {n}"));
     }
+}
+
+/// `XENON_MEMWATCH=<hex addr>:<hex len>`: polls a guest range every
+/// millisecond and logs each word that changes, with every thread's last
+/// call target (to find who fills a structure).
+fn start_memwatch(rt: Arc<Runtime>) {
+    let Some((a, n)) = std::env::var("XENON_MEMWATCH").ok().and_then(|v| {
+        let (a, n) = v.split_once(':')?;
+        Some((
+            u32::from_str_radix(a, 16).ok()?,
+            u32::from_str_radix(n, 16).ok()?,
+        ))
+    }) else {
+        return;
+    };
+    std::thread::spawn(move || {
+        let read = |i: u32| rt.mem.read_u32(a + 4 * i);
+        let mut old: Vec<u32> = (0..n / 4).map(read).collect();
+        loop {
+            std::thread::sleep(Duration::from_millis(1));
+            for (i, o) in old.iter_mut().enumerate() {
+                let v = read(i as u32);
+                if v != *o {
+                    let who: Vec<String> = ACTIVITY
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .map(|(t, x)| {
+                            format!(
+                                "{t}:{:#x}@{:#x}",
+                                x.call.load(Ordering::Relaxed),
+                                x.sp.load(Ordering::Relaxed)
+                            )
+                        })
+                        .collect();
+                    log(&format!(
+                        "[memwatch] {:#x}: {:#x} -> {v:#x}; {}",
+                        a + 4 * i as u32,
+                        *o,
+                        who.join(" ")
+                    ));
+                    *o = v;
+                }
+            }
+        }
+    });
 }
 
 /// Keeps the time stamp bundle (interrupt time, system time, tick count in

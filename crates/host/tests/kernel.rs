@@ -598,3 +598,44 @@ fn affinity_moves_a_thread_to_its_processor() {
         0
     );
 }
+
+#[test]
+fn empty_enumerations_and_request_completion() {
+    use xenon_host::kernel::xam;
+    let e = env();
+    let rt = &e.rt;
+    let mut c = ctx(0x2_5000);
+    // Synchronous: no more files, zero items.
+    assert_eq!(
+        call(
+            rt,
+            &mut c,
+            xam::xam_enumerate,
+            &[0x1234, 0, 0xE100, 0x134, 0xE000, 0]
+        ),
+        18
+    );
+    assert_eq!(rt.mem.read_u32(0xE000), 0);
+    // With a request block: pending, completed with success and no items.
+    rt.mem.write_u32(0xE200, 997);
+    assert_eq!(
+        call(
+            rt,
+            &mut c,
+            xam::xam_enumerate,
+            &[0x1234, 0, 0xE100, 0x134, 0, 0xE200]
+        ),
+        997
+    );
+    assert_eq!(
+        (
+            rt.mem.read_u32(0xE200),
+            rt.mem.read_u32(0xE204),
+            rt.mem.read_u32(0xE218)
+        ),
+        (0, 0, 0)
+    );
+    // A failure's extended error is the system error code form.
+    xam::complete(rt, &c, 0xE300, 18, 0);
+    assert_eq!(rt.mem.read_u32(0xE318), 0x8007_0012);
+}

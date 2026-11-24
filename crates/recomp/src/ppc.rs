@@ -778,7 +778,7 @@ pub fn translate(w: u32, pc: u32, func: &Func) -> Ins {
             "andis.",
             format!("c.r[{a}] = c.r[{d}] & {:#x}; c.rec(c.r[{a}]);", ui << 16),
         )),
-        30 => op30(w, d, a, b, &rec_a),
+        30 => op30(w, d, a, b, &rec_a.replace("c.rec(", "c.rec64(")),
         31 => op31(w, pc, d, a, b, xo10, &rec_a, &rec_d),
         32..=55 => load_store_d(op, d, a, si),
         58 => {
@@ -1106,7 +1106,17 @@ fn op31(
     rec_d: &str,
 ) -> Option<(&'static str, String)> {
     let x9 = xo10 & 0x1FF;
+    // Doubleword ops set CR0 from all 64 bits; the rest from the low word.
+    let (rec_a64, rec_d64) = (
+        rec_a.replace("c.rec(", "c.rec64("),
+        rec_d.replace("c.rec(", "c.rec64("),
+    );
     if let Some(name) = arith(x9) {
+        let rec_d = if matches!(x9, 233 | 457 | 489) {
+            &rec_d64
+        } else {
+            rec_d
+        };
         let oe = xo10 & 0x200 != 0;
         let (ra, rb) = (format!("c.r[{a}]"), format!("c.r[{b}]"));
         // (x, y, carry-in expression, writes CA)
@@ -1152,8 +1162,14 @@ fn op31(
     );
     let logic = |name: &'static str, e: String| Some((name, format!("c.r[{a}] = {e};{rec_a}")));
     let hi = |name: &'static str, f: &str| {
-        Some((name, format!("c.r[{d}] = ops::{f}({ra}, {rb});{rec_d}")))
+        let rec = if name.starts_with("mulhd") {
+            &rec_d64
+        } else {
+            rec_d
+        };
+        Some((name, format!("c.r[{d}] = ops::{f}({ra}, {rb});{rec}")))
     };
+    let logic64 = |name: &'static str, e: String| Some((name, format!("c.r[{a}] = {e};{rec_a64}")));
     let ea = ea_x(a, b);
     let ld = |name: &'static str, e: &str, u: bool| {
         let up = if u {
@@ -1235,17 +1251,17 @@ fn op31(
         }
         24 => logic("slw", format!("ops::slw({rs}, {rb})")),
         536 => logic("srw", format!("ops::srw({rs}, {rb})")),
-        27 => logic("sld", format!("ops::sld({rs}, {rb})")),
-        539 => logic("srd", format!("ops::srd({rs}, {rb})")),
+        27 => logic64("sld", format!("ops::sld({rs}, {rb})")),
+        539 => logic64("srd", format!("ops::srd({rs}, {rb})")),
         792 => Some(("sraw", format!("{{ let (v, k) = ops::sraw({rs}, {rb}); c.r[{a}] = v; c.ca = k; }}{rec_a}"))),
         824 => Some(("srawi", format!("{{ let (v, k) = ops::sraw({rs}, {b}); c.r[{a}] = v; c.ca = k; }}{rec_a}"))),
-        794 => Some(("srad", format!("{{ let (v, k) = ops::srad({rs}, {rb}); c.r[{a}] = v; c.ca = k; }}{rec_a}"))),
+        794 => Some(("srad", format!("{{ let (v, k) = ops::srad({rs}, {rb}); c.r[{a}] = v; c.ca = k; }}{rec_a64}"))),
         826 | 827 => {
             let sh = b | (w >> 1 & 1) << 5;
-            Some(("sradi", format!("{{ let (v, k) = ops::srad({rs}, {sh}); c.r[{a}] = v; c.ca = k; }}{rec_a}")))
+            Some(("sradi", format!("{{ let (v, k) = ops::srad({rs}, {sh}); c.r[{a}] = v; c.ca = k; }}{rec_a64}")))
         }
         26 => logic("cntlzw", format!("({rs} as u32).leading_zeros() as u64")),
-        58 => logic("cntlzd", format!("{rs}.leading_zeros() as u64")),
+        58 => logic64("cntlzd", format!("{rs}.leading_zeros() as u64")),
         28 => logic("and", format!("{rs} & {rb}")),
         60 => logic("andc", format!("{rs} & !{rb}")),
         124 => logic("nor", format!("!({rs} | {rb})")),
@@ -1256,7 +1272,7 @@ fn op31(
         476 => logic("nand", format!("!({rs} & {rb})")),
         922 => logic("extsh", format!("{rs} as i16 as i64 as u64")),
         954 => logic("extsb", format!("{rs} as i8 as i64 as u64")),
-        986 => logic("extsw", format!("{rs} as i32 as i64 as u64")),
+        986 => logic64("extsw", format!("{rs} as i32 as i64 as u64")),
         20 => Some((
             "lwarx",
             format!(

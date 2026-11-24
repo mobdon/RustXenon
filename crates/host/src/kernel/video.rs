@@ -185,6 +185,12 @@ pub fn start(rt: std::sync::Arc<Runtime>) {
                 }
             };
             let mut gpu = Gpu::default();
+            if super::gpu::capture::RENDER.load(Ordering::Relaxed) {
+                match xenon_draw::Drawer::new() {
+                    Ok(d) => gpu.drawer = Some(d),
+                    Err(e) => crate::log(&format!("[draw] no drawer: {e}")),
+                }
+            }
             // Registers the title reads and the hardware keeps current:
             // EDRAM timing, cache control, the scan-out line counter, the
             // display interrupt status (vertical blank pending) and the

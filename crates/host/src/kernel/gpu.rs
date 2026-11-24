@@ -48,6 +48,17 @@ impl GuestRead for Physical<'_> {
     }
 }
 
+impl xenon_draw::GuestMemory for Physical<'_> {
+    fn write_bytes(&mut self, addr: u32, bytes: &[u8]) -> bool {
+        let a = gpu_to_cpu(addr);
+        if a as u64 + bytes.len() as u64 > 0xC000_0000 {
+            return false;
+        }
+        self.0.mem.write_bytes(a, bytes);
+        true
+    }
+}
+
 /// A GPU write of `v` at physical `addr` in byte order `e`.
 fn store(rt: &Runtime, addr: u32, e: Endian, v: u32) {
     rt.mem
@@ -69,6 +80,11 @@ pub struct Gpu {
     pub vblanks: u32,
     /// When set, applied commands are also kept here (see [`capture`]).
     pub keep: Option<Vec<Command>>,
+    /// Renders every command when set (`--render`).
+    pub drawer: Option<xenon_draw::Drawer>,
+    /// The newest frame the drawer produced, and how many it produced.
+    pub last_frame: Option<xenon_draw::Frame>,
+    pub frames_drawn: u32,
 }
 
 impl Gpu {
@@ -119,6 +135,24 @@ impl Gpu {
         self.rec.warnings.clear();
         for c in &cmds {
             self.apply(rt, c, idle);
+        }
+        if let Some(d) = self.drawer.as_mut() {
+            match d.replay(&cmds, &mut Physical(rt)) {
+                Ok(r) => {
+                    for u in r.unsupported.iter().chain(&r.warnings) {
+                        capture::note(u);
+                    }
+                    for f in r.frames {
+                        self.frames_drawn += 1;
+                        capture::frame_done(self.frames_drawn, &f);
+                        self.last_frame = Some(f);
+                    }
+                }
+                Err(e) => {
+                    crate::log(&format!("[draw] stopped: {e}"));
+                    self.drawer = None;
+                }
+            }
         }
         if let Some(k) = self.keep.as_mut() {
             k.extend(cmds);
@@ -234,6 +268,47 @@ pub mod capture {
     pub static SETTINGS: std::sync::OnceLock<(std::path::PathBuf, Vec<u32>)> =
         std::sync::OnceLock::new();
 
+    /// `--render`: draw every frame with the headless drawer.
+    pub static RENDER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+    /// `--capture-frames N,M --capture-dir DIR`: frame numbers (counted
+    /// from 1, one per swap) to write as `DIR/frame-N.png`.
+    pub static FRAMES: std::sync::OnceLock<(std::path::PathBuf, Vec<u32>)> =
+        std::sync::OnceLock::new();
+
+    /// Writes the drawer's frame number `n` when it was asked for.
+    pub fn frame_done(n: u32, f: &xenon_draw::Frame) {
+        let Some((dir, want)) = FRAMES.get() else {
+            return;
+        };
+        if !want.contains(&n) {
+            return;
+        }
+        let path = dir.join(format!("frame-{n}.png"));
+        let r = std::fs::create_dir_all(dir)
+            .map_err(|e| e.to_string())
+            .and_then(|_| f.write_png(&path).map_err(|e| e.to_string()));
+        match r {
+            Ok(()) => crate::log(&format!(
+                "[capture] {} ({}x{})",
+                path.display(),
+                f.width,
+                f.height
+            )),
+            Err(e) => crate::log(&format!("[capture] {}: {e}", path.display())),
+        }
+    }
+
+    /// Logs each drawer note once.
+    pub fn note(s: &str) {
+        static SEEN: Mutex<Vec<String>> = Mutex::new(Vec::new());
+        let mut v = SEEN.lock().unwrap();
+        if !v.iter().any(|x| x == s) {
+            crate::log(&format!("[draw] {s}"));
+            v.push(s.to_string());
+        }
+    }
+
     /// The capture schedule, run by the GPU thread after each ring span.
     pub struct Plan {
         dir: Option<std::path::PathBuf>,
@@ -278,6 +353,16 @@ pub mod capture {
             }
             let frame = &kept[swaps[0] + 1..=swaps[1]];
             let out = dir.join(format!("t{}", t / 1000));
+            if let Some(f) = &g.last_frame {
+                let _ = std::fs::create_dir_all(&out);
+                match f.write_png(out.join("frame.png")) {
+                    Ok(()) => crate::log(&format!(
+                        "[capture] frame image {}x{} written",
+                        f.width, f.height
+                    )),
+                    Err(e) => crate::log(&format!("[capture] frame image: {e}")),
+                }
+            }
             match dump(rt, frame, &out) {
                 Ok((d, n)) => crate::log(&format!(
                     "[capture] frame at {} s: {d} draws, {n} textures in {}",
@@ -338,7 +423,18 @@ pub mod capture {
                         used.join(" ")
                     );
                 }
-                Command::Resolve(_) => list.push_str("resolve\n"),
+                Command::Resolve(r) => {
+                    let _ = writeln!(
+                        list,
+                        "resolve: source {} format {}, destination format {} pitch {} height {}, {:?}",
+                        if r.is_depth { "depth" } else { "colour" },
+                        r.src_format,
+                        r.dest_format,
+                        r.dest_pitch,
+                        r.dest_height,
+                        r.copy_command
+                    );
+                }
                 Command::Swap { width, height, .. } => {
                     let _ = writeln!(list, "swap {width}x{height}");
                 }

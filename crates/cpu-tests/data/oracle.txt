@@ -1,4 +1,5 @@
-# Reference results from a 64-bit PowerPC CPU emulator; regenerate with
+# Reference results from a 64-bit PowerPC CPU emulator, with CR0 of integer
+# record forms from the low 32 bits as on the console; regenerate with
 # `python3 tools/ppc-oracle/cases.py`. Format: see crates/cpu-tests/src/lib.rs.
 add_0 | 7c642a14 | r4=fedcba9876543210 r5=100000000 vscr=10000 xer=20000000 | r3=fedcba9976543210 | 
 add_1 | 7c642a14 | r4=959ef8713231c2ca r5=8000000000000000 vscr=10000 xer=20000000 | r3=159ef8713231c2ca | 
@@ -10,13 +11,13 @@ add_6 | 7c642a14 | r4=7fffffffffffffff r5=1 vscr=10000 xer=20000000 | r3=8000000
 add_7 | 7c642a14 | r4=80000000 r5=80000000 vscr=10000 xer=0 | r3=100000000 | 
 add_alias | 7c842a14 | r4=fedcba9876543210 r5=100000000 vscr=10000 xer=20000000 | r4=fedcba9976543210 | 
 add_rc_0 | 7c642a15 | r4=959ef8713231c2ca r5=d1ea2fa4dd9af44c vscr=10000 xer=20000000 | r3=678928160fccb716 cr=40000000 | 
-add_rc_1 | 7c642a15 | r4=80000000 r5=1 vscr=10000 xer=20000000 | r3=80000001 cr=40000000 | 
+add_rc_1 | 7c642a15 | r4=80000000 r5=1 vscr=10000 xer=20000000 | r3=80000001 cr=80000000 | 
 add_rc_2 | 7c642a15 | r4=8000000000000000 r5=ffffffff vscr=10000 xer=20000000 | r3=80000000ffffffff cr=80000000 | 
 add_rc_3 | 7c642a15 | r4=d1ea2fa4dd9af44c r5=959ef8713231c2ca vscr=10000 xer=20000000 | r3=678928160fccb716 cr=40000000 | 
 add_rc_4 | 7c642a15 | r4=6b82bddd r5=1 vscr=10000 xer=0 | r3=6b82bdde cr=40000000 | 
-add_rc_5 | 7c642a15 | r4=7fffffff r5=7 vscr=10000 xer=20000000 | r3=80000006 cr=40000000 | 
-add_rc_6 | 7c642a15 | r4=7fffffffffffffff r5=1 vscr=10000 xer=0 | r3=8000000000000000 cr=80000000 | 
-add_rc_7 | 7c642a15 | r4=80000000 r5=80000000 vscr=10000 xer=0 | r3=100000000 cr=40000000 | 
+add_rc_5 | 7c642a15 | r4=7fffffff r5=7 vscr=10000 xer=20000000 | r3=80000006 cr=80000000 | 
+add_rc_6 | 7c642a15 | r4=7fffffffffffffff r5=1 vscr=10000 xer=0 | r3=8000000000000000 cr=20000000 | 
+add_rc_7 | 7c642a15 | r4=80000000 r5=80000000 vscr=10000 xer=0 | r3=100000000 cr=20000000 | 
 add_rc_alias | 7c842a15 | r4=959ef8713231c2ca r5=d1ea2fa4dd9af44c vscr=10000 xer=20000000 | r4=678928160fccb716 cr=40000000 | 
 addo_0 | 7c642e14 | r4=ffff0000 r5=80000000 vscr=10000 xer=20000000 | r3=17fff0000 | 
 addo_1 | 7c642e14 | r4=a402cba4 r5=80000000 vscr=10000 xer=0 | r3=12402cba4 | 
@@ -30,11 +31,11 @@ addo_alias | 7c842e14 | r4=ffff0000 r5=80000000 vscr=10000 xer=20000000 | r4=17f
 addo_rc_0 | 7c642e15 | r4=685bd8519d0023db r5=80000000 vscr=10000 xer=20000000 | r3=685bd8521d0023db cr=40000000 | 
 addo_rc_1 | 7c642e15 | r4=7fffffffffffffff r5=8000000000000000 vscr=10000 xer=0 | r3=ffffffffffffffff cr=80000000 | 
 addo_rc_2 | 7c642e15 | r4=ffffffff r5=6b82bddd vscr=10000 xer=0 | r3=16b82bddc cr=40000000 | 
-addo_rc_3 | 7c642e15 | r4=ffffffffffffffff r5=8000000000000000 vscr=10000 xer=20000000 | r3=7fffffffffffffff cr=50000000 xer=e0000000 | 
-addo_rc_4 | 7c642e15 | r4=123456789abcdef0 r5=1 vscr=10000 xer=0 | r3=123456789abcdef1 cr=40000000 | 
+addo_rc_3 | 7c642e15 | r4=ffffffffffffffff r5=8000000000000000 vscr=10000 xer=20000000 | r3=7fffffffffffffff cr=90000000 xer=e0000000 | 
+addo_rc_4 | 7c642e15 | r4=123456789abcdef0 r5=1 vscr=10000 xer=0 | r3=123456789abcdef1 cr=80000000 | 
 addo_rc_5 | 7c642e15 | r4=7fffffff r5=100000000 vscr=10000 xer=0 | r3=17fffffff cr=40000000 | 
-addo_rc_6 | 7c642e15 | r4=7fffffffffffffff r5=1 vscr=10000 xer=20000000 | r3=8000000000000000 cr=90000000 xer=e0000000 | 
-addo_rc_7 | 7c642e15 | r4=80000000 r5=80000000 vscr=10000 xer=0 | r3=100000000 cr=40000000 | 
+addo_rc_6 | 7c642e15 | r4=7fffffffffffffff r5=1 vscr=10000 xer=20000000 | r3=8000000000000000 cr=30000000 xer=e0000000 | 
+addo_rc_7 | 7c642e15 | r4=80000000 r5=80000000 vscr=10000 xer=0 | r3=100000000 cr=20000000 | 
 addo_rc_alias | 7c842e15 | r4=685bd8519d0023db r5=80000000 vscr=10000 xer=20000000 | r4=685bd8521d0023db cr=40000000 | 
 addc_0 | 7c642814 | r4=d1ea2fa4dd9af44c r5=7fffffff vscr=10000 xer=20000000 | r3=d1ea2fa55d9af44b xer=0 | 
 addc_1 | 7c642814 | r4=6b82bddd r5=7 vscr=10000 xer=0 | r3=6b82bde4 | 
@@ -45,15 +46,15 @@ addc_5 | 7c642814 | r4=ffffffff r5=7fffffffffffffff vscr=10000 xer=20000000 | r3
 addc_6 | 7c642814 | r4=7fffffffffffffff r5=1 vscr=10000 xer=20000000 | r3=8000000000000000 xer=0 | 
 addc_7 | 7c642814 | r4=80000000 r5=80000000 vscr=10000 xer=20000000 | r3=100000000 xer=0 | 
 addc_alias | 7c842814 | r4=d1ea2fa4dd9af44c r5=7fffffff vscr=10000 xer=20000000 | r4=d1ea2fa55d9af44b xer=0 | 
-addc_rc_0 | 7c642815 | r4=7 r5=959ef8713231c2ca vscr=10000 xer=20000000 | r3=959ef8713231c2d1 cr=80000000 xer=0 | 
+addc_rc_0 | 7c642815 | r4=7 r5=959ef8713231c2ca vscr=10000 xer=20000000 | r3=959ef8713231c2d1 cr=40000000 xer=0 | 
 addc_rc_1 | 7c642815 | r4=80000000 r5=ffffffff vscr=10000 xer=20000000 | r3=17fffffff cr=40000000 xer=0 | 
-addc_rc_2 | 7c642815 | r4=100000001 r5=ffffffffffffffff vscr=10000 xer=20000000 | r3=100000000 cr=40000000 | 
-addc_rc_3 | 7c642815 | r4=0 r5=7fffffffffffffff vscr=10000 xer=20000000 | r3=7fffffffffffffff cr=40000000 xer=0 | 
-addc_rc_4 | 7c642815 | r4=100000001 r5=daeb8ebd244a330c vscr=10000 xer=20000000 | r3=daeb8ebe244a330d cr=80000000 xer=0 | 
-addc_rc_5 | 7c642815 | r4=100000000 r5=685bd8519d0023db vscr=10000 xer=20000000 | r3=685bd8529d0023db cr=40000000 xer=0 | 
-addc_rc_6 | 7c642815 | r4=7fffffffffffffff r5=1 vscr=10000 xer=20000000 | r3=8000000000000000 cr=80000000 xer=0 | 
-addc_rc_7 | 7c642815 | r4=80000000 r5=80000000 vscr=10000 xer=20000000 | r3=100000000 cr=40000000 xer=0 | 
-addc_rc_alias | 7c842815 | r4=7 r5=959ef8713231c2ca vscr=10000 xer=20000000 | r4=959ef8713231c2d1 cr=80000000 xer=0 | 
+addc_rc_2 | 7c642815 | r4=100000001 r5=ffffffffffffffff vscr=10000 xer=20000000 | r3=100000000 cr=20000000 | 
+addc_rc_3 | 7c642815 | r4=0 r5=7fffffffffffffff vscr=10000 xer=20000000 | r3=7fffffffffffffff cr=80000000 xer=0 | 
+addc_rc_4 | 7c642815 | r4=100000001 r5=daeb8ebd244a330c vscr=10000 xer=20000000 | r3=daeb8ebe244a330d cr=40000000 xer=0 | 
+addc_rc_5 | 7c642815 | r4=100000000 r5=685bd8519d0023db vscr=10000 xer=20000000 | r3=685bd8529d0023db cr=80000000 xer=0 | 
+addc_rc_6 | 7c642815 | r4=7fffffffffffffff r5=1 vscr=10000 xer=20000000 | r3=8000000000000000 cr=20000000 xer=0 | 
+addc_rc_7 | 7c642815 | r4=80000000 r5=80000000 vscr=10000 xer=20000000 | r3=100000000 cr=20000000 xer=0 | 
+addc_rc_alias | 7c842815 | r4=7 r5=959ef8713231c2ca vscr=10000 xer=20000000 | r4=959ef8713231c2d1 cr=40000000 xer=0 | 
 addco_0 | 7c642c14 | r4=80000000 r5=a402cba4 vscr=10000 xer=20000000 | r3=12402cba4 xer=0 | 
 addco_1 | 7c642c14 | r4=100000001 r5=7fffffff vscr=10000 xer=20000000 | r3=180000000 xer=0 | 
 addco_2 | 7c642c14 | r4=959ef8713231c2ca r5=ffffffff vscr=10000 xer=20000000 | r3=959ef8723231c2c9 xer=0 | 
@@ -63,15 +64,15 @@ addco_5 | 7c642c14 | r4=d1ea2fa4dd9af44c r5=8000000000000000 vscr=10000 xer=2000
 addco_6 | 7c642c14 | r4=7fffffffffffffff r5=1 vscr=10000 xer=0 | r3=8000000000000000 xer=c0000000 | 
 addco_7 | 7c642c14 | r4=80000000 r5=80000000 vscr=10000 xer=20000000 | r3=100000000 xer=0 | 
 addco_alias | 7c842c14 | r4=80000000 r5=a402cba4 vscr=10000 xer=20000000 | r4=12402cba4 xer=0 | 
-addco_rc_0 | 7c642c15 | r4=fffffffffffffffe r5=a402cba4 vscr=10000 xer=0 | r3=a402cba2 cr=40000000 xer=20000000 | 
-addco_rc_1 | 7c642c15 | r4=a402cba4 r5=7 vscr=10000 xer=20000000 | r3=a402cbab cr=40000000 xer=0 | 
-addco_rc_2 | 7c642c15 | r4=a402cba4 r5=7 vscr=10000 xer=0 | r3=a402cbab cr=40000000 | 
-addco_rc_3 | 7c642c15 | r4=7 r5=80000000 vscr=10000 xer=0 | r3=80000007 cr=40000000 | 
+addco_rc_0 | 7c642c15 | r4=fffffffffffffffe r5=a402cba4 vscr=10000 xer=0 | r3=a402cba2 cr=80000000 xer=20000000 | 
+addco_rc_1 | 7c642c15 | r4=a402cba4 r5=7 vscr=10000 xer=20000000 | r3=a402cbab cr=80000000 xer=0 | 
+addco_rc_2 | 7c642c15 | r4=a402cba4 r5=7 vscr=10000 xer=0 | r3=a402cbab cr=80000000 | 
+addco_rc_3 | 7c642c15 | r4=7 r5=80000000 vscr=10000 xer=0 | r3=80000007 cr=80000000 | 
 addco_rc_4 | 7c642c15 | r4=100000000 r5=1 vscr=10000 xer=20000000 | r3=100000001 cr=40000000 xer=0 | 
 addco_rc_5 | 7c642c15 | r4=d1ea2fa4dd9af44c r5=ffffffffffffffff vscr=10000 xer=20000000 | r3=d1ea2fa4dd9af44b cr=80000000 | 
-addco_rc_6 | 7c642c15 | r4=7fffffffffffffff r5=1 vscr=10000 xer=20000000 | r3=8000000000000000 cr=90000000 xer=c0000000 | 
-addco_rc_7 | 7c642c15 | r4=80000000 r5=80000000 vscr=10000 xer=0 | r3=100000000 cr=40000000 | 
-addco_rc_alias | 7c842c15 | r4=fffffffffffffffe r5=a402cba4 vscr=10000 xer=20000000 | r4=a402cba2 cr=40000000 | 
+addco_rc_6 | 7c642c15 | r4=7fffffffffffffff r5=1 vscr=10000 xer=20000000 | r3=8000000000000000 cr=30000000 xer=c0000000 | 
+addco_rc_7 | 7c642c15 | r4=80000000 r5=80000000 vscr=10000 xer=0 | r3=100000000 cr=20000000 | 
+addco_rc_alias | 7c842c15 | r4=fffffffffffffffe r5=a402cba4 vscr=10000 xer=20000000 | r4=a402cba2 cr=80000000 | 
 adde_0 | 7c642914 | r4=8000000000000000 r5=100000001 vscr=10000 xer=0 | r3=8000000100000001 | 
 adde_1 | 7c642914 | r4=123456789abcdef0 r5=7fffffffffffffff vscr=10000 xer=20000000 | r3=923456789abcdef0 xer=0 | 
 adde_2 | 7c642914 | r4=ffff0000 r5=ffffffff80000000 vscr=10000 xer=0 | r3=7fff0000 xer=20000000 | 
@@ -81,15 +82,15 @@ adde_5 | 7c642914 | r4=123456789abcdef0 r5=100000001 vscr=10000 xer=20000000 | r
 adde_6 | 7c642914 | r4=7fffffffffffffff r5=1 vscr=10000 xer=20000000 | r3=8000000000000001 xer=0 | 
 adde_7 | 7c642914 | r4=80000000 r5=80000000 vscr=10000 xer=20000000 | r3=100000001 xer=0 | 
 adde_alias | 7c842914 | r4=8000000000000000 r5=100000001 vscr=10000 xer=20000000 | r4=8000000100000002 xer=0 | 
-adde_rc_0 | 7c642915 | r4=ffff0000 r5=100000001 vscr=10000 xer=0 | r3=1ffff0001 cr=40000000 | 
-adde_rc_1 | 7c642915 | r4=ffff0000 r5=a402cba4 vscr=10000 xer=0 | r3=1a401cba4 cr=40000000 | 
+adde_rc_0 | 7c642915 | r4=ffff0000 r5=100000001 vscr=10000 xer=0 | r3=1ffff0001 cr=80000000 | 
+adde_rc_1 | 7c642915 | r4=ffff0000 r5=a402cba4 vscr=10000 xer=0 | r3=1a401cba4 cr=80000000 | 
 adde_rc_2 | 7c642915 | r4=123456789abcdef0 r5=80000000 vscr=10000 xer=0 | r3=123456791abcdef0 cr=40000000 | 
 adde_rc_3 | 7c642915 | r4=ffff0000 r5=80000000 vscr=10000 xer=0 | r3=17fff0000 cr=40000000 | 
-adde_rc_4 | 7c642915 | r4=daeb8ebd244a330c r5=0 vscr=10000 xer=20000000 | r3=daeb8ebd244a330d cr=80000000 xer=0 | 
-adde_rc_5 | 7c642915 | r4=7 r5=80000000 vscr=10000 xer=0 | r3=80000007 cr=40000000 | 
-adde_rc_6 | 7c642915 | r4=7fffffffffffffff r5=1 vscr=10000 xer=20000000 | r3=8000000000000001 cr=80000000 xer=0 | 
-adde_rc_7 | 7c642915 | r4=80000000 r5=80000000 vscr=10000 xer=0 | r3=100000000 cr=40000000 | 
-adde_rc_alias | 7c842915 | r4=ffff0000 r5=100000001 vscr=10000 xer=20000000 | r4=1ffff0002 cr=40000000 xer=0 | 
+adde_rc_4 | 7c642915 | r4=daeb8ebd244a330c r5=0 vscr=10000 xer=20000000 | r3=daeb8ebd244a330d cr=40000000 xer=0 | 
+adde_rc_5 | 7c642915 | r4=7 r5=80000000 vscr=10000 xer=0 | r3=80000007 cr=80000000 | 
+adde_rc_6 | 7c642915 | r4=7fffffffffffffff r5=1 vscr=10000 xer=20000000 | r3=8000000000000001 cr=40000000 xer=0 | 
+adde_rc_7 | 7c642915 | r4=80000000 r5=80000000 vscr=10000 xer=0 | r3=100000000 cr=20000000 | 
+adde_rc_alias | 7c842915 | r4=ffff0000 r5=100000001 vscr=10000 xer=20000000 | r4=1ffff0002 cr=80000000 xer=0 | 
 addeo_0 | 7c642d14 | r4=ffff0000 r5=d1ea2fa4dd9af44c vscr=10000 xer=20000000 | r3=d1ea2fa5dd99f44d xer=0 | 
 addeo_1 | 7c642d14 | r4=ffffffff80000000 r5=7fffffff vscr=10000 xer=0 | r3=ffffffffffffffff | 
 addeo_2 | 7c642d14 | r4=0 r5=a402cba4 vscr=10000 xer=0 | r3=a402cba4 | 
@@ -101,12 +102,12 @@ addeo_7 | 7c642d14 | r4=80000000 r5=80000000 vscr=10000 xer=0 | r3=100000000 |
 addeo_alias | 7c842d14 | r4=ffff0000 r5=d1ea2fa4dd9af44c vscr=10000 xer=20000000 | r4=d1ea2fa5dd99f44d xer=0 | 
 addeo_rc_0 | 7c642d15 | r4=d1ea2fa4dd9af44c r5=0 vscr=10000 xer=20000000 | r3=d1ea2fa4dd9af44d cr=80000000 xer=0 | 
 addeo_rc_1 | 7c642d15 | r4=6b82bddd r5=ffffffffffffffff vscr=10000 xer=0 | r3=6b82bddc cr=40000000 xer=20000000 | 
-addeo_rc_2 | 7c642d15 | r4=ffffffff r5=959ef8713231c2ca vscr=10000 xer=20000000 | r3=959ef8723231c2ca cr=80000000 xer=0 | 
+addeo_rc_2 | 7c642d15 | r4=ffffffff r5=959ef8713231c2ca vscr=10000 xer=20000000 | r3=959ef8723231c2ca cr=40000000 xer=0 | 
 addeo_rc_3 | 7c642d15 | r4=7fffffff r5=100000000 vscr=10000 xer=0 | r3=17fffffff cr=40000000 | 
 addeo_rc_4 | 7c642d15 | r4=100000000 r5=7 vscr=10000 xer=0 | r3=100000007 cr=40000000 | 
 addeo_rc_5 | 7c642d15 | r4=80000000 r5=8000000000000000 vscr=10000 xer=0 | r3=8000000080000000 cr=80000000 | 
-addeo_rc_6 | 7c642d15 | r4=7fffffffffffffff r5=1 vscr=10000 xer=20000000 | r3=8000000000000001 cr=90000000 xer=c0000000 | 
-addeo_rc_7 | 7c642d15 | r4=80000000 r5=80000000 vscr=10000 xer=0 | r3=100000000 cr=40000000 | 
+addeo_rc_6 | 7c642d15 | r4=7fffffffffffffff r5=1 vscr=10000 xer=20000000 | r3=8000000000000001 cr=50000000 xer=c0000000 | 
+addeo_rc_7 | 7c642d15 | r4=80000000 r5=80000000 vscr=10000 xer=0 | r3=100000000 cr=20000000 | 
 addeo_rc_alias | 7c842d15 | r4=d1ea2fa4dd9af44c r5=0 vscr=10000 xer=20000000 | r4=d1ea2fa4dd9af44d cr=80000000 xer=0 | 
 subf_0 | 7c642850 | r4=d1ea2fa4dd9af44c r5=100000000 vscr=10000 xer=0 | r3=2e15d05c22650bb4 | 
 subf_1 | 7c642850 | r4=a402cba4 r5=daeb8ebd244a330c vscr=10000 xer=0 | r3=daeb8ebc80476768 | 
@@ -117,15 +118,15 @@ subf_5 | 7c642850 | r4=ffffffffffffffff r5=ffffffff80000000 vscr=10000 xer=0 | r
 subf_6 | 7c642850 | r4=7fffffffffffffff r5=1 vscr=10000 xer=20000000 | r3=8000000000000002 | 
 subf_7 | 7c642850 | r4=80000000 r5=80000000 vscr=10000 xer=0 |  | 
 subf_alias | 7c842850 | r4=d1ea2fa4dd9af44c r5=100000000 vscr=10000 xer=20000000 | r4=2e15d05c22650bb4 | 
-subf_rc_0 | 7c642851 | r4=fffffffffffffffe r5=8000000000000000 vscr=10000 xer=0 | r3=8000000000000002 cr=80000000 | 
-subf_rc_1 | 7c642851 | r4=123456789abcdef0 r5=a402cba4 vscr=10000 xer=0 | r3=edcba9880945ecb4 cr=80000000 | 
-subf_rc_2 | 7c642851 | r4=ffff0000 r5=123456789abcdef0 vscr=10000 xer=0 | r3=123456779abddef0 cr=40000000 | 
+subf_rc_0 | 7c642851 | r4=fffffffffffffffe r5=8000000000000000 vscr=10000 xer=0 | r3=8000000000000002 cr=40000000 | 
+subf_rc_1 | 7c642851 | r4=123456789abcdef0 r5=a402cba4 vscr=10000 xer=0 | r3=edcba9880945ecb4 cr=40000000 | 
+subf_rc_2 | 7c642851 | r4=ffff0000 r5=123456789abcdef0 vscr=10000 xer=0 | r3=123456779abddef0 cr=80000000 | 
 subf_rc_3 | 7c642851 | r4=d1ea2fa4dd9af44c r5=ffffffffffffffff vscr=10000 xer=0 | r3=2e15d05b22650bb3 cr=40000000 | 
 subf_rc_4 | 7c642851 | r4=fffffffffffffffe r5=100000001 vscr=10000 xer=0 | r3=100000003 cr=40000000 | 
-subf_rc_5 | 7c642851 | r4=685bd8519d0023db r5=959ef8713231c2ca vscr=10000 xer=0 | r3=2d43201f95319eef cr=40000000 | 
-subf_rc_6 | 7c642851 | r4=7fffffffffffffff r5=1 vscr=10000 xer=20000000 | r3=8000000000000002 cr=80000000 | 
+subf_rc_5 | 7c642851 | r4=685bd8519d0023db r5=959ef8713231c2ca vscr=10000 xer=0 | r3=2d43201f95319eef cr=80000000 | 
+subf_rc_6 | 7c642851 | r4=7fffffffffffffff r5=1 vscr=10000 xer=20000000 | r3=8000000000000002 cr=40000000 | 
 subf_rc_7 | 7c642851 | r4=80000000 r5=80000000 vscr=10000 xer=20000000 | cr=20000000 | 
-subf_rc_alias | 7c842851 | r4=fffffffffffffffe r5=8000000000000000 vscr=10000 xer=20000000 | r4=8000000000000002 cr=80000000 | 
+subf_rc_alias | 7c842851 | r4=fffffffffffffffe r5=8000000000000000 vscr=10000 xer=20000000 | r4=8000000000000002 cr=40000000 | 
 subfo_0 | 7c642c50 | r4=123456789abcdef0 r5=a402cba4 vscr=10000 xer=20000000 | r3=edcba9880945ecb4 | 
 subfo_1 | 7c642c50 | r4=2 r5=100000000 vscr=10000 xer=0 | r3=fffffffe | 
 subfo_2 | 7c642c50 | r4=0 r5=0 vscr=10000 xer=20000000 |  | 
@@ -137,11 +138,11 @@ subfo_7 | 7c642c50 | r4=80000000 r5=80000000 vscr=10000 xer=20000000 |  |
 subfo_alias | 7c842c50 | r4=123456789abcdef0 r5=a402cba4 vscr=10000 xer=20000000 | r4=edcba9880945ecb4 | 
 subfo_rc_0 | 7c642c51 | r4=1 r5=0 vscr=10000 xer=0 | r3=ffffffffffffffff cr=80000000 | 
 subfo_rc_1 | 7c642c51 | r4=100000000 r5=ffffffff80000000 vscr=10000 xer=20000000 | r3=fffffffe80000000 cr=80000000 | 
-subfo_rc_2 | 7c642c51 | r4=8000000000000000 r5=6b82bddd vscr=10000 xer=0 | r3=800000006b82bddd cr=90000000 xer=c0000000 | 
-subfo_rc_3 | 7c642c51 | r4=80000000 r5=8000000000000000 vscr=10000 xer=20000000 | r3=7fffffff80000000 cr=50000000 xer=e0000000 | 
+subfo_rc_2 | 7c642c51 | r4=8000000000000000 r5=6b82bddd vscr=10000 xer=0 | r3=800000006b82bddd cr=50000000 xer=c0000000 | 
+subfo_rc_3 | 7c642c51 | r4=80000000 r5=8000000000000000 vscr=10000 xer=20000000 | r3=7fffffff80000000 cr=90000000 xer=e0000000 | 
 subfo_rc_4 | 7c642c51 | r4=123456789abcdef0 r5=fedcba9876543210 vscr=10000 xer=20000000 | r3=eca8641fdb975320 cr=80000000 | 
-subfo_rc_5 | 7c642c51 | r4=8000000000000000 r5=7fffffff vscr=10000 xer=20000000 | r3=800000007fffffff cr=90000000 xer=e0000000 | 
-subfo_rc_6 | 7c642c51 | r4=7fffffffffffffff r5=1 vscr=10000 xer=20000000 | r3=8000000000000002 cr=80000000 | 
+subfo_rc_5 | 7c642c51 | r4=8000000000000000 r5=7fffffff vscr=10000 xer=20000000 | r3=800000007fffffff cr=50000000 xer=e0000000 | 
+subfo_rc_6 | 7c642c51 | r4=7fffffffffffffff r5=1 vscr=10000 xer=20000000 | r3=8000000000000002 cr=40000000 | 
 subfo_rc_7 | 7c642c51 | r4=80000000 r5=80000000 vscr=10000 xer=0 | cr=20000000 | 
 subfo_rc_alias | 7c842c51 | r4=1 r5=0 vscr=10000 xer=20000000 | r4=ffffffffffffffff cr=80000000 | 
 subfc_0 | 7c642810 | r4=100000000 r5=0 vscr=10000 xer=20000000 | r3=ffffffff00000000 xer=0 | 
@@ -154,12 +155,12 @@ subfc_6 | 7c642810 | r4=7fffffffffffffff r5=1 vscr=10000 xer=20000000 | r3=80000
 subfc_7 | 7c642810 | r4=80000000 r5=80000000 vscr=10000 xer=0 | xer=20000000 | 
 subfc_alias | 7c842810 | r4=100000000 r5=0 vscr=10000 xer=20000000 | r4=ffffffff00000000 xer=0 | 
 subfc_rc_0 | 7c642811 | r4=a402cba4 r5=7fffffffffffffff vscr=10000 xer=0 | r3=7fffffff5bfd345b cr=40000000 xer=20000000 | 
-subfc_rc_1 | 7c642811 | r4=0 r5=7fffffffffffffff vscr=10000 xer=0 | r3=7fffffffffffffff cr=40000000 xer=20000000 | 
+subfc_rc_1 | 7c642811 | r4=0 r5=7fffffffffffffff vscr=10000 xer=0 | r3=7fffffffffffffff cr=80000000 xer=20000000 | 
 subfc_rc_2 | 7c642811 | r4=ffffffffffffffff r5=fffffffffffffffe vscr=10000 xer=0 | r3=ffffffffffffffff cr=80000000 | 
 subfc_rc_3 | 7c642811 | r4=0 r5=ffffffff80000000 vscr=10000 xer=20000000 | r3=ffffffff80000000 cr=80000000 | 
 subfc_rc_4 | 7c642811 | r4=ffffffffffffffff r5=fffffffffffffffe vscr=10000 xer=0 | r3=ffffffffffffffff cr=80000000 | 
-subfc_rc_5 | 7c642811 | r4=d1ea2fa4dd9af44c r5=a402cba4 vscr=10000 xer=20000000 | r3=2e15d05bc667d758 cr=40000000 xer=0 | 
-subfc_rc_6 | 7c642811 | r4=7fffffffffffffff r5=1 vscr=10000 xer=20000000 | r3=8000000000000002 cr=80000000 xer=0 | 
+subfc_rc_5 | 7c642811 | r4=d1ea2fa4dd9af44c r5=a402cba4 vscr=10000 xer=20000000 | r3=2e15d05bc667d758 cr=80000000 xer=0 | 
+subfc_rc_6 | 7c642811 | r4=7fffffffffffffff r5=1 vscr=10000 xer=20000000 | r3=8000000000000002 cr=40000000 xer=0 | 
 subfc_rc_7 | 7c642811 | r4=80000000 r5=80000000 vscr=10000 xer=0 | cr=20000000 xer=20000000 | 
 subfc_rc_alias | 7c842811 | r4=a402cba4 r5=7fffffffffffffff vscr=10000 xer=20000000 | r4=7fffffff5bfd345b cr=40000000 | 
 subfco_0 | 7c642c10 | r4=ffffffff80000000 r5=8000000000000000 vscr=10000 xer=20000000 | r3=8000000080000000 xer=0 | 
@@ -171,15 +172,15 @@ subfco_5 | 7c642c10 | r4=fedcba9876543210 r5=ffff0000 vscr=10000 xer=0 | r3=1234
 subfco_6 | 7c642c10 | r4=7fffffffffffffff r5=1 vscr=10000 xer=20000000 | r3=8000000000000002 xer=0 | 
 subfco_7 | 7c642c10 | r4=80000000 r5=80000000 vscr=10000 xer=0 | xer=20000000 | 
 subfco_alias | 7c842c10 | r4=ffffffff80000000 r5=8000000000000000 vscr=10000 xer=20000000 | r4=8000000080000000 xer=0 | 
-subfco_rc_0 | 7c642c11 | r4=ffff0000 r5=fedcba9876543210 vscr=10000 xer=20000000 | r3=fedcba9776553210 cr=80000000 | 
+subfco_rc_0 | 7c642c11 | r4=ffff0000 r5=fedcba9876543210 vscr=10000 xer=20000000 | r3=fedcba9776553210 cr=40000000 | 
 subfco_rc_1 | 7c642c11 | r4=685bd8519d0023db r5=fedcba9876543210 vscr=10000 xer=20000000 | r3=9680e246d9540e35 cr=80000000 | 
-subfco_rc_2 | 7c642c11 | r4=7 r5=a402cba4 vscr=10000 xer=0 | r3=a402cb9d cr=40000000 xer=20000000 | 
+subfco_rc_2 | 7c642c11 | r4=7 r5=a402cba4 vscr=10000 xer=0 | r3=a402cb9d cr=80000000 xer=20000000 | 
 subfco_rc_3 | 7c642c11 | r4=2 r5=fffffffffffffffe vscr=10000 xer=0 | r3=fffffffffffffffc cr=80000000 xer=20000000 | 
-subfco_rc_4 | 7c642c11 | r4=7fffffff r5=100000000 vscr=10000 xer=0 | r3=80000001 cr=40000000 xer=20000000 | 
-subfco_rc_5 | 7c642c11 | r4=d1ea2fa4dd9af44c r5=123456789abcdef0 vscr=10000 xer=20000000 | r3=404a26d3bd21eaa4 cr=40000000 xer=0 | 
-subfco_rc_6 | 7c642c11 | r4=7fffffffffffffff r5=1 vscr=10000 xer=20000000 | r3=8000000000000002 cr=80000000 xer=0 | 
+subfco_rc_4 | 7c642c11 | r4=7fffffff r5=100000000 vscr=10000 xer=0 | r3=80000001 cr=80000000 xer=20000000 | 
+subfco_rc_5 | 7c642c11 | r4=d1ea2fa4dd9af44c r5=123456789abcdef0 vscr=10000 xer=20000000 | r3=404a26d3bd21eaa4 cr=80000000 xer=0 | 
+subfco_rc_6 | 7c642c11 | r4=7fffffffffffffff r5=1 vscr=10000 xer=20000000 | r3=8000000000000002 cr=40000000 xer=0 | 
 subfco_rc_7 | 7c642c11 | r4=80000000 r5=80000000 vscr=10000 xer=20000000 | cr=20000000 | 
-subfco_rc_alias | 7c842c11 | r4=ffff0000 r5=fedcba9876543210 vscr=10000 xer=20000000 | r4=fedcba9776553210 cr=80000000 | 
+subfco_rc_alias | 7c842c11 | r4=ffff0000 r5=fedcba9876543210 vscr=10000 xer=20000000 | r4=fedcba9776553210 cr=40000000 | 
 subfe_0 | 7c642910 | r4=a402cba4 r5=fedcba9876543210 vscr=10000 xer=20000000 | r3=fedcba97d251666c | 
 subfe_1 | 7c642910 | r4=ffffffff80000000 r5=d1ea2fa4dd9af44c vscr=10000 xer=20000000 | r3=d1ea2fa55d9af44c xer=0 | 
 subfe_2 | 7c642910 | r4=ffffffffffffffff r5=2 vscr=10000 xer=0 | r3=2 | 
@@ -189,15 +190,15 @@ subfe_5 | 7c642910 | r4=100000001 r5=ffff0000 vscr=10000 xer=0 | r3=fffffffffffe
 subfe_6 | 7c642910 | r4=7fffffffffffffff r5=1 vscr=10000 xer=20000000 | r3=8000000000000002 xer=0 | 
 subfe_7 | 7c642910 | r4=80000000 r5=80000000 vscr=10000 xer=0 | r3=ffffffffffffffff | 
 subfe_alias | 7c842910 | r4=a402cba4 r5=fedcba9876543210 vscr=10000 xer=20000000 | r4=fedcba97d251666c | 
-subfe_rc_0 | 7c642911 | r4=daeb8ebd244a330c r5=ffff0000 vscr=10000 xer=20000000 | r3=25147143dbb4ccf4 cr=40000000 xer=0 | 
+subfe_rc_0 | 7c642911 | r4=daeb8ebd244a330c r5=ffff0000 vscr=10000 xer=20000000 | r3=25147143dbb4ccf4 cr=80000000 xer=0 | 
 subfe_rc_1 | 7c642911 | r4=0 r5=0 vscr=10000 xer=20000000 | cr=20000000 | 
 subfe_rc_2 | 7c642911 | r4=ffff0000 r5=100000001 vscr=10000 xer=20000000 | r3=10001 cr=40000000 | 
 subfe_rc_3 | 7c642911 | r4=0 r5=6b82bddd vscr=10000 xer=0 | r3=6b82bddc cr=40000000 xer=20000000 | 
 subfe_rc_4 | 7c642911 | r4=1 r5=d1ea2fa4dd9af44c vscr=10000 xer=20000000 | r3=d1ea2fa4dd9af44b cr=80000000 | 
-subfe_rc_5 | 7c642911 | r4=2 r5=100000001 vscr=10000 xer=20000000 | r3=ffffffff cr=40000000 | 
-subfe_rc_6 | 7c642911 | r4=7fffffffffffffff r5=1 vscr=10000 xer=20000000 | r3=8000000000000002 cr=80000000 xer=0 | 
+subfe_rc_5 | 7c642911 | r4=2 r5=100000001 vscr=10000 xer=20000000 | r3=ffffffff cr=80000000 | 
+subfe_rc_6 | 7c642911 | r4=7fffffffffffffff r5=1 vscr=10000 xer=20000000 | r3=8000000000000002 cr=40000000 xer=0 | 
 subfe_rc_7 | 7c642911 | r4=80000000 r5=80000000 vscr=10000 xer=0 | r3=ffffffffffffffff cr=80000000 | 
-subfe_rc_alias | 7c842911 | r4=daeb8ebd244a330c r5=ffff0000 vscr=10000 xer=20000000 | r4=25147143dbb4ccf4 cr=40000000 xer=0 | 
+subfe_rc_alias | 7c842911 | r4=daeb8ebd244a330c r5=ffff0000 vscr=10000 xer=20000000 | r4=25147143dbb4ccf4 cr=80000000 xer=0 | 
 subfeo_0 | 7c642d10 | r4=ffffffff80000000 r5=a402cba4 vscr=10000 xer=20000000 | r3=12402cba4 xer=0 | 
 subfeo_1 | 7c642d10 | r4=d1ea2fa4dd9af44c r5=100000000 vscr=10000 xer=0 | r3=2e15d05c22650bb3 | 
 subfeo_2 | 7c642d10 | r4=0 r5=daeb8ebd244a330c vscr=10000 xer=0 | r3=daeb8ebd244a330b xer=20000000 | 
@@ -211,11 +212,11 @@ subfeo_rc_0 | 7c642d11 | r4=80000000 r5=ffffffff80000000 vscr=10000 xer=0 | r3=f
 subfeo_rc_1 | 7c642d11 | r4=ffff0000 r5=ffffffff80000000 vscr=10000 xer=0 | r3=fffffffe8000ffff cr=80000000 xer=20000000 | 
 subfeo_rc_2 | 7c642d11 | r4=123456789abcdef0 r5=fedcba9876543210 vscr=10000 xer=20000000 | r3=eca8641fdb975320 cr=80000000 | 
 subfeo_rc_3 | 7c642d11 | r4=8000000000000000 r5=daeb8ebd244a330c vscr=10000 xer=20000000 | r3=5aeb8ebd244a330c cr=40000000 | 
-subfeo_rc_4 | 7c642d11 | r4=ffff0000 r5=fedcba9876543210 vscr=10000 xer=20000000 | r3=fedcba9776553210 cr=80000000 | 
+subfeo_rc_4 | 7c642d11 | r4=ffff0000 r5=fedcba9876543210 vscr=10000 xer=20000000 | r3=fedcba9776553210 cr=40000000 | 
 subfeo_rc_5 | 7c642d11 | r4=ffff0000 r5=7fffffff vscr=10000 xer=0 | r3=ffffffff8000fffe cr=80000000 | 
-subfeo_rc_6 | 7c642d11 | r4=7fffffffffffffff r5=1 vscr=10000 xer=0 | r3=8000000000000001 cr=80000000 | 
+subfeo_rc_6 | 7c642d11 | r4=7fffffffffffffff r5=1 vscr=10000 xer=0 | r3=8000000000000001 cr=40000000 | 
 subfeo_rc_7 | 7c642d11 | r4=80000000 r5=80000000 vscr=10000 xer=20000000 | cr=20000000 | 
-subfeo_rc_alias | 7c842d11 | r4=80000000 r5=ffffffff80000000 vscr=10000 xer=20000000 | r4=ffffffff00000000 cr=80000000 | 
+subfeo_rc_alias | 7c842d11 | r4=80000000 r5=ffffffff80000000 vscr=10000 xer=20000000 | r4=ffffffff00000000 cr=20000000 | 
 mullw_0 | 7c6429d6 | r4=80000000 r5=ffffffff80000000 vscr=10000 xer=20000000 | r3=4000000000000000 | 
 mullw_1 | 7c6429d6 | r4=ffffffff80000000 r5=7fffffff vscr=10000 xer=20000000 | r3=c000000080000000 | 
 mullw_2 | 7c6429d6 | r4=a402cba4 r5=ffff0000 vscr=10000 xer=20000000 | r3=5bfd345c0000 | 
@@ -225,15 +226,15 @@ mullw_5 | 7c6429d6 | r4=7fffffff r5=7 vscr=10000 xer=0 | r3=37ffffff9 |
 mullw_6 | 7c6429d6 | r4=7fffffffffffffff r5=1 vscr=10000 xer=0 | r3=ffffffffffffffff | 
 mullw_7 | 7c6429d6 | r4=80000000 r5=80000000 vscr=10000 xer=20000000 | r3=4000000000000000 | 
 mullw_alias | 7c8429d6 | r4=80000000 r5=ffffffff80000000 vscr=10000 xer=20000000 | r4=4000000000000000 | 
-mullw_rc_0 | 7c6429d7 | r4=ffffffff80000000 r5=ffffffff vscr=10000 xer=20000000 | r3=80000000 cr=40000000 | 
+mullw_rc_0 | 7c6429d7 | r4=ffffffff80000000 r5=ffffffff vscr=10000 xer=20000000 | r3=80000000 cr=80000000 | 
 mullw_rc_1 | 7c6429d7 | r4=ffffffffffffffff r5=a402cba4 vscr=10000 xer=20000000 | r3=5bfd345c cr=40000000 | 
 mullw_rc_2 | 7c6429d7 | r4=ffffffffffffffff r5=123456789abcdef0 vscr=10000 xer=20000000 | r3=65432110 cr=40000000 | 
 mullw_rc_3 | 7c6429d7 | r4=959ef8713231c2ca r5=ffffffff vscr=10000 xer=0 | r3=ffffffffcdce3d36 cr=80000000 | 
 mullw_rc_4 | 7c6429d7 | r4=7fffffffffffffff r5=d1ea2fa4dd9af44c vscr=10000 xer=20000000 | r3=22650bb4 cr=40000000 | 
 mullw_rc_5 | 7c6429d7 | r4=2 r5=fffffffffffffffe vscr=10000 xer=20000000 | r3=fffffffffffffffc cr=80000000 | 
 mullw_rc_6 | 7c6429d7 | r4=7fffffffffffffff r5=1 vscr=10000 xer=20000000 | r3=ffffffffffffffff cr=80000000 | 
-mullw_rc_7 | 7c6429d7 | r4=80000000 r5=80000000 vscr=10000 xer=0 | r3=4000000000000000 cr=40000000 | 
-mullw_rc_alias | 7c8429d7 | r4=ffffffff80000000 r5=ffffffff vscr=10000 xer=20000000 | r4=80000000 cr=40000000 | 
+mullw_rc_7 | 7c6429d7 | r4=80000000 r5=80000000 vscr=10000 xer=0 | r3=4000000000000000 cr=20000000 | 
+mullw_rc_alias | 7c8429d7 | r4=ffffffff80000000 r5=ffffffff vscr=10000 xer=20000000 | r4=80000000 cr=80000000 | 
 mullwo_0 | 7c642dd6 | r4=8000000000000000 r5=ffffffff80000000 vscr=10000 xer=20000000 |  | 
 mullwo_1 | 7c642dd6 | r4=8000000000000000 r5=d1ea2fa4dd9af44c vscr=10000 xer=0 |  | 
 mullwo_2 | 7c642dd6 | r4=ffffffffffffffff r5=7fffffff vscr=10000 xer=20000000 | r3=ffffffff80000001 | 
@@ -245,12 +246,12 @@ mullwo_7 | 7c642dd6 | r4=80000000 r5=80000000 vscr=10000 xer=20000000 | r3=40000
 mullwo_alias | 7c842dd6 | r4=8000000000000000 r5=ffffffff80000000 vscr=10000 xer=20000000 | r4=0 | 
 mullwo_rc_0 | 7c642dd7 | r4=fffffffffffffffe r5=daeb8ebd244a330c vscr=10000 xer=20000000 | r3=ffffffffb76b99e8 cr=80000000 | 
 mullwo_rc_1 | 7c642dd7 | r4=1 r5=7fffffffffffffff vscr=10000 xer=20000000 | r3=ffffffffffffffff cr=80000000 | 
-mullwo_rc_2 | 7c642dd7 | r4=7fffffff r5=a402cba4 vscr=10000 xer=0 | r3=d20165d25bfd345c cr=90000000 xer=c0000000 | 
+mullwo_rc_2 | 7c642dd7 | r4=7fffffff r5=a402cba4 vscr=10000 xer=0 | r3=d20165d25bfd345c cr=50000000 xer=c0000000 | 
 mullwo_rc_3 | 7c642dd7 | r4=7fffffffffffffff r5=daeb8ebd244a330c vscr=10000 xer=0 | r3=ffffffffdbb5ccf4 cr=80000000 | 
-mullwo_rc_4 | 7c642dd7 | r4=685bd8519d0023db r5=fffffffffffffffe vscr=10000 xer=0 | r3=c5ffb84a cr=50000000 xer=c0000000 | 
+mullwo_rc_4 | 7c642dd7 | r4=685bd8519d0023db r5=fffffffffffffffe vscr=10000 xer=0 | r3=c5ffb84a cr=90000000 xer=c0000000 | 
 mullwo_rc_5 | 7c642dd7 | r4=ffffffffffffffff r5=fedcba9876543210 vscr=10000 xer=0 | r3=ffffffff89abcdf0 cr=80000000 | 
 mullwo_rc_6 | 7c642dd7 | r4=7fffffffffffffff r5=1 vscr=10000 xer=20000000 | r3=ffffffffffffffff cr=80000000 | 
-mullwo_rc_7 | 7c642dd7 | r4=80000000 r5=80000000 vscr=10000 xer=0 | r3=4000000000000000 cr=50000000 xer=c0000000 | 
+mullwo_rc_7 | 7c642dd7 | r4=80000000 r5=80000000 vscr=10000 xer=0 | r3=4000000000000000 cr=30000000 xer=c0000000 | 
 mullwo_rc_alias | 7c842dd7 | r4=fffffffffffffffe r5=daeb8ebd244a330c vscr=10000 xer=20000000 | r4=ffffffffb76b99e8 cr=80000000 | 
 mulld_0 | 7c6429d2 | r4=7fffffff r5=ffffffff80000000 vscr=10000 xer=0 | r3=c000000080000000 | 
 mulld_1 | 7c6429d2 | r4=0 r5=7fffffff vscr=10000 xer=20000000 |  | 
@@ -300,10 +301,10 @@ mulhw_alias | 7c842896 | r4=7fffffffffffffff r5=100000000 vscr=10000 xer=2000000
 mulhw_rc_0 | 7c642897 | r4=ffffffffffffffff r5=123456789abcdef0 vscr=10000 xer=0 | cr=20000000 | 
 mulhw_rc_1 | 7c642897 | r4=8000000000000000 r5=2 vscr=10000 xer=0 | cr=20000000 | 
 mulhw_rc_2 | 7c642897 | r4=100000000 r5=ffffffff vscr=10000 xer=20000000 | cr=20000000 | 
-mulhw_rc_3 | 7c642897 | r4=fedcba9876543210 r5=fffffffffffffffe vscr=10000 xer=20000000 | r3=ffffffff cr=40000000 | 
+mulhw_rc_3 | 7c642897 | r4=fedcba9876543210 r5=fffffffffffffffe vscr=10000 xer=20000000 | r3=ffffffff cr=80000000 | 
 mulhw_rc_4 | 7c642897 | r4=8000000000000000 r5=daeb8ebd244a330c vscr=10000 xer=0 | cr=20000000 | 
-mulhw_rc_5 | 7c642897 | r4=ffffffff80000000 r5=100000001 vscr=10000 xer=20000000 | r3=ffffffff cr=40000000 | 
-mulhw_rc_6 | 7c642897 | r4=7fffffffffffffff r5=1 vscr=10000 xer=20000000 | r3=ffffffff cr=40000000 | 
+mulhw_rc_5 | 7c642897 | r4=ffffffff80000000 r5=100000001 vscr=10000 xer=20000000 | r3=ffffffff cr=80000000 | 
+mulhw_rc_6 | 7c642897 | r4=7fffffffffffffff r5=1 vscr=10000 xer=20000000 | r3=ffffffff cr=80000000 | 
 mulhw_rc_7 | 7c642897 | r4=80000000 r5=80000000 vscr=10000 xer=0 | r3=40000000 cr=40000000 | 
 mulhw_rc_alias | 7c842897 | r4=ffffffffffffffff r5=123456789abcdef0 vscr=10000 xer=20000000 | r4=0 cr=20000000 | 
 mulhwu_0 | 7c642816 | r4=d1ea2fa4dd9af44c r5=2 vscr=10000 xer=0 | r3=1 | 
@@ -370,13 +371,13 @@ and_6 | 7c832838 | r4=7fffffffffffffff r5=1 vscr=10000 xer=20000000 | r3=1 |
 and_7 | 7c832838 | r4=80000000 r5=80000000 vscr=10000 xer=0 | r3=80000000 | 
 and_alias | 7c842838 | r4=123456789abcdef0 r5=a402cba4 vscr=10000 xer=20000000 | r4=8000caa0 | 
 and_rc_0 | 7c832839 | r4=fedcba9876543210 r5=0 vscr=10000 xer=0 | cr=20000000 | 
-and_rc_1 | 7c832839 | r4=daeb8ebd244a330c r5=fffffffffffffffe vscr=10000 xer=20000000 | r3=daeb8ebd244a330c cr=80000000 | 
+and_rc_1 | 7c832839 | r4=daeb8ebd244a330c r5=fffffffffffffffe vscr=10000 xer=20000000 | r3=daeb8ebd244a330c cr=40000000 | 
 and_rc_2 | 7c832839 | r4=7 r5=ffffffffffffffff vscr=10000 xer=0 | r3=7 cr=40000000 | 
 and_rc_3 | 7c832839 | r4=7fffffff r5=a402cba4 vscr=10000 xer=20000000 | r3=2402cba4 cr=40000000 | 
 and_rc_4 | 7c832839 | r4=a402cba4 r5=8000000000000000 vscr=10000 xer=20000000 | cr=20000000 | 
-and_rc_5 | 7c832839 | r4=ffffffff80000000 r5=80000000 vscr=10000 xer=20000000 | r3=80000000 cr=40000000 | 
+and_rc_5 | 7c832839 | r4=ffffffff80000000 r5=80000000 vscr=10000 xer=20000000 | r3=80000000 cr=80000000 | 
 and_rc_6 | 7c832839 | r4=7fffffffffffffff r5=1 vscr=10000 xer=20000000 | r3=1 cr=40000000 | 
-and_rc_7 | 7c832839 | r4=80000000 r5=80000000 vscr=10000 xer=0 | r3=80000000 cr=40000000 | 
+and_rc_7 | 7c832839 | r4=80000000 r5=80000000 vscr=10000 xer=0 | r3=80000000 cr=80000000 | 
 and_rc_alias | 7c842839 | r4=fedcba9876543210 r5=0 vscr=10000 xer=20000000 | r4=0 cr=20000000 | 
 andc_0 | 7c832878 | r4=7fffffffffffffff r5=100000000 vscr=10000 xer=0 | r3=7ffffffeffffffff | 
 andc_1 | 7c832878 | r4=7 r5=8000000000000000 vscr=10000 xer=20000000 | r3=7 | 
@@ -387,15 +388,15 @@ andc_5 | 7c832878 | r4=123456789abcdef0 r5=0 vscr=10000 xer=0 | r3=123456789abcd
 andc_6 | 7c832878 | r4=7fffffffffffffff r5=1 vscr=10000 xer=0 | r3=7ffffffffffffffe | 
 andc_7 | 7c832878 | r4=80000000 r5=80000000 vscr=10000 xer=0 |  | 
 andc_alias | 7c842878 | r4=7fffffffffffffff r5=100000000 vscr=10000 xer=20000000 | r4=7ffffffeffffffff | 
-andc_rc_0 | 7c832879 | r4=ffffffff80000000 r5=123456789abcdef0 vscr=10000 xer=0 | r3=edcba98700000000 cr=80000000 | 
+andc_rc_0 | 7c832879 | r4=ffffffff80000000 r5=123456789abcdef0 vscr=10000 xer=0 | r3=edcba98700000000 cr=20000000 | 
 andc_rc_1 | 7c832879 | r4=2 r5=6b82bddd vscr=10000 xer=20000000 | r3=2 cr=40000000 | 
-andc_rc_2 | 7c832879 | r4=8000000000000000 r5=6b82bddd vscr=10000 xer=20000000 | r3=8000000000000000 cr=80000000 | 
+andc_rc_2 | 7c832879 | r4=8000000000000000 r5=6b82bddd vscr=10000 xer=20000000 | r3=8000000000000000 cr=20000000 | 
 andc_rc_3 | 7c832879 | r4=a402cba4 r5=7fffffffffffffff vscr=10000 xer=0 | cr=20000000 | 
-andc_rc_4 | 7c832879 | r4=80000000 r5=fedcba9876543210 vscr=10000 xer=0 | r3=80000000 cr=40000000 | 
+andc_rc_4 | 7c832879 | r4=80000000 r5=fedcba9876543210 vscr=10000 xer=0 | r3=80000000 cr=80000000 | 
 andc_rc_5 | 7c832879 | r4=685bd8519d0023db r5=d1ea2fa4dd9af44c vscr=10000 xer=0 | r3=2811d05100000393 cr=40000000 | 
-andc_rc_6 | 7c832879 | r4=7fffffffffffffff r5=1 vscr=10000 xer=20000000 | r3=7ffffffffffffffe cr=40000000 | 
+andc_rc_6 | 7c832879 | r4=7fffffffffffffff r5=1 vscr=10000 xer=20000000 | r3=7ffffffffffffffe cr=80000000 | 
 andc_rc_7 | 7c832879 | r4=80000000 r5=80000000 vscr=10000 xer=0 | cr=20000000 | 
-andc_rc_alias | 7c842879 | r4=ffffffff80000000 r5=123456789abcdef0 vscr=10000 xer=20000000 | r4=edcba98700000000 cr=80000000 | 
+andc_rc_alias | 7c842879 | r4=ffffffff80000000 r5=123456789abcdef0 vscr=10000 xer=20000000 | r4=edcba98700000000 cr=20000000 | 
 or_0 | 7c832b78 | r4=7fffffff r5=100000001 vscr=10000 xer=0 | r3=17fffffff | 
 or_1 | 7c832b78 | r4=ffff0000 r5=ffffffff80000000 vscr=10000 xer=20000000 | r3=ffffffffffff0000 | 
 or_2 | 7c832b78 | r4=2 r5=7 vscr=10000 xer=0 | r3=7 | 
@@ -407,12 +408,12 @@ or_7 | 7c832b78 | r4=80000000 r5=80000000 vscr=10000 xer=20000000 | r3=80000000 
 or_alias | 7c842b78 | r4=7fffffff r5=100000001 vscr=10000 xer=20000000 | r4=17fffffff | 
 or_rc_0 | 7c832b79 | r4=d1ea2fa4dd9af44c r5=80000000 vscr=10000 xer=0 | r3=d1ea2fa4dd9af44c cr=80000000 | 
 or_rc_1 | 7c832b79 | r4=fffffffffffffffe r5=7 vscr=10000 xer=0 | r3=ffffffffffffffff cr=80000000 | 
-or_rc_2 | 7c832b79 | r4=ffff0000 r5=80000000 vscr=10000 xer=0 | r3=ffff0000 cr=40000000 | 
+or_rc_2 | 7c832b79 | r4=ffff0000 r5=80000000 vscr=10000 xer=0 | r3=ffff0000 cr=80000000 | 
 or_rc_3 | 7c832b79 | r4=959ef8713231c2ca r5=ffffffff80000000 vscr=10000 xer=0 | r3=ffffffffb231c2ca cr=80000000 | 
 or_rc_4 | 7c832b79 | r4=ffffffff80000000 r5=8000000000000000 vscr=10000 xer=20000000 | r3=ffffffff80000000 cr=80000000 | 
-or_rc_5 | 7c832b79 | r4=daeb8ebd244a330c r5=1 vscr=10000 xer=20000000 | r3=daeb8ebd244a330d cr=80000000 | 
-or_rc_6 | 7c832b79 | r4=7fffffffffffffff r5=1 vscr=10000 xer=0 | r3=7fffffffffffffff cr=40000000 | 
-or_rc_7 | 7c832b79 | r4=80000000 r5=80000000 vscr=10000 xer=20000000 | r3=80000000 cr=40000000 | 
+or_rc_5 | 7c832b79 | r4=daeb8ebd244a330c r5=1 vscr=10000 xer=20000000 | r3=daeb8ebd244a330d cr=40000000 | 
+or_rc_6 | 7c832b79 | r4=7fffffffffffffff r5=1 vscr=10000 xer=0 | r3=7fffffffffffffff cr=80000000 | 
+or_rc_7 | 7c832b79 | r4=80000000 r5=80000000 vscr=10000 xer=20000000 | r3=80000000 cr=80000000 | 
 or_rc_alias | 7c842b79 | r4=d1ea2fa4dd9af44c r5=80000000 vscr=10000 xer=20000000 | cr=80000000 | 
 orc_0 | 7c832b38 | r4=fffffffffffffffe r5=80000000 vscr=10000 xer=20000000 | r3=ffffffffffffffff | 
 orc_1 | 7c832b38 | r4=7 r5=7 vscr=10000 xer=0 | r3=ffffffffffffffff | 
@@ -423,7 +424,7 @@ orc_5 | 7c832b38 | r4=123456789abcdef0 r5=daeb8ebd244a330c vscr=10000 xer=0 | r3
 orc_6 | 7c832b38 | r4=7fffffffffffffff r5=1 vscr=10000 xer=20000000 | r3=ffffffffffffffff | 
 orc_7 | 7c832b38 | r4=80000000 r5=80000000 vscr=10000 xer=20000000 | r3=ffffffffffffffff | 
 orc_alias | 7c842b38 | r4=fffffffffffffffe r5=80000000 vscr=10000 xer=20000000 | r4=ffffffffffffffff | 
-orc_rc_0 | 7c832b39 | r4=daeb8ebd244a330c r5=d1ea2fa4dd9af44c vscr=10000 xer=0 | r3=feffdeff266f3bbf cr=80000000 | 
+orc_rc_0 | 7c832b39 | r4=daeb8ebd244a330c r5=d1ea2fa4dd9af44c vscr=10000 xer=0 | r3=feffdeff266f3bbf cr=40000000 | 
 orc_rc_1 | 7c832b39 | r4=d1ea2fa4dd9af44c r5=a402cba4 vscr=10000 xer=0 | r3=ffffffffdffff45f cr=80000000 | 
 orc_rc_2 | 7c832b39 | r4=100000001 r5=100000001 vscr=10000 xer=0 | r3=ffffffffffffffff cr=80000000 | 
 orc_rc_3 | 7c832b39 | r4=1 r5=1 vscr=10000 xer=0 | r3=ffffffffffffffff cr=80000000 | 
@@ -431,7 +432,7 @@ orc_rc_4 | 7c832b39 | r4=fffffffffffffffe r5=7fffffffffffffff vscr=10000 xer=0 |
 orc_rc_5 | 7c832b39 | r4=8000000000000000 r5=959ef8713231c2ca vscr=10000 xer=0 | r3=ea61078ecdce3d35 cr=80000000 | 
 orc_rc_6 | 7c832b39 | r4=7fffffffffffffff r5=1 vscr=10000 xer=0 | r3=ffffffffffffffff cr=80000000 | 
 orc_rc_7 | 7c832b39 | r4=80000000 r5=80000000 vscr=10000 xer=20000000 | r3=ffffffffffffffff cr=80000000 | 
-orc_rc_alias | 7c842b39 | r4=daeb8ebd244a330c r5=d1ea2fa4dd9af44c vscr=10000 xer=20000000 | r4=feffdeff266f3bbf cr=80000000 | 
+orc_rc_alias | 7c842b39 | r4=daeb8ebd244a330c r5=d1ea2fa4dd9af44c vscr=10000 xer=20000000 | r4=feffdeff266f3bbf cr=40000000 | 
 xor_0 | 7c832a78 | r4=7fffffffffffffff r5=7fffffff vscr=10000 xer=20000000 | r3=7fffffff80000000 | 
 xor_1 | 7c832a78 | r4=d1ea2fa4dd9af44c r5=fedcba9876543210 vscr=10000 xer=20000000 | r3=2f36953cabcec65c | 
 xor_2 | 7c832a78 | r4=2 r5=2 vscr=10000 xer=0 |  | 
@@ -441,15 +442,15 @@ xor_5 | 7c832a78 | r4=123456789abcdef0 r5=80000000 vscr=10000 xer=20000000 | r3=
 xor_6 | 7c832a78 | r4=7fffffffffffffff r5=1 vscr=10000 xer=20000000 | r3=7ffffffffffffffe | 
 xor_7 | 7c832a78 | r4=80000000 r5=80000000 vscr=10000 xer=0 |  | 
 xor_alias | 7c842a78 | r4=7fffffffffffffff r5=7fffffff vscr=10000 xer=20000000 | r4=7fffffff80000000 | 
-xor_rc_0 | 7c832a79 | r4=100000000 r5=a402cba4 vscr=10000 xer=0 | r3=1a402cba4 cr=40000000 | 
-xor_rc_1 | 7c832a79 | r4=fffffffffffffffe r5=ffffffff vscr=10000 xer=20000000 | r3=ffffffff00000001 cr=80000000 | 
-xor_rc_2 | 7c832a79 | r4=80000000 r5=7fffffff vscr=10000 xer=20000000 | r3=ffffffff cr=40000000 | 
+xor_rc_0 | 7c832a79 | r4=100000000 r5=a402cba4 vscr=10000 xer=0 | r3=1a402cba4 cr=80000000 | 
+xor_rc_1 | 7c832a79 | r4=fffffffffffffffe r5=ffffffff vscr=10000 xer=20000000 | r3=ffffffff00000001 cr=40000000 | 
+xor_rc_2 | 7c832a79 | r4=80000000 r5=7fffffff vscr=10000 xer=20000000 | r3=ffffffff cr=80000000 | 
 xor_rc_3 | 7c832a79 | r4=8000000000000000 r5=fedcba9876543210 vscr=10000 xer=20000000 | r3=7edcba9876543210 cr=40000000 | 
-xor_rc_4 | 7c832a79 | r4=ffffffff r5=100000000 vscr=10000 xer=0 | r3=1ffffffff cr=40000000 | 
-xor_rc_5 | 7c832a79 | r4=80000000 r5=7 vscr=10000 xer=20000000 | r3=80000007 cr=40000000 | 
-xor_rc_6 | 7c832a79 | r4=7fffffffffffffff r5=1 vscr=10000 xer=20000000 | r3=7ffffffffffffffe cr=40000000 | 
+xor_rc_4 | 7c832a79 | r4=ffffffff r5=100000000 vscr=10000 xer=0 | r3=1ffffffff cr=80000000 | 
+xor_rc_5 | 7c832a79 | r4=80000000 r5=7 vscr=10000 xer=20000000 | r3=80000007 cr=80000000 | 
+xor_rc_6 | 7c832a79 | r4=7fffffffffffffff r5=1 vscr=10000 xer=20000000 | r3=7ffffffffffffffe cr=80000000 | 
 xor_rc_7 | 7c832a79 | r4=80000000 r5=80000000 vscr=10000 xer=20000000 | cr=20000000 | 
-xor_rc_alias | 7c842a79 | r4=100000000 r5=a402cba4 vscr=10000 xer=20000000 | r4=1a402cba4 cr=40000000 | 
+xor_rc_alias | 7c842a79 | r4=100000000 r5=a402cba4 vscr=10000 xer=20000000 | r4=1a402cba4 cr=80000000 | 
 nor_0 | 7c8328f8 | r4=685bd8519d0023db r5=8000000000000000 vscr=10000 xer=0 | r3=17a427ae62ffdc24 | 
 nor_1 | 7c8328f8 | r4=100000001 r5=d1ea2fa4dd9af44c vscr=10000 xer=0 | r3=2e15d05a22650bb2 | 
 nor_2 | 7c8328f8 | r4=959ef8713231c2ca r5=100000000 vscr=10000 xer=0 | r3=6a61078ecdce3d35 | 
@@ -460,13 +461,13 @@ nor_6 | 7c8328f8 | r4=7fffffffffffffff r5=1 vscr=10000 xer=20000000 | r3=8000000
 nor_7 | 7c8328f8 | r4=80000000 r5=80000000 vscr=10000 xer=0 | r3=ffffffff7fffffff | 
 nor_alias | 7c8428f8 | r4=685bd8519d0023db r5=8000000000000000 vscr=10000 xer=20000000 | r4=17a427ae62ffdc24 | 
 nor_rc_0 | 7c8328f9 | r4=7fffffffffffffff r5=daeb8ebd244a330c vscr=10000 xer=20000000 | cr=20000000 | 
-nor_rc_1 | 7c8328f9 | r4=7fffffffffffffff r5=0 vscr=10000 xer=0 | r3=8000000000000000 cr=80000000 | 
+nor_rc_1 | 7c8328f9 | r4=7fffffffffffffff r5=0 vscr=10000 xer=0 | r3=8000000000000000 cr=20000000 | 
 nor_rc_2 | 7c8328f9 | r4=fffffffffffffffe r5=1 vscr=10000 xer=20000000 | cr=20000000 | 
-nor_rc_3 | 7c8328f9 | r4=7fffffffffffffff r5=685bd8519d0023db vscr=10000 xer=0 | r3=8000000000000000 cr=80000000 | 
-nor_rc_4 | 7c8328f9 | r4=100000001 r5=7fffffffffffffff vscr=10000 xer=0 | r3=8000000000000000 cr=80000000 | 
+nor_rc_3 | 7c8328f9 | r4=7fffffffffffffff r5=685bd8519d0023db vscr=10000 xer=0 | r3=8000000000000000 cr=20000000 | 
+nor_rc_4 | 7c8328f9 | r4=100000001 r5=7fffffffffffffff vscr=10000 xer=0 | r3=8000000000000000 cr=20000000 | 
 nor_rc_5 | 7c8328f9 | r4=ffffffffffffffff r5=7fffffff vscr=10000 xer=20000000 | cr=20000000 | 
-nor_rc_6 | 7c8328f9 | r4=7fffffffffffffff r5=1 vscr=10000 xer=0 | r3=8000000000000000 cr=80000000 | 
-nor_rc_7 | 7c8328f9 | r4=80000000 r5=80000000 vscr=10000 xer=20000000 | r3=ffffffff7fffffff cr=80000000 | 
+nor_rc_6 | 7c8328f9 | r4=7fffffffffffffff r5=1 vscr=10000 xer=0 | r3=8000000000000000 cr=20000000 | 
+nor_rc_7 | 7c8328f9 | r4=80000000 r5=80000000 vscr=10000 xer=20000000 | r3=ffffffff7fffffff cr=40000000 | 
 nor_rc_alias | 7c8428f9 | r4=7fffffffffffffff r5=daeb8ebd244a330c vscr=10000 xer=20000000 | r4=0 cr=20000000 | 
 nand_0 | 7c832bb8 | r4=fffffffffffffffe r5=0 vscr=10000 xer=0 | r3=ffffffffffffffff | 
 nand_1 | 7c832bb8 | r4=ffff0000 r5=959ef8713231c2ca vscr=10000 xer=0 | r3=ffffffffcdceffff | 
@@ -478,13 +479,13 @@ nand_6 | 7c832bb8 | r4=7fffffffffffffff r5=1 vscr=10000 xer=20000000 | r3=ffffff
 nand_7 | 7c832bb8 | r4=80000000 r5=80000000 vscr=10000 xer=0 | r3=ffffffff7fffffff | 
 nand_alias | 7c842bb8 | r4=fffffffffffffffe r5=0 vscr=10000 xer=20000000 | r4=ffffffffffffffff | 
 nand_rc_0 | 7c832bb9 | r4=7 r5=8000000000000000 vscr=10000 xer=0 | r3=ffffffffffffffff cr=80000000 | 
-nand_rc_1 | 7c832bb9 | r4=685bd8519d0023db r5=fffffffffffffffe vscr=10000 xer=0 | r3=97a427ae62ffdc25 cr=80000000 | 
+nand_rc_1 | 7c832bb9 | r4=685bd8519d0023db r5=fffffffffffffffe vscr=10000 xer=0 | r3=97a427ae62ffdc25 cr=40000000 | 
 nand_rc_2 | 7c832bb9 | r4=1 r5=100000000 vscr=10000 xer=0 | r3=ffffffffffffffff cr=80000000 | 
-nand_rc_3 | 7c832bb9 | r4=a402cba4 r5=123456789abcdef0 vscr=10000 xer=20000000 | r3=ffffffff7fff355f cr=80000000 | 
-nand_rc_4 | 7c832bb9 | r4=123456789abcdef0 r5=7fffffffffffffff vscr=10000 xer=0 | r3=edcba9876543210f cr=80000000 | 
+nand_rc_3 | 7c832bb9 | r4=a402cba4 r5=123456789abcdef0 vscr=10000 xer=20000000 | r3=ffffffff7fff355f cr=40000000 | 
+nand_rc_4 | 7c832bb9 | r4=123456789abcdef0 r5=7fffffffffffffff vscr=10000 xer=0 | r3=edcba9876543210f cr=40000000 | 
 nand_rc_5 | 7c832bb9 | r4=daeb8ebd244a330c r5=100000000 vscr=10000 xer=0 | r3=fffffffeffffffff cr=80000000 | 
 nand_rc_6 | 7c832bb9 | r4=7fffffffffffffff r5=1 vscr=10000 xer=20000000 | r3=fffffffffffffffe cr=80000000 | 
-nand_rc_7 | 7c832bb9 | r4=80000000 r5=80000000 vscr=10000 xer=0 | r3=ffffffff7fffffff cr=80000000 | 
+nand_rc_7 | 7c832bb9 | r4=80000000 r5=80000000 vscr=10000 xer=0 | r3=ffffffff7fffffff cr=40000000 | 
 nand_rc_alias | 7c842bb9 | r4=7 r5=8000000000000000 vscr=10000 xer=20000000 | r4=ffffffffffffffff cr=80000000 | 
 eqv_0 | 7c832a38 | r4=7fffffff r5=7 vscr=10000 xer=20000000 | r3=ffffffff80000007 | 
 eqv_1 | 7c832a38 | r4=123456789abcdef0 r5=100000001 vscr=10000 xer=0 | r3=edcba9866543210e | 
@@ -496,12 +497,12 @@ eqv_6 | 7c832a38 | r4=7fffffffffffffff r5=1 vscr=10000 xer=20000000 | r3=8000000
 eqv_7 | 7c832a38 | r4=80000000 r5=80000000 vscr=10000 xer=0 | r3=ffffffffffffffff | 
 eqv_alias | 7c842a38 | r4=7fffffff r5=7 vscr=10000 xer=20000000 | r4=ffffffff80000007 | 
 eqv_rc_0 | 7c832a39 | r4=ffffffff r5=80000000 vscr=10000 xer=0 | r3=ffffffff80000000 cr=80000000 | 
-eqv_rc_1 | 7c832a39 | r4=959ef8713231c2ca r5=0 vscr=10000 xer=0 | r3=6a61078ecdce3d35 cr=40000000 | 
+eqv_rc_1 | 7c832a39 | r4=959ef8713231c2ca r5=0 vscr=10000 xer=0 | r3=6a61078ecdce3d35 cr=80000000 | 
 eqv_rc_2 | 7c832a39 | r4=2 r5=1 vscr=10000 xer=0 | r3=fffffffffffffffc cr=80000000 | 
-eqv_rc_3 | 7c832a39 | r4=0 r5=ffffffff vscr=10000 xer=0 | r3=ffffffff00000000 cr=80000000 | 
+eqv_rc_3 | 7c832a39 | r4=0 r5=ffffffff vscr=10000 xer=0 | r3=ffffffff00000000 cr=20000000 | 
 eqv_rc_4 | 7c832a39 | r4=fffffffffffffffe r5=0 vscr=10000 xer=20000000 | r3=1 cr=40000000 | 
 eqv_rc_5 | 7c832a39 | r4=959ef8713231c2ca r5=123456789abcdef0 vscr=10000 xer=20000000 | r3=785551f65772e3c5 cr=40000000 | 
-eqv_rc_6 | 7c832a39 | r4=7fffffffffffffff r5=1 vscr=10000 xer=20000000 | r3=8000000000000001 cr=80000000 | 
+eqv_rc_6 | 7c832a39 | r4=7fffffffffffffff r5=1 vscr=10000 xer=20000000 | r3=8000000000000001 cr=40000000 | 
 eqv_rc_7 | 7c832a39 | r4=80000000 r5=80000000 vscr=10000 xer=20000000 | r3=ffffffffffffffff cr=80000000 | 
 eqv_rc_alias | 7c842a39 | r4=ffffffff r5=80000000 vscr=10000 xer=20000000 | r4=ffffffff80000000 cr=80000000 | 
 addze_0 | 7c640194 | r4=0 vscr=10000 xer=0 |  | 
@@ -513,9 +514,9 @@ addze_5 | 7c640194 | r4=3c733ae58b513730 vscr=10000 xer=20000000 | r3=3c733ae58b
 addze_rc_0 | 7c640195 | r4=0 vscr=10000 xer=0 | cr=20000000 | 
 addze_rc_1 | 7c640195 | r4=1 vscr=10000 xer=20000000 | r3=2 cr=40000000 xer=0 | 
 addze_rc_2 | 7c640195 | r4=ffffffffffffffff vscr=10000 xer=0 | r3=ffffffffffffffff cr=80000000 | 
-addze_rc_3 | 7c640195 | r4=7fffffffffffffff vscr=10000 xer=20000000 | r3=8000000000000000 cr=80000000 xer=0 | 
-addze_rc_4 | 7c640195 | r4=8000000000000000 vscr=10000 xer=0 | r3=8000000000000000 cr=80000000 | 
-addze_rc_5 | 7c640195 | r4=b37442f95df4f7d9 vscr=10000 xer=20000000 | r3=b37442f95df4f7da cr=80000000 xer=0 | 
+addze_rc_3 | 7c640195 | r4=7fffffffffffffff vscr=10000 xer=20000000 | r3=8000000000000000 cr=20000000 xer=0 | 
+addze_rc_4 | 7c640195 | r4=8000000000000000 vscr=10000 xer=0 | r3=8000000000000000 cr=20000000 | 
+addze_rc_5 | 7c640195 | r4=b37442f95df4f7d9 vscr=10000 xer=20000000 | r3=b37442f95df4f7da cr=40000000 xer=0 | 
 addzeo_0 | 7c640594 | r4=0 vscr=10000 xer=0 |  | 
 addzeo_1 | 7c640594 | r4=1 vscr=10000 xer=20000000 | r3=2 xer=0 | 
 addzeo_2 | 7c640594 | r4=ffffffffffffffff vscr=10000 xer=0 | r3=ffffffffffffffff | 
@@ -525,9 +526,9 @@ addzeo_5 | 7c640594 | r4=22414603368a90db vscr=10000 xer=20000000 | r3=224146033
 addzeo_rc_0 | 7c640595 | r4=0 vscr=10000 xer=0 | cr=20000000 | 
 addzeo_rc_1 | 7c640595 | r4=1 vscr=10000 xer=20000000 | r3=2 cr=40000000 xer=0 | 
 addzeo_rc_2 | 7c640595 | r4=ffffffffffffffff vscr=10000 xer=0 | r3=ffffffffffffffff cr=80000000 | 
-addzeo_rc_3 | 7c640595 | r4=7fffffffffffffff vscr=10000 xer=20000000 | r3=8000000000000000 cr=90000000 xer=c0000000 | 
-addzeo_rc_4 | 7c640595 | r4=8000000000000000 vscr=10000 xer=0 | r3=8000000000000000 cr=80000000 | 
-addzeo_rc_5 | 7c640595 | r4=17abe053dbf89fa5 vscr=10000 xer=20000000 | r3=17abe053dbf89fa6 cr=40000000 xer=0 | 
+addzeo_rc_3 | 7c640595 | r4=7fffffffffffffff vscr=10000 xer=20000000 | r3=8000000000000000 cr=30000000 xer=c0000000 | 
+addzeo_rc_4 | 7c640595 | r4=8000000000000000 vscr=10000 xer=0 | r3=8000000000000000 cr=20000000 | 
+addzeo_rc_5 | 7c640595 | r4=17abe053dbf89fa5 vscr=10000 xer=20000000 | r3=17abe053dbf89fa6 cr=80000000 xer=0 | 
 addme_0 | 7c6401d4 | r4=0 vscr=10000 xer=0 | r3=ffffffffffffffff | 
 addme_1 | 7c6401d4 | r4=1 vscr=10000 xer=20000000 | r3=1 | 
 addme_2 | 7c6401d4 | r4=ffffffffffffffff vscr=10000 xer=0 | r3=fffffffffffffffe xer=20000000 | 
@@ -537,9 +538,9 @@ addme_5 | 7c6401d4 | r4=a1e1b316614ce456 vscr=10000 xer=20000000 | r3=a1e1b31661
 addme_rc_0 | 7c6401d5 | r4=0 vscr=10000 xer=0 | r3=ffffffffffffffff cr=80000000 | 
 addme_rc_1 | 7c6401d5 | r4=1 vscr=10000 xer=20000000 | r3=1 cr=40000000 | 
 addme_rc_2 | 7c6401d5 | r4=ffffffffffffffff vscr=10000 xer=0 | r3=fffffffffffffffe cr=80000000 xer=20000000 | 
-addme_rc_3 | 7c6401d5 | r4=7fffffffffffffff vscr=10000 xer=20000000 | r3=7fffffffffffffff cr=40000000 | 
-addme_rc_4 | 7c6401d5 | r4=8000000000000000 vscr=10000 xer=0 | r3=7fffffffffffffff cr=40000000 xer=20000000 | 
-addme_rc_5 | 7c6401d5 | r4=b2b0b65e33ea9e92 vscr=10000 xer=20000000 | r3=b2b0b65e33ea9e92 cr=80000000 | 
+addme_rc_3 | 7c6401d5 | r4=7fffffffffffffff vscr=10000 xer=20000000 | r3=7fffffffffffffff cr=80000000 | 
+addme_rc_4 | 7c6401d5 | r4=8000000000000000 vscr=10000 xer=0 | r3=7fffffffffffffff cr=80000000 xer=20000000 | 
+addme_rc_5 | 7c6401d5 | r4=b2b0b65e33ea9e92 vscr=10000 xer=20000000 | r3=b2b0b65e33ea9e92 cr=40000000 | 
 addmeo_0 | 7c6405d4 | r4=0 vscr=10000 xer=0 | r3=ffffffffffffffff | 
 addmeo_1 | 7c6405d4 | r4=1 vscr=10000 xer=20000000 | r3=1 | 
 addmeo_2 | 7c6405d4 | r4=ffffffffffffffff vscr=10000 xer=0 | r3=fffffffffffffffe xer=20000000 | 
@@ -549,8 +550,8 @@ addmeo_5 | 7c6405d4 | r4=c25a431cf7a354fd vscr=10000 xer=20000000 | r3=c25a431cf
 addmeo_rc_0 | 7c6405d5 | r4=0 vscr=10000 xer=0 | r3=ffffffffffffffff cr=80000000 | 
 addmeo_rc_1 | 7c6405d5 | r4=1 vscr=10000 xer=20000000 | r3=1 cr=40000000 | 
 addmeo_rc_2 | 7c6405d5 | r4=ffffffffffffffff vscr=10000 xer=0 | r3=fffffffffffffffe cr=80000000 xer=20000000 | 
-addmeo_rc_3 | 7c6405d5 | r4=7fffffffffffffff vscr=10000 xer=20000000 | r3=7fffffffffffffff cr=40000000 | 
-addmeo_rc_4 | 7c6405d5 | r4=8000000000000000 vscr=10000 xer=0 | r3=7fffffffffffffff cr=50000000 xer=e0000000 | 
+addmeo_rc_3 | 7c6405d5 | r4=7fffffffffffffff vscr=10000 xer=20000000 | r3=7fffffffffffffff cr=80000000 | 
+addmeo_rc_4 | 7c6405d5 | r4=8000000000000000 vscr=10000 xer=0 | r3=7fffffffffffffff cr=90000000 xer=e0000000 | 
 addmeo_rc_5 | 7c6405d5 | r4=399952364906aa78 vscr=10000 xer=20000000 | r3=399952364906aa78 cr=40000000 | 
 subfze_0 | 7c640190 | r4=0 vscr=10000 xer=0 | r3=ffffffffffffffff | 
 subfze_1 | 7c640190 | r4=1 vscr=10000 xer=20000000 | r3=ffffffffffffffff xer=0 | 
@@ -561,8 +562,8 @@ subfze_5 | 7c640190 | r4=730091fce20521ba vscr=10000 xer=20000000 | r3=8cff6e031
 subfze_rc_0 | 7c640191 | r4=0 vscr=10000 xer=0 | r3=ffffffffffffffff cr=80000000 | 
 subfze_rc_1 | 7c640191 | r4=1 vscr=10000 xer=20000000 | r3=ffffffffffffffff cr=80000000 xer=0 | 
 subfze_rc_2 | 7c640191 | r4=ffffffffffffffff vscr=10000 xer=0 | cr=20000000 | 
-subfze_rc_3 | 7c640191 | r4=7fffffffffffffff vscr=10000 xer=20000000 | r3=8000000000000001 cr=80000000 xer=0 | 
-subfze_rc_4 | 7c640191 | r4=8000000000000000 vscr=10000 xer=0 | r3=7fffffffffffffff cr=40000000 | 
+subfze_rc_3 | 7c640191 | r4=7fffffffffffffff vscr=10000 xer=20000000 | r3=8000000000000001 cr=40000000 xer=0 | 
+subfze_rc_4 | 7c640191 | r4=8000000000000000 vscr=10000 xer=0 | r3=7fffffffffffffff cr=80000000 | 
 subfze_rc_5 | 7c640191 | r4=9eda3005704ea9e vscr=10000 xer=20000000 | r3=f6125cffa8fb1562 cr=80000000 xer=0 | 
 subfzeo_0 | 7c640590 | r4=0 vscr=10000 xer=0 | r3=ffffffffffffffff | 
 subfzeo_1 | 7c640590 | r4=1 vscr=10000 xer=20000000 | r3=ffffffffffffffff xer=0 | 
@@ -573,8 +574,8 @@ subfzeo_5 | 7c640590 | r4=9e3db18f9336936b vscr=10000 xer=20000000 | r3=61c24e70
 subfzeo_rc_0 | 7c640591 | r4=0 vscr=10000 xer=0 | r3=ffffffffffffffff cr=80000000 | 
 subfzeo_rc_1 | 7c640591 | r4=1 vscr=10000 xer=20000000 | r3=ffffffffffffffff cr=80000000 xer=0 | 
 subfzeo_rc_2 | 7c640591 | r4=ffffffffffffffff vscr=10000 xer=0 | cr=20000000 | 
-subfzeo_rc_3 | 7c640591 | r4=7fffffffffffffff vscr=10000 xer=20000000 | r3=8000000000000001 cr=80000000 xer=0 | 
-subfzeo_rc_4 | 7c640591 | r4=8000000000000000 vscr=10000 xer=0 | r3=7fffffffffffffff cr=40000000 | 
+subfzeo_rc_3 | 7c640591 | r4=7fffffffffffffff vscr=10000 xer=20000000 | r3=8000000000000001 cr=40000000 xer=0 | 
+subfzeo_rc_4 | 7c640591 | r4=8000000000000000 vscr=10000 xer=0 | r3=7fffffffffffffff cr=80000000 | 
 subfzeo_rc_5 | 7c640591 | r4=e45e68a5e7275996 vscr=10000 xer=20000000 | r3=1ba1975a18d8a66a cr=40000000 xer=0 | 
 subfme_0 | 7c6401d0 | r4=0 vscr=10000 xer=0 | r3=fffffffffffffffe xer=20000000 | 
 subfme_1 | 7c6401d0 | r4=1 vscr=10000 xer=20000000 | r3=fffffffffffffffe | 
@@ -585,9 +586,9 @@ subfme_5 | 7c6401d0 | r4=af6fa91810b41c09 vscr=10000 xer=20000000 | r3=509056e7e
 subfme_rc_0 | 7c6401d1 | r4=0 vscr=10000 xer=0 | r3=fffffffffffffffe cr=80000000 xer=20000000 | 
 subfme_rc_1 | 7c6401d1 | r4=1 vscr=10000 xer=20000000 | r3=fffffffffffffffe cr=80000000 | 
 subfme_rc_2 | 7c6401d1 | r4=ffffffffffffffff vscr=10000 xer=0 | r3=ffffffffffffffff cr=80000000 | 
-subfme_rc_3 | 7c6401d1 | r4=7fffffffffffffff vscr=10000 xer=20000000 | r3=8000000000000000 cr=80000000 | 
-subfme_rc_4 | 7c6401d1 | r4=8000000000000000 vscr=10000 xer=0 | r3=7ffffffffffffffe cr=40000000 xer=20000000 | 
-subfme_rc_5 | 7c6401d1 | r4=77c4ca2a93f3b32 vscr=10000 xer=20000000 | r3=f883b35d56c0c4cd cr=80000000 | 
+subfme_rc_3 | 7c6401d1 | r4=7fffffffffffffff vscr=10000 xer=20000000 | r3=8000000000000000 cr=20000000 | 
+subfme_rc_4 | 7c6401d1 | r4=8000000000000000 vscr=10000 xer=0 | r3=7ffffffffffffffe cr=80000000 xer=20000000 | 
+subfme_rc_5 | 7c6401d1 | r4=77c4ca2a93f3b32 vscr=10000 xer=20000000 | r3=f883b35d56c0c4cd cr=40000000 | 
 subfmeo_0 | 7c6405d0 | r4=0 vscr=10000 xer=0 | r3=fffffffffffffffe xer=20000000 | 
 subfmeo_1 | 7c6405d0 | r4=1 vscr=10000 xer=20000000 | r3=fffffffffffffffe | 
 subfmeo_2 | 7c6405d0 | r4=ffffffffffffffff vscr=10000 xer=0 | r3=ffffffffffffffff | 
@@ -597,8 +598,8 @@ subfmeo_5 | 7c6405d0 | r4=6855645aa43d4afe vscr=10000 xer=20000000 | r3=97aa9ba5
 subfmeo_rc_0 | 7c6405d1 | r4=0 vscr=10000 xer=0 | r3=fffffffffffffffe cr=80000000 xer=20000000 | 
 subfmeo_rc_1 | 7c6405d1 | r4=1 vscr=10000 xer=20000000 | r3=fffffffffffffffe cr=80000000 | 
 subfmeo_rc_2 | 7c6405d1 | r4=ffffffffffffffff vscr=10000 xer=0 | r3=ffffffffffffffff cr=80000000 | 
-subfmeo_rc_3 | 7c6405d1 | r4=7fffffffffffffff vscr=10000 xer=20000000 | r3=8000000000000000 cr=80000000 | 
-subfmeo_rc_4 | 7c6405d1 | r4=8000000000000000 vscr=10000 xer=0 | r3=7ffffffffffffffe cr=40000000 xer=20000000 | 
+subfmeo_rc_3 | 7c6405d1 | r4=7fffffffffffffff vscr=10000 xer=20000000 | r3=8000000000000000 cr=20000000 | 
+subfmeo_rc_4 | 7c6405d1 | r4=8000000000000000 vscr=10000 xer=0 | r3=7ffffffffffffffe cr=80000000 xer=20000000 | 
 subfmeo_rc_5 | 7c6405d1 | r4=bc336cb1d06308d8 vscr=10000 xer=20000000 | r3=43cc934e2f9cf727 cr=40000000 | 
 neg_0 | 7c6400d0 | r4=0 vscr=10000 xer=0 |  | 
 neg_1 | 7c6400d0 | r4=1 vscr=10000 xer=20000000 | r3=ffffffffffffffff | 
@@ -609,9 +610,9 @@ neg_5 | 7c6400d0 | r4=4188209e49483d3d vscr=10000 xer=20000000 | r3=be77df61b6b7
 neg_rc_0 | 7c6400d1 | r4=0 vscr=10000 xer=0 | cr=20000000 | 
 neg_rc_1 | 7c6400d1 | r4=1 vscr=10000 xer=20000000 | r3=ffffffffffffffff cr=80000000 | 
 neg_rc_2 | 7c6400d1 | r4=ffffffffffffffff vscr=10000 xer=0 | r3=1 cr=40000000 | 
-neg_rc_3 | 7c6400d1 | r4=7fffffffffffffff vscr=10000 xer=20000000 | r3=8000000000000001 cr=80000000 | 
-neg_rc_4 | 7c6400d1 | r4=8000000000000000 vscr=10000 xer=0 | r3=8000000000000000 cr=80000000 | 
-neg_rc_5 | 7c6400d1 | r4=e3260d92289b6f1c vscr=10000 xer=20000000 | r3=1cd9f26dd76490e4 cr=40000000 | 
+neg_rc_3 | 7c6400d1 | r4=7fffffffffffffff vscr=10000 xer=20000000 | r3=8000000000000001 cr=40000000 | 
+neg_rc_4 | 7c6400d1 | r4=8000000000000000 vscr=10000 xer=0 | r3=8000000000000000 cr=20000000 | 
+neg_rc_5 | 7c6400d1 | r4=e3260d92289b6f1c vscr=10000 xer=20000000 | r3=1cd9f26dd76490e4 cr=80000000 | 
 nego_0 | 7c6404d0 | r4=0 vscr=10000 xer=0 |  | 
 nego_1 | 7c6404d0 | r4=1 vscr=10000 xer=20000000 | r3=ffffffffffffffff | 
 nego_2 | 7c6404d0 | r4=ffffffffffffffff vscr=10000 xer=0 | r3=1 | 
@@ -621,9 +622,9 @@ nego_5 | 7c6404d0 | r4=cd6cd70e3a27018d vscr=10000 xer=20000000 | r3=329328f1c5d
 nego_rc_0 | 7c6404d1 | r4=0 vscr=10000 xer=0 | cr=20000000 | 
 nego_rc_1 | 7c6404d1 | r4=1 vscr=10000 xer=20000000 | r3=ffffffffffffffff cr=80000000 | 
 nego_rc_2 | 7c6404d1 | r4=ffffffffffffffff vscr=10000 xer=0 | r3=1 cr=40000000 | 
-nego_rc_3 | 7c6404d1 | r4=7fffffffffffffff vscr=10000 xer=20000000 | r3=8000000000000001 cr=80000000 | 
-nego_rc_4 | 7c6404d1 | r4=8000000000000000 vscr=10000 xer=0 | r3=8000000000000000 cr=90000000 xer=c0000000 | 
-nego_rc_5 | 7c6404d1 | r4=17e11083e9250200 vscr=10000 xer=20000000 | r3=e81eef7c16dafe00 cr=80000000 | 
+nego_rc_3 | 7c6404d1 | r4=7fffffffffffffff vscr=10000 xer=20000000 | r3=8000000000000001 cr=40000000 | 
+nego_rc_4 | 7c6404d1 | r4=8000000000000000 vscr=10000 xer=0 | r3=8000000000000000 cr=30000000 xer=c0000000 | 
+nego_rc_5 | 7c6404d1 | r4=17e11083e9250200 vscr=10000 xer=20000000 | r3=e81eef7c16dafe00 cr=40000000 | 
 divw_0 | 7c642bd6 | r4=64 r5=7 vscr=10000 | r3=e | 
 divw_1 | 7c642bd6 | r4=ffffffffffffff9c r5=7 vscr=10000 | r3=fffffff2 | 
 divw_2 | 7c642bd6 | r4=80000000 r5=3 vscr=10000 | r3=d5555556 | 
@@ -631,10 +632,10 @@ divw_3 | 7c642bd6 | r4=7 r5=ffffffffffffffff vscr=10000 | r3=fffffff9 |
 divw_4 | 7c642bd6 | r4=123456789abcdef0 r5=1234 vscr=10000 | r3=fffa6fe6 | 
 divw_5 | 7c642bd6 | r4=5 r5=100000003 vscr=10000 | r3=1 | 
 divw_rc_0 | 7c642bd7 | r4=64 r5=7 vscr=10000 | r3=e cr=40000000 | 
-divw_rc_1 | 7c642bd7 | r4=ffffffffffffff9c r5=7 vscr=10000 | r3=fffffff2 cr=40000000 | 
-divw_rc_2 | 7c642bd7 | r4=80000000 r5=3 vscr=10000 | r3=d5555556 cr=40000000 | 
-divw_rc_3 | 7c642bd7 | r4=7 r5=ffffffffffffffff vscr=10000 | r3=fffffff9 cr=40000000 | 
-divw_rc_4 | 7c642bd7 | r4=123456789abcdef0 r5=1234 vscr=10000 | r3=fffa6fe6 cr=40000000 | 
+divw_rc_1 | 7c642bd7 | r4=ffffffffffffff9c r5=7 vscr=10000 | r3=fffffff2 cr=80000000 | 
+divw_rc_2 | 7c642bd7 | r4=80000000 r5=3 vscr=10000 | r3=d5555556 cr=80000000 | 
+divw_rc_3 | 7c642bd7 | r4=7 r5=ffffffffffffffff vscr=10000 | r3=fffffff9 cr=80000000 | 
+divw_rc_4 | 7c642bd7 | r4=123456789abcdef0 r5=1234 vscr=10000 | r3=fffa6fe6 cr=80000000 | 
 divw_rc_5 | 7c642bd7 | r4=5 r5=100000003 vscr=10000 | r3=1 cr=40000000 | 
 divwo_0 | 7c642fd6 | r4=64 r5=7 vscr=10000 | r3=e | 
 divwo_1 | 7c642fd6 | r4=ffffffffffffff9c r5=7 vscr=10000 | r3=fffffff2 | 
@@ -643,10 +644,10 @@ divwo_3 | 7c642fd6 | r4=7 r5=ffffffffffffffff vscr=10000 | r3=fffffff9 |
 divwo_4 | 7c642fd6 | r4=123456789abcdef0 r5=1234 vscr=10000 | r3=fffa6fe6 | 
 divwo_5 | 7c642fd6 | r4=5 r5=100000003 vscr=10000 | r3=1 | 
 divwo_rc_0 | 7c642fd7 | r4=64 r5=7 vscr=10000 | r3=e cr=40000000 | 
-divwo_rc_1 | 7c642fd7 | r4=ffffffffffffff9c r5=7 vscr=10000 | r3=fffffff2 cr=40000000 | 
-divwo_rc_2 | 7c642fd7 | r4=80000000 r5=3 vscr=10000 | r3=d5555556 cr=40000000 | 
-divwo_rc_3 | 7c642fd7 | r4=7 r5=ffffffffffffffff vscr=10000 | r3=fffffff9 cr=40000000 | 
-divwo_rc_4 | 7c642fd7 | r4=123456789abcdef0 r5=1234 vscr=10000 | r3=fffa6fe6 cr=40000000 | 
+divwo_rc_1 | 7c642fd7 | r4=ffffffffffffff9c r5=7 vscr=10000 | r3=fffffff2 cr=80000000 | 
+divwo_rc_2 | 7c642fd7 | r4=80000000 r5=3 vscr=10000 | r3=d5555556 cr=80000000 | 
+divwo_rc_3 | 7c642fd7 | r4=7 r5=ffffffffffffffff vscr=10000 | r3=fffffff9 cr=80000000 | 
+divwo_rc_4 | 7c642fd7 | r4=123456789abcdef0 r5=1234 vscr=10000 | r3=fffa6fe6 cr=80000000 | 
 divwo_rc_5 | 7c642fd7 | r4=5 r5=100000003 vscr=10000 | r3=1 cr=40000000 | 
 divwu_0 | 7c642b96 | r4=64 r5=7 vscr=10000 | r3=e | 
 divwu_1 | 7c642b96 | r4=ffffffffffffff9c r5=7 vscr=10000 | r3=24924916 | 
@@ -739,7 +740,7 @@ cmpldi_0 | 2ba47fff | r4=1 vscr=10000 | cr=8 |
 addi_1 | 38647fff | r4=7fffffff vscr=10000 | r3=80007ffe | 
 addis_1 | 3c647fff | r4=7fffffff vscr=10000 | r3=fffeffff | 
 addic_1 | 30647fff | r4=7fffffff vscr=10000 | r3=80007ffe | 
-addic_rc_1 | 34647fff | r4=7fffffff vscr=10000 | r3=80007ffe cr=40000000 | 
+addic_rc_1 | 34647fff | r4=7fffffff vscr=10000 | r3=80007ffe cr=80000000 | 
 subfic_1 | 20647fff | r4=7fffffff vscr=10000 | r3=ffffffff80008000 | 
 mulli_1 | 1c647fff | r4=7fffffff vscr=10000 | r3=3fff7fff8001 | 
 andi_rc_1 | 70837fff | r4=7fffffff vscr=10000 | r3=7fff cr=40000000 | 
@@ -771,11 +772,11 @@ cmpldi_2 | 2ba40000 | r4=0 vscr=10000 | cr=2 |
 addi_3 | 38648000 | r4=a402cba4 vscr=10000 | r3=a4024ba4 | 
 addis_3 | 3c648000 | r4=a402cba4 vscr=10000 | r3=2402cba4 | 
 addic_3 | 30648000 | r4=a402cba4 vscr=10000 | r3=a4024ba4 xer=20000000 | 
-addic_rc_3 | 34648000 | r4=a402cba4 vscr=10000 | r3=a4024ba4 cr=40000000 xer=20000000 | 
+addic_rc_3 | 34648000 | r4=a402cba4 vscr=10000 | r3=a4024ba4 cr=80000000 xer=20000000 | 
 subfic_3 | 20648000 | r4=a402cba4 vscr=10000 | r3=ffffffff5bfcb45c xer=20000000 | 
 mulli_3 | 1c648000 | r4=a402cba4 vscr=10000 | r3=ffffadfe9a2e0000 | 
 andi_rc_3 | 70838000 | r4=a402cba4 vscr=10000 | r3=8000 cr=40000000 | 
-andis_rc_3 | 74838000 | r4=a402cba4 vscr=10000 | r3=80000000 cr=40000000 | 
+andis_rc_3 | 74838000 | r4=a402cba4 vscr=10000 | r3=80000000 cr=80000000 | 
 ori_3 | 60838000 | r4=a402cba4 vscr=10000 | r3=a402cba4 | 
 oris_3 | 64838000 | r4=a402cba4 vscr=10000 | r3=a402cba4 | 
 xori_3 | 68838000 | r4=a402cba4 vscr=10000 | r3=a4024ba4 | 
@@ -787,7 +788,7 @@ cmpldi_3 | 2ba48000 | r4=a402cba4 vscr=10000 | cr=4 |
 addi_4 | 38641234 | r4=7fffffff vscr=10000 | r3=80001233 | 
 addis_4 | 3c641234 | r4=7fffffff vscr=10000 | r3=9233ffff | 
 addic_4 | 30641234 | r4=7fffffff vscr=10000 | r3=80001233 | 
-addic_rc_4 | 34641234 | r4=7fffffff vscr=10000 | r3=80001233 cr=40000000 | 
+addic_rc_4 | 34641234 | r4=7fffffff vscr=10000 | r3=80001233 cr=80000000 | 
 subfic_4 | 20641234 | r4=7fffffff vscr=10000 | r3=ffffffff80001235 | 
 mulli_4 | 1c641234 | r4=7fffffff vscr=10000 | r3=919ffffedcc | 
 andi_rc_4 | 70831234 | r4=7fffffff vscr=10000 | r3=1234 cr=40000000 | 
@@ -819,7 +820,7 @@ cmpldi_5 | 2ba40000 | r4=7fffffff vscr=10000 | cr=4 |
 addi_6 | 38640000 | r4=80000000 vscr=10000 | r3=80000000 | 
 addis_6 | 3c640000 | r4=80000000 vscr=10000 | r3=80000000 | 
 addic_6 | 30640000 | r4=80000000 vscr=10000 | r3=80000000 | 
-addic_rc_6 | 34640000 | r4=80000000 vscr=10000 | r3=80000000 cr=40000000 | 
+addic_rc_6 | 34640000 | r4=80000000 vscr=10000 | r3=80000000 cr=80000000 | 
 subfic_6 | 20640000 | r4=80000000 vscr=10000 | r3=ffffffff80000000 | 
 mulli_6 | 1c640000 | r4=80000000 vscr=10000 |  | 
 andi_rc_6 | 70830000 | r4=80000000 vscr=10000 | cr=20000000 | 
@@ -1014,7 +1015,7 @@ slw_7 | 7c832830 | r4=e165f788a8f6de37 r5=40 vscr=10000 | r3=a8f6de37 |
 slw_8 | 7c832830 | r4=ffffffff87654321 r5=41 vscr=10000 | r3=eca8642 | 
 slw_9 | 7c832830 | r4=80000001 r5=7f vscr=10000 |  | 
 slw_10 | 7c832830 | r4=8000000000000001 r5=ffffffffffffff83 vscr=10000 | r3=8 | 
-slw_rc_0 | 7c832831 | r4=ffffffff87654321 r5=0 vscr=10000 | r3=87654321 cr=40000000 | 
+slw_rc_0 | 7c832831 | r4=ffffffff87654321 r5=0 vscr=10000 | r3=87654321 cr=80000000 | 
 slw_rc_1 | 7c832831 | r4=80000001 r5=1 vscr=10000 | r3=2 cr=40000000 | 
 slw_rc_2 | 7c832831 | r4=8000000000000001 r5=5 vscr=10000 | r3=20 cr=40000000 | 
 slw_rc_3 | 7c832831 | r4=6a02e34ebeae2fc r5=1f vscr=10000 | cr=20000000 | 
@@ -1036,7 +1037,7 @@ srw_7 | 7c832c30 | r4=f1f121e378712e5d r5=40 vscr=10000 | r3=78712e5d |
 srw_8 | 7c832c30 | r4=ffffffff87654321 r5=41 vscr=10000 | r3=43b2a190 | 
 srw_9 | 7c832c30 | r4=80000001 r5=7f vscr=10000 |  | 
 srw_10 | 7c832c30 | r4=8000000000000001 r5=ffffffffffffff83 vscr=10000 |  | 
-srw_rc_0 | 7c832c31 | r4=ffffffff87654321 r5=0 vscr=10000 | r3=87654321 cr=40000000 | 
+srw_rc_0 | 7c832c31 | r4=ffffffff87654321 r5=0 vscr=10000 | r3=87654321 cr=80000000 | 
 srw_rc_1 | 7c832c31 | r4=80000001 r5=1 vscr=10000 | r3=40000000 cr=40000000 | 
 srw_rc_2 | 7c832c31 | r4=8000000000000001 r5=5 vscr=10000 | cr=20000000 | 
 srw_rc_3 | 7c832c31 | r4=583edc71e79ff991 r5=1f vscr=10000 | r3=1 cr=40000000 | 

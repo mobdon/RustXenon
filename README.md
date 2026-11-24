@@ -20,10 +20,10 @@ owns runs as a native program.
 > objects, files on the player's unpacked game folder, content and profile
 > stubs, input and network stubs), with a headless GPU command processor,
 > checked with synthetic tests.
-> Step 5 groundwork has started: the GPU command recorder, texture
-> decoding, shader translation to WGSL and a headless wgpu drawer work on
-> synthetic command streams (unit tested, run on a software Vulkan driver;
-> nothing has run in a game yet).
+> multi-thread programs). Step 5 groundwork has started: the GPU command
+> recorder, texture decoding, shader translation to WGSL and a headless wgpu
+> drawer work on synthetic command streams (unit tested, run on a software
+> Vulkan driver; nothing has run in a game yet).
 
 ## You need your own copy
 
@@ -223,8 +223,8 @@ of that screen waits for the drawer.
 
 Not covered yet: structured exception handling (not reached so far), asynchronous I/O completion
 routines and APCs, alertable waits, physical memory mirrors at `0xC0000000`
-and `0xE0000000`, timer completion routines, and rendering.
-
+and `0xE0000000`, timer completion routines, the audio render callback, and
+rendering.
 ### GPU (step 5)
 
 | Crate | Covers |
