@@ -36,6 +36,8 @@ pub fn default_links(
         ("d:".into(), game.into(), false),
         ("\\device\\cdrom0".into(), game.into(), false),
         ("cache:".into(), w("cache"), true),
+        ("cache0:".into(), w("cache"), true),
+        ("cache1:".into(), w("cache"), true),
         ("\\device\\harddisk0\\cache0".into(), w("cache"), true),
         ("\\device\\harddisk0\\cache1".into(), w("cache"), true),
         ("\\device\\harddisk0\\partition1".into(), w("hdd"), true),
@@ -43,6 +45,12 @@ pub fn default_links(
         ("hdd:".into(), w("hdd"), true),
         ("\\device\\mu0".into(), w("mu"), true),
     ]);
+    // Writable devices exist from the start, as on a console with a disk.
+    for (_, dir, writable) in &v {
+        if *writable {
+            let _ = std::fs::create_dir_all(dir);
+        }
+    }
     v
 }
 

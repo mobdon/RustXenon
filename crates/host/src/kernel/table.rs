@@ -458,14 +458,14 @@ pub const XAM: &[(u16, &str, GuestFn)] = &[
     (
         400,
         "XamInputGetCapabilities",
-        xam::xam_input_get_capabilities,
+        input::xam_input_get_capabilities,
     ),
-    (401, "XamInputGetState", xam::xam_input_get_state),
-    (402, "XamInputSetState", xam::xam_input_set_state),
+    (401, "XamInputGetState", input::xam_input_get_state),
+    (402, "XamInputSetState", input::xam_input_set_state),
     (
         408,
         "XamInputGetKeystrokeEx",
-        xam::xam_input_get_keystroke_ex,
+        input::xam_input_get_keystroke_ex,
     ),
     (
         416,
@@ -488,10 +488,18 @@ pub const XAM: &[(u16, &str, GuestFn)] = &[
     (503, "XMsgStartIORequest", xam::x_msg_start_io_request),
     (504, "XMsgCancelIORequest", xam::x_msg_cancel_io_request),
     (508, "XMsgStartIORequestEx", xam::x_msg_start_io_request_ex),
-    (522, "XamUserGetXUID", xam::xam_user_get_xuid),
-    (526, "XamUserGetName", xam::xam_user_get_name),
-    (528, "XamUserGetSigninState", xam::xam_user_get_signin_state),
-    (530, "XamUserCheckPrivilege", xam::xam_user_check_privilege),
+    (522, "XamUserGetXUID", profile::xam_user_get_xuid),
+    (526, "XamUserGetName", profile::xam_user_get_name),
+    (
+        528,
+        "XamUserGetSigninState",
+        profile::xam_user_get_signin_state,
+    ),
+    (
+        530,
+        "XamUserCheckPrivilege",
+        profile::xam_user_check_privilege,
+    ),
     (
         531,
         "XamUserAreUsersFriends",
@@ -510,14 +518,18 @@ pub const XAM: &[(u16, &str, GuestFn)] = &[
     (
         537,
         "XamUserReadProfileSettings",
-        xam::xam_user_read_profile_settings,
+        profile::xam_user_read_profile_settings,
     ),
     (
         538,
         "XamUserWriteProfileSettings",
-        xam::xam_user_write_profile_settings,
+        profile::xam_user_write_profile_settings,
     ),
-    (551, "XamUserGetSigninInfo", xam::xam_user_get_signin_info),
+    (
+        551,
+        "XamUserGetSigninInfo",
+        profile::xam_user_get_signin_info,
+    ),
     (
         590,
         "XamCreateEnumeratorHandle",

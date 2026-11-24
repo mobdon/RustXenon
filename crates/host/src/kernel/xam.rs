@@ -1,6 +1,7 @@
-//! System library calls: controllers (none connected), users (nobody
-//! signed in), content packages on the local data folder, notifications,
-//! tasks, system interface screens (closed at once) and voice (no headset).
+//! System library calls: content packages on the local data folder,
+//! notifications, tasks, system interface screens (closed at once) and
+//! voice (no headset). The controller is in [`super::input`], the profile
+//! in [`super::profile`].
 
 use super::*;
 use std::path::PathBuf;
@@ -35,20 +36,6 @@ fn finish(rt: &Runtime, c: &mut Context, ov: u32, result: u32) {
     }
 }
 
-// ---- input -----------------------------------------------------------------
-
-pub fn xam_input_get_capabilities(_: &Runtime, c: &mut Context) {
-    ret(c, ERROR_DEVICE_NOT_CONNECTED);
-}
-pub fn xam_input_get_state(_: &Runtime, c: &mut Context) {
-    ret(c, ERROR_DEVICE_NOT_CONNECTED);
-}
-pub fn xam_input_set_state(_: &Runtime, c: &mut Context) {
-    ret(c, ERROR_DEVICE_NOT_CONNECTED);
-}
-pub fn xam_input_get_keystroke_ex(_: &Runtime, c: &mut Context) {
-    ret(c, ERROR_DEVICE_NOT_CONNECTED);
-}
 pub fn xam_enable_inactivity_processing(_: &Runtime, c: &mut Context) {
     ret(c, 0);
 }
@@ -58,25 +45,6 @@ pub fn xam_reset_inactivity(_: &Runtime, c: &mut Context) {
 
 // ---- users -----------------------------------------------------------------
 
-pub fn xam_user_get_signin_state(_: &Runtime, c: &mut Context) {
-    ret(c, 0);
-}
-pub fn xam_user_get_xuid(_: &Runtime, c: &mut Context) {
-    ret(c, ERROR_NO_SUCH_USER);
-}
-pub fn xam_user_get_name(_: &Runtime, c: &mut Context) {
-    ret(c, ERROR_NO_SUCH_USER);
-}
-pub fn xam_user_get_signin_info(rt: &Runtime, c: &mut Context) {
-    let p = arg(rt, c, 2);
-    if p != 0 {
-        fill(rt, p, 0x28, 0);
-    }
-    ret(c, ERROR_NO_SUCH_USER);
-}
-pub fn xam_user_check_privilege(_: &Runtime, c: &mut Context) {
-    ret(c, ERROR_NO_SUCH_USER);
-}
 pub fn xam_user_are_users_friends(rt: &Runtime, c: &mut Context) {
     let ov = arg(rt, c, 4);
     finish(rt, c, ov, ERROR_NOT_LOGGED_ON);
@@ -89,16 +57,21 @@ pub fn xam_user_get_online_country_from_xuid(rt: &Runtime, c: &mut Context) {
     let ov = arg(rt, c, 2);
     finish(rt, c, ov, ERROR_NO_SUCH_USER);
 }
-pub fn xam_user_read_profile_settings(rt: &Runtime, c: &mut Context) {
-    let ov = arg(rt, c, 8);
-    finish(rt, c, ov, ERROR_NOT_LOGGED_ON);
-}
-pub fn xam_user_write_profile_settings(rt: &Runtime, c: &mut Context) {
-    let ov = arg(rt, c, 4);
-    finish(rt, c, ov, ERROR_NOT_LOGGED_ON);
-}
-pub fn xam_user_create_achievement_enumerator(_: &Runtime, c: &mut Context) {
-    ret(c, ERROR_NO_SUCH_USER);
+/// (title, user, id, flags, offset, count, buffer size out, handle out):
+/// an empty list of achievements for the signed-in profile.
+pub fn xam_user_create_achievement_enumerator(rt: &Runtime, c: &mut Context) {
+    let (user, count, size, out) = (arg(rt, c, 1), arg(rt, c, 5), arg(rt, c, 6), arg(rt, c, 7));
+    if user != 0 {
+        return ret(c, ERROR_NO_SUCH_USER);
+    }
+    if size != 0 {
+        rt.mem.write_u32(size, count.max(1) * 0x24);
+    }
+    let h = k().add_handle(Handle::Other(3));
+    if out != 0 {
+        rt.mem.write_u32(out, h);
+    }
+    ret(c, ERROR_SUCCESS);
 }
 pub fn xam_user_create_stats_enumerator(_: &Runtime, c: &mut Context) {
     ret(c, ERROR_NO_SUCH_USER);
@@ -260,7 +233,7 @@ pub fn xam_loader_terminate_title(_: &Runtime, _: &mut Context) {
 /// Runs the task callback on a new thread with the message as argument.
 pub fn xam_task_schedule(rt: &Runtime, c: &mut Context) {
     let (f, msg, out) = (arg(rt, c, 0), arg(rt, c, 1), arg(rt, c, 3));
-    let (h, _) = super::threads::create(rt, 0, f, msg, 0, false);
+    let (h, _) = super::threads::create(rt, 0, f, msg, 0, false, 0);
     if out != 0 {
         rt.mem.write_u32(out, h);
     }
@@ -275,6 +248,68 @@ pub fn xam_task_should_exit(_: &Runtime, c: &mut Context) {
 }
 
 // ---- messages and notifications ----------------------------------------------
+
+/// Notification queues by listener handle: (area mask, queued (id, value)).
+/// One notification listener: handle, area mask, queued (id, value).
+type Listener = (u32, u64, std::collections::VecDeque<(u32, u32)>);
+static LISTENERS: Mutex<Vec<Listener>> = Mutex::new(Vec::new());
+
+/// Queues a notification for every listener of its area (the id's top
+/// bits name the area: 0 system, 1 live, 2 friends, 3 custom...).
+pub fn broadcast(id: u32, value: u32) {
+    let area = 1u64 << (id >> 25);
+    for l in LISTENERS
+        .lock()
+        .unwrap()
+        .iter_mut()
+        .filter(|l| l.1 & area != 0)
+    {
+        l.2.push_back((id, value));
+    }
+}
+
+/// (mask, highest version). The first system listener gets what a console
+/// sends at start: system interface on and off, sign-in changed, input
+/// devices changed, input configuration changed (each twice).
+pub fn xam_notify_create_listener(_: &Runtime, c: &mut Context) {
+    let mask = c.r[3];
+    let h = k().add_handle(Handle::Other(1));
+    let mut ls = LISTENERS.lock().unwrap();
+    let first = ls.iter().all(|l| l.1 & 1 == 0);
+    let mut q = std::collections::VecDeque::new();
+    if first && mask & 1 != 0 {
+        q.extend([
+            (9, 1),
+            (9, 0),
+            (0xA, 1),
+            (0xA, 1),
+            (0x12, 0),
+            (0x12, 0),
+            (0x13, 0),
+            (0x13, 0),
+        ]);
+    }
+    ls.push((h, mask, q));
+    ret(c, h);
+}
+
+/// (listener, wanted id or 0, id out, value out): 1 when one was taken.
+pub fn x_notify_get_next(rt: &Runtime, c: &mut Context) {
+    let (h, want, id_p, val_p) = (arg(rt, c, 0), arg(rt, c, 1), arg(rt, c, 2), arg(rt, c, 3));
+    let mut ls = LISTENERS.lock().unwrap();
+    let got = ls.iter_mut().find(|l| l.0 == h).and_then(|l| {
+        let i = l.2.iter().position(|x| want == 0 || x.0 == want)?;
+        l.2.remove(i)
+    });
+    let (id, val) = got.unwrap_or((0, 0));
+    if id_p != 0 {
+        rt.mem.write_u32(id_p, id);
+    }
+    if val_p != 0 {
+        rt.mem.write_u32(val_p, val);
+    }
+    ret(c, got.is_some() as u32);
+}
 
 pub fn x_msg_in_process_call(rt: &Runtime, c: &mut Context) {
     crate::log(&format!(
@@ -300,23 +335,21 @@ pub fn x_msg_cancel_io_request(_: &Runtime, c: &mut Context) {
     ret(c, 0);
 }
 
-pub fn xam_notify_create_listener(_: &Runtime, c: &mut Context) {
-    let h = k().add_handle(Handle::Other(1));
-    ret(c, h);
-}
 /// No notifications.
-pub fn x_notify_get_next(_: &Runtime, c: &mut Context) {
-    ret(c, 0);
-}
 pub fn x_notify_position_ui(_: &Runtime, c: &mut Context) {
     ret(c, 0);
 }
 
 // ---- system screens: closed at once ------------------------------------------
 
+/// The profile is already signed in: the screen opens and closes, and the
+/// title hears that the system interface closed.
 pub fn xam_show_signin_ui(_: &Runtime, c: &mut Context) {
+    broadcast(9, 1);
+    broadcast(9, 0);
     ret(c, ERROR_SUCCESS);
 }
+
 pub fn xam_show_player_review_ui(_: &Runtime, c: &mut Context) {
     ret(c, ERROR_SUCCESS);
 }

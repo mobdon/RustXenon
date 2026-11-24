@@ -17,6 +17,24 @@ pub struct ThreadInfo {
     pub id: u32,
     /// Dynamic TLS slots: one word per slot.
     pub tls_dynamic: u32,
+    /// Processor control region (r13).
+    pub pcr: u32,
+}
+
+/// Hardware thread (0..5) for a processor mask: its highest bit, as the
+/// console's kernel picks it; 0 for an empty mask.
+pub fn cpu_for_mask(mask: u32) -> u8 {
+    match mask & 0x3F {
+        0 => 0,
+        m => (31 - m.leading_zeros()) as u8,
+    }
+}
+
+/// Records which hardware thread a thread runs on, in its thread object
+/// (+0xBF) and control region (+0x10C), where titles read it.
+pub fn set_cpu(rt: &Runtime, kthread: u32, pcr: u32, cpu: u8) {
+    rt.mem.write_u8(kthread + 0xBF, cpu);
+    rt.mem.write_u8(pcr + 0x10C, cpu);
 }
 
 /// Size of the guest stack frame padding left above the first frame;
@@ -76,9 +94,11 @@ pub fn create(
     r3: u32,
     r4: u32,
     suspended: bool,
+    cpu: u8,
 ) -> (u32, u32) {
     let kx = k();
     let (mut c, kthread) = new_context(rt, if stack == 0 { kx.default_stack } else { stack });
+    set_cpu(rt, kthread, c.r[13] as u32, cpu);
     c.r[3] = r3 as u64;
     c.r[4] = r4 as u64;
     rt.mem.write_u32(kthread + 0x150, entry);
@@ -88,6 +108,7 @@ pub fn create(
         ThreadInfo {
             id: 0,
             tls_dynamic: tls + kx.tls_data.1,
+            pcr: c.r[13] as u32,
         },
     );
     // Started suspended so the id is recorded before the first instruction.
@@ -144,7 +165,16 @@ pub fn ex_create_thread(rt: &Runtime, c: &mut Context) {
     } else {
         (start, ctx, 0)
     };
-    let (h, kthread) = create(rt, stack, entry, r3, r4, flags & 1 != 0);
+    // The top byte of the flags is the processor mask.
+    let (h, kthread) = create(
+        rt,
+        stack,
+        entry,
+        r3,
+        r4,
+        flags & 1 != 0,
+        cpu_for_mask(flags >> 24),
+    );
     if handle_out != 0 {
         rt.mem.write_u32(handle_out, h);
     }
@@ -185,12 +215,18 @@ pub fn ke_resume_thread(rt: &Runtime, c: &mut Context) {
     ret(c, prev);
 }
 
+/// (thread object, processor mask, previous mask out): moves the thread to
+/// the mask's processor and answers the previous mask.
 pub fn ke_set_affinity_thread(rt: &Runtime, c: &mut Context) {
-    let out = arg(rt, c, 2);
-    if out != 0 {
-        rt.mem.write_u32(out, 0x3F);
+    let (t, mask, out) = (arg(rt, c, 0), arg(rt, c, 1), arg(rt, c, 2));
+    let prev = 1u32 << rt.mem.read_u8(t + 0xBF).min(5);
+    if let Some(pcr) = k().threads.lock().unwrap().get(&t).map(|i| i.pcr) {
+        set_cpu(rt, t, pcr, cpu_for_mask(mask));
     }
-    ret(c, 0x3F);
+    if out != 0 {
+        rt.mem.write_u32(out, prev);
+    }
+    ret(c, prev);
 }
 
 pub fn ke_set_base_priority_thread(_: &Runtime, c: &mut Context) {
@@ -272,5 +308,5 @@ pub fn ke_tls_set_value(rt: &Runtime, c: &mut Context) {
 
 /// Shared by the main thread start in `lib.rs`.
 pub fn register_main(rt: &Arc<Runtime>, entry: u32) -> u32 {
-    create(rt, k().default_stack, entry, 0, 0, false).1
+    create(rt, k().default_stack, entry, 0, 0, false, 0).1
 }
