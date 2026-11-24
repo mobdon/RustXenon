@@ -37,11 +37,18 @@ macro_rules! access {
         #[inline]
         pub fn $read(&self, addr: u32) -> $t {
             const N: usize = size_of::<$t>();
-            let p = self.at(addr, N);
             if addr as usize % N == 0 {
+                let p = self.at(addr, N);
                 // SAFETY: in bounds and aligned (the base is 16-byte aligned).
                 <$t>::from_be(unsafe { <$atomic>::from_ptr(p.cast()) }.load(Relaxed))
+            } else if crosses_view(addr, N) {
+                let mut b = [0u8; N];
+                for (i, x) in b.iter_mut().enumerate() {
+                    *x = self.read_u8(addr.wrapping_add(i as u32));
+                }
+                <$t>::from_be_bytes(b)
             } else {
+                let p = self.at(addr, N);
                 let mut b = [0u8; N];
                 for (i, x) in b.iter_mut().enumerate() {
                     *x = byte(p, i).load(Relaxed);
@@ -53,11 +60,16 @@ macro_rules! access {
         #[inline]
         pub fn $write(&self, addr: u32, v: $t) {
             const N: usize = size_of::<$t>();
-            let p = self.at(addr, N);
             if addr as usize % N == 0 {
+                let p = self.at(addr, N);
                 // SAFETY: in bounds and aligned.
                 unsafe { <$atomic>::from_ptr(p.cast()) }.store(v.to_be(), Relaxed);
+            } else if crosses_view(addr, N) {
+                for (i, x) in v.to_be_bytes().into_iter().enumerate() {
+                    self.write_u8(addr.wrapping_add(i as u32), x);
+                }
             } else {
+                let p = self.at(addr, N);
                 for (i, x) in v.to_be_bytes().into_iter().enumerate() {
                     byte(p, i).store(x, Relaxed);
                 }
@@ -77,6 +89,14 @@ fn alias(addr: u32) -> u32 {
     }
     let off = if addr >= 0xE000_0000 { 0x1000 } else { 0 };
     0xA000_0000 | ((addr & 0x1FFF_FFFF) + off) & 0x1FFF_FFFF
+}
+
+/// An unaligned access whose bytes are not contiguous after `alias`: it runs
+/// off the end of a mirrored view and wraps, so it goes byte by byte.
+#[inline]
+fn crosses_view(addr: u32, n: usize) -> bool {
+    let last = n as u32 - 1;
+    alias(addr.wrapping_add(last)) != alias(addr).wrapping_add(last)
 }
 
 /// Byte `i` after `p`, which `at` has bounds checked.
@@ -269,6 +289,16 @@ mod tests {
     #[should_panic(expected = "at 0x0000003e is outside the 64-byte guest memory")]
     fn out_of_range_reports_the_address() {
         GuestMemory::new(64).read_u32(62);
+    }
+
+    #[test]
+    fn unaligned_access_wraps_at_the_end_of_a_view() {
+        let m = GuestMemory::new(0xC000_0000);
+        // 0xFFFFEFFE is the last physical bytes; the next ones wrap to 0.
+        m.write_u32(0xFFFF_EFFE, 0x1122_3344);
+        assert_eq!(m.read_u16(0xBFFF_FFFE), 0x1122);
+        assert_eq!(m.read_u16(0xA000_0000), 0x3344);
+        assert_eq!(m.read_u32(0xFFFF_EFFE), 0x1122_3344);
     }
 
     #[test]
