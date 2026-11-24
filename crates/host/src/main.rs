@@ -16,7 +16,7 @@ fn main() {
         println!("xenon-host: scaffold only. Run with --probe to check the runtime links.");
         return;
     }
-    let mut rt = Runtime::new(GuestMemory::new(GUEST_RAM));
+    let rt = Runtime::new(GuestMemory::new(GUEST_RAM));
     let mut ctx = Context::new();
     rt.mem.write_u32(0, 0xDEAD_BEEF);
     ctx.r[1] = rt.mem.read_u32(0) as u64;

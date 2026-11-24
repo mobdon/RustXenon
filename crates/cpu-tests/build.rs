@@ -90,6 +90,80 @@ fn main() {
         calls,
     )
     .unwrap();
+    // Guest programs for the multi-thread tests in tests/threads.rs.
+    // Assembled with llvm-mc (branch offsets filled in by hand).
+    let funcs: &[(&str, &[u32])] = &[
+        // Adds 1 to the word at r3, r4 times:
+        // mtctr r4; 1: lwarx r5,0,r3; addi r5,r5,1; stwcx. r5,0,r3; bne- 1b;
+        // bdnz 1b; blr
+        (
+            "atomic_add32",
+            &[
+                0x7C89_03A6,
+                0x7CA0_1828,
+                0x38A5_0001,
+                0x7CA0_192D,
+                0x40C2_FFF4,
+                0x4200_FFF0,
+                0x4E80_0020,
+            ],
+        ),
+        // The same on a doubleword with ldarx / stdcx.
+        (
+            "atomic_add64",
+            &[
+                0x7C89_03A6,
+                0x7CA0_18A8,
+                0x38A5_0001,
+                0x7CA0_19AD,
+                0x40C2_FFF4,
+                0x4200_FFF0,
+                0x4E80_0020,
+            ],
+        ),
+        // Spin lock at r3 guarding a plain counter at r3+4, r4 times:
+        // mtctr r4
+        // 1: lwarx r5,0,r3; cmpwi r5,0; bne- 1b; li r5,1; stwcx. r5,0,r3;
+        //    bne- 1b; isync
+        //    lwz r6,4(r3); addi r6,r6,1; stw r6,4(r3)
+        //    lwsync; li r5,0; stw r5,0(r3)
+        //    bdnz 1b
+        // blr
+        (
+            "spin_lock_count",
+            &[
+                0x7C89_03A6,
+                0x7CA0_1828,
+                0x2C05_0000,
+                0x40C2_FFF8,
+                0x38A0_0001,
+                0x7CA0_192D,
+                0x40C2_FFEC,
+                0x4C00_012C,
+                0x80C3_0004,
+                0x38C6_0001,
+                0x90C3_0004,
+                0x7C20_04AC,
+                0x38A0_0000,
+                0x90A3_0000,
+                0x4200_FFCC,
+                0x4E80_0020,
+            ],
+        ),
+    ];
+    let mut threads = String::from(xenon_recomp::emit::PRELUDE);
+    for (name, words) in funcs {
+        threads.push_str(&xenon_recomp::emit::function(
+            name,
+            xenon_cpu_tests_start(),
+            words,
+        ));
+    }
+    std::fs::write(
+        Path::new(&std::env::var("OUT_DIR").unwrap()).join("threads.rs"),
+        threads,
+    )
+    .unwrap();
     // Keep the build script's view of the translator fresh.
     println!("cargo:rerun-if-changed=../recomp/src");
 }

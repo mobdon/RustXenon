@@ -1178,17 +1178,17 @@ pub fn lvsr(ea: u32) -> V128 {
 pub fn lvx(m: &GuestMemory, ea: u32) -> V128 {
     m.read_v128(ea & !15)
 }
-pub fn stvx(m: &mut GuestMemory, ea: u32, v: V128) {
+pub fn stvx(m: &GuestMemory, ea: u32, v: V128) {
     m.write_v128(ea & !15, v)
 }
-pub fn stvebx(m: &mut GuestMemory, ea: u32, v: V128) {
+pub fn stvebx(m: &GuestMemory, ea: u32, v: V128) {
     m.write_u8(ea, bytes(v)[(ea & 15) as usize]);
 }
-pub fn stvehx(m: &mut GuestMemory, ea: u32, v: V128) {
+pub fn stvehx(m: &GuestMemory, ea: u32, v: V128) {
     let ea = ea & !1;
     m.write_u16(ea, halves(v)[((ea & 15) >> 1) as usize]);
 }
-pub fn stvewx(m: &mut GuestMemory, ea: u32, v: V128) {
+pub fn stvewx(m: &GuestMemory, ea: u32, v: V128) {
     let ea = ea & !3;
     m.write_u32(ea, v[((ea & 15) >> 2) as usize]);
 }
@@ -1213,7 +1213,7 @@ pub fn lvrx(m: &GuestMemory, ea: u32) -> V128 {
     from_bytes(o)
 }
 /// `stvlx`: the leftmost `16 - (ea & 15)` bytes to `ea` onwards.
-pub fn stvlx(m: &mut GuestMemory, ea: u32, v: V128) {
+pub fn stvlx(m: &GuestMemory, ea: u32, v: V128) {
     let k = (ea & 15) as usize;
     let b = bytes(v);
     for (i, &x) in b.iter().enumerate().take(16 - k) {
@@ -1221,7 +1221,7 @@ pub fn stvlx(m: &mut GuestMemory, ea: u32, v: V128) {
     }
 }
 /// `stvrx`: the rightmost `ea & 15` bytes to the start of the quadword.
-pub fn stvrx(m: &mut GuestMemory, ea: u32, v: V128) {
+pub fn stvrx(m: &GuestMemory, ea: u32, v: V128) {
     let k = (ea & 15) as usize;
     let base = ea & !15;
     let b = bytes(v);
