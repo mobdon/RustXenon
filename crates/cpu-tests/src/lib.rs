@@ -93,8 +93,7 @@ fn snapshot(c: &Context, m: &GuestMemory) -> BTreeMap<String, String> {
         s.insert(format!("r{i}"), format!("{:x}", c.r[i]));
         s.insert(format!("f{i}"), format!("{:x}", c.f[i].to_bits()));
     }
-    for i in 0..128 {
-        let v = c.v[i];
+    for (i, v) in c.v.iter().enumerate() {
         let x = (v[0] as u128) << 96 | (v[1] as u128) << 64 | (v[2] as u128) << 32 | v[3] as u128;
         s.insert(format!("v{i}"), format!("{x:032x}"));
     }
