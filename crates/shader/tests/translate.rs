@@ -6,7 +6,10 @@ mod common;
 use common::{has, ok, Lcg};
 use xenon_shader::asm::*;
 use xenon_shader::ucode::*;
-use xenon_shader::{translate, Error, ShaderStage, PIXEL_FLOAT_CONST_BASE};
+use xenon_shader::{
+    translate, translate_with, Error, ParamGen, ParamGenPrimitive, ShaderStage,
+    PIXEL_FLOAT_CONST_BASE,
+};
 
 use ShaderStage::{Pixel, Vertex};
 
@@ -116,6 +119,69 @@ fn passthrough_pixel_shader() {
     has(&t, "o_col[0].x = vr.x;");
     has(&t, "out.c0 = o_col[0];");
     assert!(!t.wgsl.contains("var<storage"));
+}
+
+/// SQ_PROGRAM_CNTL.param_gen: r1 holds the pixel parameters instead of an
+/// interpolator; the sign bits carry facing, point and line.
+#[test]
+fn pixel_param_gen() {
+    let words = assemble(
+        &[exec(0, 2, true)],
+        &[alu(export(0, r(0))), alu(export(1, r(1)))],
+    );
+    let plain = ok(&words, Pixel);
+    assert_eq!(plain.info.interpolators_read, 0b11);
+    assert!(!plain.wgsl.contains("xe_frag_coord"));
+    let gen = |primitive| {
+        let t = translate_with(
+            &words,
+            Pixel,
+            Some(ParamGen {
+                register: 1,
+                primitive,
+            }),
+        )
+        .unwrap();
+        common::validate(&t.wgsl);
+        assert_eq!(t.info.interpolators_read, 0b01);
+        has(&t, "@builtin(position) xe_frag_coord: vec4<f32>,");
+        has(&t, "let xy = floor(input.xe_frag_coord.xy);");
+        assert!(!t.wgsl.contains("r[1] = input.i1;"));
+        t
+    };
+    let t = gen(ParamGenPrimitive::Polygon);
+    has(&t, "@builtin(front_facing) xe_front_facing: bool,");
+    has(
+        &t,
+        "r[1] = vec4<f32>(bitcast<f32>(bitcast<u32>(xy.x) | select(0x80000000u, 0u, input.xe_front_facing)), xy.y, 0.0, 0.0);",
+    );
+    let t = gen(ParamGenPrimitive::Line);
+    assert!(!t.wgsl.contains("front_facing"));
+    has(
+        &t,
+        "r[1] = vec4<f32>(xy.x, xy.y, bitcast<f32>(0x80000000u), 0.0);",
+    );
+    let t = gen(ParamGenPrimitive::Point);
+    has(
+        &t,
+        "r[1] = vec4<f32>(xy.x, bitcast<f32>(bitcast<u32>(xy.y) | 0x80000000u), 0.0, 0.0);",
+    );
+    let t = gen(ParamGenPrimitive::Other);
+    has(&t, "r[1] = vec4<f32>(xy.x, xy.y, 0.0, 0.0);");
+    // Registers past the 16 interpolators and the vertex stage get nothing.
+    let pg = |register| {
+        Some(ParamGen {
+            register,
+            primitive: ParamGenPrimitive::Polygon,
+        })
+    };
+    let t = translate_with(&words, Pixel, pg(16)).unwrap();
+    assert_eq!(t.wgsl, plain.wgsl);
+    let v = assemble(&[exec(0, 1, true)], &[alu(export(62, r(0)))]);
+    assert_eq!(
+        translate_with(&v, Vertex, pg(0)).unwrap().wgsl,
+        translate(&v, Vertex).unwrap().wgsl
+    );
 }
 
 #[test]

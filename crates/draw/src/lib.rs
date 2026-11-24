@@ -9,7 +9,10 @@
 // shader in src/xenia/gpu/vulkan/vulkan_pipeline_cache.cc, no face culling
 // for rectangle lists follows IsPrimitivePolygonal in draw_util.h, and the
 // surface pitch 0 skip follows IsRasterizationPotentiallyDone in
-// draw_util.cc (BSD 3-Clause, see CREDITS.md).
+// draw_util.cc, and pixel parameter generation setup follows
+// Shader::GetInterpolatorInputMask in shader_translator.cc and the pixel
+// shader modification in vulkan/vulkan_pipeline_cache.cc (BSD 3-Clause, see
+// CREDITS.md).
 
 //! `xenon-draw`: a headless wgpu drawer for recorded Xenos command lists.
 //!
@@ -86,8 +89,11 @@
 //! half-pixel centre, then conversion to the host's NDC for a viewport that
 //! covers the whole render target. Interpolators the pixel shader reads but
 //! the vertex shader does not write are added to the vertex outputs as
-//! zero. Quad lists and triangle fans are expanded to triangle lists by
-//! index. Rectangle lists draw six host vertices per rectangle through a
+//! zero. With SQ_PROGRAM_CNTL.param_gen the pixel shader's register
+//! SQ_CONTEXT_MISC.param_gen_pos holds the pixel position and the
+//! facing / point / line flags instead ([`xenon_shader::ParamGen`]; points
+//! get no sprite coordinates). Quad lists and triangle fans are expanded
+//! to triangle lists by index. Rectangle lists draw six host vertices per rectangle through a
 //! wrapper around the translated vertex shader that makes the fourth corner
 //! from the three guest vertices after the vertex shader, as Xenia's
 //! geometry shader does (`rect_list_wgsl`); they are never face culled.
@@ -114,7 +120,7 @@ use xenon_gpu::{
     Command, CopyCommand, Draw, FetchConstantType, GuestRead, RegisterFile, Resolve, ShaderStage,
     SliceMemory, PHYSICAL_MASK,
 };
-use xenon_shader::{ShaderInfo, Translated};
+use xenon_shader::{ParamGen, ParamGenPrimitive, ShaderInfo, Translated};
 
 pub use frame::Frame;
 
@@ -379,6 +385,7 @@ struct PipelineKey {
     vs_variant: Variant,
     ps: u64,
     ps_variant: Variant,
+    ps_param_gen: Option<ParamGen>,
     topology: wgpu::PrimitiveTopology,
     /// Colour target i: format, blend and write mask.
     color: [Option<(
@@ -430,10 +437,11 @@ pub struct Drawer {
     regs: RegisterFile,
     vs: Option<Program>,
     ps: Option<Program>,
-    translated: HashMap<(u64, bool), Result<Translated, String>>,
-    /// Keyed by program hash, stage, extra vertex outputs and variant (the
-    /// rectangle list wrapper or the pixel output clamp).
-    modules: HashMap<(u64, bool, u16, Variant), wgpu::ShaderModule>,
+    translated: HashMap<(u64, bool, Option<ParamGen>), Result<Translated, String>>,
+    /// Keyed by program hash, stage, extra vertex outputs, variant (the
+    /// rectangle list wrapper or the pixel output clamp) and pixel parameter
+    /// generation.
+    modules: HashMap<(u64, bool, u16, Variant, Option<ParamGen>), wgpu::ShaderModule>,
     pipelines: HashMap<PipelineKey, wgpu::RenderPipeline>,
     texture_layouts: HashMap<u32, (wgpu::BindGroupLayout, wgpu::PipelineLayout)>,
     group0: wgpu::BindGroupLayout,
@@ -1073,16 +1081,24 @@ impl Drawer {
         }
     }
 
-    fn translate(&mut self, p: &Program, stage: ShaderStage) -> Result<Translated, Skip> {
+    fn translate(
+        &mut self,
+        p: &Program,
+        stage: ShaderStage,
+        param_gen: Option<ParamGen>,
+    ) -> Result<Translated, Skip> {
         let vertex = stage == ShaderStage::Vertex;
-        let t = self.translated.entry((p.hash, vertex)).or_insert_with(|| {
-            let s = if vertex {
-                xenon_shader::ShaderStage::Vertex
-            } else {
-                xenon_shader::ShaderStage::Pixel
-            };
-            xenon_shader::translate(&p.words, s).map_err(|e| e.to_string())
-        });
+        let t = self
+            .translated
+            .entry((p.hash, vertex, param_gen))
+            .or_insert_with(|| {
+                let s = if vertex {
+                    xenon_shader::ShaderStage::Vertex
+                } else {
+                    xenon_shader::ShaderStage::Pixel
+                };
+                xenon_shader::translate_with(&p.words, s, param_gen).map_err(|e| e.to_string())
+            });
         match t {
             Ok(t) => Ok(t.clone()),
             Err(e) => unsupported(format!(
@@ -1109,9 +1125,10 @@ impl Drawer {
         vertex: bool,
         extra: u16,
         variant: Variant,
+        param_gen: Option<ParamGen>,
         t: &Translated,
     ) -> Result<wgpu::ShaderModule, Skip> {
-        let key = (hash, vertex, extra, variant);
+        let key = (hash, vertex, extra, variant, param_gen);
         if let Some(m) = self.modules.get(&key) {
             return Ok(m.clone());
         }
@@ -1343,6 +1360,30 @@ impl Drawer {
         })
     }
 
+    /// Pixel parameter generation of the draw: SQ_PROGRAM_CNTL.param_gen
+    /// (bit 18) into register SQ_CONTEXT_MISC.param_gen_pos (bits 8..16),
+    /// as Xenia's GetInterpolatorInputMask and pipeline caches set it up.
+    // shortcut: any register below 16 is written, where Xenia also requires
+    // it below the program's register count (static bound or ps_num_reg);
+    // differs only for a program that reads registers it never declares.
+    fn param_gen(&self, topology: wgpu::PrimitiveTopology, polygonal: bool) -> Option<ParamGen> {
+        use wgpu::PrimitiveTopology as T;
+        if self.regs.get(regs::SQ_PROGRAM_CNTL) & (1 << 18) == 0 {
+            return None;
+        }
+        let register = (self.regs.get(regs::SQ_CONTEXT_MISC) >> 8) & 0xFF;
+        let primitive = match topology {
+            _ if polygonal => ParamGenPrimitive::Polygon,
+            T::LineList | T::LineStrip => ParamGenPrimitive::Line,
+            T::PointList => ParamGenPrimitive::Point,
+            _ => ParamGenPrimitive::Other,
+        };
+        (register < 16).then_some(ParamGen {
+            register,
+            primitive,
+        })
+    }
+
     /// Draws `d`; Ok(false) when the state makes it draw nothing.
     fn draw(&mut self, d: &Draw, mem: &dyn GuestMemory, report: &mut Report) -> Result<bool, Skip> {
         let color_on = match self.regs.get(regs::RB_MODECONTROL) & 7 {
@@ -1365,9 +1406,18 @@ impl Drawer {
         let (Some(vs), Some(ps)) = (self.vs.clone(), self.ps.clone()) else {
             return unsupported("draw without both shaders loaded");
         };
+        let rect_list = expand == indices::Expand::Rects;
+        // Rectangle lists are not polygonal for Xenia (IsPrimitivePolygonal):
+        // no face culling.
+        let polygonal = !rect_list
+            && matches!(
+                topology,
+                wgpu::PrimitiveTopology::TriangleList | wgpu::PrimitiveTopology::TriangleStrip
+            );
+        let param_gen = self.param_gen(topology, polygonal);
         let mut t = Instant::now();
-        let vs_t = self.translate(&vs, ShaderStage::Vertex)?;
-        let ps_t = self.translate(&ps, ShaderStage::Pixel)?;
+        let vs_t = self.translate(&vs, ShaderStage::Vertex, None)?;
+        let ps_t = self.translate(&ps, ShaderStage::Pixel, param_gen)?;
         let surface = self.regs.get(regs::RB_SURFACE_INFO);
         // shortcut: MSAA targets are drawn with one sample per pixel (the
         // resolve then copies that sample); add samples if edges matter.
@@ -1401,14 +1451,6 @@ impl Drawer {
         if color.iter().all(Option::is_none) && depth_key.is_none() {
             return Ok(false);
         }
-        let rect_list = expand == indices::Expand::Rects;
-        // Rectangle lists are not polygonal for Xenia (IsPrimitivePolygonal):
-        // no face culling.
-        let polygonal = !rect_list
-            && matches!(
-                topology,
-                wgpu::PrimitiveTopology::TriangleList | wgpu::PrimitiveTopology::TriangleStrip
-            );
         let cull = match state::cull(self.regs.get(regs::PA_SU_SC_MODE_CNTL)) {
             Some(c) if polygonal => c,
             Some(c) => (c.0, None),
@@ -1518,8 +1560,8 @@ impl Drawer {
             report.warn("texture fetch filter overrides ignored");
         }
         let extra = ps_t.info.interpolators_read & !vs_t.info.interpolators_written;
-        let vs_mod = self.module(vs.hash, true, extra, vs_variant, &vs_t)?;
-        let ps_mod = self.module(ps.hash, false, 0, ps_variant, &ps_t)?;
+        let vs_mod = self.module(vs.hash, true, extra, vs_variant, None, &vs_t)?;
+        let ps_mod = self.module(ps.hash, false, 0, ps_variant, param_gen, &ps_t)?;
         let (g1_layout, layout) = self.texture_layout(tex_mask);
 
         let key = PipelineKey {
@@ -1528,6 +1570,7 @@ impl Drawer {
             vs_variant,
             ps: ps.hash,
             ps_variant,
+            ps_param_gen: param_gen,
             topology,
             color: std::array::from_fn(|rt| {
                 color[rt].map(|k| {
