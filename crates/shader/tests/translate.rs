@@ -845,7 +845,7 @@ fn unsupported_features_are_errors() {
         Vertex,
     );
     assert!(m.contains("memory export"), "{m}");
-    // Cube and 3D fetches, other texture ops, register LOD.
+    // Cube and 3D fetches and the texture ops still unsupported.
     for dim in [TextureDim::D1, TextureDim::D3OrStacked, TextureDim::Cube] {
         let mut tf = TextureFetch::fetch_2d(0, 0, 0);
         tf.dim = dim;
