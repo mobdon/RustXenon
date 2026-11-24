@@ -13,8 +13,9 @@
 //!   of guest memory, declared only when [`ShaderInfo::uses_vertex_fetch`].
 //!   The words are the guest bytes as stored, read little-endian by the host,
 //!   so the shader byte-swaps each word by the vertex fetch constant's endian
-//!   field (0 none, 1 8in16, 2 8in32, 3 16in32). Guest byte address `A` is
-//!   word `(A - consts.window_base) / 4`; words outside the window read as 0.
+//!   field (0 none, 1 8in16, 2 8in32, 3 16in32). Fetch addresses are masked
+//!   to physical (`& 0x1FFFFFFF`), so `window_base` is a physical address:
+//!   guest byte address `A` is word `(A - consts.window_base) / 4`; words outside the window read as 0.
 //! - `@group(0) @binding(1) var<uniform> consts: Consts` with
 //!
 //!   ```text
@@ -46,8 +47,9 @@
 //!   LOD bias (dword 4) of a texture fetch constant; format, swizzle, sign,
 //!   exponent bias and filtering are the drawer's.
 //! - Vertex stage: entry `vs_main`, input `@builtin(vertex_index)`. r0.x
-//!   starts as the signed vertex index `vertex_index + consts.vertex_base`
-//!   (the drawer draws indexed with the guest index buffer). Outputs are
+//!   starts as the vertex index `(vertex_index + consts.vertex_base) &
+//!   0xFFFFFF` (24 bits, as Xenia masks it; the min/max index clamp is not
+//!   applied) (the drawer draws indexed with the guest index buffer). Outputs are
 //!   `@builtin(position)` (oPos, as written; any viewport or clip-space
 //!   adjustment is the drawer's) and `@location(i)` vec4 for each
 //!   interpolator in [`ShaderInfo::interpolators_written`].

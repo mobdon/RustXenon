@@ -12,7 +12,11 @@ jobs:
           components: rustfmt, clippy
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
+      # Software Vulkan (lavapipe) for the headless xenon-draw tests.
+      - run: sudo apt-get update && sudo apt-get install -y mesa-vulkan-drivers
       - run: cargo test
+        env:
+          XENON_REQUIRE_GPU: "1"
   ffmpeg:
     # Runs the audio tests against a freshly built LGPL-only FFmpeg, so the
     # decoder path is tested rather than skipped.

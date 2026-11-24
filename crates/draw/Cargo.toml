@@ -1,0 +1,19 @@
+[package]
+name = "xenon-draw"
+description = "Headless wgpu drawer: replays a recorded Xenos GPU command list into offscreen render targets and writes PNG frames."
+version.workspace = true
+edition.workspace = true
+# wgpu 30 (and its naga) declare rust-version 1.87, above the workspace's 1.80.
+rust-version = "1.87"
+publish.workspace = true
+license.workspace = true
+
+[dependencies]
+# No window or surface support is used: only the Vulkan and GL backends and
+# the WGSL front end are enabled.
+wgpu = { version = "30", default-features = false, features = ["std", "parking_lot", "vulkan", "gles", "wgsl"] }
+pollster = "0.4"
+png = "0.18"
+xenon-gpu = { path = "../gpu" }
+xenon-texture = { path = "../texture" }
+xenon-shader = { path = "../shader" }
