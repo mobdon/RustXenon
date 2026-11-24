@@ -315,8 +315,9 @@ fn rgba16f_target_clear_and_resolves() {
 /// rectangle-list clear quad into a 1280x720 k_2_10_10_10_FLOAT_AS_16_16_16_16
 /// target at EDRAM base 0, a triangle, a Convert resolve to k_8_8_8_8 with
 /// pitch 1280 and height 720, and a swap of that address.
-#[test]
-fn synthetic_frame_float7e3_to_front_buffer() {
+/// The real sequence: 7e3 target, rect-list clear, triangle, Convert resolve
+/// with `endian`, swap. The frame must read back in the resolve's byte order.
+fn synthetic_frame(endian: u32, every_pixel: bool) {
     let Some(mut d) = drawer() else { return };
     let (fw, fh) = (1280u32, 720u32);
     let front = 0x20_0000;
@@ -357,7 +358,11 @@ fn synthetic_frame_float7e3_to_front_buffer() {
             &mut mem,
             (fw, fh),
             COPY_CONVERT,
-            (front, fw | (fh << 16), dest_info(DEST_8_8_8_8, 0, false)),
+            (
+                front,
+                fw | (fh << 16),
+                (dest_info(DEST_8_8_8_8, 0, false) & !3) | endian,
+            ),
             [0; 3],
         )
         .swap_at(front, fw, fh);
@@ -389,6 +394,9 @@ fn synthetic_frame_float7e3_to_front_buffer() {
     for (x, y) in [(100, 100), (150, 150), (298, 100), (100, 298)] {
         assert_eq!(px(&frame.rgba8, fw, x, y), red, "({x}, {y})");
     }
+    if !every_pixel {
+        return;
+    }
     // Every pixel: the clear quad leaves no gap (its diagonal included),
     // the triangle covers its pixel centres (centres on its hypotenuse,
     // x + y = 399, are left out).
@@ -401,5 +409,19 @@ fn synthetic_frame_float7e3_to_front_buffer() {
             let want = if inside { red } else { back };
             assert_eq!(px(&frame.rgba8, fw, x, y), want, "({x}, {y})");
         }
+    }
+}
+
+#[test]
+fn synthetic_frame_float7e3_to_front_buffer() {
+    synthetic_frame(2, true);
+}
+
+#[test]
+fn front_buffer_follows_resolve_endian() {
+    // A game may resolve its front buffer without a swap (endian 0) or with
+    // any other mode; each must give the same frame, not reversed bytes.
+    for endian in [0, 1, 3] {
+        synthetic_frame(endian, false);
     }
 }

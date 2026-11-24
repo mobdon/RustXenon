@@ -382,6 +382,9 @@ pub struct Drawer {
     clear_module: wgpu::ShaderModule,
     clear_pipelines: HashMap<wgpu::TextureFormat, wgpu::RenderPipeline>,
     targets: HashMap<RenderTargetKey, wgpu::Texture>,
+    /// Destination endian of the last 32bpp resolve to each guest address,
+    /// so a swap reads its front buffer in the byte order it was written.
+    resolved_endian: HashMap<u32, u32>,
     uncaptured: Arc<Mutex<Vec<String>>>,
     max_dim: u32,
     max_storage: u64,
@@ -639,6 +642,7 @@ impl Drawer {
             clear_module,
             clear_pipelines: HashMap::new(),
             targets: HashMap::new(),
+            resolved_endian: HashMap::new(),
             uncaptured,
             max_dim: limits.max_texture_dimension_2d,
             max_storage: limits.max_storage_buffer_binding_size,
@@ -1721,6 +1725,10 @@ impl Drawer {
             let rgba = formats::edram_rgba(format, src);
             formats::resolve_pixel(rgba, r.dest_exp_bias, r.dest_swap, r.dest_format, dst);
         }
+        if dest_bytes == 4 {
+            self.resolved_endian
+                .insert(r.dest_base & PHYSICAL_MASK, r.dest_endian);
+        }
         resolve::write_tiled_texels(
             mem,
             r.dest_base & PHYSICAL_MASK,
@@ -1733,9 +1741,10 @@ impl Drawer {
         .map_err(Skip::Unsupported)
     }
 
-    /// Reads the front buffer: a 32x32-tiled 8_8_8_8 surface, k8in32, pitch
-    /// = width rounded up to 32, R in the low byte (the layout this drawer's
-    /// resolve writes).
+    /// Reads the front buffer: a 32x32-tiled 8_8_8_8 surface, pitch = width
+    /// rounded up to 32, R in the low byte. Its byte order is the destination
+    /// endian of the last resolve to that address (a game may resolve with
+    /// any of them), else k8in32.
     fn front_buffer(
         &self,
         addr: u32,
@@ -1753,7 +1762,11 @@ impl Drawer {
         let mut raw = mem
             .read_bytes(addr, extent as usize)
             .ok_or_else(|| format!("front buffer at 0x{addr:08X} not readable"))?;
-        xenon_texture::endian::swap_in_place(&mut raw, xenon_texture::Endian::K8in32);
+        let endian = match self.resolved_endian.get(&addr) {
+            Some(&e) if e <= 3 => xenon_texture::Endian::from_bits(e),
+            _ => xenon_texture::Endian::K8in32,
+        };
+        xenon_texture::endian::swap_in_place(&mut raw, endian);
         let rgba8 = tile::detile_2d(&raw, width, height, pitch, 4).map_err(|e| e.to_string())?;
         Ok(Frame {
             width,
