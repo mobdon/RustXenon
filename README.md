@@ -139,7 +139,7 @@ packets.
 #### First headless run
 
 On the first target (2.42 million instructions in
-38,536 functions, `games/760ebac4…/hooks.toml`), built on a 32 GB, 24-thread
+38,536 functions, `games/760ebac4e5f0351edb39015eba89e729b14eaf95afdabb529a447ff8f8e11cd1/hooks.toml`), built on a 32 GB, 24-thread
 PC, the title boots headless with no window or sound: it starts 25 threads,
 opens its archives from the unpacked disc and title update, uses 89 of its
 246 imports, and its frame loop presents a steady 60 frames a second.
