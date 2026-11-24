@@ -423,6 +423,8 @@ pub struct Drawer {
     /// guest bytes they read, so an unchanged texture is not decoded again.
     texture_cache: HashMap<([u32; 6], u64), wgpu::TextureView>,
     texture_cache_bytes: u64,
+    /// Compute pipeline of resolve.wgsl, made on the first 32bpp resolve.
+    resolve_pipeline: Option<wgpu::ComputePipeline>,
     timings: Timings,
     uncaptured: Arc<Mutex<Vec<String>>>,
     max_dim: u32,
@@ -710,6 +712,7 @@ impl Drawer {
             resolved_endian: HashMap::new(),
             texture_cache: HashMap::new(),
             texture_cache_bytes: 0,
+            resolve_pipeline: None,
             timings: Timings::default(),
             uncaptured,
             max_dim: limits.max_texture_dimension_2d,
@@ -938,6 +941,16 @@ impl Drawer {
             },
         );
         let index = self.queue.submit([enc.finish()]);
+        let data = self.map_read(&buf, index)?;
+        let mut out = Vec::with_capacity((row * h) as usize);
+        for r in 0..h as usize {
+            out.extend_from_slice(&data[r * padded as usize..][..row as usize]);
+        }
+        Ok(out)
+    }
+
+    /// Waits for submission `index` and copies out the mapped `buf`.
+    fn map_read(&self, buf: &wgpu::Buffer, index: wgpu::SubmissionIndex) -> Result<Vec<u8>, Error> {
         let slot = Arc::new(Mutex::new(None));
         let sink = slot.clone();
         buf.slice(..).map_async(wgpu::MapMode::Read, move |r| {
@@ -968,10 +981,7 @@ impl Drawer {
             .slice(..)
             .get_mapped_range()
             .map_err(|e| Error::Gpu(e.to_string()))?;
-        let mut out = Vec::with_capacity((row * h) as usize);
-        for r in 0..h as usize {
-            out.extend_from_slice(&data[r * padded as usize..][..row as usize]);
-        }
+        let out = data.to_vec();
         drop(data);
         buf.unmap();
         self.check_uncaptured()?;
@@ -1839,6 +1849,11 @@ impl Drawer {
         if rect.is_empty() {
             return Ok(());
         }
+        if dest_bytes == 4 {
+            self.resolved_endian
+                .insert(r.dest_base & PHYSICAL_MASK, r.dest_endian);
+            return self.resolve_gpu(r, rect, format, &tex, mem);
+        }
         let mut t = Instant::now();
         self.wait_idle()?;
         self.timings.gpu_wait += lap(&mut t);
@@ -1853,10 +1868,6 @@ impl Drawer {
             let rgba = formats::edram_rgba(format, src);
             formats::resolve_pixel(rgba, r.dest_exp_bias, r.dest_swap, r.dest_format, dst);
         }
-        if dest_bytes == 4 {
-            self.resolved_endian
-                .insert(r.dest_base & PHYSICAL_MASK, r.dest_endian);
-        }
         let done = resolve::write_tiled_texels(
             mem,
             r.dest_base & PHYSICAL_MASK,
@@ -1869,6 +1880,134 @@ impl Drawer {
         .map_err(Skip::Unsupported);
         self.timings.resolve_cpu += lap(&mut t);
         done
+    }
+
+    /// 32bpp colour copy on the GPU: resolve.wgsl converts, tiles and
+    /// swaps each pixel into a copy of the destination's guest bytes, which
+    /// is read back once and written to guest memory. Same result as the CPU
+    /// path in [`Self::resolve_copy`].
+    fn resolve_gpu(
+        &mut self,
+        r: &Resolve,
+        rect: resolve::Rect,
+        format: TargetFormat,
+        tex: &wgpu::Texture,
+        mem: &mut dyn GuestMemory,
+    ) -> Result<(), Skip> {
+        if rect.y1 > tex.height() {
+            return Err(Error::Unsupported(format!(
+                "readback {}x{} at ({}, {}) outside the {}x{} target",
+                rect.width(),
+                rect.height(),
+                rect.x0,
+                rect.y0,
+                tex.width(),
+                tex.height()
+            ))
+            .into());
+        }
+        let mut t = Instant::now();
+        let base = r.dest_base & PHYSICAL_MASK;
+        let pitch = xenon_texture::tile::align_to_tile(r.dest_pitch);
+        let extent = xenon_texture::tile::tiled_extent_2d(rect.x1, rect.y1, pitch, 4)
+            .map_err(|e| Skip::Unsupported(format!("resolve destination: {e}")))?;
+        if u64::from(extent) > self.max_storage {
+            return unsupported(format!("resolve destination of {extent} bytes"));
+        }
+        let Some(guest) = mem.read_bytes(base, extent as usize) else {
+            return unsupported(format!("resolve destination 0x{base:08X} is not readable"));
+        };
+        let src_format = match format {
+            TargetFormat::Rgba8 => 0,
+            TargetFormat::Rgb10a2 => 1,
+            TargetFormat::Float7e3 => 2,
+            _ => 3,
+        };
+        let params = [
+            rect.x0,
+            rect.y0,
+            rect.width(),
+            rect.height(),
+            pitch,
+            src_format,
+            u32::from(r.dest_format != formats::DEST_8_8_8_8),
+            u32::from(r.dest_swap),
+            r.dest_endian,
+            2f32.powi(r.dest_exp_bias).to_bits(),
+            0,
+            0,
+        ];
+        let dest = self.buffer(
+            "resolve destination",
+            &guest,
+            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        );
+        let uniform = self.buffer(
+            "resolve params",
+            &to_bytes(&params),
+            wgpu::BufferUsages::UNIFORM,
+        );
+        let readback = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("resolve readback"),
+            size: dest.size(),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let scope = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let device = &self.device;
+        let pipeline = self.resolve_pipeline.get_or_insert_with(|| {
+            let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("resolve"),
+                source: wgpu::ShaderSource::Wgsl(include_str!("resolve.wgsl").into()),
+            });
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("resolve"),
+                layout: None,
+                module: &module,
+                entry_point: Some("main"),
+                compilation_options: Default::default(),
+                cache: None,
+            })
+        });
+        let view = tex.create_view(&Default::default());
+        let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("resolve"),
+            layout: &pipeline.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: dest.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: uniform.as_entire_binding(),
+                },
+            ],
+        });
+        let mut enc = self.device.create_command_encoder(&Default::default());
+        {
+            let mut pass = enc.begin_compute_pass(&Default::default());
+            pass.set_pipeline(pipeline);
+            pass.set_bind_group(0, &bg, &[]);
+            pass.dispatch_workgroups(rect.width().div_ceil(8), rect.height().div_ceil(8), 1);
+        }
+        enc.copy_buffer_to_buffer(&dest, 0, &readback, 0, dest.size());
+        let index = self.queue.submit([enc.finish()]);
+        if let Some(e) = block_on(scope.pop()) {
+            return Err(Skip::Fatal(Error::Gpu(e.to_string())));
+        }
+        let mut out = self.map_read(&readback, index)?;
+        self.timings.readback += lap(&mut t);
+        out.truncate(extent as usize);
+        if !mem.write_bytes(base, &out) {
+            return unsupported(format!("resolve destination 0x{base:08X} is not writable"));
+        }
+        self.timings.resolve_cpu += lap(&mut t);
+        Ok(())
     }
 
     /// Reads the front buffer: a 32x32-tiled 8_8_8_8 surface, pitch = width
