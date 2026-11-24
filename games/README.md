@@ -58,3 +58,44 @@ not the file on disc.
 
 Role names describe what a function does (`file_open`, `frame_end`), never
 what it is called in a particular game.
+
+## Regression tests
+
+A game-level test is a folder under the game's hash. Only `test.toml` is
+tracked; everything else there is ignored by git.
+
+```
+games/<sha256>/
+  tests/
+    <test name>/
+      test.toml          in git: input script, frames, tolerance
+      expected/          local only: frame-<N>.png, game pixels
+```
+
+```toml
+# Controller script, passed to the program as --press.
+input = "5000:start,9000:a"
+# Presented frames to capture and compare, counting from 1.
+frames = [300, 600]
+# Optional: extra program arguments, and a time limit (default 300 s).
+args = []
+timeout_secs = 300
+
+# Required. Runs with several guest threads are not exactly repeatable.
+[tolerance]
+channel = 8               # a pixel matches if R, G and B each differ by at most this
+max_bad_fraction = 0.001  # the frame passes if at most this fraction of pixels do not match
+```
+
+Unknown keys are an error. Run the tests headless with
+
+```sh
+xenon-regress --program <built game> games/<sha256>/tests -- <program args>
+```
+
+The first run with `--bless` saves the actual frames as the expected ones
+(look at them first). Each run prints PASS or FAIL per frame and writes, under
+`runs/regress/<test name>/`, the actual frames, `frame-<N>.sheet.png`
+(expected, actual and difference side by side, bad pixels in red) and
+`frame-<N>.blink.png` (an animated PNG that flips between expected and
+actual). See `crates/regress` for the program contract.
