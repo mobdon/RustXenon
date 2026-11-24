@@ -1893,6 +1893,11 @@ impl Drawer {
             r.dest_endian,
         )
         .map_err(Skip::Unsupported);
+        // Only a resolve that wrote its texels sets the byte order a swap reads.
+        if done.is_ok() && dest_bytes == 4 {
+            self.resolved_endian
+                .insert(r.dest_base & PHYSICAL_MASK, r.dest_endian);
+        }
         self.timings.resolve_cpu += lap(&mut t);
         done
     }
