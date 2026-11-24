@@ -1790,7 +1790,9 @@ impl Drawer {
         if r.dest_array {
             return unsupported("resolve copy to a 3D / array destination");
         }
-        if r.dest_endian > 3 {
+        // 8in64 is the one endian past 16in32 that write_tiled_texels
+        // handles, and only for 64bpp texels.
+        if r.dest_endian > 3 && !(dest_bytes == 8 && r.dest_endian == 4) {
             return unsupported(format!("resolve destination endian {}", r.dest_endian));
         }
         if r.dest_pitch == 0 {
