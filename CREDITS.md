@@ -122,8 +122,40 @@ Licence texts are kept in [`third_party/licenses/`](third_party/licenses/).
 - Project: https://github.com/hedge-dev/XenosRecomp
 - Licence: MIT, Copyright (c) 2025 hedge-dev and contributors.
   Full text: [`third_party/licenses/XenosRecomp-LICENSE.md`](third_party/licenses/XenosRecomp-LICENSE.md)
-- Use: ideas only, no code. Reference for translating the console's GPU
-  shader microcode ahead of time.
+- Use: reference for translating the console's GPU shader microcode ahead
+  of time. `crates/shader` follows its approach to non-structured control
+  flow (a program-counter switch inside a loop) and was cross-checked
+  against its instruction layouts (`XenosRecomp/shader_code.h`) and its ALU
+  and export translation (`XenosRecomp/shader_recompiler.cpp`), studied at
+  commit `70a084c2392378818a4da4086e8e3420b4c3ea8d`. No code is copied.
+
+## Xenia: ported code in `xenon-shader`
+
+- Licence: BSD 3-Clause, Copyright (c) 2015 Ben Vanik and Xenia project
+  contributors. Full text:
+  [`third_party/licenses/Xenia-LICENSE.txt`](third_party/licenses/Xenia-LICENSE.txt)
+- Studied at commit `95a5c3ee250f80c3b9d139658649d9ffb6db3eec`. Logic and
+  tables are rewritten in Rust; each file names its sources at the top.
+- From `src/xenia/gpu/`:
+  - `ucode.h`, `ucode.cc`: control-flow, ALU and fetch instruction layouts,
+    opcode tables, operand rules (scalar operand slots, the constant-op temp
+    register, const0/const1 relative addressing, export write masks).
+  - `xenos.h`, `registers.h`: vertex formats and component counts, endian
+    modes, loop and vertex fetch constant layouts, the texture fetch constant
+    LOD bias field, the vertex/pixel float constant split.
+  - `shader_translator.cc`: the control-flow area bound, exec walking, fetch
+    and ALU operand parsing, mini vertex fetch reuse.
+  - `spirv_shader_translator.cc`, `spirv_shader_translator_alu.cc`,
+    `spirv_shader_translator_fetch.cc`: ALU semantics (Shader Model 3
+    multiply by zero, max/min, cube, predicate set, kill, the clamped
+    reciprocal, square root and log forms, `mul_prev2`), loop stack and
+    `aL`, vertex fetch addressing, endian swap and format decoding, texture
+    LOD bias.
+  - `shader_interpreter.cc`, `shader_interpreter.h`: the call stack,
+    conditional exec, jump and call checks, temp register wrap, `aL` clamp.
+  - `d3d12/d3d12_command_processor.cc`: the float constant bases.
+- From `src/xenia/base/math.h`: a cross-check of the console's half-float
+  range.
 
 ## LibertyRecomp, LibertyRecompAndroid and XHYN-IV-recomp
 
