@@ -66,6 +66,19 @@ macro_rules! access {
     };
 }
 
+/// The console maps its 512 MB of physical memory three times: at
+/// 0xA0000000 (64 KB pages), 0xC0000000 (16 MB pages) and 0xE0000000 (4 KB
+/// pages, offset by 4 KB). The upper two views are folded onto the first, so
+/// a buffer written through one view reads back through another.
+#[inline]
+fn alias(addr: u32) -> u32 {
+    if addr < 0xC000_0000 {
+        return addr;
+    }
+    let off = if addr >= 0xE000_0000 { 0x1000 } else { 0 };
+    0xA000_0000 | ((addr & 0x1FFF_FFFF) + off) & 0x1FFF_FFFF
+}
+
 /// Byte `i` after `p`, which `at` has bounds checked.
 #[inline]
 fn byte<'a>(p: *mut u8, i: usize) -> &'a AtomicU8 {
@@ -96,7 +109,7 @@ impl GuestMemory {
     /// math sound).
     #[inline]
     fn at(&self, addr: u32, n: usize) -> *mut u8 {
-        let a = addr as usize;
+        let a = alias(addr) as usize;
         if a + n > self.len {
             out_of_range(addr, n, self.len);
         }
@@ -256,5 +269,14 @@ mod tests {
     #[should_panic(expected = "at 0x0000003e is outside the 64-byte guest memory")]
     fn out_of_range_reports_the_address() {
         GuestMemory::new(64).read_u32(62);
+    }
+
+    #[test]
+    fn physical_views_alias() {
+        assert_eq!(alias(0x8200_0000), 0x8200_0000);
+        assert_eq!(alias(0xA123_4560), 0xA123_4560);
+        assert_eq!(alias(0xC123_4560), 0xA123_4560);
+        assert_eq!(alias(0xE123_3560), 0xA123_4560);
+        assert_eq!(alias(0xFFFF_F000), 0xA000_0000);
     }
 }
