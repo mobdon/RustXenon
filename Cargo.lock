@@ -308,3 +308,7 @@ dependencies = [
 [[package]]
 name = "xenon-rt"
 version = "0.0.0"
+
+[[package]]
+name = "xenon-texture"
+version = "0.0.0"
