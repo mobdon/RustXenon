@@ -63,6 +63,8 @@ const PAR_ID: usize = 4; //   .codec_id
 const PAR_EXTRADATA: usize = 16; // .extradata
 const PAR_EXTRADATA_SIZE: usize = 24; // .extradata_size
 const PKT_DATA: usize = 24; // AVPacket.data
+const FRAME_DATA: usize = 0; // AVFrame.data[8]
+const FRAME_LINESIZE: usize = 64; // AVFrame.linesize[0]
 const FRAME_EXTENDED_DATA: usize = 96; // AVFrame.extended_data
 const FRAME_NB_SAMPLES: usize = 112; // AVFrame.nb_samples
 const FRAME_FORMAT: usize = 116; // AVFrame.format
@@ -219,6 +221,9 @@ impl<'a> Decoder<'a> {
         extradata: &[u8],
     ) -> Result<Self, Error> {
         let name = CString::new(codec).map_err(|_| Error::NoDecoder(codec.into()))?;
+        if !(1..=8).contains(&channels) {
+            return Err(Error::Call("open: 1 to 8 channels supported", -22));
+        }
         unsafe {
             let dec = (ff.avcodec_find_decoder_by_name)(name.as_ptr());
             if dec.is_null() {
@@ -355,6 +360,22 @@ impl<'a> Decoder<'a> {
         let planes = field::<*const *const u8>(self.frame, FRAME_EXTENDED_DATA);
         let ch = self.channels;
         let plane = |i: usize| *planes.add(i);
+        // Never read past what FFmpeg handed us: the frame must hold exactly
+        // the channels we were opened with (planar: data[c] set for c < ch
+        // and unset after; any layout: each plane at least as long as read).
+        let planar = fmt == 6 || fmt == 8;
+        let size = if fmt == 1 || fmt == 6 { 2 } else { 4 };
+        let data = |c: usize| field::<*const u8>(self.frame, FRAME_DATA + 8 * c);
+        let line = field::<c_int>(self.frame, FRAME_LINESIZE).max(0) as usize;
+        let fits = line >= n * size * if planar { 1 } else { ch }
+            && (0..if planar { ch } else { 1 }).all(|c| !data(c).is_null())
+            && !(planar && ch < 8 && !data(ch).is_null());
+        if !fits {
+            return Err(Error::Call(
+                "decoded frame does not match the channel count",
+                -22,
+            ));
+        }
         out.reserve(n * ch);
         match fmt {
             1 => {

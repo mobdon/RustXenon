@@ -50,6 +50,12 @@ impl<W: Write + Seek> WavWriter<W> {
 
     /// Interleaved samples in -1..=1 (clamped).
     pub fn write_samples(&mut self, s: &[f32]) -> io::Result<()> {
+        if s.len() % self.channels as usize != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "samples must fill whole frames",
+            ));
+        }
         let mut b = Vec::with_capacity(s.len() * 2);
         for &x in s {
             b.extend(((x.clamp(-1.0, 1.0) * 32767.0).round() as i16).to_le_bytes());
@@ -171,11 +177,11 @@ mod tests {
     #[test]
     fn refuses_past_the_size_limit() {
         let mut w = WavWriter::new(io::Cursor::new(Vec::new()), 48_000, 2).unwrap();
-        w.data_bytes = u32::MAX - 36 - 2;
-        w.write_samples(&[0.5]).unwrap(); // exactly at the limit
-        assert!(w.write_samples(&[0.5]).is_err());
+        w.data_bytes = u32::MAX - 36 - 4;
+        w.write_samples(&[0.5, 0.5]).unwrap(); // exactly at the limit
+        assert!(w.write_samples(&[0.5, 0.5]).is_err());
         let bytes = w.finish().unwrap().into_inner();
-        assert_eq!(bytes.len(), 44 + 2, "the refused sample was not written");
+        assert_eq!(bytes.len(), 44 + 4, "the refused frame was not written");
         assert_eq!(
             u32::from_le_bytes(bytes[4..8].try_into().unwrap()),
             u32::MAX
@@ -190,6 +196,7 @@ mod tests {
         assert!(new(48_000, 0).is_err());
         assert!(new(48_000, u16::MAX).is_err());
         assert!(new(48_000, 1).unwrap().write(&[0.0; 2]).is_err());
+        assert!(new(48_000, 2).unwrap().write_samples(&[0.0; 3]).is_err());
     }
 
     #[test]

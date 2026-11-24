@@ -179,6 +179,21 @@ fn ffmpeg_xma2_hand_built_silence() {
 }
 
 #[test]
+fn ffmpeg_channel_mismatch_is_an_error() {
+    let Some(ff) = ffmpeg() else { return };
+    // Mono stream data, opened as stereo: FFmpeg decodes one channel, and
+    // reading a second plane would run off the frame.
+    let mono = xenon_audio::xma::xma2_extradata(1);
+    let mut d = Decoder::open(&ff, "xma2", SAMPLE_RATE, 2, &mono).unwrap();
+    let mut pcm = Vec::new();
+    let r = (0..8)
+        .try_for_each(|_| d.decode(&silent_packet(), &mut pcm))
+        .and_then(|_| d.finish(&mut pcm));
+    assert!(r.is_err() && pcm.is_empty(), "{r:?} {}", pcm.len());
+    assert!(Decoder::open(&ff, "pcm_s16be", SAMPLE_RATE, 9, &[]).is_err());
+}
+
+#[test]
 fn ffmpeg_unknown_decoder_is_an_error() {
     let Some(ff) = ffmpeg() else { return };
     assert!(Decoder::open(&ff, "no_such_codec", SAMPLE_RATE, 2, &[]).is_err());
