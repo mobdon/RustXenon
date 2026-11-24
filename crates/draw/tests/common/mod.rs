@@ -31,11 +31,37 @@ pub const COLOR_KEY: RenderTargetKey = RenderTargetKey {
     format: TargetFormat::Rgba8,
 };
 
+/// A drawer that holds the test GPU lock while it lives.
+///
+/// One drawer at a time: on GitHub's runner the software Vulkan driver
+/// crashed (SIGSEGV) once with many devices alive in parallel test threads,
+/// and the host only ever uses one device.
+pub struct TestDrawer {
+    drawer: Drawer,
+    // Dropped after `drawer`, so the device is gone before the next test.
+    _gpu: std::sync::MutexGuard<'static, ()>,
+}
+
+impl std::ops::Deref for TestDrawer {
+    type Target = Drawer;
+    fn deref(&self) -> &Drawer {
+        &self.drawer
+    }
+}
+
+impl std::ops::DerefMut for TestDrawer {
+    fn deref_mut(&mut self) -> &mut Drawer {
+        &mut self.drawer
+    }
+}
+
 /// A drawer, or None (after a skip line) when there is no adapter and
 /// XENON_REQUIRE_GPU is not 1.
-pub fn drawer() -> Option<Drawer> {
+pub fn drawer() -> Option<TestDrawer> {
+    static GPU: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let gpu = GPU.lock().unwrap_or_else(|e| e.into_inner());
     match Drawer::new() {
-        Ok(d) => Some(d),
+        Ok(drawer) => Some(TestDrawer { drawer, _gpu: gpu }),
         Err(Error::NoAdapter) if std::env::var("XENON_REQUIRE_GPU").as_deref() != Ok("1") => {
             eprintln!("SKIP: no wgpu adapter (set XENON_REQUIRE_GPU=1 to fail instead)");
             None
