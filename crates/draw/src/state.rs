@@ -49,9 +49,8 @@ fn blend_factor(f: u32) -> Option<wgpu::BlendFactor> {
         11 => B::OneMinusDstAlpha,
         12 => B::Constant,
         13 => B::OneMinusConstant,
-        // wgpu has one constant colour; the alpha variants read its alpha
-        // only through the alpha blend channel, so this is exact there and
-        // approximate for colour.
+        // wgpu has one constant colour; see blend_constant for how the
+        // alpha variants get the constant's alpha in the colour channel.
         14 => B::Constant,
         15 => B::OneMinusConstant,
         16 => B::SrcAlphaSaturated,
@@ -93,6 +92,22 @@ pub fn blend(reg: u32) -> Result<Option<wgpu::BlendState>, String> {
             Ok((state != wgpu::BlendState::REPLACE).then_some(state))
         }
         _ => Err(format!("blend control 0x{reg:08X}")),
+    }
+}
+
+/// The blend constant for RB_BLENDCONTROL `reg` and the RB_BLEND_* colour
+/// `rgba`. wgpu has one constant colour, so when the colour factors use the
+/// constant's alpha (14, 15) and not its colour (12, 13), the colour channels
+/// get the alpha. `false` when the colour factors use both, which wgpu
+/// cannot draw exactly. The alpha channel reads the constant's alpha either
+/// way.
+pub fn blend_constant(reg: u32, rgba: [f32; 4]) -> ([f32; 4], bool) {
+    let factors = [reg & 0x1F, (reg >> 8) & 0x1F];
+    let uses = |a: u32, b: u32| factors.iter().any(|&f| f == a || f == b);
+    match (uses(12, 13), uses(14, 15)) {
+        (false, true) => ([rgba[3]; 4], true),
+        (true, true) => (rgba, false),
+        _ => (rgba, true),
     }
 }
 
@@ -281,6 +296,19 @@ fn xe_epilogue(p: vec4<f32>) -> vec4<f32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn blend_constant_alpha_factors_use_alpha_for_colour() {
+        let c = [0.1, 0.2, 0.3, 0.6];
+        // src constant alpha (14), dst one minus constant alpha (15).
+        assert_eq!(blend_constant(14 | (15 << 8), c), ([0.6; 4], true));
+        // Constant colour factors keep the colour.
+        assert_eq!(blend_constant(12 | (13 << 8), c), (c, true));
+        // Alpha-channel factors do not matter.
+        assert_eq!(blend_constant(1 | (14 << 16), c), (c, true));
+        // Both kinds in the colour channel cannot be exact.
+        assert_eq!(blend_constant(12 | (15 << 8), c), (c, false));
+    }
 
     #[test]
     fn blend_identity_is_none_and_alpha_blend_maps() {
