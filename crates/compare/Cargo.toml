@@ -1,0 +1,11 @@
+[package]
+name = "xenon-compare"
+description = "Compares two frames: per-pixel difference with a tolerance, side-by-side sheet, blink image. No window or GPU."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[dependencies]
+png = "0.17"

@@ -31,11 +31,37 @@ pub const COLOR_KEY: RenderTargetKey = RenderTargetKey {
     format: TargetFormat::Rgba8,
 };
 
+/// A drawer that holds the test GPU lock while it lives.
+///
+/// One drawer at a time: on GitHub's runner the software Vulkan driver
+/// crashed (SIGSEGV) once with many devices alive in parallel test threads,
+/// and the host only ever uses one device.
+pub struct TestDrawer {
+    drawer: Drawer,
+    // Dropped after `drawer`, so the device is gone before the next test.
+    _gpu: std::sync::MutexGuard<'static, ()>,
+}
+
+impl std::ops::Deref for TestDrawer {
+    type Target = Drawer;
+    fn deref(&self) -> &Drawer {
+        &self.drawer
+    }
+}
+
+impl std::ops::DerefMut for TestDrawer {
+    fn deref_mut(&mut self) -> &mut Drawer {
+        &mut self.drawer
+    }
+}
+
 /// A drawer, or None (after a skip line) when there is no adapter and
 /// XENON_REQUIRE_GPU is not 1.
-pub fn drawer() -> Option<Drawer> {
+pub fn drawer() -> Option<TestDrawer> {
+    static GPU: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let gpu = GPU.lock().unwrap_or_else(|e| e.into_inner());
     match Drawer::new() {
-        Ok(d) => Some(d),
+        Ok(drawer) => Some(TestDrawer { drawer, _gpu: gpu }),
         Err(Error::NoAdapter) if std::env::var("XENON_REQUIRE_GPU").as_deref() != Ok("1") => {
             eprintln!("SKIP: no wgpu adapter (set XENON_REQUIRE_GPU=1 to fail instead)");
             None
@@ -124,32 +150,77 @@ impl Stream {
         copy: bool,
         clear: Option<(u32, u32)>,
     ) -> &mut Self {
-        let (wf, hf) = (w as f32, h as f32);
-        mem.write_words(RECT, &[f(0.0), f(0.0), f(wf), f(0.0), f(wf), f(hf)]);
-        let mut control = if copy { 0 } else { 3 << 20 };
+        let mut control = if copy { 0 } else { COPY_NULL };
         let (color_clear, depth_clear) = clear.unwrap_or((0, 0));
         if clear.is_some() {
-            control |= (1 << 8) | (1 << 9);
+            control |= CLEAR_COLOR | CLEAR_DEPTH;
         }
+        // Destination info: k8in32, k_8_8_8_8.
+        self.resolve_with(
+            mem,
+            (w, h),
+            control,
+            (DEST, W | (H << 16), dest_info(6, 0, false)),
+            [depth_clear, color_clear, 0],
+        )
+    }
+
+    /// A resolve of the (0,0)-(w,h) rectangle with explicit registers:
+    /// RB_COPY_CONTROL, (RB_COPY_DEST_BASE, RB_COPY_DEST_PITCH,
+    /// RB_COPY_DEST_INFO) and (RB_DEPTH_CLEAR, RB_COLOR_CLEAR,
+    /// RB_COLOR_CLEAR_LO).
+    pub fn resolve_with(
+        &mut self,
+        mem: &mut SliceMemory,
+        (w, h): (u32, u32),
+        control: u32,
+        (dest, pitch_height, info): (u32, u32, u32),
+        clear: [u32; 3],
+    ) -> &mut Self {
+        let (wf, hf) = (w as f32, h as f32);
+        mem.write_words(RECT, &[f(0.0), f(0.0), f(wf), f(0.0), f(wf), f(hf)]);
         self.vertex_fetch(0, RECT, 6)
             .regs(RB_MODECONTROL, &[6])
-            .regs(
-                RB_COPY_CONTROL,
-                // dest base, pitch | height << 16, info: k8in32, k_8_8_8_8.
-                &[control, DEST, W | (H << 16), 2 | (6 << 7)],
-            )
-            .regs(RB_DEPTH_CLEAR, &[depth_clear, color_clear])
+            .regs(RB_COPY_CONTROL, &[control, dest, pitch_height, info])
+            .regs(RB_DEPTH_CLEAR, &clear)
             .draw_auto(8, 3)
             .regs(RB_MODECONTROL, &[4])
     }
 
     pub fn swap(&mut self, w: u32, h: u32) -> &mut Self {
+        self.swap_at(DEST, w, h)
+    }
+
+    pub fn swap_at(&mut self, addr: u32, w: u32, h: u32) -> &mut Self {
         self.0.extend(build::type3(
             PM4_XE_SWAP,
-            &[xenon_gpu::pm4::SWAP_SIGNATURE, DEST, w, h],
+            &[xenon_gpu::pm4::SWAP_SIGNATURE, addr, w, h],
         ));
         self
     }
+}
+
+/// RB_COPY_CONTROL copy commands and clear enables.
+pub const COPY_RAW: u32 = 0;
+pub const COPY_CONVERT: u32 = 1 << 20;
+pub const COPY_NULL: u32 = 3 << 20;
+pub const CLEAR_COLOR: u32 = 1 << 8;
+pub const CLEAR_DEPTH: u32 = 1 << 9;
+
+/// RB_COPY_DEST_INFO: k8in32, `format` (`xenos::ColorFormat`), exponent
+/// bias (6-bit signed) and red/blue swap.
+pub fn dest_info(format: u32, exp_bias: i32, swap: bool) -> u32 {
+    2 | (format << 7) | (((exp_bias as u32) & 0x3F) << 16) | (u32::from(swap) << 24)
+}
+
+/// `w` x `h` texels of `bytes` each at `addr`, tiled with pitch `pitch`
+/// and k8in32, back to linear rows.
+pub fn detiled(mem: &SliceMemory, addr: u32, w: u32, h: u32, pitch: u32, bytes: u32) -> Vec<u8> {
+    use xenon_texture::{endian, tile};
+    let extent = tile::tiled_extent_2d(w, h, pitch, bytes).unwrap() as usize;
+    let mut raw = mem.data[(addr - mem.base) as usize..][..extent].to_vec();
+    endian::swap_in_place(&mut raw, xenon_texture::Endian::K8in32);
+    tile::detile_2d(&raw, w, h, pitch, bytes).unwrap()
 }
 
 pub fn memory() -> SliceMemory {

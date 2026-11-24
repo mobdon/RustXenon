@@ -3,8 +3,13 @@
 // 8_8_8_8 colour clear packing (red in the low byte) follows
 // src/xenia/gpu/shaders/pixel_formats.xesli; render target formats and
 // RB_*_INFO fields follow src/xenia/gpu/xenos.h and registers.h; resolve
-// clears follow IsClearingColor in src/xenia/gpu/draw_util.h
-// (BSD 3-Clause, see CREDITS.md).
+// clears follow IsClearingColor in src/xenia/gpu/draw_util.h; the rectangle
+// list fourth corner (longest edge, v3 = (v1 - v0) + v2 in strip order for
+// the position and every interpolator) follows the kRectangleList geometry
+// shader in src/xenia/gpu/vulkan/vulkan_pipeline_cache.cc, no face culling
+// for rectangle lists follows IsPrimitivePolygonal in draw_util.h, and the
+// surface pitch 0 skip follows IsRasterizationPotentiallyDone in
+// draw_util.cc (BSD 3-Clause, see CREDITS.md).
 
 //! `xenon-draw`: a headless wgpu drawer for recorded Xenos command lists.
 //!
@@ -24,13 +29,40 @@
 //! own pixels. A target is `pitch` pixels wide and [`RENDER_TARGET_HEIGHT`]
 //! pixels high (the EDRAM holds 2048 rows of 1280 32-bit pixels).
 //!
-//! Colour targets: `k_8_8_8_8` and `k_8_8_8_8_GAMMA` as `Rgba8Unorm`. The
-//! gamma format is drawn and resolved as plain 8_8_8_8, without the
-//! piecewise-linear gamma conversion; both share one key, as they share the
-//! bit layout. Depth targets: `kD24S8` as `Depth24PlusStencil8` and
-//! `kD24FS8` as `Depth32Float` (the 20e4 float is stored at f32 precision).
-//! Anything else, MSAA and render targets 1..3 are reported in
+//! Colour targets ([`TargetFormat`]; formats with one bit layout share a
+//! key):
+//!
+//! - `k_8_8_8_8` and `k_8_8_8_8_GAMMA` as `Rgba8Unorm`. The gamma format is
+//!   drawn and resolved as plain 8_8_8_8, without the piecewise-linear gamma
+//!   conversion.
+//! - `k_2_10_10_10` and `k_2_10_10_10_AS_10_10_10_10` as `Rgb10a2Unorm`.
+//! - `k_2_10_10_10_FLOAT` and `k_2_10_10_10_FLOAT_AS_16_16_16_16` (7e3 RGB in
+//!   [0, 31.875], 2-bit alpha) as `Rgba16Float`, as Xenia hosts them. The
+//!   pixel shader's colour is clamped to [0, 31.875] and alpha to [0, 1]
+//!   when blending is off; with blending only alpha is clamped, as Xenia's
+//!   EDRAM emulation does. The blend result itself is not clamped and keeps
+//!   half precision until a resolve quantises it (see below).
+//! - `k_16_16_16_16_FLOAT` as `Rgba16Float`.
+//!
+//! Resolve clears decode the 64-bit value `RB_COLOR_CLEAR |
+//! RB_COLOR_CLEAR_LO << 32` per format ([`formats::clear_color`]).
+//! Depth targets: `kD24S8` as `Depth24PlusStencil8` and `kD24FS8` as
+//! `Depth32Float` (the 20e4 float is stored at f32 precision). Anything
+//! else (`k_16_16`, `k_16_16_16_16`, `k_16_16_FLOAT`, `k_32_FLOAT`,
+//! `k_32_32_FLOAT`), MSAA and render targets 1..3 are reported in
 //! [`Report::unsupported`] or [`Report::warnings`].
+//!
+//! # Resolves
+//!
+//! A colour copy reads the rectangle back, takes each texel as the EDRAM
+//! holds it (a 7e3 texel is rounded to 7e3 and its alpha to 2 bits, like
+//! Xenia's dump of a host render target into EDRAM), applies the exponent
+//! bias `2^copy_dest_exp_bias` and the red/blue swap, packs it like Xenia's
+//! resolve shader (unorm: saturate, `x * max + 0.5` truncated) into
+//! `k_8_8_8_8`, `k_2_10_10_10` or `k_16_16_16_16_FLOAT`, and tiles it into
+//! guest memory with the destination endian. Copy commands are described at
+//! `Drawer::resolve` (`Raw` and `Convert` alike, `Null` clears only,
+//! `ConstantOne` unsupported).
 //!
 //! # Draws
 //!
@@ -41,10 +73,17 @@
 //! half-pixel centre, then conversion to the host's NDC for a viewport that
 //! covers the whole render target. Interpolators the pixel shader reads but
 //! the vertex shader does not write are added to the vertex outputs as
-//! zero. Rectangle lists are not drawn (the fourth corner needs the
-//! post-vertex-shader positions); quad lists and triangle fans are expanded
-//! to triangle lists by index.
+//! zero. Quad lists and triangle fans are expanded to triangle lists by
+//! index. Rectangle lists draw six host vertices per rectangle through a
+//! wrapper around the translated vertex shader that makes the fourth corner
+//! from the three guest vertices after the vertex shader, as Xenia's
+//! geometry shader does (`rect_list_wgsl`); they are never face culled.
+//!
+//! Draws while RB_SURFACE_INFO's pitch is 0 rasterize nothing, as in Xenia
+//! (`IsRasterizationPotentiallyDone`): Direct3D draws before its first
+//! render target setup. They are skipped with a warning.
 
+pub mod formats;
 pub mod frame;
 pub mod indices;
 pub mod resolve;
@@ -164,7 +203,8 @@ impl Report {
     }
 }
 
-/// Render target pixel formats this drawer keeps.
+/// Render target pixel formats this drawer keeps. Guest formats with the
+/// same EDRAM bit layout share one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum TargetFormat {
     /// `k_8_8_8_8` and `k_8_8_8_8_GAMMA`.
@@ -173,6 +213,14 @@ pub enum TargetFormat {
     D24S8,
     /// `kD24FS8`.
     D24FS8,
+    /// `k_2_10_10_10` and `k_2_10_10_10_AS_10_10_10_10`, hosted as
+    /// `Rgb10a2Unorm` (the same bit layout).
+    Rgb10a2,
+    /// `k_2_10_10_10_FLOAT` and `k_2_10_10_10_FLOAT_AS_16_16_16_16` (7e3
+    /// RGB, 2-bit alpha), hosted as `Rgba16Float` like Xenia does.
+    Float7e3,
+    /// `k_16_16_16_16_FLOAT`, hosted as `Rgba16Float`.
+    Rgba16Float,
 }
 
 impl TargetFormat {
@@ -181,7 +229,24 @@ impl TargetFormat {
             TargetFormat::Rgba8 => wgpu::TextureFormat::Rgba8Unorm,
             TargetFormat::D24S8 => wgpu::TextureFormat::Depth24PlusStencil8,
             TargetFormat::D24FS8 => wgpu::TextureFormat::Depth32Float,
+            TargetFormat::Rgb10a2 => wgpu::TextureFormat::Rgb10a2Unorm,
+            TargetFormat::Float7e3 | TargetFormat::Rgba16Float => wgpu::TextureFormat::Rgba16Float,
         }
+    }
+
+    /// The host format for `xenos::ColorRenderTargetFormat` `f`.
+    pub fn color(f: u32) -> Option<TargetFormat> {
+        Some(match f {
+            0 | 1 => TargetFormat::Rgba8,
+            2 | 10 => TargetFormat::Rgb10a2,
+            3 | 12 => TargetFormat::Float7e3,
+            7 => TargetFormat::Rgba16Float,
+            _ => return None,
+        })
+    }
+
+    fn is_depth(self) -> bool {
+        matches!(self, TargetFormat::D24S8 | TargetFormat::D24FS8)
     }
 }
 
@@ -198,10 +263,9 @@ impl RenderTargetKey {
     /// Colour render target `rt` (0..4) as the registers describe it.
     pub fn color(r: &RegisterFile, rt: usize) -> Result<Self, String> {
         let info = r.get(regs::RB_COLOR_INFO_RT[rt]);
-        let format = match (info >> 16) & 0xF {
-            0 | 1 => TargetFormat::Rgba8,
-            f => return Err(format!("colour render target format {f}")),
-        };
+        let f = (info >> 16) & 0xF;
+        let format =
+            TargetFormat::color(f).ok_or_else(|| format!("colour render target format {f}"))?;
         Ok(RenderTargetKey {
             base_tiles: info & 0xFFF,
             pitch: r.get(regs::RB_SURFACE_INFO) & 0x3FFF,
@@ -246,11 +310,23 @@ struct Program {
     hash: u64,
 }
 
+/// How a translated shader is patched beyond the epilogue.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum Variant {
+    Plain,
+    /// Vertex shader wrapped to make rectangle list corners.
+    RectList,
+    /// Pixel shader colour 0 clamped to [0, rgb] and [0, alpha] (f32 bits).
+    Clamp(u32, u32),
+}
+
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct PipelineKey {
     vs: u64,
     vs_extra: u16,
+    vs_variant: Variant,
     ps: u64,
+    ps_variant: Variant,
     topology: wgpu::PrimitiveTopology,
     color: Option<wgpu::TextureFormat>,
     depth: Option<(wgpu::TextureFormat, state::Depth)>,
@@ -296,7 +372,9 @@ pub struct Drawer {
     vs: Option<Program>,
     ps: Option<Program>,
     translated: HashMap<(u64, bool), Result<Translated, String>>,
-    modules: HashMap<(u64, bool, u16), wgpu::ShaderModule>,
+    /// Keyed by program hash, stage, extra vertex outputs and variant (the
+    /// rectangle list wrapper or the pixel output clamp).
+    modules: HashMap<(u64, bool, u16, Variant), wgpu::ShaderModule>,
     pipelines: HashMap<PipelineKey, wgpu::RenderPipeline>,
     texture_layouts: HashMap<u32, (wgpu::BindGroupLayout, wgpu::PipelineLayout)>,
     group0: wgpu::BindGroupLayout,
@@ -342,6 +420,115 @@ fn patch_vertex_wgsl(wgsl: &str, extra: u16) -> Result<String, String> {
         .replacen(POS_FIELD, &fields, 1)
         .replacen(POS_STORE, &stores, 1)
         + state::EPILOGUE_WGSL)
+}
+
+/// Turns a vertex shader already patched by [`patch_vertex_wgsl`] into a
+/// rectangle list shader. Host vertex `6r + k` belongs to rectangle `r`,
+/// whose three guest indices are `xe_rect_indices[3r..3r + 3]`
+/// (`@group(0) @binding(3)`). Corners 0..2 are the guest vertices in their
+/// order (the first triangle). The translated body runs for all three
+/// guest vertices at every host vertex; the corner opposite the longest edge
+/// (squared clip-space XY lengths, ties as Xenia's geometry shader) is the
+/// right angle `a`, its successors are `b` and `c`, and the second triangle
+/// is `(c, b, d)` with the fourth vertex `d = (b - a) + c` for the position
+/// and every output (Xenia's strip `a b c d`, written as a list so both
+/// triangles keep the first one's winding). Positions are combined after
+/// the epilogue, in host clip space, as Xenia's geometry shader combines
+/// its vertex shader's clip-space output.
+///
+/// The translated `vs_main` becomes `xe_vs_body`, which first resets every
+/// module-scope private variable to its zero value, so each call starts
+/// like a fresh invocation.
+fn rect_list_wgsl(vs: &str, outputs: u16) -> Result<String, String> {
+    const ENTRY: &str =
+        "@vertex\nfn vs_main(@builtin(vertex_index) vertex_index: u32) -> VsOut {\n";
+    if !vs.contains(ENTRY) {
+        return Err("vertex shader entry point not recognised".into());
+    }
+    let mut body = "fn xe_vs_body(vertex_index: u32) -> VsOut {\n".to_string();
+    for line in vs.lines() {
+        if let Some(decl) = line.strip_prefix("var<private> ") {
+            let Some((name, ty)) = decl.strip_suffix(';').and_then(|d| d.split_once(": ")) else {
+                return Err(format!("private variable not recognised: {line}"));
+            };
+            if ty.contains('=') {
+                return Err(format!("initialised private variable: {line}"));
+            }
+            body.push_str(&format!("    {name} = {ty}();\n"));
+        }
+    }
+    let mut fourth = "    o.pos = (b.pos - a.pos) + c.pos;\n".to_string();
+    for i in (0..16).filter(|i| outputs & (1 << i) != 0) {
+        fourth.push_str(&format!("    o.o{i} = (b.o{i} - a.o{i}) + c.o{i};\n"));
+    }
+    Ok(vs.replacen(ENTRY, &body, 1)
+        + &format!(
+            "
+@group(0) @binding(3) var<storage, read> xe_rect_indices: array<u32>;
+
+fn xe_len2(v: vec2<f32>) -> f32 {{
+    return v.x * v.x + v.y * v.y;
+}}
+
+@vertex
+fn vs_main(@builtin(vertex_index) host_index: u32) -> VsOut {{
+    let first = (host_index / 6u) * 3u;
+    let corner = host_index % 6u;
+    // Every host vertex runs the body for all three guest vertices, so the
+    // shared diagonal's two corners are bit-identical in both triangles
+    // (no crack from the compiler optimising two call sites differently).
+    var v = array<VsOut, 3>(
+        xe_vs_body(xe_rect_indices[first]),
+        xe_vs_body(xe_rect_indices[first + 1u]),
+        xe_vs_body(xe_rect_indices[first + 2u]),
+    );
+    // Squared edge lengths: 12, 20, 01.
+    let l12 = xe_len2(v[2].pos.xy - v[1].pos.xy);
+    let l20 = xe_len2(v[0].pos.xy - v[2].pos.xy);
+    let l01 = xe_len2(v[1].pos.xy - v[0].pos.xy);
+    var s = 2u;
+    if (l12 > l20 && l12 > l01) {{
+        s = 0u;
+    }} else if (l20 > l01) {{
+        s = 1u;
+    }}
+    let a = v[s];
+    let b = v[(s + 1u) % 3u];
+    let c = v[(s + 2u) % 3u];
+    if (corner < 3u) {{
+        return v[corner];
+    }}
+    if (corner == 3u) {{
+        return c;
+    }}
+    if (corner == 4u) {{
+        return b;
+    }}
+    var o: VsOut;
+{fourth}    return o;
+}}
+"
+        ))
+}
+
+/// Clamps colour 0 of a translated pixel shader to [0, rgb] / [0, alpha].
+fn clamp_pixel_wgsl(ps: &str, rgb: f32, alpha: f32) -> Result<String, String> {
+    const STORE: &str = "    out.c0 = o_col[0];\n";
+    if !ps.contains(STORE) {
+        return Err("pixel shader colour output not recognised".into());
+    }
+    // An infinite bound leaves the colour as it is (blending a 7e3 target
+    // takes the source colour unclamped, as a float).
+    let rgb = if rgb.is_finite() {
+        format!("clamp(o_col[0].xyz, vec3<f32>(0.0), vec3<f32>({rgb:?}))")
+    } else {
+        "o_col[0].xyz".into()
+    };
+    Ok(ps.replacen(
+        STORE,
+        &format!("    out.c0 = vec4<f32>({rgb}, clamp(o_col[0].w, 0.0, {alpha:?}));\n"),
+        1,
+    ))
 }
 
 fn sampler_address(clamp: u8) -> (wgpu::AddressMode, bool) {
@@ -413,20 +600,18 @@ impl Drawer {
             min_binding_size: None,
         };
         let vf = wgpu::ShaderStages::VERTEX_FRAGMENT;
+        let storage = wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Storage { read_only: true },
+            has_dynamic_offset: false,
+            min_binding_size: None,
+        };
         let group0 = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("guest window, constants, epilogue"),
+            label: Some("guest window, constants, epilogue, rectangle indices"),
             entries: &[
-                entry(
-                    0,
-                    vf,
-                    wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                ),
+                entry(0, vf, storage),
                 entry(1, vf, uniform),
                 entry(2, wgpu::ShaderStages::VERTEX, uniform),
+                entry(3, wgpu::ShaderStages::VERTEX, storage),
             ],
         });
         let clear_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -566,8 +751,9 @@ impl Drawer {
         }
     }
 
-    /// Reads `w` x `h` pixels at (`x`, `y`) of a colour render target as
-    /// RGBA8 rows.
+    /// Reads `w` x `h` pixels at (`x`, `y`) of an 8_8_8_8 colour render
+    /// target as RGBA8 rows. Other colour formats:
+    /// [`Drawer::read_render_target_raw`].
     pub fn read_render_target(
         &self,
         key: RenderTargetKey,
@@ -577,6 +763,27 @@ impl Drawer {
         h: u32,
     ) -> Result<Vec<u8>, Error> {
         if key.format != TargetFormat::Rgba8 {
+            return Err(Error::Unsupported(format!(
+                "{:?} render target readback as RGBA8",
+                key.format
+            )));
+        }
+        self.read_render_target_raw(key, x, y, w, h)
+    }
+
+    /// Reads `w` x `h` pixels at (`x`, `y`) of a colour render target as
+    /// host texels, rows top to bottom, little-endian: 4 bytes per pixel for
+    /// `Rgba8` (R first) and `Rgb10a2` (one word, R in bits 0..10), 8 for
+    /// `Float7e3` and `Rgba16Float` (four halves, R first).
+    pub fn read_render_target_raw(
+        &self,
+        key: RenderTargetKey,
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
+    ) -> Result<Vec<u8>, Error> {
+        if key.format.is_depth() {
             return Err(Error::Unsupported("depth render target readback".into()));
         }
         let tex = self.targets.get(&key).ok_or(Error::NoRenderTarget(key))?;
@@ -601,7 +808,8 @@ impl Drawer {
                 tex.height()
             )));
         }
-        let row = w * 4;
+        let texel = tex.format().block_copy_size(None).unwrap_or(4);
+        let row = w * texel;
         let padded = row.next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
         let buf = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("readback"),
@@ -737,23 +945,30 @@ impl Drawer {
         hash: u64,
         vertex: bool,
         extra: u16,
+        variant: Variant,
         t: &Translated,
     ) -> Result<wgpu::ShaderModule, Skip> {
-        if let Some(m) = self.modules.get(&(hash, vertex, extra)) {
+        let key = (hash, vertex, extra, variant);
+        if let Some(m) = self.modules.get(&key) {
             return Ok(m.clone());
         }
-        let src = if vertex {
-            patch_vertex_wgsl(&t.wgsl, extra).map_err(Skip::Unsupported)?
-        } else {
-            t.wgsl.clone()
-        };
+        let src = match (vertex, variant) {
+            (true, Variant::RectList) => patch_vertex_wgsl(&t.wgsl, extra)
+                .and_then(|vs| rect_list_wgsl(&vs, t.info.interpolators_written | extra)),
+            (true, _) => patch_vertex_wgsl(&t.wgsl, extra),
+            (false, Variant::Clamp(rgb, a)) => {
+                clamp_pixel_wgsl(&t.wgsl, f32::from_bits(rgb), f32::from_bits(a))
+            }
+            (false, _) => Ok(t.wgsl.clone()),
+        }
+        .map_err(Skip::Unsupported)?;
         let m = self.validated("shader module", |d| {
             d.create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some(if vertex { "vertex" } else { "pixel" }),
                 source: wgpu::ShaderSource::Wgsl(src.into()),
             })
         })?;
-        self.modules.insert((hash, vertex, extra), m.clone());
+        self.modules.insert(key, m.clone());
         Ok(m)
     }
 
@@ -946,6 +1161,13 @@ impl Drawer {
             0 => return Ok(false),
             m => return unsupported(format!("draw with edram_mode {m}")),
         };
+        // Xenia does not rasterize with surface pitch 0
+        // (IsRasterizationPotentiallyDone in draw_util.cc); Direct3D leaves
+        // RB_SURFACE_INFO at 0 until its first render target setup.
+        if self.regs.get(regs::RB_SURFACE_INFO) & 0x3FFF == 0 {
+            report.warn("draws with surface pitch 0 skipped (no rasterization, as Xenia)");
+            return Ok(false);
+        }
         if self.regs.get(regs::VGT_OUTPUT_PATH_CNTL) & 3 != 0 {
             return unsupported("tessellated draws");
         }
@@ -975,10 +1197,14 @@ impl Drawer {
         if color.is_none() && depth_key.is_none() {
             return Ok(false);
         }
-        let polygonal = matches!(
-            topology,
-            wgpu::PrimitiveTopology::TriangleList | wgpu::PrimitiveTopology::TriangleStrip
-        );
+        let rect_list = expand == indices::Expand::Rects;
+        // Rectangle lists are not polygonal for Xenia (IsPrimitivePolygonal):
+        // no face culling.
+        let polygonal = !rect_list
+            && matches!(
+                topology,
+                wgpu::PrimitiveTopology::TriangleList | wgpu::PrimitiveTopology::TriangleStrip
+            );
         let cull = match state::cull(self.regs.get(regs::PA_SU_SC_MODE_CNTL)) {
             Some(c) if polygonal => c,
             Some(c) => (c.0, None),
@@ -987,6 +1213,16 @@ impl Drawer {
         };
         let blend =
             state::blend(self.regs.get(regs::RB_BLENDCONTROL0)).map_err(Skip::Unsupported)?;
+        let ps_variant = color
+            .and_then(|k| formats::output_clamp(k.format, blend.is_some()))
+            .map_or(Variant::Plain, |(rgb, a)| {
+                Variant::Clamp(rgb.to_bits(), a.to_bits())
+            });
+        let vs_variant = if rect_list {
+            Variant::RectList
+        } else {
+            Variant::Plain
+        };
         let mask = state::write_mask(self.regs.get(regs::RB_COLOR_MASK), 0);
 
         let mut idx =
@@ -1031,14 +1267,16 @@ impl Drawer {
             report.warn("texture fetch filter overrides ignored");
         }
         let extra = ps_t.info.interpolators_read & !vs_t.info.interpolators_written;
-        let vs_mod = self.module(vs.hash, true, extra, &vs_t)?;
-        let ps_mod = self.module(ps.hash, false, 0, &ps_t)?;
+        let vs_mod = self.module(vs.hash, true, extra, vs_variant, &vs_t)?;
+        let ps_mod = self.module(ps.hash, false, 0, ps_variant, &ps_t)?;
         let (g1_layout, layout) = self.texture_layout(tex_mask);
 
         let key = PipelineKey {
             vs: vs.hash,
             vs_extra: extra,
+            vs_variant,
             ps: ps.hash,
+            ps_variant,
             topology,
             color: color.map(|k| k.format.wgpu()),
             depth: depth_key.map(|k| (k.format.wgpu(), depth)),
@@ -1110,7 +1348,18 @@ impl Drawer {
         for n in (0..32).filter(|n| tex_mask & (1 << n) != 0) {
             textures.push((n, self.texture(n, mem, report)?));
         }
+        // Rectangle lists read their guest indices in the vertex shader and
+        // draw 6 host vertices per rectangle without an index buffer.
         let index_buf = self.buffer("indices", &to_bytes(&idx), wgpu::BufferUsages::INDEX);
+        let rect_indices = self.buffer(
+            "rectangle indices",
+            &if rect_list {
+                to_bytes(&idx)
+            } else {
+                Vec::new()
+            },
+            wgpu::BufferUsages::STORAGE,
+        );
 
         let scope = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
         let g0 = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -1128,6 +1377,10 @@ impl Drawer {
                 wgpu::BindGroupEntry {
                     binding: 2,
                     resource: epi.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: rect_indices.as_entire_binding(),
                 },
             ],
         });
@@ -1197,7 +1450,11 @@ impl Drawer {
                 b: c(regs::RB_BLEND_BLUE),
                 a: c(regs::RB_BLEND_ALPHA),
             });
-            pass.draw_indexed(0..idx.len() as u32, 0, 0..1);
+            if rect_list {
+                pass.draw(0..idx.len() as u32 * 2, 0..1);
+            } else {
+                pass.draw_indexed(0..idx.len() as u32, 0, 0..1);
+            }
         }
         self.queue.submit([enc.finish()]);
         if let Some(e) = block_on(scope.pop()) {
@@ -1356,8 +1613,16 @@ impl Drawer {
         }
     }
 
-    /// Performs a resolve: copy (8_8_8_8 colour to 8_8_8_8 only), then the
-    /// colour and depth clears. Ok(false) when the rectangle is empty.
+    /// Performs a resolve: copy, then the colour and depth clears. Ok(false)
+    /// when the rectangle is empty.
+    ///
+    /// Copy commands: `Raw` and `Convert` both convert from the source to
+    /// the destination format, as in Xenia, whose resolve shaders do not
+    /// read the command (the copy is bit-exact anyway when the formats
+    /// share a layout and the exponent bias is 0). `Null` copies nothing
+    /// and still clears; Xenia's GetResolveInfo refuses `Null` and
+    /// `ConstantOne` and drops the whole resolve, clears included. This
+    /// drawer reports `ConstantOne` as unsupported and does nothing for it.
     fn resolve(
         &mut self,
         r: &Resolve,
@@ -1376,7 +1641,7 @@ impl Drawer {
             return Ok(false);
         }
         match r.copy_command {
-            CopyCommand::Raw | CopyCommand::Convert => self.resolve_copy(r, rect, mem, report)?,
+            CopyCommand::Raw | CopyCommand::Convert => self.resolve_copy(r, rect, mem)?,
             CopyCommand::Null => {}
             CopyCommand::ConstantOne => return unsupported("resolve copy command ConstantOne"),
         }
@@ -1385,9 +1650,8 @@ impl Drawer {
         if r.color_clear_enable && !r.is_depth {
             let key = RenderTargetKey::color(&self.regs, r.src_select as usize)
                 .map_err(|e| Skip::Unsupported(format!("resolve clear of {e}")))?;
-            let c = r.color_clear;
-            let color = [0, 8, 16, 24].map(|s| ((c >> s) & 0xFF) as f32 / 255.0);
-            self.clear(key, rect, color, 0.0, 0)?;
+            let value = formats::clear_value(r.color_clear, r.color_clear_lo);
+            self.clear(key, rect, formats::clear_color(key.format, value), 0.0, 0)?;
         }
         if r.depth_clear_enable {
             let key = RenderTargetKey::depth(&self.regs);
@@ -1401,25 +1665,29 @@ impl Drawer {
         Ok(true)
     }
 
+    /// Colour copy: reads the rectangle back, converts each pixel as
+    /// Xenia's resolve shader does ([`formats::edram_rgba`],
+    /// [`formats::resolve_pixel`]: exponent bias, red/blue swap, saturate
+    /// and round for unorm destinations) and tiles it into guest memory with
+    /// the destination endian.
     fn resolve_copy(
         &mut self,
         r: &Resolve,
         rect: resolve::Rect,
         mem: &mut dyn GuestMemory,
-        report: &mut Report,
     ) -> Result<(), Skip> {
         if r.is_depth {
             return unsupported("resolve copy from depth");
         }
-        if r.src_format > 1 {
+        let Some(format) = TargetFormat::color(r.src_format) else {
             return unsupported(format!("resolve copy from colour format {}", r.src_format));
-        }
-        if r.dest_format != 6 {
+        };
+        let Some(dest_bytes) = formats::dest_bytes(r.dest_format) else {
             return unsupported(format!(
                 "resolve copy to destination format {}",
                 r.dest_format
             ));
-        }
+        };
         if r.dest_array {
             return unsupported("resolve copy to a 3D / array destination");
         }
@@ -1429,13 +1697,10 @@ impl Drawer {
         if r.dest_pitch == 0 {
             return unsupported("resolve destination pitch 0");
         }
-        if r.dest_exp_bias != 0 {
-            report.warn("resolve exponent bias ignored for 8_8_8_8");
-        }
         let key = RenderTargetKey {
             base_tiles: r.src_edram_base,
             pitch: r.surface_pitch,
-            format: TargetFormat::Rgba8,
+            format,
         };
         let tex = self.target(key)?;
         let pitch = xenon_texture::tile::align_to_tile(r.dest_pitch);
@@ -1446,16 +1711,23 @@ impl Drawer {
         if rect.is_empty() {
             return Ok(());
         }
-        let mut px = self.read_texture(&tex, rect.x0, rect.y0, rect.width(), rect.height())?;
-        if r.dest_swap {
-            px.chunks_exact_mut(4).for_each(|t| t.swap(0, 2));
+        let px = self.read_texture(&tex, rect.x0, rect.y0, rect.width(), rect.height())?;
+        let src_bytes = px.len() / (rect.width() * rect.height()) as usize;
+        let mut out = vec![0; px.len() / src_bytes * dest_bytes];
+        for (src, dst) in px
+            .chunks_exact(src_bytes)
+            .zip(out.chunks_exact_mut(dest_bytes))
+        {
+            let rgba = formats::edram_rgba(format, src);
+            formats::resolve_pixel(rgba, r.dest_exp_bias, r.dest_swap, r.dest_format, dst);
         }
-        resolve::write_tiled(
+        resolve::write_tiled_texels(
             mem,
             r.dest_base & PHYSICAL_MASK,
             r.dest_pitch,
             rect,
-            &px,
+            &out,
+            dest_bytes.trailing_zeros(),
             r.dest_endian,
         )
         .map_err(Skip::Unsupported)
@@ -1554,5 +1826,22 @@ mod tests {
         assert!(p.contains("out.pos = xe_epilogue(o_pos);\n    out.o2 = o_interp[2];"));
         assert!(p.contains("fn xe_epilogue"));
         assert!(patch_vertex_wgsl("nothing", 0).is_err());
+    }
+
+    #[test]
+    fn rect_list_wrapper_resets_privates_and_makes_the_fourth_corner() {
+        let src = "var<private> r: array<vec4<f32>, 64>;\nvar<private> a0: i32;\n\
+            @vertex\nfn vs_main(@builtin(vertex_index) vertex_index: u32) -> VsOut {\n";
+        let w = rect_list_wgsl(src, 0b101).unwrap();
+        assert!(w.contains(
+            "fn xe_vs_body(vertex_index: u32) -> VsOut {\n    \
+             r = array<vec4<f32>, 64>();\n    a0 = i32();\n"
+        ));
+        assert!(w.contains("o.o0 = (b.o0 - a.o0) + c.o0;\n    o.o2 = (b.o2 - a.o2) + c.o2;"));
+        assert!(!w.contains("o.o1 ="));
+        assert!(rect_list_wgsl("var<private> x: i32 = 1;\n", 0).is_err());
+        let ps = clamp_pixel_wgsl("    out.c0 = o_col[0];\n", 31.875, 1.0).unwrap();
+        assert!(ps.contains("vec3<f32>(31.875)), clamp(o_col[0].w, 0.0, 1.0)"));
+        assert!(clamp_pixel_wgsl("", 1.0, 1.0).is_err());
     }
 }
