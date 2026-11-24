@@ -262,6 +262,7 @@ mod tests {
         );
         assert!(F::Dxt4_5As16_16_16_16.can_convert());
         assert!(!F::Ctx1.can_convert());
+        assert!(F::K24_8.can_convert());
         assert!(F::K24_8Float.can_convert());
     }
 }

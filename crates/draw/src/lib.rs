@@ -442,6 +442,7 @@ pub struct Drawer {
     texture_cache_bytes: u64,
     /// 1x1 texture of zeros bound for a slot without a usable texture.
     zero_texture: wgpu::TextureView,
+    zero_sampler: wgpu::Sampler,
     /// Whether `Rgba32Float` textures can be sampled with filtering; without
     /// it wide formats are uploaded as `Rgba16Float`.
     float32_filterable: bool,
@@ -716,6 +717,7 @@ impl Drawer {
             label: Some("clear"),
             source: wgpu::ShaderSource::Wgsl(CLEAR_WGSL.into()),
         });
+        let zero_sampler = device.create_sampler(&Default::default());
         // wgpu zero-initialises new textures, so nothing is written.
         let zero_texture = device
             .create_texture(&wgpu::TextureDescriptor {
@@ -754,6 +756,7 @@ impl Drawer {
             texture_cache: HashMap::new(),
             texture_cache_bytes: 0,
             zero_texture,
+            zero_sampler,
             float32_filterable: !required_features.is_empty(),
             resolve_pipeline: None,
             timings: Timings::default(),
@@ -1257,8 +1260,7 @@ impl Drawer {
         let fetch = xenon_texture::TextureFetch::decode(self.regs.fetch_constant(n));
         if fetch.fetch_type != 2 {
             report.warn("texture slot without a texture fetch constant drawn with zeros");
-            let sampler = self.device.create_sampler(&Default::default());
-            return Ok((self.zero_texture.clone(), sampler));
+            return Ok((self.zero_texture.clone(), self.zero_sampler.clone()));
         }
         let sampler = self.sampler(&fetch, report);
         let view = self
