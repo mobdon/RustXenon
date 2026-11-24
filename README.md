@@ -115,13 +115,15 @@ titles test them with 64-bit record compares.
 | Area | What the host does |
 |---|---|
 | Memory | Virtual memory (64 KB granularity), physical memory (handed out in the `0xA0000000` view), kernel pool; first fit, freed ranges zeroed on reuse, usage and peak reported |
-| Threads | Stack, processor control region (r13), thread object and thread-local storage per thread; suspend and resume; dynamic TLS slots; a thread object is signalled when its thread ends |
+| Threads | Stack, processor control region (r13), thread object and thread-local storage per thread; the hardware thread (0 to 5) from the creation flags and affinity calls, where titles read it; suspend and resume; dynamic TLS slots; a thread object is signalled when its thread ends |
 | Kernel objects | Events, semaphores, mutants, timers and threads on the step-3 objects, by handle or by the guest's own dispatcher header; waits for one or several objects with timeouts; critical sections keep their owner fields current; spin locks |
 | Files | `game:`, `d:` and the disc device map to the player's unpacked game folder (read only), `update:` to an unpacked title update, cache, hard disk and content packages to a local data folder; open, read, scatter read, write, information classes, directory listing with wildcards, volume information |
-| System library | No controllers connected, nobody signed in, content packages as local folders, empty enumerators, system screens closed at once, no headset |
+| Controller | A scripted virtual pad on port 0 (`--press <ms>:<button>,...`, default Start then A every four seconds from the fifth second, `--no-controller` to unplug): state, keystroke events and capabilities; ports 1 to 3 unplugged |
+| Profile | One local profile signed in on port 0: user id, name, sign-in information, profile settings with console defaults, title settings stored in the data folder, no online privileges |
+| System library | Content packages as local folders, empty enumerators (saves, downloads, achievements), the start-up notifications a console sends, system screens closed at once, no headset |
 | Network | The stack starts with no link; socket calls fail with "network down" |
 | Video | Display mode 1280x720 at 60 Hz. A minimal command processor runs the command ring: register and memory writes, fence and event writes, conditional writes, waits and interrupts; draws are skipped. The vertical-blank interrupt runs at 60 Hz. Each `VdSwap` counts as a presented frame |
-| Audio | A render client registers but is never asked for frames |
+| Audio | Render clients are asked for a frame every 5.33 ms (48 kHz, 256 samples), as the console's audio hardware does; the frames are dropped |
 | Stops | Bug checks, exceptions other than the debugger's thread-naming one, structured exception unwinding, reboot and title launch stop with their arguments |
 
 When the title stops, the host prints the panic, the newest call targets,
@@ -157,7 +159,15 @@ honoured, the display interrupt status and line counter registers kept
 current, and the video lock released before the guest interrupt handler
 runs.
 
-Not covered yet: structured exception handling, asynchronous I/O completion
+With the controller and profile in, the front end answers: after the
+scripted Start (about 17 s in) the title reads the profile, lists saves,
+downloads and achievements, and keeps presenting 60 frames a second. It
+does not load into the world yet. Which screen it waits on cannot be seen
+until frames are rendered (step 5). Two fixes this needed: the audio
+mixer's threads meet at a per-processor barrier, so threads must carry
+their processor number, and the audio render callback must run.
+
+Not covered yet: structured exception handling (not reached so far), asynchronous I/O completion
 routines and APCs, alertable waits, physical memory mirrors at `0xC0000000`
 and `0xE0000000`, timer completion routines, the audio render callback, and
 rendering.

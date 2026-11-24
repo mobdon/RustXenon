@@ -66,6 +66,20 @@ fn from_header(rt: &Runtime, a: u32) -> KObj {
 /// type no longer matches (the memory was reused) gets a fresh object.
 pub fn get(rt: &Runtime, a: u32) -> Arc<KObj> {
     let o = rt.object(a, || from_header(rt, a));
+    if std::env::var("XENON_TRACE_OBJ")
+        .ok()
+        .and_then(|v| u32::from_str_radix(&v, 16).ok())
+        == Some(a)
+    {
+        crate::log(&format!(
+            "[obj] {} {a:#x}: host {:p} kind {} header {:02x} {:08x}",
+            super::current_import(),
+            Arc::as_ptr(&o),
+            o.kind(),
+            rt.mem.read_u8(a),
+            rt.mem.read_u32(a + 4)
+        ));
+    }
     let ty = match rt.mem.read_u8(a) {
         1 => 0,
         9 => 8,
@@ -131,14 +145,21 @@ pub fn nt_create_timer(rt: &Runtime, c: &mut Context) {
 }
 
 fn event_op(rt: &Runtime, c: &mut Context, a: Option<u32>, set: bool) -> Option<bool> {
+    let _ = c;
     let o = get(rt, a?);
-    match &*o {
+    let r = match &*o {
         KObj::Event(e) => Some(if set { e.set() } else { e.reset() }),
         _ => None,
+    };
+    if r.is_none() {
+        crate::log(&format!(
+            "[kernel] {} on {:#x}, which is not an event (type {})",
+            super::current_import(),
+            a?,
+            rt.mem.read_u8(a?)
+        ));
     }
-    .inspect(|_| {
-        let _ = c;
-    })
+    r
 }
 
 pub fn ke_set_event(rt: &Runtime, c: &mut Context) {
@@ -270,7 +291,15 @@ pub fn nt_cancel_timer(rt: &Runtime, c: &mut Context) {
 
 /// Waits for one object: STATUS_SUCCESS or STATUS_TIMEOUT.
 fn wait_one(rt: &Runtime, a: u32, t: Option<Duration>) -> u32 {
-    if get(rt, a).wait(t) {
+    let ok = get(rt, a).wait(t);
+    if std::env::var("XENON_TRACE_OBJ")
+        .ok()
+        .and_then(|v| u32::from_str_radix(&v, 16).ok())
+        == Some(a)
+    {
+        crate::log(&format!("[obj] wait on {a:#x} returned {ok}"));
+    }
+    if ok {
         STATUS_SUCCESS
     } else {
         STATUS_TIMEOUT

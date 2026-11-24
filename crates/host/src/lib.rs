@@ -50,11 +50,14 @@ struct Activity {
     /// Last guest call target and the guest stack pointer then.
     call: AtomicU32,
     sp: AtomicU32,
+    /// First argument of the last import call.
+    arg0: AtomicU32,
 }
 
 static ACTIVITY: std::sync::Mutex<Vec<(String, Arc<Activity>)>> = std::sync::Mutex::new(Vec::new());
 
-fn ms() -> u32 {
+/// Milliseconds since the host started.
+pub fn ms() -> u32 {
     START.get_or_init(Instant::now).elapsed().as_millis() as u32
 }
 
@@ -66,7 +69,8 @@ fn activity_report() {
         let imp = a.import.load(Ordering::Relaxed);
         let what = kernel::import_name(imp).unwrap_or_else(|| "-".into());
         log(&format!(
-            "  {name:<10} last import {what} {} ms ago, last call {:#010x}",
+            "  {name:<10} last import {what}({:#x}) {} ms ago, last call {:#010x}",
+            a.arg0.load(Ordering::Relaxed),
             now.saturating_sub(a.at_ms.load(Ordering::Relaxed)),
             a.call.load(Ordering::Relaxed)
         ));
@@ -145,12 +149,20 @@ fn trace(c: &Context, addr: u32) {
     if (THUNKS.0.load(Ordering::Relaxed)..=THUNKS.1.load(Ordering::Relaxed)).contains(&addr) {
         MINE.with(|m| {
             m.import.store(addr, Ordering::Relaxed);
+            m.arg0.store(c.r[3] as u32, Ordering::Relaxed);
             m.at_ms.store(ms(), Ordering::Relaxed);
         });
         if let Some(name) = kernel::count_call(addr) {
             log(&format!(
-                "[call] {name}({:#x}, {:#x}, {:#x}, {:#x}, {:#x}, {:#x}) from {:#010x}",
-                c.r[3], c.r[4], c.r[5], c.r[6], c.r[7], c.r[8], c.lr as u32
+                "[call] {} {name}({:#x}, {:#x}, {:#x}, {:#x}, {:#x}, {:#x}) from {:#010x}",
+                std::thread::current().name().unwrap_or("?"),
+                c.r[3],
+                c.r[4],
+                c.r[5],
+                c.r[6],
+                c.r[7],
+                c.r[8],
+                c.lr as u32
             ));
         }
     }
@@ -165,10 +177,15 @@ pub fn log(s: &str) {
 const USAGE: &str = "\
 USAGE: game --exe <patched executable> --game <unpacked game folder>
             [--update <unpacked title update>] [--data <writable folder>]
-            [--seconds <n>]
+            [--seconds <n>] [--press <ms>:<button>[+<button>],...]
+            [--no-controller]
 
 Runs the title headless for --seconds (default 30) and reports how far it
-got: frames presented, threads, imports called, memory in use.";
+got: frames presented, threads, imports called, memory in use. A
+virtual controller on port 0 presses Start, then A, every four seconds
+(from the fifth second) unless --press gives a script or --no-controller
+unplugs it. Buttons: up down left right start back lthumb rthumb lb rb a b
+x y.";
 
 fn opt(args: &[String], name: &str) -> Option<String> {
     args.iter()
@@ -192,6 +209,17 @@ pub fn run(sha256: &str, regs: &[fn(&mut Runtime)]) -> ExitCode {
     let seconds: u64 = opt(&args, "--seconds")
         .and_then(|s| s.parse().ok())
         .unwrap_or(30);
+    if args.iter().any(|a| a == "--no-controller") {
+        kernel::input::set_script(kernel::input::Script::Unplugged);
+    } else if let Some(p) = opt(&args, "--press") {
+        match kernel::input::parse(&p) {
+            Ok(s) => kernel::input::set_script(s),
+            Err(e) => {
+                eprintln!("--press: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
 
     let file = match std::fs::read(&exe) {
         Ok(f) => f,
@@ -309,6 +337,8 @@ fn report() {
         kx.threads.lock().map(|t| t.len()).unwrap_or(0)
     ));
     log(&format!("memory: {}", kx.usage_line()));
+    log("threads:");
+    activity_report();
     let calls = kernel::call_report();
     log(&format!("imports called: {} distinct", calls.len()));
     for (n, c) in calls.iter().take(40) {

@@ -22,9 +22,11 @@
 pub mod audio;
 pub mod files;
 pub mod gpu;
+pub mod input;
 pub mod memory;
 pub mod net;
 pub mod objects;
+pub mod profile;
 pub mod rtl;
 pub mod table;
 pub mod threads;
@@ -379,15 +381,30 @@ pub fn current_import() -> String {
 }
 
 /// Counts an import call (called from the runtime's trace hook).
-/// Returns the import's name when calls are traced (`XENON_TRACE_IMPORTS`
-/// set; critical sections left out).
+/// Returns the import's name when the call is traced (`XENON_TRACE_IMPORTS`).
 pub fn count_call(addr: u32) -> Option<String> {
-    static TRACE: OnceLock<bool> = OnceLock::new();
-    let on = *TRACE.get_or_init(|| std::env::var_os("XENON_TRACE_IMPORTS").is_some());
+    // Unset: off. "1": every import but critical sections. Otherwise only
+    // imports whose name contains one of the comma-separated words.
+    static TRACE: OnceLock<Option<Vec<String>>> = OnceLock::new();
+    let filter = TRACE.get_or_init(|| {
+        std::env::var("XENON_TRACE_IMPORTS").ok().map(|v| {
+            if v == "1" {
+                vec![]
+            } else {
+                v.split(',').map(str::to_string).collect()
+            }
+        })
+    });
     let mut calls = k().calls.lock().unwrap();
     let e = calls.get_mut(&addr)?;
     e.1 += 1;
-    (on && !e.0.contains("CriticalSection")).then(|| e.0.clone())
+    let f = filter.as_ref()?;
+    let show = if f.is_empty() {
+        !e.0.contains("CriticalSection")
+    } else {
+        f.iter().any(|w| e.0.contains(w.as_str()))
+    };
+    show.then(|| e.0.clone())
 }
 
 /// Import call counts, most called first.

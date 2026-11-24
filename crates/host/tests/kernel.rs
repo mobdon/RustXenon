@@ -461,3 +461,128 @@ fn command_processor_writes_fences_and_waits() {
     gpu.packet(rt, words(vec![type3(0x54, 1), 4]), 2, 0, &mut idle);
     assert_eq!(gpu.interrupts, vec![4]);
 }
+
+#[test]
+fn signed_in_profile_and_settings() {
+    use xenon_host::kernel::profile;
+    let e = env();
+    let rt = &e.rt;
+    let mut c = ctx(0x2_2000);
+    assert_eq!(
+        call(rt, &mut c, profile::xam_user_get_signin_state, &[0]),
+        1
+    );
+    assert_eq!(
+        call(rt, &mut c, profile::xam_user_get_signin_state, &[1]),
+        0
+    );
+    assert_eq!(
+        call(rt, &mut c, profile::xam_user_get_xuid, &[0, 7, 0xB000]),
+        0
+    );
+    assert_eq!(rt.mem.read_u64(0xB000), profile::XUID);
+    // Two settings: an integer with a non-zero default, and 1000 bytes of
+    // title data that was never written.
+    rt.mem.write_u32(0xB010, 0x1004_0003);
+    rt.mem.write_u32(0xB014, 0x63E8_3FFF);
+    rt.mem.write_u32(0xB020, 0);
+    rt.mem.write_u32(0x2_2054, 0); // no request block (ninth argument)
+    let args = [0, 0, 0, 0, 2, 0xB010, 0xB020, 0xB100];
+    assert_eq!(
+        call(rt, &mut c, profile::xam_user_read_profile_settings, &args),
+        122
+    );
+    let need = rt.mem.read_u32(0xB020);
+    assert_eq!(need, 8 + 2 * 40 + 0x3E8);
+    assert_eq!(
+        call(rt, &mut c, profile::xam_user_read_profile_settings, &args),
+        0
+    );
+    assert_eq!(rt.mem.read_u32(0xB100), 2);
+    let rec = rt.mem.read_u32(0xB104);
+    assert_eq!(
+        (
+            rt.mem.read_u32(rec),
+            rt.mem.read_u32(rec + 0x10),
+            rt.mem.read_u32(rec + 0x20)
+        ),
+        (1, 0x1004_0003, 3)
+    );
+    assert_eq!(
+        rt.mem.read_u32(rec + 40),
+        0,
+        "unwritten title data is unset"
+    );
+}
+
+#[test]
+fn startup_notifications_then_none() {
+    use xenon_host::kernel::xam;
+    let e = env();
+    let rt = &e.rt;
+    let mut c = ctx(0x2_3000);
+    let h = call(rt, &mut c, xam::xam_notify_create_listener, &[1, 1]);
+    // Sign-in changed is waiting; asking for it by id takes it out of turn.
+    assert_eq!(
+        call(
+            rt,
+            &mut c,
+            xam::x_notify_get_next,
+            &[h, 0xA, 0xC000, 0xC004]
+        ),
+        1
+    );
+    assert_eq!((rt.mem.read_u32(0xC000), rt.mem.read_u32(0xC004)), (0xA, 1));
+    let mut n = 0;
+    while call(rt, &mut c, xam::x_notify_get_next, &[h, 0, 0xC000, 0xC004]) == 1 {
+        n += 1;
+    }
+    assert_eq!(n, 7);
+}
+
+#[test]
+fn affinity_moves_a_thread_to_its_processor() {
+    let e = env();
+    let rt = &e.rt;
+    let mut c = ctx(0x2_4000);
+    call(rt, &mut c, objects::nt_create_event, &[0xD000, 0, 0, 0]);
+    let ev = rt.mem.read_u32(0xD000) as u64;
+    // Created suspended on processor 4 (mask 0x10 in the top byte).
+    let flags = 1 | 0x10 << 24;
+    call(
+        rt,
+        &mut c,
+        threads::ex_create_thread,
+        &[0xD010, 0, 0, 0, THREAD_ENTRY as u64, ev, flags],
+    );
+    let h = rt.mem.read_u32(0xD010) as u64;
+    call(
+        rt,
+        &mut c,
+        objects::ob_reference_object_by_handle,
+        &[h, 0, 0xD020],
+    );
+    let t = rt.mem.read_u32(0xD020);
+    assert_eq!(rt.mem.read_u8(t + 0xBF), 4);
+    assert_eq!(
+        call(
+            rt,
+            &mut c,
+            threads::ke_set_affinity_thread,
+            &[t as u64, 0x4, 0xD030]
+        ),
+        0x10
+    );
+    assert_eq!(rt.mem.read_u8(t + 0xBF), 2);
+    call(rt, &mut c, threads::nt_resume_thread, &[h, 0]);
+    rt.mem.write_u64(0xD040, (-50_000_000i64) as u64);
+    assert_eq!(
+        call(
+            rt,
+            &mut c,
+            objects::nt_wait_for_single_object_ex,
+            &[h, 1, 0, 0xD040]
+        ),
+        0
+    );
+}
