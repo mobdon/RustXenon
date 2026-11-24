@@ -166,16 +166,18 @@ fn profile_call(addr: u32) {
 
 /// `XENON_WATCH=<hex addr>:<what>`: at each call to `addr`, logs `what`
 /// when it changes. `what` is a register number (`3`), a guest word
-/// (`m82bf99d4`), or a byte at a register plus an offset (`b3+14c7`); a
-/// leading `*` logs every call, not only changes.
+/// (`m82bf99d4`), a byte at a register plus an offset (`b3+14c7`), or the
+/// text a register points at (`s3`); a leading `*` logs every call, not
+/// only changes.
 fn watch(c: &Context, addr: u32) {
     enum What {
         Reg(usize),
         Word(u32),
         Byte(usize, u32),
+        Text(usize),
     }
     static CFG: OnceLock<Option<(u32, What, bool)>> = OnceLock::new();
-    static LAST: AtomicU32 = AtomicU32::new(0xDEAD_BEEF);
+    thread_local!(static LAST: std::cell::Cell<u32> = const { std::cell::Cell::new(0xDEAD_BEEF) });
     let Some((a, what, every)) = CFG.get_or_init(|| {
         let v = std::env::var("XENON_WATCH").ok()?;
         let (a, r) = v.split_once(':')?;
@@ -185,6 +187,8 @@ fn watch(c: &Context, addr: u32) {
         };
         let what = if let Some(m) = r.strip_prefix('m') {
             What::Word(u32::from_str_radix(m, 16).ok()?)
+        } else if let Some(t) = r.strip_prefix('s') {
+            What::Text(t.parse().ok()?)
         } else if let Some(b) = r.strip_prefix('b') {
             let (reg, off) = b.split_once('+')?;
             What::Byte(reg.parse().ok()?, u32::from_str_radix(off, 16).ok()?)
@@ -199,7 +203,8 @@ fn watch(c: &Context, addr: u32) {
     }) else {
         return;
     };
-    if addr != *a {
+    // Address 0 watches at every call, to find the call after a change.
+    if addr != *a && *a != 0 {
         return;
     }
     let Some(rt) = RT.get() else { return };
@@ -213,11 +218,30 @@ fn watch(c: &Context, addr: u32) {
                 format!("byte [r{r}+{o:#x}] ({at:#x})"),
             )
         }
+        What::Text(r) => {
+            let at = c.r[*r] as u32;
+            let text: String = (0..120)
+                .map(|i| rt.mem.read_u8(at + i))
+                .take_while(|&b| b != 0)
+                .map(|b| {
+                    if (0x20..0x7F).contains(&b) {
+                        b as char
+                    } else {
+                        '.'
+                    }
+                })
+                .collect();
+            // Fold the text in so an edit in place at the same address still logs.
+            let v = text.bytes().fold(at, |h, b| h.rotate_left(5) ^ b as u32);
+            (v, format!("text at r{r} ({at:#x}) {text:?}"))
+        }
     };
-    if LAST.swap(v, Ordering::Relaxed) != v || *every {
+    if LAST.with(|l| l.replace(v)) != v || *every {
         log(&format!(
-            "[watch] {name} = {v:#x} at call to {a:#010x} from {:#010x}",
-            c.lr as u32
+            "[watch] {name} = {v:#x} at call to {addr:#010x} from {:#010x} in {} after {:x?}",
+            c.lr as u32,
+            std::thread::current().name().unwrap_or("?"),
+            RECENT.with(|r| r.get())
         ));
     }
 }
@@ -496,7 +520,13 @@ fn start_memwatch(rt: Arc<Runtime>) {
                         .lock()
                         .unwrap()
                         .iter()
-                        .map(|(t, x)| format!("{t}:{:#x}", x.call.load(Ordering::Relaxed)))
+                        .map(|(t, x)| {
+                            format!(
+                                "{t}:{:#x}@{:#x}",
+                                x.call.load(Ordering::Relaxed),
+                                x.sp.load(Ordering::Relaxed)
+                            )
+                        })
                         .collect();
                     log(&format!(
                         "[memwatch] {:#x}: {:#x} -> {v:#x}; {}",

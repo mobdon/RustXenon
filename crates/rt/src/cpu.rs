@@ -145,10 +145,12 @@ impl Context {
         self.set_cr_field(n, v | self.so as u32);
     }
 
-    /// Record form: CR0 from the full 64-bit result compared with zero.
+    /// Record form: CR0 from the low 32 bits of the result compared with
+    /// zero, as titles expect (a C runtime stream count stored as -1 and
+    /// reloaded zero-extended must still test negative after `addic.`).
     #[inline]
     pub fn rec(&mut self, v: u64) {
-        self.cmp_s(0, v as i64, 0);
+        self.cmp_s(0, v as i32 as i64, 0);
     }
 
     /// XER as the 32-bit register `mfxer` reads.
@@ -201,11 +203,14 @@ mod tests {
     }
 
     #[test]
-    fn record_compares_all_64_bits() {
+    fn record_compares_the_low_32_bits() {
         let mut c = Context::new();
         c.rec(0x8000_0000);
-        assert_eq!(c.cr_field(0), GT);
+        assert_eq!(c.cr_field(0), LT);
         c.rec(0xFFFF_FFFF_0000_0000);
+        assert_eq!(c.cr_field(0), EQ);
+        // 0xFFFFFFFF loaded by lwz, minus one.
+        c.rec(0x0000_0000_FFFF_FFFE);
         assert_eq!(c.cr_field(0), LT);
     }
 
