@@ -76,3 +76,6 @@
 Thumbs.db
 .idea/
 .vscode/
+
+# Python bytecode from tools/
+__pycache__/

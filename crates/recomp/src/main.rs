@@ -1,9 +1,10 @@
 //! `xenon-recomp`: reads an Xbox 360 executable and writes Rust that links
 //! against `xenon-rt`.
 //!
-//! Step 0 scaffold. Planned stages, in order:
+//! Stages, in order:
 //! 1. 64-bit PowerPC and vector instruction translation, tested per instruction
-//!    against a CPU emulator with no game bytes.
+//!    against a CPU emulator with no game bytes (done: see `ppc.rs` and the
+//!    `xenon-cpu-tests` crate).
 //! 2. Executable loader, package unpackers, function and jump-table analysis.
 //! 3. Code generation by fixed address range, written only when bytes change,
 //!    with oversized functions split and capped parallel compiles.

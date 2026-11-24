@@ -60,6 +60,54 @@ impl GuestMemory {
     pub fn write_u64(&mut self, addr: u32, v: u64) {
         self.slice_mut::<8>(addr).copy_from_slice(&v.to_be_bytes());
     }
+
+    /// Reads 16 bytes at `addr` as a vector (element 0 at the lowest address).
+    pub fn read_v128(&self, addr: u32) -> crate::V128 {
+        let b: [u8; 16] = self.slice(addr);
+        crate::vmx::from_bytes(b)
+    }
+
+    pub fn write_v128(&mut self, addr: u32, v: crate::V128) {
+        self.slice_mut::<16>(addr)
+            .copy_from_slice(&crate::vmx::bytes(v));
+    }
+
+    /// Zeroes the `size`-byte cache block holding `addr` (`dcbz`, `dcbz128`).
+    pub fn zero_block(&mut self, addr: u32, size: u32) {
+        let a = (addr & !(size - 1)) as usize;
+        self.bytes[a..a + size as usize].fill(0);
+    }
+
+    /// Conditional store for `stwcx.`: writes `new` only if the word still
+    /// holds `old`. Single-threaded today; step 3 makes it a host
+    /// compare-and-swap.
+    pub fn cas_u32(&mut self, addr: u32, old: u32, new: u32) -> bool {
+        if self.read_u32(addr) == old {
+            self.write_u32(addr, new);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Conditional store for `stdcx.`.
+    pub fn cas_u64(&mut self, addr: u32, old: u64, new: u64) -> bool {
+        if self.read_u64(addr) == old {
+            self.write_u64(addr, new);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Raw bytes, for loaders and tests.
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    pub fn bytes_mut(&mut self) -> &mut [u8] {
+        &mut self.bytes
+    }
 }
 
 #[cfg(test)]

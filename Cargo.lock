@@ -3,6 +3,14 @@
 version = 3
 
 [[package]]
+name = "xenon-cpu-tests"
+version = "0.0.0"
+dependencies = [
+ "xenon-recomp",
+ "xenon-rt",
+]
+
+[[package]]
 name = "xenon-host"
 version = "0.0.0"
 dependencies = [
@@ -12,6 +20,9 @@ dependencies = [
 [[package]]
 name = "xenon-recomp"
 version = "0.0.0"
+dependencies = [
+ "xenon-rt",
+]
 
 [[package]]
 name = "xenon-rt"
