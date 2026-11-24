@@ -213,6 +213,8 @@ impl TextureFormat {
                 | F::Dxt1
                 | F::Dxt2_3
                 | F::Dxt4_5
+                | F::K24_8
+                | F::K24_8Float
                 | F::K16
                 | F::K16_16
                 | F::K16_16_16_16
@@ -260,6 +262,6 @@ mod tests {
         );
         assert!(F::Dxt4_5As16_16_16_16.can_convert());
         assert!(!F::Ctx1.can_convert());
-        assert!(!F::K24_8.can_convert());
+        assert!(F::K24_8Float.can_convert());
     }
 }

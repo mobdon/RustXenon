@@ -532,3 +532,88 @@ fn gpu_resolve_matches_cpu_reference() {
         }
     }
 }
+
+/// Draws a quad over the whole k_16_16_16_16_FLOAT target sampling a 1x1
+/// linear texture of `format` (endian none, swizzle RGBA, point filter)
+/// whose guest bytes are `texel_bytes`, and returns the halves at (8, 8).
+fn sample_into_rgba16f(d: &mut xenon_draw::Drawer, format: u32, texel_bytes: &[u8]) -> [u16; 4] {
+    let mut mem = memory();
+    mem.data[TEXTURE as usize..][..texel_bytes.len()].copy_from_slice(texel_bytes);
+    let q = W as f32;
+    let verts: Vec<u32> = [(0.0, 0.0), (q, 0.0), (q, q), (0.0, q)]
+        .iter()
+        .flat_map(|&(x, y)| [f(x), f(y), f(0.0), f(0.5), f(0.5)])
+        .collect();
+    mem.write_words(VERTS, &verts);
+    let swizzle_rgba = (1 << 3) | (2 << 6) | (3 << 9);
+    let fetch = [
+        2 | (2 << 10) | (2 << 13) | (1 << 22), // clamp, pitch 32, linear
+        format | TEXTURE,
+        0, // 1x1
+        swizzle_rgba << 1,
+        0,
+        1 << 9, // 2D
+    ];
+    let mut s = Stream::default();
+    s.setup()
+        .regs(RB_COLOR_INFO, &[RT_16_16_16_16_FLOAT << 16])
+        .shader(false, &vs_uv())
+        .shader(true, &ps_texture(1))
+        .vertex_fetch(0, VERTS, 20)
+        .regs(SHADER_CONSTANT_FETCH + 6, &fetch)
+        .draw_auto(PRIM_QUAD_LIST, 4);
+    let report = run(d, &s, &mut mem);
+    assert_eq!(report.draws, 1, "{report:?}");
+    assert!(report.unsupported.is_empty(), "{report:?}");
+    assert!(report.warnings.is_empty(), "{report:?}");
+    let raw = d
+        .read_render_target_raw(key(TargetFormat::Rgba16Float), 0, 0, W, H)
+        .unwrap();
+    halves(&texel(&raw, W, 8, 8, 8))
+}
+
+const PRIM_QUAD_LIST: u32 = 13;
+
+/// Depth textures sample their depth (high 24 bits) in every channel at
+/// float precision: 20e4 0.75 and unorm 0x800000 (0.5 + 2^-24, a half's
+/// 0.5) would read 191/255 and 128/255 through 8-bit unorm.
+#[test]
+fn depth_textures_sample_depth() {
+    let Some(mut d) = drawer() else { return };
+    const K24_8: u32 = 22;
+    const K24_8_FLOAT: u32 = 23;
+    let word = |depth: u32| ((depth << 8) | 0x5A).to_le_bytes();
+    assert_eq!(
+        sample_into_rgba16f(&mut d, K24_8_FLOAT, &word((14 << 20) | (1 << 19))),
+        [0x3A00; 4]
+    );
+    assert_eq!(
+        sample_into_rgba16f(&mut d, K24_8, &word(0x80_0000)),
+        [0x3800; 4]
+    );
+}
+
+/// Half and single float textures keep values outside [0, 1].
+#[test]
+fn hdr_textures_sample_unclamped() {
+    let Some(mut d) = drawer() else { return };
+    const K16_16_16_16_FLOAT: u32 = 32;
+    const K32_32_32_32_FLOAT: u32 = 38;
+    // 4.0, -2.0, 0.5, 1.0 as halves.
+    let h: Vec<u8> = [0x4400u16, 0xC000, 0x3800, 0x3C00]
+        .iter()
+        .flat_map(|v| v.to_le_bytes())
+        .collect();
+    assert_eq!(
+        sample_into_rgba16f(&mut d, K16_16_16_16_FLOAT, &h),
+        [0x4400, 0xC000, 0x3800, 0x3C00]
+    );
+    let s: Vec<u8> = [3.0f32, 0.25, 100.0, -1.0]
+        .iter()
+        .flat_map(|v| v.to_le_bytes())
+        .collect();
+    assert_eq!(
+        sample_into_rgba16f(&mut d, K32_32_32_32_FLOAT, &s),
+        [0x4200, 0x3400, 0x5640, 0xBC00]
+    );
+}

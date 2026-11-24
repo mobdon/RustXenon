@@ -42,6 +42,30 @@ fn half_to_f32(h: u16) -> f32 {
     }
 }
 
+/// 24-bit unorm depth to float (Xenia xenos.h UNorm24To32): exact, unlike a
+/// division by 0xFFFFFF. Bits above 24 are ignored.
+pub fn unorm24_to_f32(n24: u32) -> f32 {
+    let n24 = n24 & 0xFF_FFFF;
+    (n24 + (n24 >> 23)) as f32 / (1 << 24) as f32
+}
+
+/// Xenos 20e4 depth to float (Xenia xenos.cc Float20e4To32). Bits above 24
+/// are ignored.
+pub fn float20e4_to_f32(f24: u32) -> f32 {
+    let f24 = f24 & 0xFF_FFFF;
+    if f24 == 0 {
+        return 0.0;
+    }
+    let mut mantissa = f24 & 0xF_FFFF;
+    let mut exponent = f24 >> 20;
+    if exponent == 0 {
+        let lz = mantissa.leading_zeros() - (32 - 21);
+        exponent = (1 - lz as i32) as u32;
+        mantissa = (mantissa << lz) & 0xF_FFFF;
+    }
+    f32::from_bits((exponent.wrapping_add(112) << 23) | (mantissa << 3))
+}
+
 fn read_le(data: &[u8]) -> u64 {
     data.iter().rev().fold(0, |acc, &b| (acc << 8) | b as u64)
 }
@@ -66,6 +90,10 @@ fn texel(format: TextureFormat, d: &[u8]) -> [f32; 4] {
         // Xenia loads k_10_11_11 as R11G11B10 and k_11_11_10 as R10G11B11.
         F::K10_11_11 => [u(0, 11), u(11, 11), u(22, 10), u(22, 10)],
         F::K11_11_10 => [u(0, 10), u(10, 11), u(21, 11), u(21, 11)],
+        // Depth in the high 24 bits, stencil in the low 8 (Xenia's
+        // texture_load_depth_* shaders); the host swizzle is RRRR.
+        F::K24_8 => [unorm24_to_f32((v >> 8) as u32); 4],
+        F::K24_8Float => [float20e4_to_f32((v >> 8) as u32); 4],
         F::K16 => [u(0, 16); 4],
         F::K16_16 => [u(0, 16), u(16, 16), u(16, 16), u(16, 16)],
         F::K16_16_16_16 => [u(0, 16), u(16, 16), u(32, 16), u(48, 16)],
@@ -269,17 +297,26 @@ pub fn to_rgba8(
 /// constant 0, 5 constant 1. 6 and 7 are undefined; like Xenia's
 /// `TextureCache::GuestToHostSwizzle` (texture_cache.cc) they become 0 and 1.
 pub fn apply_swizzle(rgba8: &mut [u8], swizzle: u16) {
+    swizzle_texels(rgba8, swizzle, 0, 255);
+}
+
+/// [`apply_swizzle`] for XYZW floats (constant 1 is 1.0).
+pub fn apply_swizzle_f32(rgba: &mut [f32], swizzle: u16) {
+    swizzle_texels(rgba, swizzle, 0.0, 1.0);
+}
+
+fn swizzle_texels<T: Copy>(texels: &mut [T], swizzle: u16, zero: T, one: T) {
     let sel: [u16; 4] = std::array::from_fn(|i| (swizzle >> (3 * i)) & 7);
     if sel == [0, 1, 2, 3] {
         return;
     }
-    for t in rgba8.chunks_exact_mut(4) {
+    for t in texels.chunks_exact_mut(4) {
         let src = [t[0], t[1], t[2], t[3]];
         for (dst, &s) in t.iter_mut().zip(&sel) {
             *dst = match s {
                 0..=3 => src[s as usize],
-                _ if s & 1 == 0 => 0,
-                _ => 255,
+                _ if s & 1 == 0 => zero,
+                _ => one,
             };
         }
     }
@@ -406,6 +443,45 @@ mod tests {
     }
 
     /// Builds a DXT1 block: color0, color1, 2-bit codes row-major.
+    #[test]
+    fn depth_24_8_unorm_and_float() {
+        // Depth in bits 8..32, stencil (0x5A) in bits 0..8 and ignored.
+        let word = |d: u32| ((d << 8) | 0x5A).to_le_bytes();
+        let f = |format, d| to_rgba_f32(format, &word(d), 1, 1).unwrap();
+        assert_eq!(f(F::K24_8, 0xFF_FFFF), [1.0; 4]);
+        assert_eq!(f(F::K24_8, 0x80_0000), [0.5 + 1.0 / (1 << 24) as f32; 4]);
+        assert_eq!(f(F::K24_8, 0), [0.0; 4]);
+        // 20e4: exponent 15 is 1.0; 14 with the top mantissa bit is 0.75.
+        assert_eq!(f(F::K24_8Float, 15 << 20), [1.0; 4]);
+        assert_eq!(f(F::K24_8Float, (14 << 20) | (1 << 19)), [0.75; 4]);
+        // Smallest denormal: 2^-20 * 2^-14.
+        assert_eq!(f(F::K24_8Float, 1), [f32::powi(2.0, -34); 4]);
+        assert_eq!(f(F::K24_8Float, 0), [0.0; 4]);
+        assert_eq!(one(F::K24_8, &word(0x80_0000)), [128; 4]);
+    }
+
+    #[test]
+    fn unorm24_end_points() {
+        assert_eq!(unorm24_to_f32(0), 0.0);
+        assert_eq!(unorm24_to_f32(0xFF_FFFF), 1.0);
+        assert_eq!(unorm24_to_f32(0x80_0000), 0.5 + 1.0 / (1 << 24) as f32);
+    }
+
+    #[test]
+    fn float20e4_known_values() {
+        assert_eq!(float20e4_to_f32(0), 0.0);
+        // Exponent 15 (bias 15), mantissa 0: 1.0.
+        assert_eq!(float20e4_to_f32(15 << 20), 1.0);
+        assert_eq!(float20e4_to_f32((15 << 20) | (1 << 19)), 1.5);
+    }
+
+    #[test]
+    fn swizzle_f32_constants() {
+        let mut t = [0.25, 2.0, -3.0, 4.0];
+        apply_swizzle_f32(&mut t, swz([3, 0, 4, 5]));
+        assert_eq!(t, [4.0, 0.25, 0.0, 1.0]);
+    }
+
     fn dxt1_block(c0: u16, c1: u16, codes: [u32; 16]) -> Vec<u8> {
         let mut b = Vec::new();
         b.extend_from_slice(&c0.to_le_bytes());
