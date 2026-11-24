@@ -1,5 +1,4 @@
-// float20e4 is ported from Xenia src/xenia/gpu/xenos.cc (Float20e4To32) and
-// unorm24 from src/xenia/gpu/xenos.h (UNorm24To32); the
+// float20e4 is ported from Xenia src/xenia/gpu/xenos.cc (Float20e4To32); the
 // 8_8_8_8 colour clear packing (red in the low byte) follows
 // src/xenia/gpu/shaders/pixel_formats.xesli; render target formats and
 // RB_*_INFO fields follow src/xenia/gpu/xenos.h and registers.h; resolve
@@ -71,9 +70,10 @@
 //! `Drawer::resolve` (`Raw` and `Convert` alike, `Null` clears only,
 //! `ConstantOne` unsupported).
 //!
-//! A depth copy (to any 32bpp destination format) writes the raw EDRAM word,
-//! as Xenia's fast resolve does: depth in bits 8..31 (`kD24S8` as 24-bit
-//! unorm, rounded; `kD24FS8` as 20e4, rounded to nearest even) and stencil in
+//! A depth copy writes the raw 32-bit EDRAM word whatever the destination
+//! format, as Xenia's fast resolve does: depth in bits 8..31 (`kD24S8` as
+//! 24-bit unorm, rounded to nearest even; `kD24FS8` as 20e4, truncated like
+//! Xenia's default) and stencil in
 //! bits 0..7 (0 for a `kD24FS8` hosted without stencil), with the destination
 //! endian and no bias or swap.
 //!
@@ -1927,7 +1927,10 @@ impl Drawer {
             let d = r.depth_clear >> 8;
             let depth = match key.format {
                 TargetFormat::D24FS8 => float20e4(d),
-                _ => unorm24(d),
+                // Not Xenia's UNorm24To32: n / 0xFFFFFF is the value the
+                // depth resolve's round(d * 0xFFFFFF) gives back exactly for
+                // every 24-bit n, as the EDRAM keeps it.
+                _ => (f64::from(d) / f64::from(0xFF_FFFFu32)) as f32,
             };
             let t = Instant::now();
             self.clear(key, rect, [0.0; 4], depth, r.depth_clear & 0xFF)?;
@@ -1959,7 +1962,14 @@ impl Drawer {
             };
             format
         };
-        let Some(dest_bytes) = formats::dest_bytes(r.dest_format) else {
+        // A depth copy always writes 32bpp words whatever the destination
+        // format says (Xenia GetResolveInfo replaces it with k_24_8).
+        let dest_bytes = if r.is_depth {
+            Some(4)
+        } else {
+            formats::dest_bytes(r.dest_format)
+        };
+        let Some(dest_bytes) = dest_bytes else {
             return unsupported(format!(
                 "resolve copy to destination format {}",
                 r.dest_format
@@ -1989,12 +1999,6 @@ impl Drawer {
         };
         if rect.is_empty() {
             return Ok(());
-        }
-        if r.is_depth && dest_bytes != 4 {
-            return unsupported(format!(
-                "depth resolve to {dest_bytes}-byte destination format {}",
-                r.dest_format
-            ));
         }
         if dest_bytes == 4 {
             self.resolve_gpu(r, rect, format, &tex, mem)?;
@@ -2227,13 +2231,6 @@ impl Drawer {
     }
 }
 
-/// 24-bit unorm depth to float (Xenia xenos.h UNorm24To32): exact, unlike a
-/// division by 0xFFFFFF.
-fn unorm24(n24: u32) -> f32 {
-    let n24 = n24 & 0xFF_FFFF;
-    (n24 + (n24 >> 23)) as f32 / (1 << 24) as f32
-}
-
 /// Xenos 20e4 depth (Xenia xenos.cc Float20e4To32).
 fn float20e4(f24: u32) -> f32 {
     let f24 = f24 & 0xFF_FFFF;
@@ -2264,13 +2261,6 @@ mod tests {
         assert!(!m.write_bytes(0x13, &[1, 2]));
         assert!(!m.write_bytes(0x0F, &[1]));
         assert_eq!(m.data, vec![0, 0, 1, 2]);
-    }
-
-    #[test]
-    fn unorm24_end_points() {
-        assert_eq!(unorm24(0), 0.0);
-        assert_eq!(unorm24(0xFF_FFFF), 1.0);
-        assert_eq!(unorm24(0x80_0000), 0.5 + 1.0 / (1 << 24) as f32);
     }
 
     #[test]
