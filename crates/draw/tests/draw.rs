@@ -678,3 +678,80 @@ fn strip_primitive_reset_32_bit() {
         assert_eq!(px(&img, W, x, y), CLEAR, "({x}, {y})");
     }
 }
+
+/// Depth resolve of `format` (RB_DEPTH_INFO bit 16): clear depth and
+/// stencil, draw a triangle at z = 0.25 with depth always passing, resolve
+/// the depth surface raw to k_8_8_8_8 and return the words at (2, 2) (in
+/// the triangle) and (40, 40) (cleared).
+fn depth_resolve_words(depth_info: u32, clear: u32) -> (u32, u32) {
+    let Some(mut d) = drawer() else {
+        return (0, 0);
+    };
+    let mut mem = memory();
+    let z = 0.25;
+    mem.write_words(
+        VERTS,
+        &color_verts(&[
+            (0.0, 0.0, z, WHITE),
+            (16.0, 0.0, z, WHITE),
+            (0.0, 16.0, z, WHITE),
+        ]),
+    );
+    let mut s = Stream::default();
+    s.setup()
+        .regs(RB_DEPTH_INFO, &[depth_info])
+        .resolve_with(
+            &mut mem,
+            (W, H),
+            COPY_NULL | CLEAR_DEPTH,
+            (DEST, W | (H << 16), 0),
+            [clear, 0, 0],
+        )
+        .shader(false, &vs_color())
+        .shader(true, &ps_interp())
+        .vertex_fetch(0, VERTS, 12)
+        // z test always, z write.
+        .regs(RB_DEPTHCONTROL, &[2 | 4 | (7 << 4)])
+        .draw_auto(PRIM_TRI_LIST, 3)
+        .regs(RB_DEPTHCONTROL, &[0])
+        .resolve_with(
+            &mut mem,
+            (W, H),
+            4 | COPY_RAW,
+            (DEST, W | (H << 16), dest_info(6, 0, false)),
+            [0; 3],
+        );
+    let report = run(&mut d, &s, &mut mem);
+    assert_eq!((report.draws, report.resolves), (1, 2), "{report:?}");
+    assert!(report.unsupported.is_empty(), "{report:?}");
+    let img = detiled(&mem, DEST, W, H, W, 4);
+    let word = |x: u32, y: u32| u32::from_le_bytes(px(&img, W, x, y));
+    (word(2, 2), word(40, 40))
+}
+
+/// A D24S8 depth resolve writes the EDRAM word: 24-bit unorm depth in
+/// bits 8..31, stencil in 0..7, as Xenia's fast resolve copies it.
+#[test]
+fn depth_resolve_d24s8_words() {
+    if drawer().is_none() {
+        return;
+    }
+    assert_eq!(
+        depth_resolve_words(DEPTH_BASE, 0x1234_5678),
+        ((0x40_0000 << 8) | 0x78, 0x1234_5678)
+    );
+}
+
+/// A D24FS8 depth resolve writes 20e4 depth in bits 8..31; the host
+/// surface has no stencil, so bits 0..7 are 0.
+#[test]
+fn depth_resolve_d24fs8_words() {
+    if drawer().is_none() {
+        return;
+    }
+    // 0.25 is 20e4 exponent 13, 0.5 exponent 14.
+    assert_eq!(
+        depth_resolve_words(DEPTH_BASE | (1 << 16), (14 << 28) | 0x78),
+        (13 << 28, 14 << 28)
+    );
+}

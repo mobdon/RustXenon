@@ -70,6 +70,12 @@
 //! `Drawer::resolve` (`Raw` and `Convert` alike, `Null` clears only,
 //! `ConstantOne` unsupported).
 //!
+//! A depth copy (to any 32bpp destination format) writes the raw EDRAM word,
+//! as Xenia's fast resolve does: depth in bits 8..31 (`kD24S8` as 24-bit
+//! unorm, rounded; `kD24FS8` as 20e4, rounded to nearest even) and stencil in
+//! bits 0..7 (0 for `kD24FS8`, hosted without stencil), with the destination
+//! endian and no bias or swap.
+//!
 //! # Draws
 //!
 //! The vertex shader's position goes through a WGSL epilogue the drawer
@@ -438,7 +444,8 @@ pub struct Drawer {
     texture_cache: HashMap<([u32; 6], u64), wgpu::TextureView>,
     texture_cache_bytes: u64,
     /// Compute pipeline of resolve.wgsl, made on the first 32bpp resolve.
-    resolve_pipeline: Option<wgpu::ComputePipeline>,
+    /// Colour, depth and depth + stencil entry points of resolve.wgsl.
+    resolve_pipelines: [Option<wgpu::ComputePipeline>; 3],
     timings: Timings,
     uncaptured: Arc<Mutex<Vec<String>>>,
     max_dim: u32,
@@ -726,7 +733,7 @@ impl Drawer {
             resolved_endian: HashMap::new(),
             texture_cache: HashMap::new(),
             texture_cache_bytes: 0,
-            resolve_pipeline: None,
+            resolve_pipelines: [None, None, None],
             timings: Timings::default(),
             uncaptured,
             max_dim: limits.max_texture_dimension_2d,
@@ -1890,11 +1897,17 @@ impl Drawer {
         rect: resolve::Rect,
         mem: &mut dyn GuestMemory,
     ) -> Result<(), Skip> {
-        if r.is_depth {
-            return unsupported("resolve copy from depth");
-        }
-        let Some(format) = TargetFormat::color(r.src_format) else {
-            return unsupported(format!("resolve copy from colour format {}", r.src_format));
+        let format = if r.is_depth {
+            if r.src_format & 1 != 0 {
+                TargetFormat::D24FS8
+            } else {
+                TargetFormat::D24S8
+            }
+        } else {
+            let Some(format) = TargetFormat::color(r.src_format) else {
+                return unsupported(format!("resolve copy from colour format {}", r.src_format));
+            };
+            format
         };
         let Some(dest_bytes) = formats::dest_bytes(r.dest_format) else {
             return unsupported(format!(
@@ -1926,6 +1939,12 @@ impl Drawer {
         };
         if rect.is_empty() {
             return Ok(());
+        }
+        if r.is_depth && dest_bytes != 4 {
+            return unsupported(format!(
+                "depth resolve to {dest_bytes}-byte destination format {}",
+                r.dest_format
+            ));
         }
         if dest_bytes == 4 {
             self.resolve_gpu(r, rect, format, &tex, mem)?;
@@ -2007,9 +2026,13 @@ impl Drawer {
             TargetFormat::Float7e3 => 2,
             TargetFormat::Rgba16Float => 3,
             TargetFormat::Float32 => 4,
-            TargetFormat::D24S8 | TargetFormat::D24FS8 => {
-                return unsupported("GPU resolve from a depth format")
-            }
+            TargetFormat::D24S8 => 5,
+            TargetFormat::D24FS8 => 6,
+        };
+        let entry = match format {
+            TargetFormat::D24S8 => 2,
+            TargetFormat::D24FS8 => 1,
+            _ => 0,
         };
         let params = [
             rect.x0,
@@ -2047,7 +2070,7 @@ impl Drawer {
         });
         let scope = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
         let device = &self.device;
-        let pipeline = self.resolve_pipeline.get_or_insert_with(|| {
+        let pipeline = self.resolve_pipelines[entry].get_or_insert_with(|| {
             let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("resolve"),
                 source: wgpu::ShaderSource::Wgsl(include_str!("resolve.wgsl").into()),
@@ -2056,29 +2079,46 @@ impl Drawer {
                 label: Some("resolve"),
                 layout: None,
                 module: &module,
-                entry_point: Some("main"),
+                entry_point: Some(["main", "depth_main", "depth_stencil_main"][entry]),
                 compilation_options: Default::default(),
                 cache: None,
             })
         });
-        let view = tex.create_view(&Default::default());
+        let aspect = |aspect| {
+            tex.create_view(&wgpu::TextureViewDescriptor {
+                aspect,
+                ..Default::default()
+            })
+        };
+        let views = match entry {
+            0 => vec![(0, aspect(wgpu::TextureAspect::All))],
+            1 => vec![(3, aspect(wgpu::TextureAspect::DepthOnly))],
+            _ => vec![
+                (3, aspect(wgpu::TextureAspect::DepthOnly)),
+                (4, aspect(wgpu::TextureAspect::StencilOnly)),
+            ],
+        };
+        let mut entries: Vec<_> = views
+            .iter()
+            .map(|(binding, view)| wgpu::BindGroupEntry {
+                binding: *binding,
+                resource: wgpu::BindingResource::TextureView(view),
+            })
+            .collect();
+        entries.extend([
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: dest.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: uniform.as_entire_binding(),
+            },
+        ]);
         let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("resolve"),
             layout: &pipeline.get_bind_group_layout(0),
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: dest.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: uniform.as_entire_binding(),
-                },
-            ],
+            entries: &entries,
         });
         let mut enc = self.device.create_command_encoder(&Default::default());
         {
