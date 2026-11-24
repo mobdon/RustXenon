@@ -608,6 +608,10 @@ def vx128_cases():
                 words=[enc_vx128_1(xo, vd, 4, 5)], rename={vd: 1})
 
 
+# Doubleword ops (primary 31): their record forms keep CR0 from all 64 bits.
+DWORD_XO = {27, 539, 794, 58, 986, 9, 73}
+DWORD_X9 = {233, 457, 489}
+
 # Logical and shift ops (primary 31) that write rA rather than rD.
 RA_XO = {28, 60, 444, 412, 316, 476, 124, 284, 24, 536, 792, 824, 27, 539, 794, 954, 922, 986, 26, 58}
 
@@ -616,17 +620,21 @@ def console_cr0(word, out):
     """The console's titles see CR0 of an integer record form from the low
     32 bits of the result (the reference CPU compares all 64), so a C
     runtime count stored as -1 and reloaded zero-extended still tests
-    negative. Rewrites CR0 in `out` for such an instruction."""
+    negative. Rewrites CR0 in `out` for such an instruction. Doubleword
+    ops (rld*, sld, srd, srad(i), cntlzd, extsw, mulld, mulhd(u), divd(u))
+    keep the reference CPU's 64-bit CR0."""
     op = word >> 26
     rd, ra = (word >> 21) & 31, (word >> 16) & 31
     if op == 31 and word & 1:
         xo = (word >> 1) & 0x3FF
         if xo in (0, 32, 150, 214):  # compares and conditional stores
             return
+        if xo in DWORD_XO or xo & 0x1FF in DWORD_X9 or (word >> 2) & 0x1FF == 413:
+            return
         dest = ra if xo in RA_XO or (word >> 2) & 0x1FF == 413 else rd
     elif op == 13:
         dest = rd
-    elif op in (28, 29) or (op in (20, 21, 23, 30) and word & 1):
+    elif op in (28, 29) or (op in (20, 21, 23) and word & 1):
         dest = ra
     else:
         return
