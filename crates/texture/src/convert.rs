@@ -442,7 +442,6 @@ mod tests {
         assert_eq!(to_rgba_f32(F::K32Float, &d[4..8], 1, 1).unwrap(), [1.5; 4]);
     }
 
-    /// Builds a DXT1 block: color0, color1, 2-bit codes row-major.
     #[test]
     fn depth_24_8_unorm_and_float() {
         // Depth in bits 8..32, stencil (0x5A) in bits 0..8 and ignored.
@@ -482,6 +481,7 @@ mod tests {
         assert_eq!(t, [4.0, 0.25, 0.0, 1.0]);
     }
 
+    /// Builds a DXT1 block: color0, color1, 2-bit codes row-major.
     fn dxt1_block(c0: u16, c1: u16, codes: [u32; 16]) -> Vec<u8> {
         let mut b = Vec::new();
         b.extend_from_slice(&c0.to_le_bytes());

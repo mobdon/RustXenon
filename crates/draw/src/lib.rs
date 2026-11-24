@@ -2214,7 +2214,10 @@ impl Drawer {
 /// `Rgba32Float` for depth, 16-bit unorm and 32-bit floats (16-bit unorm and
 /// 24-bit depth need more than a half's 11 bits), `Rgba8Unorm` for the rest.
 /// Without filterable 32-bit floats the wide formats fall back to
-/// `Rgba16Float`, which keeps their range but not their precision.
+/// `Rgba16Float`. That keeps the [-1, 1] range of 16-bit unorm and 24-bit
+/// depth but not their precision. 32-bit floats also lose range: values with
+/// a magnitude of 65520 or more become infinity and values below about 2^-25
+/// flush to zero.
 fn host_texture_format(format: xenon_texture::TextureFormat, float32: bool) -> wgpu::TextureFormat {
     use xenon_texture::TextureFormat as F;
     match format.data_format() {
