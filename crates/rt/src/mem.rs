@@ -91,7 +91,8 @@ fn alias(addr: u32) -> u32 {
     0xA000_0000 | ((addr & 0x1FFF_FFFF) + off) & 0x1FFF_FFFF
 }
 
-/// An unaligned access whose bytes are not contiguous after `alias`: it runs
+/// An access (unaligned scalar or byte range; aligned scalars never cross)
+/// whose bytes are not contiguous after `alias`: it runs
 /// off the end of a mirrored view and wraps, so it goes byte by byte.
 #[inline]
 fn crosses_view(addr: u32, n: usize) -> bool {
@@ -205,6 +206,12 @@ impl GuestMemory {
 
     /// Copies guest bytes at `addr` into `out`.
     pub fn read_bytes(&self, addr: u32, out: &mut [u8]) {
+        if !out.is_empty() && crosses_view(addr, out.len()) {
+            for (i, x) in out.iter_mut().enumerate() {
+                *x = self.read_u8(addr.wrapping_add(i as u32));
+            }
+            return;
+        }
         let p = self.at(addr, out.len());
         for (i, x) in out.iter_mut().enumerate() {
             *x = byte(p, i).load(Relaxed);
@@ -213,6 +220,12 @@ impl GuestMemory {
 
     /// Copies `data` into guest memory at `addr`.
     pub fn write_bytes(&self, addr: u32, data: &[u8]) {
+        if !data.is_empty() && crosses_view(addr, data.len()) {
+            for (i, &x) in data.iter().enumerate() {
+                self.write_u8(addr.wrapping_add(i as u32), x);
+            }
+            return;
+        }
         let p = self.at(addr, data.len());
         for (i, &x) in data.iter().enumerate() {
             byte(p, i).store(x, Relaxed);
@@ -299,6 +312,11 @@ mod tests {
         assert_eq!(m.read_u16(0xBFFF_FFFE), 0x1122);
         assert_eq!(m.read_u16(0xA000_0000), 0x3344);
         assert_eq!(m.read_u32(0xFFFF_EFFE), 0x1122_3344);
+        m.write_bytes(0xFFFF_EFFC, &[1, 2, 3, 4, 5, 6]);
+        assert_eq!(m.read_u16(0xA000_0000), 0x0506);
+        let mut b = [0; 6];
+        m.read_bytes(0xFFFF_EFFC, &mut b);
+        assert_eq!(b, [1, 2, 3, 4, 5, 6]);
     }
 
     #[test]
