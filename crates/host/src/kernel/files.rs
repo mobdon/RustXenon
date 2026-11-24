@@ -360,6 +360,17 @@ pub fn nt_read_file(rt: &Runtime, c: &mut Context) {
     let mut f = f.lock().unwrap();
     let at = offset(rt, off, &f);
     let r = read_into(rt, &mut f, at, &[(buf, len)]);
+    if std::env::var_os("XENON_TRACE_READS").is_some() {
+        let name = f
+            .path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        crate::log(&format!(
+            "[read] {name} at {at:#x} len {len:#x} -> {:?} into {buf:#x}",
+            r.as_ref().ok()
+        ));
+    }
     drop(f);
     finish_read(rt, c, r, io, event, len);
 }

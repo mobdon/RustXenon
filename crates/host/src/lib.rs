@@ -164,38 +164,61 @@ fn profile_call(addr: u32) {
         .or_default() += 1;
 }
 
-/// `XENON_WATCH=<hex addr>:<reg>` or `<hex addr>:m<hex address>`: logs a
-/// register, or a guest word, whenever a call to `addr` sees a new value
-/// (to follow a state variable).
+/// `XENON_WATCH=<hex addr>:<what>`: at each call to `addr`, logs `what`
+/// when it changes. `what` is a register number (`3`), a guest word
+/// (`m82bf99d4`), or a byte at a register plus an offset (`b3+14c7`); a
+/// leading `*` logs every call, not only changes.
 fn watch(c: &Context, addr: u32) {
-    static CFG: OnceLock<Option<(u32, Result<usize, u32>)>> = OnceLock::new();
+    enum What {
+        Reg(usize),
+        Word(u32),
+        Byte(usize, u32),
+    }
+    static CFG: OnceLock<Option<(u32, What, bool)>> = OnceLock::new();
     static LAST: AtomicU32 = AtomicU32::new(0xDEAD_BEEF);
-    let Some((a, what)) = *CFG.get_or_init(|| {
+    let Some((a, what, every)) = CFG.get_or_init(|| {
         let v = std::env::var("XENON_WATCH").ok()?;
         let (a, r) = v.split_once(':')?;
-        let what = match r.strip_prefix('m') {
-            Some(m) => Err(u32::from_str_radix(m, 16).ok()?),
-            None => Ok(r.parse().ok()?),
+        let (every, r) = match r.strip_prefix('*') {
+            Some(r) => (true, r),
+            None => (false, r),
+        };
+        let what = if let Some(m) = r.strip_prefix('m') {
+            What::Word(u32::from_str_radix(m, 16).ok()?)
+        } else if let Some(b) = r.strip_prefix('b') {
+            let (reg, off) = b.split_once('+')?;
+            What::Byte(reg.parse().ok()?, u32::from_str_radix(off, 16).ok()?)
+        } else {
+            What::Reg(r.parse().ok()?)
         };
         Some((
             u32::from_str_radix(a.trim_start_matches("0x"), 16).ok()?,
             what,
+            every,
         ))
     }) else {
         return;
     };
-    if addr != a {
+    if addr != *a {
         return;
     }
+    let Some(rt) = RT.get() else { return };
     let (v, name) = match what {
-        Ok(r) => (c.r[r] as u32, format!("r{r}")),
-        Err(m) => match RT.get() {
-            Some(rt) => (rt.mem.read_u32(m), format!("[{m:#x}]")),
-            None => return,
-        },
+        What::Reg(r) => (c.r[*r] as u32, format!("r{r}")),
+        What::Word(m) => (rt.mem.read_u32(*m), format!("[{m:#x}]")),
+        What::Byte(r, o) => {
+            let at = (c.r[*r] as u32).wrapping_add(*o);
+            (
+                rt.mem.read_u8(at) as u32,
+                format!("byte [r{r}+{o:#x}] ({at:#x})"),
+            )
+        }
     };
-    if LAST.swap(v, Ordering::Relaxed) != v {
-        log(&format!("[watch] {name} = {v:#x} at call to {a:#010x}"));
+    if LAST.swap(v, Ordering::Relaxed) != v || *every {
+        log(&format!(
+            "[watch] {name} = {v:#x} at call to {a:#010x} from {:#010x}",
+            c.lr as u32
+        ));
     }
 }
 
