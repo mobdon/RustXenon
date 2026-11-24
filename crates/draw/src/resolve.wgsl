@@ -10,7 +10,7 @@ struct Params {
     // Destination pitch in texels, a multiple of 32.
     pitch: u32,
     // 0 8_8_8_8, 1 2_10_10_10, 2 7e3 (hosted as half), 3 16_16_16_16 float,
-    // 4 32 float.
+    // 4 32 float, 5 D24S8, 6 D24FS8.
     src_format: u32,
     // 0 8_8_8_8, 1 2_10_10_10, 2 32_FLOAT.
     dest_format: u32,
@@ -127,5 +127,65 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
         w = to_unorm(c.r, 1023.0) | (to_unorm(c.g, 1023.0) << 10u) | (to_unorm(c.b, 1023.0) << 20u)
             | (to_unorm(c.a, 3.0) << 30u);
     }
+    store(x, y, w);
+}
+
+fn store(x: u32, y: u32, w: u32) {
     dest[tiled(x, y, p.pitch) >> 2u] = swap_endian(w, p.endian);
+}
+
+// Depth copies are raw EDRAM words, as in Xenia's fast resolve: depth in
+// bits 8..31 (24-bit unorm, or 20e4 for src_format 6), stencil in 0..7;
+// no conversion, bias or swap, only the destination endian.
+@group(0) @binding(3) var depth_src: texture_depth_2d;
+@group(0) @binding(4) var stencil_src: texture_2d<u32>;
+
+// Xenia pixel_formats.xesli XeFloat32To20e4 without rounding (truncating),
+// as Xenia's host render target dump does by default (depth_float24_round
+// off).
+fn to_20e4(f: f32) -> u32 {
+    if !(f > 0.0) {
+        return 0u;
+    }
+    var u = bitcast<u32>(f);
+    if u >= 0x3FFFFFF8u {
+        return 0xFFFFFFu;
+    }
+    if u < 0x38800000u {
+        u = (0x800000u | (u & 0x7FFFFFu)) >> min(113u - (u >> 23u), 24u);
+    } else {
+        u = u + 0xC8000000u;
+    }
+    return (u >> 3u) & 0xFFFFFFu;
+}
+
+fn depth_word(x: u32, y: u32) -> u32 {
+    let d = textureLoad(depth_src, vec2<u32>(x, y), 0);
+    if p.src_format == 6u {
+        return to_20e4(d) << 8u;
+    }
+    // Round to nearest even, as Xenia's dump does: `+ 0.5` ties every odd
+    // value from 2^23 up to the next even one.
+    return u32(round(clamp(d, 0.0, 1.0) * 16777215.0)) << 8u;
+}
+
+// D24FS8 is hosted without stencil, so its stencil bits are 0.
+@compute @workgroup_size(8, 8)
+fn depth_main(@builtin(global_invocation_id) id: vec3<u32>) {
+    if id.x >= p.w || id.y >= p.h {
+        return;
+    }
+    let x = p.x0 + id.x;
+    let y = p.y0 + id.y;
+    store(x, y, depth_word(x, y));
+}
+
+@compute @workgroup_size(8, 8)
+fn depth_stencil_main(@builtin(global_invocation_id) id: vec3<u32>) {
+    if id.x >= p.w || id.y >= p.h {
+        return;
+    }
+    let x = p.x0 + id.x;
+    let y = p.y0 + id.y;
+    store(x, y, depth_word(x, y) | (textureLoad(stencil_src, vec2<u32>(x, y), 0).r & 0xFFu));
 }

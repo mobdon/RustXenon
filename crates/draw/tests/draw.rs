@@ -720,6 +720,181 @@ fn strip_primitive_reset_32_bit() {
     }
 }
 
+/// Depth resolve of `format` (RB_DEPTH_INFO bit 16): clear depth and
+/// stencil, draw a triangle at z = 0.25 with depth always passing, resolve
+/// the depth surface raw to k_8_8_8_8 and return the words at (2, 2) (in
+/// the triangle) and (40, 40) (cleared).
+fn depth_resolve_words(d: &mut xenon_draw::Drawer, depth_info: u32, clear: u32) -> (u32, u32) {
+    depth_resolve_words_at(d, depth_info, clear, 0.25, 6)
+}
+
+/// [`depth_resolve_words`] with the triangle at depth `z` and destination
+/// format `dest_format` (ignored for depth copies).
+fn depth_resolve_words_at(
+    d: &mut xenon_draw::Drawer,
+    depth_info: u32,
+    clear: u32,
+    z: f32,
+    dest_format: u32,
+) -> (u32, u32) {
+    let mut mem = memory();
+    mem.write_words(
+        VERTS,
+        &color_verts(&[
+            (0.0, 0.0, z, WHITE),
+            (16.0, 0.0, z, WHITE),
+            (0.0, 16.0, z, WHITE),
+        ]),
+    );
+    let mut s = Stream::default();
+    s.setup()
+        .regs(RB_DEPTH_INFO, &[depth_info])
+        .resolve_with(
+            &mut mem,
+            (W, H),
+            COPY_NULL | CLEAR_DEPTH,
+            (DEST, W | (H << 16), 0),
+            [clear, 0, 0],
+        )
+        .shader(false, &vs_color())
+        .shader(true, &ps_interp())
+        .vertex_fetch(0, VERTS, 12)
+        // z test always, z write.
+        .regs(RB_DEPTHCONTROL, &[2 | 4 | (7 << 4)])
+        .draw_auto(PRIM_TRI_LIST, 3)
+        .regs(RB_DEPTHCONTROL, &[0])
+        .resolve_with(
+            &mut mem,
+            (W, H),
+            4 | COPY_RAW,
+            (DEST, W | (H << 16), dest_info(dest_format, 0, false)),
+            [0; 3],
+        );
+    let report = run(d, &s, &mut mem);
+    assert_eq!((report.draws, report.resolves), (1, 2), "{report:?}");
+    assert!(report.unsupported.is_empty(), "{report:?}");
+    let img = detiled(&mem, DEST, W, H, W, 4);
+    let word = |x: u32, y: u32| u32::from_le_bytes(px(&img, W, x, y));
+    (word(2, 2), word(40, 40))
+}
+
+/// A D24S8 depth resolve writes the EDRAM word: 24-bit unorm depth in
+/// bits 8..31, stencil in 0..7, as Xenia's fast resolve copies it.
+#[test]
+fn depth_resolve_d24s8_words() {
+    let Some(mut d) = drawer() else { return };
+    assert_eq!(
+        depth_resolve_words(&mut d, DEPTH_BASE, 0x1234_5678),
+        ((0x40_0000 << 8) | 0x78, 0x1234_5678)
+    );
+}
+
+/// A D24FS8 depth resolve writes 20e4 depth in bits 8..31 and the
+/// stencil in 0..7 (0 where the host has no float depth with stencil).
+#[test]
+fn depth_resolve_d24fs8_words() {
+    let Some(mut d) = drawer() else { return };
+    let stencil = if d.float_stencil() { 0x78 } else { 0 };
+    // 0.25 is 20e4 exponent 13, 0.5 exponent 14.
+    assert_eq!(
+        depth_resolve_words(&mut d, DEPTH_BASE | (1 << 16), (14 << 28) | 0x78),
+        ((13 << 28) | stencil, (14 << 28) | stencil)
+    );
+}
+
+/// Stencil on depth surface `depth_info`: a corner triangle writes
+/// reference 5 (always, replace) with colour off, then a full-window
+/// triangle drawn only where the stencil equals 5 colours the corner red
+/// and leaves the rest at the clear colour.
+fn stencil_masks_draw(depth_info: u32) {
+    let Some(mut d) = drawer() else { return };
+    let mut mem = memory();
+    mem.write_words(
+        VERTS,
+        &color_verts(&[
+            (0.0, 0.0, 0.0, WHITE),
+            (16.0, 0.0, 0.0, WHITE),
+            (0.0, 16.0, 0.0, WHITE),
+            (0.0, 0.0, 0.0, RED),
+            (128.0, 0.0, 0.0, RED),
+            (0.0, 128.0, 0.0, RED),
+        ]),
+    );
+    let always_replace = 1 | (7 << 8) | (2 << 11) | (2 << 14) | (2 << 17);
+    let equal_keep = 1 | (2 << 8);
+    let mut s = Stream::default();
+    s.setup()
+        .regs(RB_DEPTH_INFO, &[depth_info])
+        .resolve(&mut mem, W, H, false, Some((rgba(CLEAR), 0)))
+        .shader(false, &vs_color())
+        .shader(true, &ps_interp())
+        .vertex_fetch(0, VERTS, 24)
+        // Reference 5, read mask 0xFF, write mask 0xFF.
+        .regs(RB_STENCILREFMASK, &[5 | (0xFF << 8) | (0xFF << 16)])
+        .regs(RB_DEPTHCONTROL, &[always_replace])
+        .regs(RB_COLOR_MASK, &[0])
+        .draw_auto(PRIM_TRI_LIST, 3)
+        .regs(RB_COLOR_MASK, &[0xF])
+        .regs(RB_DEPTHCONTROL, &[equal_keep])
+        .vertex_fetch(0, VERTS + 48, 12)
+        .draw_auto(PRIM_TRI_LIST, 3);
+    let report = run(&mut d, &s, &mut mem);
+    if !d.float_stencil() && depth_info & (1 << 16) != 0 {
+        assert!(
+            report.warnings.iter().any(|w| w.contains("stencil")),
+            "{report:?}"
+        );
+        return;
+    }
+    assert_eq!(report.draws, 2, "{report:?}");
+    assert!(report.warnings.is_empty(), "{report:?}");
+    let img = d.read_render_target(COLOR_KEY, 0, 0, W, H).unwrap();
+    assert_eq!(px(&img, W, 2, 2), RED);
+    assert_eq!(px(&img, W, 30, 30), CLEAR);
+}
+
+#[test]
+fn stencil_masks_draw_d24s8() {
+    stencil_masks_draw(DEPTH_BASE);
+}
+
+#[test]
+fn stencil_masks_draw_d24fs8() {
+    stencil_masks_draw(DEPTH_BASE | (1 << 16));
+}
+
+/// 24-bit depth survives clear and resolve exactly for odd values from
+/// 2^23 up (where `x + 0.5` rounding would tie upwards), and a depth copy
+/// ignores the destination format (k_16_16 here) as Xenia does.
+#[test]
+fn depth_resolve_d24s8_exact_and_any_dest_format() {
+    let Some(mut d) = drawer() else { return };
+    // shortcut: values within a few steps of 1.0 (0xFFFFFD) can come back
+    // one step high where the host reads 24-bit depth through a reciprocal
+    // multiply (lavapipe does); exact readback needs an integer depth copy.
+    for clear in [0x8000_0178, 0xABCD_EF78, 0xFFFF_FF78] {
+        assert_eq!(depth_resolve_words(&mut d, DEPTH_BASE, clear).1, clear);
+    }
+    // 0.75 * 0xFFFFFF = 12582911.25.
+    assert_eq!(
+        depth_resolve_words_at(&mut d, DEPTH_BASE, 0x1234_5678, 0.75, 25),
+        ((12_582_911 << 8) | 0x78, 0x1234_5678)
+    );
+}
+
+/// 20e4 depth is truncated like Xenia's default dump: f32 0x3E99999E
+/// truncates to 0xD33333 (rounding would give 0xD33334).
+#[test]
+fn depth_resolve_d24fs8_truncates() {
+    let Some(mut d) = drawer() else { return };
+    let stencil = if d.float_stencil() { 0x78 } else { 0 };
+    let z = f32::from_bits(0x3E99_999E);
+    assert_eq!(
+        depth_resolve_words_at(&mut d, DEPTH_BASE | (1 << 16), 0x78, z, 6).0,
+        (0xD3_3333 << 8) | stencil
+    );
+}
+
 /// A pixel shader with getGradients goes through the drawer's own WGSL
 /// validation (the derivatives sit inside the pc-switch dispatch) and
 /// draws the colour's screen-space derivatives: red rises 255 over 64

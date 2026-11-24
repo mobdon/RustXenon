@@ -149,6 +149,67 @@ impl Depth {
     }
 }
 
+fn stencil_op(op: u32) -> wgpu::StencilOperation {
+    use wgpu::StencilOperation as S;
+    match op & 7 {
+        0 => S::Keep,
+        1 => S::Zero,
+        2 => S::Replace,
+        3 => S::IncrementClamp,
+        4 => S::DecrementClamp,
+        5 => S::Invert,
+        6 => S::IncrementWrap,
+        _ => S::DecrementWrap,
+    }
+}
+
+fn stencil_face(bits: u32) -> wgpu::StencilFaceState {
+    wgpu::StencilFaceState {
+        compare: compare(bits),
+        fail_op: stencil_op(bits >> 3),
+        pass_op: stencil_op(bits >> 6),
+        depth_fail_op: stencil_op(bits >> 9),
+    }
+}
+
+/// RB_DEPTHCONTROL stencil part with RB_STENCILREFMASK(_BF): the stencil
+/// state and reference, `None` when the stencil test is off. As in Xenia
+/// (d3d12 pipeline_cache.cc), the back face has its own functions only for
+/// polygons with backface_enable, and the host's single reference and
+/// masks are the back face's only when front faces are culled.
+pub fn stencil(
+    depth_control: u32,
+    ref_mask: u32,
+    ref_mask_bf: u32,
+    polygonal: bool,
+    cull_front: bool,
+) -> Option<(wgpu::StencilState, u32)> {
+    if depth_control & 1 == 0 {
+        return None;
+    }
+    let backface = polygonal && depth_control & (1 << 7) != 0;
+    let front = stencil_face(depth_control >> 8);
+    let back = if backface {
+        stencil_face(depth_control >> 20)
+    } else {
+        front
+    };
+    let m = if backface && cull_front {
+        ref_mask_bf
+    } else {
+        ref_mask
+    };
+    Some((
+        wgpu::StencilState {
+            front,
+            back,
+            read_mask: (m >> 8) & 0xFF,
+            write_mask: (m >> 16) & 0xFF,
+        },
+        m & 0xFF,
+    ))
+}
+
 /// PA_SU_SC_MODE_CNTL: front face and culled face. `None` when both faces
 /// are culled (the draw produces nothing, as Xenia skips it).
 pub fn cull(mode_cntl: u32) -> Option<(wgpu::FrontFace, Option<wgpu::Face>)> {
@@ -296,6 +357,42 @@ fn xe_epilogue(p: vec4<f32>) -> vec4<f32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stencil_state() {
+        use wgpu::{CompareFunction as C, StencilOperation as S};
+        assert!(stencil(0, 0, 0, true, false).is_none());
+        // Front: func equal, fail keep, zpass replace, zfail incr wrap; back
+        // (backface_enable): never, zero, invert, decr clamp.
+        let dc =
+            1 | (2 << 8) | (2 << 14) | (6 << 17) | (1 << 7) | (1 << 23) | (5 << 26) | (4 << 29);
+        let (s, r) = stencil(dc, 0x00F0_3C12, 0x0001_0203, true, false).unwrap();
+        assert_eq!((r, s.read_mask, s.write_mask), (0x12, 0x3C, 0xF0));
+        assert_eq!(
+            (
+                s.front.compare,
+                s.front.fail_op,
+                s.front.pass_op,
+                s.front.depth_fail_op
+            ),
+            (C::Equal, S::Keep, S::Replace, S::IncrementWrap)
+        );
+        assert_eq!(
+            (
+                s.back.compare,
+                s.back.fail_op,
+                s.back.pass_op,
+                s.back.depth_fail_op
+            ),
+            (C::Never, S::Zero, S::Invert, S::DecrementClamp)
+        );
+        // Front faces culled: back-face reference and masks.
+        let (s, r) = stencil(dc, 0x00F0_3C12, 0x0001_0203, true, true).unwrap();
+        assert_eq!((r, s.read_mask, s.write_mask), (3, 2, 1));
+        // Not polygonal: the back face follows the front.
+        let (s, r) = stencil(dc, 0x00F0_3C12, 0x0001_0203, false, true).unwrap();
+        assert_eq!((r, s.back), (0x12, s.front));
+    }
 
     #[test]
     fn blend_constant_alpha_factors_use_alpha_for_colour() {
