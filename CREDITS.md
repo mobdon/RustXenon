@@ -213,6 +213,16 @@ Licence texts are kept in [`third_party/licenses/`](third_party/licenses/).
      here, naming the FFmpeg version and its configure options.
   4. State where the matching FFmpeg source can be obtained.
 
+## Disc and content package formats
+
+- The console's disc file system (volume descriptor, directory trees,
+  partition offsets of each disc generation) and the content package
+  layout (volume descriptor, file table, hash-table interleaving and its
+  block-number formula) are public format facts, checked against Xenia's
+  readers (BSD-3) and the Free60 project's documentation. No code was
+  copied: `crates/recomp/src/disc.rs` and `crates/recomp/src/stfs.rs` are
+  written from these descriptions.
+
 ## Our own earlier work
 
 The instruction translator, runtime call choke point, headless host shape and

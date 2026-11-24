@@ -99,6 +99,7 @@ impl Analysis {
 
 const BLR: u32 = 0x4E80_0020;
 const BCTR: u32 = 0x4E80_0420;
+const NOP: u32 = 0x6000_0000;
 const MFLR_R12: u32 = 0x7D88_02A6;
 
 fn op(w: u32) -> u32 {
@@ -381,7 +382,12 @@ fn find_tables(img: &Image, hooks: &Hooks, a: &mut Analysis) {
         if w != BCTR || hooks.is_data(pc) {
             continue;
         }
-        let mtctr = pc - 4;
+        // The compiler sometimes puts a nop between mtctr and bctr.
+        let mtctr = if img.u32(pc - 4) == Some(NOP) {
+            pc - 8
+        } else {
+            pc - 4
+        };
         if !img.u32(mtctr).is_some_and(is_mtctr) {
             continue;
         }
@@ -662,7 +668,6 @@ mod tests {
     const BASE: u32 = 0x8200_0000;
     const RDATA: u32 = BASE + 0x100;
     const TEXT: u32 = BASE + 0x1000;
-    const NOP: u32 = 0x6000_0000;
 
     fn image(code: &[u32], rdata: &[u8]) -> Image {
         let mut data = vec![0u8; 0x1000 + code.len() * 4];
@@ -801,6 +806,11 @@ mod tests {
 
     /// A switch on r11 with 3 cases; returns (code, rdata, bctr index).
     fn switch(kind: TableKind) -> (Vec<u32>, Vec<u8>, usize) {
+        switch_with(kind, false)
+    }
+
+    /// `nop_before_bctr` puts a nop between mtctr and bctr.
+    fn switch_with(kind: TableKind, nop_before_bctr: bool) -> (Vec<u32>, Vec<u8>, usize) {
         let table = RDATA;
         let mut code = vec![cmplwi(6, 11, 2), bc(12, 25, 1, 0)]; // bgt cr6, default (patched)
         let tbl = match kind {
@@ -839,7 +849,11 @@ mod tests {
             TableKind::Override => vec![],
         };
         code.extend(tbl);
-        code.extend([MTCTR_R0, BCTR]);
+        code.push(MTCTR_R0);
+        if nop_before_bctr {
+            code.push(NOP);
+        }
+        code.push(BCTR);
         let bctr = code.len() - 1;
         let cases: Vec<usize> = (0..3).map(|i| code.len() + i * 2).collect();
         for _ in 0..3 {
@@ -862,13 +876,15 @@ mod tests {
 
     #[test]
     fn four_jump_table_shapes() {
-        for kind in [
-            TableKind::Absolute,
-            TableKind::Computed,
-            TableKind::ByteOffset,
-            TableKind::ShortOffset,
+        for (kind, nop) in [
+            (TableKind::Absolute, false),
+            (TableKind::Computed, false),
+            (TableKind::ByteOffset, false),
+            (TableKind::ShortOffset, false),
+            (TableKind::ShortOffset, true),
+            (TableKind::ByteOffset, true),
         ] {
-            let (code, rdata, bctr) = switch(kind);
+            let (code, rdata, bctr) = switch_with(kind, nop);
             let img = image(&code, &rdata);
             let a = analyze(&img, &Hooks::default());
             let t = &a.jump_tables[&at(bctr)];

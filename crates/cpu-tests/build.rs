@@ -164,6 +164,50 @@ fn main() {
         threads,
     )
     .unwrap();
+    // Whole-executable layout (tests/blocks.rs): basic blocks, split into
+    // parts of at most two instructions so every part boundary is crossed.
+    let start = xenon_cpu_tests_start();
+    let funcs: &[(&str, &[u32], &[u32])] = &[
+        // li r3,0; li r4,10; mtctr r4; 1: addi r3,r3,1; bdnz 1b; blr
+        (
+            "count_loop",
+            &[
+                0x3860_0000,
+                0x3880_000A,
+                0x7C89_03A6,
+                0x3863_0001,
+                0x4200_FFFC,
+                0x4E80_0020,
+            ],
+            &[],
+        ),
+        // li r3,5, then falls into the next function
+        ("fall_off", &[0x3860_0005], &[]),
+        // mtctr r3; bctr; li r4,1; blr; li r4,2; blr (table targets +8, +16)
+        (
+            "table",
+            &[
+                0x7C69_03A6,
+                0x4E80_0420,
+                0x3880_0001,
+                0x4E80_0020,
+                0x3880_0002,
+                0x4E80_0020,
+            ],
+            &[start + 8, start + 16],
+        ),
+    ];
+    let mut blocks = String::from(xenon_recomp::emit::PRELUDE);
+    for (name, words, extra) in funcs {
+        blocks.push_str(&xenon_recomp::emit::block_function(
+            name, start, words, extra, 2,
+        ));
+    }
+    std::fs::write(
+        Path::new(&std::env::var("OUT_DIR").unwrap()).join("blocks.rs"),
+        blocks,
+    )
+    .unwrap();
     // Keep the build script's view of the translator fresh.
     println!("cargo:rerun-if-changed=../recomp/src");
 }
