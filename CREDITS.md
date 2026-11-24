@@ -60,6 +60,15 @@ Licence texts are kept in [`third_party/licenses/`](third_party/licenses/).
   decoder against the VMX128 encodings published in Xenia's instruction
   tests; none of its test data is copied into this repository.
 
+- Use in the host (step 4, facts about the console, no code): the export
+  numbers of the kernel and system-library functions and variables, the
+  argument order of the calls we replace, the layout of the processor
+  control region and thread object, the file information classes, the
+  command-packet formats of the GPU's command processor, which GPU
+  registers the hardware keeps current, and that the vertical-blank
+  interrupt runs as processor 2. Studied at Xenia's `master` branch on
+  2026-11-24 (`src/xenia/kernel`, `src/xenia/gpu`).
+
 ## Xenia: ported code in `xenon-gpu`
 
 - Licence: BSD 3-Clause, Copyright (c) 2015 Ben Vanik and Xenia project
@@ -86,6 +95,12 @@ Licence texts are kept in [`third_party/licenses/`](third_party/licenses/).
     copy mode is a resolve.
   - `graphics_system.cc`: the `CP_RB_WPTR` address.
 - From `src/xenia/memory.h` (`TranslatePhysical`): the physical address mask.
+
+## Calendar arithmetic
+
+- Howard Hinnant's `days_from_civil` / `civil_from_days` algorithms
+  (public domain), rewritten in `crates/host/src/kernel/rtl.rs` for the
+  kernel's time-field conversions.
 
 ## LZX format description (Microsoft)
 

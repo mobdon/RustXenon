@@ -15,7 +15,11 @@ owns runs as a native program.
 > Step 3 is in: guest threads run at the same time on host threads, reserved
 > stores are host compare-and-swap, and the runtime has the locks, events and
 > semaphores that guest kernel objects map onto (checked with synthetic
-> multi-thread programs).
+> multi-thread programs). Step 4 has started: the host replaces every
+> kernel and system-library call a title imports (memory, threads, kernel
+> objects, files on the player's unpacked game folder, content and profile
+> stubs, input and network stubs), with a headless GPU command processor,
+> checked with synthetic tests.
 
 ## You need your own copy
 
@@ -134,6 +138,64 @@ host refuses any other executable. Everything under the build folder is
 derived from the game and stays local.
 
 Jump tables now also match when a `nop` sits between `mtctr` and `bctr`.
+
+### System calls (step 4)
+
+`xenon-host` installs a host function on every import thunk of the
+executable (`crates/host/src/kernel/table.rs` maps export numbers to them)
+and writes the imported variables. An import it does not know stops with
+its name. Results are sign-extended to 64 bits as on the console, because
+titles test them with 64-bit record compares.
+
+| Area | What the host does |
+|---|---|
+| Memory | Virtual memory (64 KB granularity), physical memory (handed out in the `0xA0000000` view), kernel pool; first fit, freed ranges zeroed on reuse, usage and peak reported |
+| Threads | Stack, processor control region (r13), thread object and thread-local storage per thread; suspend and resume; dynamic TLS slots; a thread object is signalled when its thread ends |
+| Kernel objects | Events, semaphores, mutants, timers and threads on the step-3 objects, by handle or by the guest's own dispatcher header; waits for one or several objects with timeouts; critical sections keep their owner fields current; spin locks |
+| Files | `game:`, `d:` and the disc device map to the player's unpacked game folder (read only), `update:` to an unpacked title update, cache, hard disk and content packages to a local data folder; open, read, scatter read, write, information classes, directory listing with wildcards, volume information |
+| System library | No controllers connected, nobody signed in, content packages as local folders, empty enumerators, system screens closed at once, no headset |
+| Network | The stack starts with no link; socket calls fail with "network down" |
+| Video | Display mode 1280x720 at 60 Hz. A minimal command processor runs the command ring: register and memory writes, fence and event writes, conditional writes, waits and interrupts; draws are skipped. The vertical-blank interrupt runs at 60 Hz. Each `VdSwap` counts as a presented frame |
+| Audio | A render client registers but is never asked for frames |
+| Stops | Bug checks, exceptions other than the debugger's thread-naming one, structured exception unwinding, reboot and title launch stop with their arguments |
+
+When the title stops, the host prints the panic, the newest call targets,
+the guest return addresses (walked from the stack back chain), frames
+presented, memory in use and the imports called. When no frame arrives for
+three seconds it prints each thread's last import and return addresses, so
+a wait shows up apart from running out of memory.
+
+Tests in `crates/host/tests/kernel.rs` drive the calls with synthetic guest
+state (no game bytes): memory headroom, thread start and exit with TLS,
+semaphore limits and waits on several objects, recursive critical
+sections, files in a temporary folder, `printf` formatting, and command
+packets.
+
+#### First headless run
+
+On the first target (2.42 million instructions in
+38,536 functions, `games/760ebac4e5f0351edb39015eba89e729b14eaf95afdabb529a447ff8f8e11cd1/hooks.toml`), built on a 32 GB, 24-thread
+PC, the title boots headless with no window or sound: it starts 25 threads,
+opens its archives from the unpacked disc and title update, uses 89 of its
+246 imports, and its frame loop presents a steady 60 frames a second.
+Three runs of two minutes each presented 7,186, 7,164 and 7,156 frames with
+no stop. Physical memory in use is 450 of 512 MB (62 MB of headroom),
+virtual memory 4 MB. File reads stop after the first 712: the title waits
+on its front end with no controller connected and nobody signed in.
+
+Fixes the run needed (in the system-call layer above): kernel results
+sign-extended to 64 bits (a failed open read as success), the debugger's
+thread-naming exception allowed to continue, file information classes for
+sectors, alignment and mode, GPU memory byte order (the GPU reads memory
+little-endian, then applies the packet's swap), waits in the command ring
+honoured, the display interrupt status and line counter registers kept
+current, and the video lock released before the guest interrupt handler
+runs.
+
+Not covered yet: structured exception handling, asynchronous I/O completion
+routines and APCs, alertable waits, physical memory mirrors at `0xC0000000`
+and `0xE0000000`, timer completion routines, the audio render callback, and
+rendering.
 
 ### Design notes
 
