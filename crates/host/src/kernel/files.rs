@@ -552,7 +552,11 @@ pub fn nt_query_full_attributes_file(rt: &Runtime, c: &mut Context) {
             network_info(rt, out, &m, w);
             ret(c, STATUS_SUCCESS)
         }
-        None => ret(c, STATUS_OBJECT_NAME_NOT_FOUND),
+        None => {
+            let name = ansi(rt, rt.mem.read_u32(attrs + 4));
+            crate::log(&format!("[files] attributes of {name:?}: not found"));
+            ret(c, STATUS_OBJECT_NAME_NOT_FOUND)
+        }
     }
 }
 

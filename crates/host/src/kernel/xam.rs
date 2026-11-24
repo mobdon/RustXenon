@@ -22,7 +22,14 @@ pub fn complete(rt: &Runtime, c: &Context, ov: u32, result: u32, length: u32) {
     }
     rt.mem.write_u32(ov, result);
     rt.mem.write_u32(ov + 4, length);
-    rt.mem.write_u32(ov + 0x18, result);
+    // The extended error is the result as a system error code (HRESULT):
+    // titles check it for "no more files" to end an enumeration.
+    let extended = if result == 0 {
+        0
+    } else {
+        0x8007_0000 | (result & 0xFFFF)
+    };
+    rt.mem.write_u32(ov + 0x18, extended);
     let ev = rt.mem.read_u32(ov + 0xC);
     if ev != 0 {
         if let Some(a) = super::objects::object_of(rt, c, ev) {
@@ -93,13 +100,26 @@ pub fn xam_create_enumerator_handle(_: &Runtime, c: &mut Context) {
 pub fn xam_get_private_enum_structure_from_handle(_: &Runtime, c: &mut Context) {
     ret(c, STATUS_INVALID_HANDLE);
 }
-/// Every enumerator is empty.
+/// (handle, flags, buffer, size, items out, request block). Every list is
+/// empty. Asked synchronously the answer is "no more files"; with a request
+/// block it completes with success and zero items, which is what a title
+/// that scans saves waits for (with "no more files" there it never ends the
+/// scan).
 pub fn xam_enumerate(rt: &Runtime, c: &mut Context) {
     let (items, ov) = (arg(rt, c, 4), arg(rt, c, 5));
     if items != 0 {
         rt.mem.write_u32(items, 0);
     }
-    finish(rt, c, ov, ERROR_NO_MORE_FILES);
+    finish(
+        rt,
+        c,
+        ov,
+        if ov != 0 {
+            ERROR_SUCCESS
+        } else {
+            ERROR_NO_MORE_FILES
+        },
+    );
 }
 
 // ---- content -----------------------------------------------------------------

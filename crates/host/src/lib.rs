@@ -134,7 +134,74 @@ pub fn last_call() -> u32 {
     RECENT.with(|r| r.get()[7])
 }
 
+/// `XENON_CALL_PROFILE=<thread>:<from ms>:<to ms>`: counts the guest
+/// call targets of one thread in a time window (printed in the report).
+static PROFILE: std::sync::Mutex<Option<std::collections::HashMap<u32, u64>>> =
+    std::sync::Mutex::new(None);
+
+fn profile_call(addr: u32) {
+    static CFG: OnceLock<Option<(String, u32, u32)>> = OnceLock::new();
+    let Some((who, from, to)) = CFG.get_or_init(|| {
+        let v = std::env::var("XENON_CALL_PROFILE").ok()?;
+        let mut p = v.split(':');
+        Some((
+            p.next()?.to_string(),
+            p.next()?.parse().ok()?,
+            p.next()?.parse().ok()?,
+        ))
+    }) else {
+        return;
+    };
+    let t = ms();
+    if t < *from || t >= *to || std::thread::current().name() != Some(who.as_str()) {
+        return;
+    }
+    *PROFILE
+        .lock()
+        .unwrap()
+        .get_or_insert_with(Default::default)
+        .entry(addr)
+        .or_default() += 1;
+}
+
+/// `XENON_WATCH=<hex addr>:<reg>` or `<hex addr>:m<hex address>`: logs a
+/// register, or a guest word, whenever a call to `addr` sees a new value
+/// (to follow a state variable).
+fn watch(c: &Context, addr: u32) {
+    static CFG: OnceLock<Option<(u32, Result<usize, u32>)>> = OnceLock::new();
+    static LAST: AtomicU32 = AtomicU32::new(0xDEAD_BEEF);
+    let Some((a, what)) = *CFG.get_or_init(|| {
+        let v = std::env::var("XENON_WATCH").ok()?;
+        let (a, r) = v.split_once(':')?;
+        let what = match r.strip_prefix('m') {
+            Some(m) => Err(u32::from_str_radix(m, 16).ok()?),
+            None => Ok(r.parse().ok()?),
+        };
+        Some((
+            u32::from_str_radix(a.trim_start_matches("0x"), 16).ok()?,
+            what,
+        ))
+    }) else {
+        return;
+    };
+    if addr != a {
+        return;
+    }
+    let (v, name) = match what {
+        Ok(r) => (c.r[r] as u32, format!("r{r}")),
+        Err(m) => match RT.get() {
+            Some(rt) => (rt.mem.read_u32(m), format!("[{m:#x}]")),
+            None => return,
+        },
+    };
+    if LAST.swap(v, Ordering::Relaxed) != v {
+        log(&format!("[watch] {name} = {v:#x} at call to {a:#010x}"));
+    }
+}
+
 fn trace(c: &Context, addr: u32) {
+    profile_call(addr);
+    watch(c, addr);
     SP.with(|s| s.set(c.r[1] as u32));
     RECENT.with(|r| {
         let mut v = r.get();
@@ -363,6 +430,14 @@ fn report() {
         kx.threads.lock().map(|t| t.len()).unwrap_or(0)
     ));
     log(&format!("memory: {}", kx.usage_line()));
+    if let Some(p) = PROFILE.lock().unwrap().as_ref() {
+        let mut v: Vec<_> = p.iter().collect();
+        v.sort_by(|a, b| b.1.cmp(a.1));
+        log(&format!("call profile, {} targets:", v.len()));
+        for (a, n) in v.iter().take(400) {
+            log(&format!("  {n:>8} {a:#010x}"));
+        }
+    }
     log("threads:");
     activity_report();
     let calls = kernel::call_report();
