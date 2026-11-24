@@ -42,7 +42,9 @@
 //!   (count in bits 0..8, aL start in 8..16, signed aL step in 16..24).
 //! - Texture fetch slot `n` binds `@group(1) @binding(2n)` as
 //!   `texture_2d<f32>` and `@group(1) @binding(2n+1)` as `sampler`, only for
-//!   the slots in [`ShaderInfo::textures_used`].
+//!   the slots in [`ShaderInfo::textures_used`]. The shader reads only the
+//!   LOD bias (dword 4) of a texture fetch constant; format, swizzle, sign,
+//!   exponent bias and filtering are the drawer's.
 //! - Vertex stage: entry `vs_main`, input `@builtin(vertex_index)`. r0.x
 //!   starts as the signed vertex index `vertex_index + consts.vertex_base`
 //!   (the drawer draws indexed with the guest index buffer). Outputs are
@@ -70,8 +72,9 @@
 //! Multiplies (`mul`, `mad`, `dp*`, `dst`, `muls*`) follow the Shader Model 3
 //! rule Xenia implements: if either factor is 0 the product is 0, even for
 //! infinity or NaN. `max`/`min` return the first operand when the comparison
-//! holds and the second otherwise. The `*c` reciprocal/log variants clamp
-//! infinities to +-FLT_MAX, the `*f` variants turn them into signed zeros.
+//! holds and the second otherwise. `rcpc`/`rsqc` clamp infinities to
+//! +-FLT_MAX, `logc` clamps only -infinity, and the `*f` variants turn
+//! infinities into signed zeros.
 
 pub mod asm;
 pub mod ucode;

@@ -175,9 +175,14 @@ fn cube(v: vec4<f32>) -> vec4<f32> {
     return vec4<f32>(-y, select(-z, z, x < 0.0), 2.0 * x, select(0.0, 1.0, x < 0.0));
 }
 
-// Clamps infinities to +-FLT_MAX (the *c variants of rcp/rsq/log).
+// Clamps infinities to +-FLT_MAX (rcpc, rsqc).
 fn clamp_inf(v: f32) -> f32 {
     return select(select(v, FLT_MAX, v > FLT_MAX), -FLT_MAX, v < -FLT_MAX);
+}
+
+// Clamps only -inf to -FLT_MAX (logc).
+fn clamp_neg_inf(v: f32) -> f32 {
+    return select(v, -FLT_MAX, v < -FLT_MAX);
 }
 
 // Turns infinities into signed zeros (the *f variants of rcp/rsq).
@@ -809,7 +814,8 @@ impl Gen {
                 S::Floors => "floor(sa)".into(),
                 S::Exp => "exp2(sa)".into(),
                 S::Log => "log2(sa)".into(),
-                S::Logc => "clamp_inf(log2(sa))".into(),
+                // Only -inf is clamped (log of 0); +inf stays (Xenia ucode.h kLogc).
+                S::Logc => "clamp_neg_inf(log2(sa))".into(),
                 S::Rcp => "1.0 / sa".into(),
                 S::Rcpc => "clamp_inf(1.0 / sa)".into(),
                 S::Rcpf => "zero_inf(1.0 / sa)".into(),
@@ -1013,15 +1019,21 @@ impl Gen {
             );
         }
         self.line(&format!("let uv = {coord};"));
-        let bias = flit(t.lod_bias as f32 / 16.0);
+        // LOD bias: the fetch constant's (dword 4 bits 12..21, signed, 1/32
+        // steps; Xenia xenos.h xe_gpu_texture_fetch_t) plus the instruction's
+        // (1/16 steps), as spirv_shader_translator_fetch.cc adds them.
+        self.line(&format!(
+            "let lod = f32(extractBits(bitcast<i32>({}), 12u, 10u)) / 32.0 + {};",
+            fetch_dword(n * 6 + 4),
+            flit(t.lod_bias as f32 / 16.0)
+        ));
         let sample = match (self.stage, t.use_computed_lod) {
-            (ShaderStage::Pixel, true) if t.lod_bias != 0 => {
-                format!("textureSampleBias(tex{n}, samp{n}, uv, {bias})")
+            (ShaderStage::Pixel, true) => {
+                format!("textureSampleBias(tex{n}, samp{n}, uv, lod)")
             }
-            (ShaderStage::Pixel, true) => format!("textureSample(tex{n}, samp{n}, uv)"),
             // No derivatives in the vertex stage; without computed LOD the
             // bias is the LOD.
-            _ => format!("textureSampleLevel(tex{n}, samp{n}, uv, {bias})"),
+            _ => format!("textureSampleLevel(tex{n}, samp{n}, uv, lod)"),
         };
         self.line(&format!("let v = {sample};"));
         self.fetch_store(t.dest, t.dest_relative, t.dest_swizzle);

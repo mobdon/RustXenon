@@ -130,7 +130,12 @@ fn pixel_shader_texture_fetch() {
     has(&t, "@group(1) @binding(10) var tex5: texture_2d<f32>;");
     has(&t, "@group(1) @binding(11) var samp5: sampler;");
     has(&t, "let uv = r[0].yx + vec2<f32>(0.5f, -1.0f) / size;");
-    has(&t, "textureSampleBias(tex5, samp5, uv, 0.5f)");
+    // Slot 5's dword 4 is fetch dword 34: fetch[8][2].
+    has(
+        &t,
+        "let lod = f32(extractBits(bitcast<i32>(consts.fetch[8u][2u]), 12u, 10u)) / 32.0 + 0.5f;",
+    );
+    has(&t, "textureSampleBias(tex5, samp5, uv, lod)");
     has(&t, "@location(1) c1: vec4<f32>,");
 }
 
@@ -145,7 +150,7 @@ fn texture_fetch_variants() {
     let words = assemble(&[exec(0, 2, true)], &[tfetch(tf), alu(export(62, r(2)))]);
     let t = ok(&words, Vertex);
     has(&t, "let uv = (r[3].xy) / size;");
-    has(&t, "textureSampleLevel(tex0, samp0, uv, 0.0f)");
+    has(&t, "textureSampleLevel(tex0, samp0, uv, lod)");
     has(&t, "r[2].z = 0.0;");
     has(&t, "r[2].w = 1.0;");
     assert!(!t.wgsl.contains("r[2].y ="));
@@ -154,8 +159,8 @@ fn texture_fetch_variants() {
     tf.use_computed_lod = false;
     let words = assemble(&[exec(0, 2, true)], &[tfetch(tf), alu(export(0, r(0)))]);
     let t = ok(&words, Pixel);
-    has(&t, "textureSampleLevel(tex1, samp1, uv, 0.0f)");
-    // And the plain implicit-LOD case.
+    has(&t, "textureSampleLevel(tex1, samp1, uv, lod)");
+    // The implicit-LOD case still applies the fetch constant's bias.
     let words = assemble(
         &[exec(0, 2, true)],
         &[
@@ -163,7 +168,10 @@ fn texture_fetch_variants() {
             alu(export(0, r(0))),
         ],
     );
-    has(&ok(&words, Pixel), "textureSample(tex1, samp1, uv)");
+    has(
+        &ok(&words, Pixel),
+        "textureSampleBias(tex1, samp1, uv, lod)",
+    );
 }
 
 #[test]
@@ -525,7 +533,7 @@ fn every_scalar_opcode() {
             ScalarOp::Truncs => "trunc(sa)",
             ScalarOp::Floors => "floor(sa)",
             ScalarOp::Exp => "exp2(sa)",
-            ScalarOp::Logc => "clamp_inf(log2(sa))",
+            ScalarOp::Logc => "clamp_neg_inf(log2(sa))",
             ScalarOp::Log => "= log2(sa)",
             ScalarOp::Rcpc => "clamp_inf(1.0 / sa)",
             ScalarOp::Rcpf => "zero_inf(1.0 / sa)",
