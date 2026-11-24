@@ -43,14 +43,20 @@
 //!   EDRAM emulation does. The blend result itself is not clamped and keeps
 //!   half precision until a resolve quantises it (see below).
 //! - `k_16_16_16_16_FLOAT` as `Rgba16Float`.
+//! - `k_32_FLOAT` as `R32Float`, drawn without blending (a warning) and
+//!   resolvable to `k_32_FLOAT` with its float bits kept, unsaturated.
 //!
+//! All four render targets (`RB_COLOR_INFO_RT[0..4]`) are drawn, each with
+//! its own `RB_COLOR_MASK` bits, `RB_BLENDCONTROL_RT` blend and output
+//! clamp; a target is skipped when the pixel shader does not export it.
+//! MSAA surfaces are drawn and resolved with one sample per pixel (a
+//! warning).
 //! Resolve clears decode the 64-bit value `RB_COLOR_CLEAR |
 //! RB_COLOR_CLEAR_LO << 32` per format ([`formats::clear_color`]).
 //! Depth targets: `kD24S8` as `Depth24PlusStencil8` and `kD24FS8` as
 //! `Depth32Float` (the 20e4 float is stored at f32 precision). Anything
-//! else (`k_16_16`, `k_16_16_16_16`, `k_16_16_FLOAT`, `k_32_FLOAT`,
-//! `k_32_32_FLOAT`), MSAA and render targets 1..3 are reported in
-//! [`Report::unsupported`] or [`Report::warnings`].
+//! else (`k_16_16`, `k_16_16_16_16`, `k_16_16_FLOAT`, `k_32_32_FLOAT`) is
+//! reported in [`Report::unsupported`].
 //!
 //! # Resolves
 //!
@@ -255,6 +261,8 @@ pub enum TargetFormat {
     Float7e3,
     /// `k_16_16_16_16_FLOAT`, hosted as `Rgba16Float`.
     Rgba16Float,
+    /// `k_32_FLOAT`, hosted as `R32Float`.
+    Float32,
 }
 
 impl TargetFormat {
@@ -265,6 +273,7 @@ impl TargetFormat {
             TargetFormat::D24FS8 => wgpu::TextureFormat::Depth32Float,
             TargetFormat::Rgb10a2 => wgpu::TextureFormat::Rgb10a2Unorm,
             TargetFormat::Float7e3 | TargetFormat::Rgba16Float => wgpu::TextureFormat::Rgba16Float,
+            TargetFormat::Float32 => wgpu::TextureFormat::R32Float,
         }
     }
 
@@ -274,6 +283,7 @@ impl TargetFormat {
             0 | 1 => TargetFormat::Rgba8,
             2 | 10 => TargetFormat::Rgb10a2,
             3 | 12 => TargetFormat::Float7e3,
+            14 => TargetFormat::Float32,
             7 => TargetFormat::Rgba16Float,
             _ => return None,
         })
@@ -350,8 +360,9 @@ enum Variant {
     Plain,
     /// Vertex shader wrapped to make rectangle list corners.
     RectList,
-    /// Pixel shader colour 0 clamped to [0, rgb] and [0, alpha] (f32 bits).
-    Clamp(u32, u32),
+    /// Pixel shader colour i clamped to [0, rgb] and [0, alpha] (f32 bits)
+    /// where entry i is set.
+    Clamp([Option<(u32, u32)>; 4]),
 }
 
 #[derive(Clone, PartialEq, Eq, Hash)]
@@ -362,10 +373,13 @@ struct PipelineKey {
     ps: u64,
     ps_variant: Variant,
     topology: wgpu::PrimitiveTopology,
-    color: Option<wgpu::TextureFormat>,
+    /// Colour target i: format, blend and write mask.
+    color: [Option<(
+        wgpu::TextureFormat,
+        Option<wgpu::BlendState>,
+        wgpu::ColorWrites,
+    )>; 4],
     depth: Option<(wgpu::TextureFormat, state::Depth)>,
-    blend: Option<wgpu::BlendState>,
-    mask: wgpu::ColorWrites,
     cull: (wgpu::FrontFace, Option<wgpu::Face>),
     textures: u32,
 }
@@ -582,21 +596,21 @@ fn vs_main(@builtin(vertex_index) host_index: u32) -> VsOut {{
 }
 
 /// Clamps colour 0 of a translated pixel shader to [0, rgb] / [0, alpha].
-fn clamp_pixel_wgsl(ps: &str, rgb: f32, alpha: f32) -> Result<String, String> {
-    const STORE: &str = "    out.c0 = o_col[0];\n";
-    if !ps.contains(STORE) {
-        return Err("pixel shader colour output not recognised".into());
+fn clamp_pixel_wgsl(ps: &str, rt: usize, rgb: f32, alpha: f32) -> Result<String, String> {
+    let store = format!("    out.c{rt} = o_col[{rt}];\n");
+    if !ps.contains(&store) {
+        return Err(format!("pixel shader colour output {rt} not recognised"));
     }
     // An infinite bound leaves the colour as it is (blending a 7e3 target
     // takes the source colour unclamped, as a float).
     let rgb = if rgb.is_finite() {
-        format!("clamp(o_col[0].xyz, vec3<f32>(0.0), vec3<f32>({rgb:?}))")
+        format!("clamp(o_col[{rt}].xyz, vec3<f32>(0.0), vec3<f32>({rgb:?}))")
     } else {
-        "o_col[0].xyz".into()
+        format!("o_col[{rt}].xyz")
     };
     Ok(ps.replacen(
-        STORE,
-        &format!("    out.c0 = vec4<f32>({rgb}, clamp(o_col[0].w, 0.0, {alpha:?}));\n"),
+        &store,
+        &format!("    out.c{rt} = vec4<f32>({rgb}, clamp(o_col[{rt}].w, 0.0, {alpha:?}));\n"),
         1,
     ))
 }
@@ -1064,8 +1078,15 @@ impl Drawer {
             (true, Variant::RectList) => patch_vertex_wgsl(&t.wgsl, extra)
                 .and_then(|vs| rect_list_wgsl(&vs, t.info.interpolators_written | extra)),
             (true, _) => patch_vertex_wgsl(&t.wgsl, extra),
-            (false, Variant::Clamp(rgb, a)) => {
-                clamp_pixel_wgsl(&t.wgsl, f32::from_bits(rgb), f32::from_bits(a))
+            (false, Variant::Clamp(c)) => {
+                c.iter()
+                    .enumerate()
+                    .try_fold(t.wgsl.clone(), |ps, (rt, c)| match c {
+                        Some((rgb, a)) => {
+                            clamp_pixel_wgsl(&ps, rt, f32::from_bits(*rgb), f32::from_bits(*a))
+                        }
+                        None => Ok(ps),
+                    })
             }
             (false, _) => Ok(t.wgsl.clone()),
         }
@@ -1307,23 +1328,38 @@ impl Drawer {
         let vs_t = self.translate(&vs, ShaderStage::Vertex)?;
         let ps_t = self.translate(&ps, ShaderStage::Pixel)?;
         let surface = self.regs.get(regs::RB_SURFACE_INFO);
+        // shortcut: MSAA targets are drawn with one sample per pixel (the
+        // resolve then copies that sample); add samples if edges matter.
         if (surface >> 16) & 3 != 0 {
-            return unsupported("MSAA render targets");
+            report.warn("MSAA surfaces drawn and resolved single-sampled");
         }
-        let color = if color_on && ps_t.info.colour_targets_written & 1 != 0 {
-            Some(RenderTargetKey::color(&self.regs, 0).map_err(Skip::Unsupported)?)
-        } else {
-            None
-        };
-        if ps_t.info.colour_targets_written & !1 != 0 {
-            report.warn("pixel shader writes render targets 1..3; only 0 is drawn");
+        // Render target i is drawn when the pixel shader writes oC<i> and
+        // RB_COLOR_MASK enables any of its channels (Xenia
+        // GetNormalizedColorMask).
+        let color_mask = self.regs.get(regs::RB_COLOR_MASK);
+        let mut color: [Option<RenderTargetKey>; 4] = [None; 4];
+        for rt in 0..4 {
+            let written = ps_t.info.colour_targets_written & (1 << rt) != 0;
+            if !color_on || !written || state::write_mask(color_mask, rt as u32).is_empty() {
+                continue;
+            }
+            let key = RenderTargetKey::color(&self.regs, rt).map_err(Skip::Unsupported)?;
+            if color
+                .iter()
+                .flatten()
+                .any(|k| k.base_tiles == key.base_tiles)
+            {
+                report.warn("two render targets of one draw at the same EDRAM base; the later one is not drawn");
+                continue;
+            }
+            color[rt] = Some(key);
         }
         let depth = state::depth(self.regs.get(regs::RB_DEPTHCONTROL));
         if depth.stencil {
             report.warn("stencil test ignored");
         }
         let depth_key = depth.used().then(|| RenderTargetKey::depth(&self.regs));
-        if color.is_none() && depth_key.is_none() {
+        if color.iter().all(Option::is_none) && depth_key.is_none() {
             return Ok(false);
         }
         let rect_list = expand == indices::Expand::Rects;
@@ -1340,20 +1376,36 @@ impl Drawer {
             None if polygonal => return Ok(false),
             None => (wgpu::FrontFace::Ccw, None),
         };
-        let blend =
-            state::blend(self.regs.get(regs::RB_BLENDCONTROL0)).map_err(Skip::Unsupported)?;
-        let ps_variant = color
-            .and_then(|k| formats::output_clamp(k.format, blend.is_some()))
-            .map_or(Variant::Plain, |(rgb, a)| {
-                Variant::Clamp(rgb.to_bits(), a.to_bits())
-            });
+        let mut blends = [None; 4];
+        for rt in (0..4).filter(|&rt| color[rt].is_some()) {
+            blends[rt] = state::blend(self.regs.get(regs::RB_BLENDCONTROL_RT[rt]))
+                .map_err(Skip::Unsupported)?;
+            // shortcut: wgpu blends R32Float only with FLOAT32_BLENDABLE;
+            // request it if a game blends into a 32-bit float target.
+            if blends[rt].is_some() && color[rt].map(|k| k.format) == Some(TargetFormat::Float32) {
+                report.warn("blending into a 32-bit float render target drawn without blending");
+                blends[rt] = None;
+            }
+        }
+        let clamps: [Option<(u32, u32)>; 4] = std::array::from_fn(|rt| {
+            color[rt]
+                .and_then(|k| formats::output_clamp(k.format, blends[rt].is_some()))
+                .map(|(rgb, a)| (rgb.to_bits(), a.to_bits()))
+        });
+        let ps_variant = if clamps.iter().any(Option::is_some) {
+            Variant::Clamp(clamps)
+        } else {
+            Variant::Plain
+        };
         let vs_variant = if rect_list {
             Variant::RectList
         } else {
             Variant::Plain
         };
+        // One blend constant for the pass: from the first blended target.
+        let blend_rt = (0..4).find(|&rt| blends[rt].is_some()).unwrap_or(0);
         let (blend_rgba, exact) = state::blend_constant(
-            self.regs.get(regs::RB_BLENDCONTROL0),
+            self.regs.get(regs::RB_BLENDCONTROL_RT[blend_rt]),
             [
                 regs::RB_BLEND_RED,
                 regs::RB_BLEND_GREEN,
@@ -1362,10 +1414,9 @@ impl Drawer {
             ]
             .map(|r| f32::from_bits(self.regs.get(r))),
         );
-        if blend.is_some() && !exact {
+        if blends[blend_rt].is_some() && !exact {
             report.warn("blend uses the constant colour and its alpha in the colour channel; drawn with the colour");
         }
-        let mask = state::write_mask(self.regs.get(regs::RB_COLOR_MASK), 0);
 
         let mut idx =
             indices::guest_indices(mem, &d.source, d.index_count).map_err(Skip::Unsupported)?;
@@ -1386,10 +1437,15 @@ impl Drawer {
             return Ok(false);
         }
 
-        let color_tex = color.map(|k| self.target(k)).transpose()?;
+        let mut color_tex: [Option<wgpu::Texture>; 4] = Default::default();
+        for rt in 0..4 {
+            color_tex[rt] = color[rt].map(|k| self.target(k)).transpose()?;
+        }
         let depth_tex = depth_key.map(|k| self.target(k)).transpose()?;
         let any = color_tex
-            .as_ref()
+            .iter()
+            .flatten()
+            .next()
             .or(depth_tex.as_ref())
             .expect("one target");
         let (w, h) = (any.width(), any.height());
@@ -1420,10 +1476,16 @@ impl Drawer {
             ps: ps.hash,
             ps_variant,
             topology,
-            color: color.map(|k| k.format.wgpu()),
+            color: std::array::from_fn(|rt| {
+                color[rt].map(|k| {
+                    (
+                        k.format.wgpu(),
+                        blends[rt],
+                        state::write_mask(color_mask, rt as u32),
+                    )
+                })
+            }),
             depth: depth_key.map(|k| (k.format.wgpu(), depth)),
-            blend,
-            mask,
             cull,
             textures: tex_mask,
         };
@@ -1460,11 +1522,13 @@ impl Drawer {
                             module: &ps_mod,
                             entry_point: Some("ps_main"),
                             compilation_options: Default::default(),
-                            targets: &[k.color.map(|format| wgpu::ColorTargetState {
-                                format,
-                                blend: k.blend,
-                                write_mask: k.mask,
-                            })],
+                            targets: &k.color.map(|c| {
+                                c.map(|(format, blend, write_mask)| wgpu::ColorTargetState {
+                                    format,
+                                    blend,
+                                    write_mask,
+                                })
+                            }),
                         }),
                         multiview_mask: None,
                         cache: None,
@@ -1546,9 +1610,9 @@ impl Drawer {
             layout: &g1_layout,
             entries: &entries,
         });
-        let color_view = color_tex
-            .as_ref()
-            .map(|t| t.create_view(&Default::default()));
+        let color_views = color_tex
+            .each_ref()
+            .map(|t| t.as_ref().map(|t| t.create_view(&Default::default())));
         let depth_view = depth_tex
             .as_ref()
             .map(|t| t.create_view(&Default::default()));
@@ -1556,8 +1620,8 @@ impl Drawer {
         {
             let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("draw"),
-                color_attachments: &[color_view.as_ref().map(|view| {
-                    wgpu::RenderPassColorAttachment {
+                color_attachments: &color_views.each_ref().map(|v| {
+                    v.as_ref().map(|view| wgpu::RenderPassColorAttachment {
                         view,
                         depth_slice: None,
                         resolve_target: None,
@@ -1565,8 +1629,8 @@ impl Drawer {
                             load: wgpu::LoadOp::Load,
                             store: wgpu::StoreOp::Store,
                         },
-                    }
-                })],
+                    })
+                }),
                 depth_stencil_attachment: depth_view.as_ref().map(|view| {
                     wgpu::RenderPassDepthStencilAttachment {
                         view,
@@ -1776,7 +1840,7 @@ impl Drawer {
         report: &mut Report,
     ) -> Result<bool, Skip> {
         if r.msaa_samples != 0 {
-            return unsupported("resolve from an MSAA surface");
+            report.warn("MSAA surfaces drawn and resolved single-sampled");
         }
         let height = RENDER_TARGET_HEIGHT.min(self.max_dim);
         let (rect, from_vertices) = resolve::rect(r, &self.regs, &*mem, height);
@@ -1942,6 +2006,7 @@ impl Drawer {
             TargetFormat::Rgb10a2 => 1,
             TargetFormat::Float7e3 => 2,
             TargetFormat::Rgba16Float => 3,
+            TargetFormat::Float32 => 4,
             TargetFormat::D24S8 | TargetFormat::D24FS8 => {
                 return unsupported("GPU resolve from a depth format")
             }
@@ -1953,7 +2018,11 @@ impl Drawer {
             rect.height(),
             pitch,
             src_format,
-            u32::from(r.dest_format != formats::DEST_8_8_8_8),
+            match r.dest_format {
+                formats::DEST_8_8_8_8 => 0,
+                formats::DEST_2_10_10_10 => 1,
+                _ => 2,
+            },
             u32::from(r.dest_swap),
             r.dest_endian,
             2f32.powi(r.dest_exp_bias).to_bits(),
@@ -2145,8 +2214,10 @@ mod tests {
         assert!(w.contains("o.o0 = (b.o0 - a.o0) + c.o0;\n    o.o2 = (b.o2 - a.o2) + c.o2;"));
         assert!(!w.contains("o.o1 ="));
         assert!(rect_list_wgsl("var<private> x: i32 = 1;\n", 0).is_err());
-        let ps = clamp_pixel_wgsl("    out.c0 = o_col[0];\n", 31.875, 1.0).unwrap();
+        let ps = clamp_pixel_wgsl("    out.c0 = o_col[0];\n", 0, 31.875, 1.0).unwrap();
         assert!(ps.contains("vec3<f32>(31.875)), clamp(o_col[0].w, 0.0, 1.0)"));
-        assert!(clamp_pixel_wgsl("", 1.0, 1.0).is_err());
+        assert!(clamp_pixel_wgsl("", 0, 1.0, 1.0).is_err());
+        let ps = clamp_pixel_wgsl("    out.c2 = o_col[2];\n", 2, f32::INFINITY, 1.0).unwrap();
+        assert!(ps.contains("out.c2 = vec4<f32>(o_col[2].xyz, clamp(o_col[2].w, 0.0, 1.0));"));
     }
 }

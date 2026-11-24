@@ -8,6 +8,8 @@ mod common;
 use common::*;
 use xenon_draw::{RenderTargetKey, TargetFormat};
 use xenon_gpu::regs::*;
+use xenon_shader::asm::*;
+use xenon_shader::ucode::*;
 
 const PRIM_TRI_LIST: u32 = 4;
 const PRIM_RECT_LIST: u32 = 8;
@@ -16,6 +18,7 @@ const PRIM_RECT_LIST: u32 = 8;
 const RT_2_10_10_10: u32 = 2;
 const RT_16_16_16_16_FLOAT: u32 = 7;
 const RT_2_10_10_10_FLOAT_AS_16_16_16_16: u32 = 12;
+const RT_32_FLOAT: u32 = 14;
 
 /// `xenos::ColorFormat` destination values.
 const DEST_8_8_8_8: u32 = 6;
@@ -531,4 +534,176 @@ fn gpu_resolve_matches_cpu_reference() {
             );
         }
     }
+}
+
+/// One draw into three render targets of different formats: oC<i> goes
+/// to RB_COLOR_INFO<i>, and a target whose RB_COLOR_MASK bits are all off
+/// is not drawn (nor created).
+#[test]
+fn multiple_render_targets() {
+    let Some(mut d) = drawer() else { return };
+    let mut mem = memory();
+    mem.write_words(VERTS, &corner_triangle(128.0));
+    let ps = assemble(
+        &[exec(0, 4, true)],
+        &(0..4)
+            .map(|i| export(i, AluSrc::constant(i, SWZ_XYZW)))
+            .collect::<Vec<_>>(),
+    );
+    let (b1, b2, b3) = (100, 200, 300);
+    let mut s = Stream::default();
+    s.setup()
+        .regs(
+            RB_COLOR_INFO_RT[1],
+            &[b1 | (RT_2_10_10_10_FLOAT_AS_16_16_16_16 << 16)],
+        )
+        .regs(RB_COLOR_INFO_RT[2], &[b2 | (RT_32_FLOAT << 16)])
+        .regs(RB_COLOR_INFO_RT[3], &[b3])
+        // Blending off (one, zero, add) on every target.
+        .regs(RB_BLENDCONTROL1, &[0x0001_0001; 3])
+        // RT0 red and alpha, RT1 and RT2 all channels, RT3 none.
+        .regs(RB_COLOR_MASK, &[0x9 | (0xF << 4) | (0xF << 8)])
+        .shader(false, &vs_color())
+        .shader(true, &ps)
+        .vertex_fetch(0, VERTS, 12)
+        .regs(
+            SHADER_CONSTANT_FLOAT + 256 * 4,
+            &[
+                [0.5, 0.25, 0.75, 1.0],
+                [2.5, 0.5, 40.0, 0.5],
+                [-3.25, 9.0, 9.0, 9.0],
+                [1.0, 1.0, 1.0, 1.0],
+            ]
+            .concat()
+            .into_iter()
+            .map(f)
+            .collect::<Vec<_>>(),
+        )
+        .draw_auto(PRIM_TRI_LIST, 3);
+    let report = run(&mut d, &s, &mut mem);
+    assert_eq!(report.draws, 1, "{report:?}");
+    assert!(report.unsupported.is_empty(), "{report:?}");
+    let at = |base, format| RenderTargetKey {
+        base_tiles: base,
+        pitch: W,
+        format,
+    };
+    let rt0 = d
+        .read_render_target(key(TargetFormat::Rgba8), 0, 0, W, H)
+        .unwrap();
+    // Green and blue masked off: they keep the zero the target starts with.
+    assert_eq!(px(&rt0, W, 4, 4), [128, 0, 0, 255]);
+    let rt1 = d
+        .read_render_target_raw(at(b1, TargetFormat::Float7e3), 0, 0, W, H)
+        .unwrap();
+    // 7e3 output clamp (blending off): 40 to 31.875.
+    assert_eq!(
+        halves(&texel(&rt1, W, 8, 4, 4)),
+        [0x4100, 0x3800, 0x4FF8, 0x3800]
+    );
+    let rt2 = d
+        .read_render_target_raw(at(b2, TargetFormat::Float32), 0, 0, W, H)
+        .unwrap();
+    assert_eq!(texel(&rt2, W, 4, 4, 4), (-3.25f32).to_le_bytes());
+    assert!(!d.render_targets().iter().any(|k| k.base_tiles == b3));
+}
+
+/// MSAA surfaces are drawn and resolved with one sample per pixel instead
+/// of skipping the draw.
+#[test]
+fn msaa_surface_draws_and_resolves_single_sampled() {
+    let Some(mut d) = drawer() else { return };
+    let mut mem = memory();
+    mem.write_words(VERTS, &corner_triangle(128.0));
+    let mut s = Stream::default();
+    s.setup()
+        // 2x MSAA.
+        .regs(RB_SURFACE_INFO, &[W | (1 << 16)])
+        .shader(false, &vs_color())
+        .shader(true, &ps_const())
+        .vertex_fetch(0, VERTS, 12);
+    c0(&mut s, [0.0, 1.0, 0.0, 1.0]).draw_auto(PRIM_TRI_LIST, 3);
+    s.resolve_with(
+        &mut mem,
+        (W, H),
+        COPY_CONVERT,
+        (DEST, W | (H << 16), dest_info(DEST_8_8_8_8, 0, false)),
+        [0; 3],
+    );
+    let report = run(&mut d, &s, &mut mem);
+    assert_eq!((report.draws, report.resolves), (1, 1), "{report:?}");
+    assert!(report.unsupported.is_empty(), "{report:?}");
+    assert!(
+        report.warnings.iter().any(|w| w.contains("MSAA")),
+        "{report:?}"
+    );
+    let img = detiled(&mem, DEST, W, H, W, 4);
+    assert_eq!(px(&img, W, 10, 10), [0, 255, 0, 255]);
+}
+
+/// A k_32_FLOAT render target resolved to k_32_FLOAT keeps the red
+/// channel's float bits, scaled by the exponent bias and not saturated,
+/// on the GPU and the CPU reference alike; a clear writes the clear word's
+/// float.
+#[test]
+fn float32_target_clear_draw_and_resolve() {
+    use xenon_draw::formats;
+    let Some(mut d) = drawer() else { return };
+    let mut mem = memory();
+    mem.write_words(VERTS, &corner_triangle(16.0));
+    let dest2 = DEST + 0x1_0000;
+    let mut s = Stream::default();
+    s.setup()
+        .regs(RB_COLOR_INFO, &[RT_32_FLOAT << 16])
+        .resolve_with(
+            &mut mem,
+            (W, H),
+            COPY_NULL | CLEAR_COLOR,
+            (DEST, W | (H << 16), 0),
+            [0, 0.125f32.to_bits(), 0],
+        )
+        .shader(false, &vs_color())
+        .shader(true, &ps_const())
+        .vertex_fetch(0, VERTS, 12);
+    c0(&mut s, [6.5, 2.0, 3.0, 4.0]).draw_auto(PRIM_TRI_LIST, 3);
+    s.resolve_with(
+        &mut mem,
+        (W, H),
+        COPY_CONVERT,
+        (
+            DEST,
+            W | (H << 16),
+            dest_info(formats::DEST_32_FLOAT, 0, false),
+        ),
+        [0; 3],
+    )
+    .resolve_with(
+        &mut mem,
+        (W, H),
+        COPY_CONVERT,
+        (
+            dest2,
+            W | (H << 16),
+            dest_info(formats::DEST_32_FLOAT, -1, false),
+        ),
+        [0; 3],
+    );
+    let report = run(&mut d, &s, &mut mem);
+    assert_eq!((report.draws, report.resolves), (1, 3), "{report:?}");
+    assert!(report.unsupported.is_empty(), "{report:?}");
+    let word =
+        |img: &[u8], x: u32, y: u32| f32::from_le_bytes(texel(img, W, 4, x, y).try_into().unwrap());
+    let img = detiled(&mem, DEST, W, H, W, 4);
+    assert_eq!((word(&img, 2, 2), word(&img, 40, 40)), (6.5, 0.125));
+    let img = detiled(&mem, dest2, W, H, W, 4);
+    assert_eq!((word(&img, 2, 2), word(&img, 40, 40)), (3.25, 0.0625));
+    let mut out = [0; 4];
+    formats::resolve_pixel(
+        formats::edram_rgba(TargetFormat::Float32, &6.5f32.to_le_bytes()),
+        -1,
+        false,
+        formats::DEST_32_FLOAT,
+        &mut out,
+    );
+    assert_eq!(out, 3.25f32.to_le_bytes());
 }
