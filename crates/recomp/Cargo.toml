@@ -8,3 +8,4 @@ publish.workspace = true
 license.workspace = true
 
 [dependencies]
+xenon-rt = { path = "../rt" }

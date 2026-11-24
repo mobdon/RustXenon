@@ -46,6 +46,35 @@ impl Runtime {
             .unwrap_or_else(|| panic!("no guest function at {addr:#010x}"));
         f(self, ctx);
     }
+
+    /// A trap instruction (`tw`, `td`, `twi`, `tdi`) whose condition held.
+    /// Games use these for assertions, so stop with the address.
+    #[cold]
+    pub fn trap(&mut self, _ctx: &mut Context, pc: u32) -> ! {
+        panic!("guest trap at {pc:#010x}");
+    }
+
+    /// `sc`. Titles reach the kernel through imports, not system calls.
+    #[cold]
+    pub fn syscall(&mut self, _ctx: &mut Context, pc: u32) -> ! {
+        panic!("guest system call instruction at {pc:#010x}");
+    }
+
+    /// An instruction the translator does not know. Generated code still
+    /// compiles; reaching it stops with the address and the word.
+    #[cold]
+    pub fn unknown(&mut self, _ctx: &mut Context, pc: u32, word: u32) -> ! {
+        panic!("untranslated instruction {word:#010x} at {pc:#010x}");
+    }
+
+    /// Time base (`mftb`), ticking at the console's 49.875 MHz.
+    pub fn timebase(&self) -> u64 {
+        use std::sync::OnceLock;
+        use std::time::Instant;
+        static START: OnceLock<Instant> = OnceLock::new();
+        let t = START.get_or_init(Instant::now).elapsed();
+        (t.as_nanos() * 49_875 / 1_000_000) as u64
+    }
 }
 
 #[cfg(test)]

@@ -1,0 +1,173 @@
+# Hand-written cases: VMX128-only instructions and forms the reference CPU
+# lacks. Values are worked out by hand from the instruction definitions.
+# Format: see crates/cpu-tests/src/lib.rs.
+# vmsum3fp128: (1*2 + 1.5*3.75) + 1.1*2.31, each step rounded to single; element 3 ignored
+vmsum3fp128_dot | 14c3219b | v3=3f8000003fc000003f8ccccd01020304 v100=40000000407000004013d70a01020304 | v70=4122a7f04122a7f04122a7f04122a7f0 | 
+# vmsum3fp128 with vD = vA
+vmsum3fp128_d_eq_a | 14632193 | v3=3f80000040000000404000007fc00000 v100=3f8000003f8000003f80000040000000 | v3=40c0000040c0000040c0000040c00000 | 
+# vmsum4fp128: [1,2,3,4].[5,6,7,8] = 70
+vmsum4fp128_dot | 17e00ddc | v64=3f800000400000004040000040800000 v1=40a0000040c0000040e0000041000000 | v127=428c0000428c0000428c0000428c0000 | 
+# vmsum4fp128 with vD = vB
+vmsum4fp128_d_eq_b | 15204dd0 | v64=3f800000400000004040000040800000 v9=40a0000040c0000040e0000041000000 | v9=428c0000428c0000428c0000428c0000 | 
+# vmsum4fp128: a NaN element gives that NaN, quieted, everywhere
+vmsum4fp128_nan | 144321d0 | v3=3f8000007f8000010000000000000000 v4=3f8000003f8000000000000000000000 | v2=7fc000017fc000017fc000017fc00001 | 
+# vmulfp128: a denormal product flushes to zero, keeping the sign
+vmulfp128_ftz | 14432090 | v3=00800000808000003f80000000000001 v4=3f0000003f000000000000013f800000 | v2=00000000800000000000000000000000 | 
+# vpermwi128 0x1B: element i takes vB[(imm >> (6 - 2i)) & 3]
+vpermwi128_identity | 1b5b4219 | v40=000102030405060708090a0b0c0d0e0f | v90=000102030405060708090a0b0c0d0e0f | 
+# vpermwi128 0xE4: element i takes vB[(imm >> (6 - 2i)) & 3]
+vpermwi128_reverse | 1b4443d9 | v40=000102030405060708090a0b0c0d0e0f | v90=0c0d0e0f08090a0b0405060700010203 | 
+# vpermwi128 0x00: element i takes vB[(imm >> (6 - 2i)) & 3]
+vpermwi128_splat0 | 1b404219 | v40=000102030405060708090a0b0c0d0e0f | v90=00010203000102030001020300010203 | 
+# vpermwi128 0xFF: element i takes vB[(imm >> (6 - 2i)) & 3]
+vpermwi128_splat3 | 1b5f43d9 | v40=000102030405060708090a0b0c0d0e0f | v90=0c0d0e0f0c0d0e0f0c0d0e0f0c0d0e0f | 
+# vpermwi128 0x9C: element i takes vB[(imm >> (6 - 2i)) & 3]
+vpermwi128_mixed | 1b5c4319 | v40=000102030405060708090a0b0c0d0e0f | v90=08090a0b040506070c0d0e0f00010203 | 
+# vpermwi128 with vD = vB
+vpermwi128_d_eq_b | 190443d5 | v40=000102030405060708090a0b0c0d0e0f | v40=0c0d0e0f08090a0b0405060700010203 | 
+# vrlimi128 mask 0xf rotate 0: rotate vB left by 0 words, insert where the mask bit is set (8 = x)
+vrlimi128_all_rot0 | 188f1f1c | v3=000102030405060708090a0b0c0d0e0f v100=cccccccccccccccccccccccccccccccc | v100=000102030405060708090a0b0c0d0e0f | 
+# vrlimi128 mask 0xf rotate 1: rotate vB left by 1 words, insert where the mask bit is set (8 = x)
+vrlimi128_all_rot1 | 188f1f5c | v3=000102030405060708090a0b0c0d0e0f v100=cccccccccccccccccccccccccccccccc | v100=0405060708090a0b0c0d0e0f00010203 | 
+# vrlimi128 mask 0xf rotate 2: rotate vB left by 2 words, insert where the mask bit is set (8 = x)
+vrlimi128_all_rot2 | 188f1f9c | v3=000102030405060708090a0b0c0d0e0f v100=cccccccccccccccccccccccccccccccc | v100=08090a0b0c0d0e0f0001020304050607 | 
+# vrlimi128 mask 0xf rotate 3: rotate vB left by 3 words, insert where the mask bit is set (8 = x)
+vrlimi128_all_rot3 | 188f1fdc | v3=000102030405060708090a0b0c0d0e0f v100=cccccccccccccccccccccccccccccccc | v100=0c0d0e0f000102030405060708090a0b | 
+# vrlimi128 mask 0x8 rotate 0: rotate vB left by 0 words, insert where the mask bit is set (8 = x)
+vrlimi128_x_only | 18881f1c | v3=000102030405060708090a0b0c0d0e0f v100=cccccccccccccccccccccccccccccccc | v100=00010203cccccccccccccccccccccccc | 
+# vrlimi128 mask 0x2 rotate 0: rotate vB left by 0 words, insert where the mask bit is set (8 = x)
+vrlimi128_z_only | 18821f1c | v3=000102030405060708090a0b0c0d0e0f v100=cccccccccccccccccccccccccccccccc | v100=cccccccccccccccc08090a0bcccccccc | 
+# vrlimi128 mask 0x5 rotate 3: rotate vB left by 3 words, insert where the mask bit is set (8 = x)
+vrlimi128_yw_rot3 | 18851fdc | v3=000102030405060708090a0b0c0d0e0f v100=cccccccccccccccccccccccccccccccc | v100=cccccccc00010203cccccccc08090a0b | 
+# vrlimi128 mask 0: vD unchanged
+vrlimi128_none | 18801f1c | v3=000102030405060708090a0b0c0d0e0f v100=cccccccccccccccccccccccccccccccc |  | 
+# vrlimi128 with vD = vB
+vrlimi128_d_eq_b | 188f2750 | v4=000102030405060708090a0b0c0d0e0f | v4=0405060708090a0b0c0d0e0f00010203 | 
+# vupkd3d128 type 0
+vupkd3d128_color | 18401ff9 | v35=cdcdcdcdcdcdcdcdcdcdcdcd04010203 | v66=3f8000013f8000023f8000033f800004 | 
+# vupkd3d128 type 1
+vupkd3d128_short2 | 18441ff9 | v35=cdcdcdcdcdcdcdcdcdcdcdcd7fff8001 | v66=40407fff403f8001000000003f800000 | 
+# vupkd3d128 type 1
+vupkd3d128_short2_b | 18441ff9 | v35=cdcdcdcdcdcdcdcdcdcdcdcd4000c000 | v66=40404000403fc000000000003f800000 | 
+# vupkd3d128 type 1
+vupkd3d128_short2_min_is_nan | 18441ff9 | v35=cdcdcdcdcdcdcdcdcdcdcdcd00008000 | v66=404000007fc00000000000003f800000 | 
+# vupkd3d128 type 4
+vupkd3d128_short4 | 18501ff9 | v35=cdcdcdcdcdcdcdcd7fffffff007ffff8 | v66=40407fff403fffff4040007f403ffff8 | 
+# vupkd3d128 type 3
+vupkd3d128_half2 | 184c1ff9 | v35=cdcdcdcdcdcdcdcdcdcdcdcd3800b800 | v66=3f000000bf000000000000003f800000 | 
+# vupkd3d128 type 5
+vupkd3d128_half4 | 18541ff9 | v35=cdcdcdcdcdcdcdcd3800b8013802b803 | v66=3f000000bf0020003f004000bf006000 | 
+# vupkd3d128 type 5
+vupkd3d128_half4_special | 18541ff9 | v35=cdcdcdcdcdcdcdcd7c0000010001fc00 | v66=7f8000003380000033800000ff800000 | 
+# vupkd3d128 with vD = vB
+vupkd3d128_d_eq_b | 18601ff0 | v3=cdcdcdcdcdcdcdcdcdcdcdcd04010203 | v3=3f8000013f8000023f8000033f800004 | 
+# vpkd3d128 type 0 pack 1 shift 0
+vpkd3d128_color | 18811e13 | v99=40400001404000024040000340400004 v4=cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd | v4=cdcdcdcdcdcdcdcdcdcdcdcd04010203 | 
+# vpkd3d128 type 0 pack 1 shift 1
+vpkd3d128_color_shift1 | 18811e53 | v99=40400001404000024040000340400004 v4=cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd | v4=cdcdcdcdcdcdcdcd04010203cdcdcdcd | 
+# vpkd3d128 type 0 pack 1 shift 3
+vpkd3d128_color_shift3 | 18811ed3 | v99=40400001404000024040000340400004 v4=cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd | v4=04010203cdcdcdcdcdcdcdcdcdcdcdcd | 
+# vpkd3d128 type 0 pack 1 shift 0
+vpkd3d128_color_clamp | 18811e13 | v99=4080000040000000c2f600004b3bdf83 v4=cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd | v4=cdcdcdcdcdcdcdcdcdcdcdcdffff0000 | 
+# vpkd3d128 type 0 pack 1 shift 0
+vpkd3d128_color_nan | 18811e13 | v99=4080000040000000c2f60000ffffffff v4=cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd | v4=cdcdcdcdcdcdcdcdcdcdcdcd00ff0000 | 
+# vpkd3d128 type 1 pack 1 shift 0
+vpkd3d128_short2 | 18851e13 | v99=40407fff403f80010000000000000000 v4=cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd | v4=cdcdcdcdcdcdcdcdcdcdcdcd7fff8001 | 
+# vpkd3d128 type 1 pack 1 shift 0
+vpkd3d128_short2_clamp | 18851e13 | v99=4040fffe403ff33342a23ec8403db757 v4=cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd | v4=cdcdcdcdcdcdcdcdcdcdcdcd7ffff333 | 
+# vpkd3d128 type 1 pack 1 shift 0
+vpkd3d128_short2_far | 18851e13 | v99=43817e00c37cfc000000000000000000 v4=cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd | v4=cdcdcdcdcdcdcdcdcdcdcdcd7fff8001 | 
+# vpkd3d128 type 4 pack 2 shift 0
+vpkd3d128_short4 | 18921e13 | v99=403f8001403ffff84040007f40400000 v4=cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd | v4=cdcdcdcdcdcdcdcd8001fff8007f0000 | 
+# vpkd3d128 type 3 pack 1 shift 0
+vpkd3d128_half2 | 188d1e13 | v99=3f000000bf0000000000000000000000 v4=cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd | v4=cdcdcdcdcdcdcdcdcdcdcdcd3800b800 | 
+# vpkd3d128 type 3 pack 1 shift 0
+vpkd3d128_half2_b | 188d1e13 | v99=3fc00000bfc0000042a23ec8403db757 v4=cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd | v4=cdcdcdcdcdcdcdcdcdcdcdcd3e00be00 | 
+# vpkd3d128 type 5 pack 2 shift 0
+vpkd3d128_half4 | 18961e13 | v99=3f000000bf0000003f800000bf800000 v4=cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd | v4=cdcdcdcdcdcdcdcd3800b8003c00bc00 | 
+# vpkd3d128 type 5 pack 2 shift 1
+vpkd3d128_half4_shift1 | 18961e53 | v99=3f000000bf0000003f800000bf800000 v4=cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd | v4=cdcdcdcd3800b8003c00bc00cdcdcdcd | 
+# vpkd3d128 type 5 pack 2 shift 2
+vpkd3d128_half4_shift2 | 18961e93 | v99=3f000000bf0000003f800000bf800000 v4=cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd | v4=3800b8003c00bc00cdcdcdcdcdcdcdcd | 
+# vpkd3d128 type 5 pack 2 shift 0
+vpkd3d128_half4_saturate | 18961e13 | v99=47c35000c7c350007fc0000033800000 v4=cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd | v4=cdcdcdcdcdcdcdcd7fffffff7fff0001 | 
+# vpkd3d128 with vD = vB: the source is packed before vD is merged
+vpkd3d128_d_eq_b | 18812610 | v4=40400001404000024040000340400004 | v4=40400001404000024040000304010203 | 
+# lvlx: bytes from EA to the end of its quadword, left-justified, rest zero
+lvlx_7 | 7c242c0e | r4=100020 r5=7 v1=cccccccccccccccccccccccccccccccc m100020=404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f | v1=4748494a4b4c4d4e4f00000000000000 | 
+# lvlx aligned: the whole quadword
+lvlx_0 | 7c242c0e | r4=100020 r5=10 m100020=404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f | v1=505152535455565758595a5b5c5d5e5f | 
+# lvlxl: bytes from EA to the end of its quadword, left-justified, rest zero
+lvlxl_7 | 7c242e0e | r4=100020 r5=7 v1=cccccccccccccccccccccccccccccccc m100020=404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f | v1=4748494a4b4c4d4e4f00000000000000 | 
+# lvlxl aligned: the whole quadword
+lvlxl_0 | 7c242e0e | r4=100020 r5=10 m100020=404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f | v1=505152535455565758595a5b5c5d5e5f | 
+# lvrx: bytes from the quadword start up to EA, right-justified
+lvrx_7 | 7c242c4e | r4=100020 r5=7 v1=cccccccccccccccccccccccccccccccc m100020=404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f | v1=00000000000000000040414243444546 | 
+# lvrx aligned: zero
+lvrx_0 | 7c242c4e | r4=100020 r5=10 v1=cccccccccccccccccccccccccccccccc m100020=404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f | v1=00000000000000000000000000000000 | 
+# lvrxl: bytes from the quadword start up to EA, right-justified
+lvrxl_7 | 7c242e4e | r4=100020 r5=7 v1=cccccccccccccccccccccccccccccccc m100020=404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f | v1=00000000000000000040414243444546 | 
+# lvrxl aligned: zero
+lvrxl_0 | 7c242e4e | r4=100020 r5=10 v1=cccccccccccccccccccccccccccccccc m100020=404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f | v1=00000000000000000000000000000000 | 
+# stvlx: the leftmost 16 - (EA & 15) bytes to EA onwards
+stvlx_4 | 7c642d0e | r4=100040 r5=4 v3=f0f1f2f3f4f5f6f7f8f9fafbfcfdfeff | m100044=f0f1f2f3f4f5f6f7f8f9fafb | 
+# stvlxl: the leftmost 16 - (EA & 15) bytes to EA onwards
+stvlxl_4 | 7c642f0e | r4=100040 r5=4 v3=f0f1f2f3f4f5f6f7f8f9fafbfcfdfeff | m100044=f0f1f2f3f4f5f6f7f8f9fafb | 
+# stvrx: the rightmost EA & 15 bytes to the quadword start
+stvrx_4 | 7c642d4e | r4=100040 r5=4 v3=f0f1f2f3f4f5f6f7f8f9fafbfcfdfeff | m100040=fcfdfeff | 
+# stvrx aligned: stores nothing
+stvrx_0 | 7c642d4e | r4=100040 r5=0 v3=f0f1f2f3f4f5f6f7f8f9fafbfcfdfeff |  | 
+# stvrxl: the rightmost EA & 15 bytes to the quadword start
+stvrxl_4 | 7c642f4e | r4=100040 r5=4 v3=f0f1f2f3f4f5f6f7f8f9fafbfcfdfeff | m100040=fcfdfeff | 
+# stvrxl aligned: stores nothing
+stvrxl_0 | 7c642f4e | r4=100040 r5=0 v3=f0f1f2f3f4f5f6f7f8f9fafbfcfdfeff |  | 
+# lvlx128 into a high register
+lvlx128_7 | 10642c0f | r4=100020 r5=7 v99=cccccccccccccccccccccccccccccccc m100020=404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f | v99=4748494a4b4c4d4e4f00000000000000 | 
+# lvlxl128 into a high register
+lvlxl128_7 | 10642e0f | r4=100020 r5=7 v99=cccccccccccccccccccccccccccccccc m100020=404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f | v99=4748494a4b4c4d4e4f00000000000000 | 
+# lvrx128 into a high register
+lvrx128_7 | 13e42c4f | r4=100020 r5=7 v127=cccccccccccccccccccccccccccccccc m100020=404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f | v127=00000000000000000040414243444546 | 
+# lvrxl128 into a high register
+lvrxl128_7 | 13e42e4f | r4=100020 r5=7 v127=cccccccccccccccccccccccccccccccc m100020=404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f | v127=00000000000000000040414243444546 | 
+# stvlx128 from a high register
+stvlx128_4 | 10c42d0b | r4=100040 r5=4 v70=f0f1f2f3f4f5f6f7f8f9fafbfcfdfeff | m100044=f0f1f2f3f4f5f6f7f8f9fafb | 
+# stvlxl128 from a high register
+stvlxl128_4 | 10c42f0b | r4=100040 r5=4 v70=f0f1f2f3f4f5f6f7f8f9fafbfcfdfeff | m100044=f0f1f2f3f4f5f6f7f8f9fafb | 
+# stvrx128 from a high register
+stvrx128_4 | 10242d47 | r4=100040 r5=4 v33=f0f1f2f3f4f5f6f7f8f9fafbfcfdfeff | m100040=fcfdfeff | 
+# stvrxl128 from a high register
+stvrxl128_4 | 10242f47 | r4=100040 r5=4 v33=f0f1f2f3f4f5f6f7f8f9fafbfcfdfeff | m100040=fcfdfeff | 
+# lvebx loads the whole aligned quadword (the other elements are architecturally undefined)
+lvebx_whole | 7c24280e | r4=100020 r5=6 v1=cccccccccccccccccccccccccccccccc m100020=404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f | v1=404142434445464748494a4b4c4d4e4f | 
+# lvehx loads the whole aligned quadword (the other elements are architecturally undefined)
+lvehx_whole | 7c24284e | r4=100020 r5=6 v1=cccccccccccccccccccccccccccccccc m100020=404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f | v1=404142434445464748494a4b4c4d4e4f | 
+# lvewx loads the whole aligned quadword (the other elements are architecturally undefined)
+lvewx_whole | 7c24288e | r4=100020 r5=6 v1=cccccccccccccccccccccccccccccccc m100020=404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f | v1=404142434445464748494a4b4c4d4e4f | 
+# lvewx128 loads the whole aligned quadword
+lvewx128_whole | 1204288b | r4=100020 r5=6 v80=cccccccccccccccccccccccccccccccc m100020=404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f | v80=404142434445464748494a4b4c4d4e4f | 
+# dcbz clears the 32-byte block holding EA
+dcbz_32 | 7c042fec | r4=100040 r5=13 m100000=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa | m100040=0000000000000000000000000000000000000000000000000000000000000000 | 
+# dcbz128 clears the 128-byte block holding EA
+dcbz128 | 7c242fec | r4=100040 r5=53 m100000=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa | m100080=0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000 | 
+# lmw r28: four words into r28..r31, zero-extended
+lmw_28 | bb840004 | r4=10001c r31=ffffffffffffffff m100020=404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f | r28=40414243 r29=44454647 r30=48494a4b r31=4c4d4e4f | 
+# stmw r29: low words of r29..r31
+stmw_29 | bfa40010 | r4=100030 r29=1111111122222222 r30=3 r31=ffffffff80000000 | m100040=222222220000000380000000 | 
+# stwcx. with no reservation fails: no store, CR0 = SO
+stwcx_no_reservation | 7c60212d | r3=12345678 r4=100020 xer=80000000 | cr=10000000 | 
+# ldarx then stdcx. to another address fails
+stdcx_other_address | 7c6020a8 7c6029ad | r4=100020 r5=100028 m100020=404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f | r3=4041424344454647 | 
+# fres of +0 is +infinity
+fres_zero | ec201030 | f2=0 | f1=7ff0000000000000 | ignore_fpscr
+# fres of -0 is -infinity
+fres_nzero | ec201030 | f2=8000000000000000 | f1=fff0000000000000 | ignore_fpscr
+# vexptefp: 2^[0, 1, 4, -1]
+vexptefp_exact | 1020118a | v2=000000003f80000040800000bf800000 | v1=3f80000040000000418000003f000000 | 
+# vexptefp with vD = vB
+vexptefp_d_eq_b | 1040118a | v2=40400000c00000007f800000ff800000 | v2=410000003e8000007f80000000000000 | 
+# vlogefp: log2 [1, 2, 16, 0.5]
+vlogefp_exact | 102011ca | v2=3f80000040000000418000003f000000 | v1=000000003f80000040800000bf800000 | 
+# vlogefp: negative gives the default NaN, zero gives -infinity
+vlogefp_special | 102011ca | v2=bf800000000000007f80000080000001 | v1=7fc00000ff8000007f800000ff800000 | 
+# vrsqrtefp of a negative number is the default NaN
+vrsqrtefp_negative | 1020114a | v2=bf800000408000000000000080000000 | v1=7fc000003f0000007f800000ff800000 | 

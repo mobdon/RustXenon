@@ -1,0 +1,13 @@
+[package]
+name = "xenon-cpu-tests"
+description = "Per-instruction tests for the translator: hand-assembled instructions, no game bytes."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+xenon-rt = { path = "../rt" }
+
+[build-dependencies]
+xenon-recomp = { path = "../recomp" }

@@ -12,6 +12,10 @@ Licence texts are kept in [`third_party/licenses/`](third_party/licenses/).
   function, a small runtime, function and jump-table analysis). Any code
   ported from it will be marked at the place it is used and keeps this
   notice.
+- Ported code: the single-to-half conversion used by `vpkd3d128`
+  (`f32_to_half` in `crates/rt/src/vmx.rs`), rewritten in Rust from
+  XenonRecomp's recompiler. Its operand order for the VMX128 multiply-add
+  forms was also our reference.
 
 ## ReXGlue SDK
 
@@ -34,6 +38,12 @@ Licence texts are kept in [`third_party/licenses/`](third_party/licenses/).
 - Use: ideas only, no code. Much of what ReXGlue does for guest memory
   layout, kernel objects, the GPU command processor and audio decoding comes
   from Xenia, so what we learned there traces back to Xenia too.
+- Use in the instruction translator (facts about the hardware, no code):
+  the VMX128 opcode values and register field layout, the D3D pack and
+  unpack formats of `vpkd3d128`/`vupkd3d128` and where the packed words land,
+  and the whole-quadword behaviour of the element loads. We checked our own
+  decoder against the VMX128 encodings published in Xenia's instruction
+  tests; none of its test data is copied into this repository.
 
 ## XenosRecomp
 
@@ -55,6 +65,19 @@ Licence texts are kept in [`third_party/licenses/`](third_party/licenses/).
   whose output register is also an input, 64-bit call arguments, unaligned
   title-update records, guest memory reservation, GPU driver workarounds,
   audio queue depth) shaped our test plan.
+
+## QEMU and LLVM (tools only)
+
+- Projects: https://www.qemu.org (GPL v2) and https://llvm.org (Apache 2.0
+  with LLVM exceptions).
+- Use: `tools/ppc-oracle` assembles test instructions with LLVM's `llvm-mc`
+  and `ld.lld` and runs them on QEMU's 64-bit PowerPC user-mode emulator to
+  record reference results. Neither is linked into or shipped with
+  RustXenon, and no code from either is copied. The committed results in
+  `crates/cpu-tests/data/oracle.txt` are measurements of emulated hardware
+  behaviour. Where QEMU's behaviour differs from the console (its 128-byte
+  `dcbz`, its inexact `vexptefp`/`vlogefp`, `fres` of zero) the case is a
+  hand-written value instead.
 
 ## FFmpeg (planned, not used yet)
 
