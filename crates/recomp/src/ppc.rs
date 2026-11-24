@@ -6,7 +6,7 @@
 //! `Context` (`c`) and guest memory (`rt.mem`), calling small helpers in
 //! `xenon_rt::{ops, fpu, vmx}` where the semantics are not a one-liner.
 //!
-//! Emitted code assumes these names are in scope: `rt: &mut Runtime`,
+//! Emitted code assumes these names are in scope: `rt: &Runtime`,
 //! `c: &mut Context`, a mutable `pc: u32` loop variable, and the modules
 //! `ops`, `fpu`, `vmx` from `xenon_rt`. See [`crate::emit::function`].
 //!
@@ -324,7 +324,7 @@ fn vmem(name: &'static str, v: u32, ea: &str) -> String {
     match op {
         "lvsl" | "lvsr" => format!("c.v[{v}] = vmx::{op}(({ea}) as u32);"),
         "lvx" | "lvlx" | "lvrx" => format!("c.v[{v}] = vmx::{op}(&rt.mem, ({ea}) as u32);"),
-        _ => format!("vmx::{op}(&mut rt.mem, ({ea}) as u32, c.v[{v}]);"),
+        _ => format!("vmx::{op}(&rt.mem, ({ea}) as u32, c.v[{v}]);"),
     }
 }
 
@@ -931,7 +931,10 @@ fn op19(
         }
         33 => crop("crnor", "!(a | b)"),
         129 => crop("crandc", "a & !b"),
-        150 => Some(("isync", String::new())),
+        150 => Some((
+            "isync",
+            "std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);".into(),
+        )),
         193 => crop("crxor", "a ^ b"),
         225 => crop("crnand", "!(a & b)"),
         257 => crop("crand", "a & b"),
@@ -1329,9 +1332,21 @@ fn op31(
         342 => Some(("dst", String::new())),
         374 => Some(("dstst", String::new())),
         470 => Some(("dcbi", String::new())),
-        598 => Some(("sync", String::new())),
+        // sync (L=0) is a full barrier; lwsync (L=1) orders everything but
+        // store-then-load, which is what acquire/release fences give.
+        598 if d & 3 == 1 => Some((
+            "lwsync",
+            "std::sync::atomic::fence(std::sync::atomic::Ordering::AcqRel);".into(),
+        )),
+        598 => Some((
+            "sync",
+            "std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);".into(),
+        )),
         822 => Some(("dss", String::new())),
-        854 => Some(("eieio", String::new())),
+        854 => Some((
+            "eieio",
+            "std::sync::atomic::fence(std::sync::atomic::Ordering::Release);".into(),
+        )),
         982 => Some(("icbi", String::new())),
         _ => None,
     }

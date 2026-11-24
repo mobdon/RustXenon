@@ -24,7 +24,7 @@ pub fn function(name: &str, start: u32, words: &[u32]) -> String {
         s,
         "#[allow(unused_mut, unused_variables, unreachable_code, unused_braces, clippy::all)]"
     );
-    let _ = writeln!(s, "pub fn {name}(rt: &mut Runtime, c: &mut Context) {{");
+    let _ = writeln!(s, "pub fn {name}(rt: &Runtime, c: &mut Context) {{");
     let _ = writeln!(s, "    let mut pc: u32 = {start:#010x};");
     let _ = writeln!(s, "    loop {{");
     let _ = writeln!(s, "        match pc {{");

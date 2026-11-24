@@ -50,7 +50,7 @@ fn hex_bytes(v: &str) -> Vec<u8> {
         .collect()
 }
 
-fn set(c: &mut Context, m: &mut GuestMemory, k: &str, v: &str) {
+fn set(c: &mut Context, m: &GuestMemory, k: &str, v: &str) {
     if let Some(addr) = k.strip_prefix('m') {
         let addr = u32::from_str_radix(addr, 16).unwrap();
         for (i, b) in hex_bytes(v).into_iter().enumerate() {
@@ -103,7 +103,8 @@ fn snapshot(c: &Context, m: &GuestMemory) -> BTreeMap<String, String> {
     s.insert("lr".into(), format!("{:x}", c.lr));
     s.insert("fpscr".into(), format!("{:x}", c.fpscr));
     s.insert("vscr".into(), format!("{:x}", c.vscr));
-    let mem = &m.bytes()[SCRATCH as usize..(SCRATCH + SCRATCH_LEN) as usize];
+    let mut mem = [0u8; SCRATCH_LEN as usize];
+    m.read_bytes(SCRATCH, &mut mem);
     for (i, b) in mem.iter().enumerate() {
         s.insert(format!("m{:x}", SCRATCH as usize + i), format!("{b:02x}"));
     }
@@ -118,22 +119,22 @@ pub fn check(line: &str, f: GuestFn) {
     let flags = parts.get(4).copied().unwrap_or("");
 
     let mut c = Context::new();
-    let mut m = GuestMemory::new((SCRATCH + 0x1000) as usize);
+    let m = GuestMemory::new((SCRATCH + 0x1000) as usize);
     for (k, v) in &inputs {
-        set(&mut c, &mut m, k, v);
+        set(&mut c, &m, k, v);
     }
     let before = snapshot(&c, &m);
 
     // Expected state: inputs with the reference's changes applied.
     let (mut ec, mut em) = (c.clone(), GuestMemory::new((SCRATCH + 0x1000) as usize));
-    em.bytes_mut().copy_from_slice(m.bytes());
+    m.read_bytes(0, em.bytes_mut());
     for (k, v) in &expect {
-        set(&mut ec, &mut em, k, v);
+        set(&mut ec, &em, k, v);
     }
     let want = snapshot(&ec, &em);
 
-    let mut rt = Runtime::new(m);
-    f(&mut rt, &mut c);
+    let rt = Runtime::new(m);
+    f(&rt, &mut c);
     let got = snapshot(&c, &rt.mem);
 
     let mut bad = Vec::new();

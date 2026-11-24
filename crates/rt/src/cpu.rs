@@ -53,6 +53,9 @@ pub struct Context {
     pub msr: u64,
     /// Load reservation for the next conditional store.
     pub reserve: Option<Reservation>,
+    /// Guest calls made through `Runtime::call` (checked against the call
+    /// budget).
+    pub calls: u64,
 }
 
 impl Default for Context {
@@ -73,6 +76,7 @@ impl Default for Context {
             vrsave: 0,
             msr: 0x8000_0000_0000_0000,
             reserve: None,
+            calls: 0,
         }
     }
 }

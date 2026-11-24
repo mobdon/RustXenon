@@ -9,16 +9,20 @@
 //!
 //! Contents: guest CPU state, big-endian guest memory, the call choke point,
 //! and the helpers that translated instructions call (`ops` for integer,
-//! `fpu` for scalar floating point, `vmx` for the vector unit). Threads and
-//! real atomics arrive in step 3.
+//! `fpu` for scalar floating point, `vmx` for the vector unit), plus
+//! concurrent guest threads (`Runtime::spawn`) and the host objects behind
+//! guest locks, events and semaphores (`sync`).
 
 pub mod cpu;
 pub mod fpu;
 pub mod mem;
 pub mod ops;
 pub mod runtime;
+pub mod sync;
+mod thread;
 pub mod vmx;
 
 pub use cpu::{Context, Reservation, V128};
 pub use mem::GuestMemory;
 pub use runtime::{GuestFn, Runtime};
+pub use sync::{CriticalSection, Event, Semaphore};

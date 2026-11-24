@@ -12,6 +12,10 @@ owns runs as a native program.
 > (about 4,000 cases). Step 2 has started: the executable loader, title-update
 > patching and function/jump-table analysis work on synthetic test files
 > (`xenon-recomp scan`). Code generation for a whole executable is next.
+> Step 3 is in: guest threads run at the same time on host threads, reserved
+> stores are host compare-and-swap, and the runtime has the locks, events and
+> semaphores that guest kernel objects map onto (checked with synthetic
+> multi-thread programs).
 
 ## You need your own copy
 
@@ -69,6 +73,32 @@ register. Not covered yet: string loads and stores (`lswi`, `lswx`, `stswi`,
 FPSCR exception and result-class bits, non-default rounding modes for float
 arithmetic, and privileged instructions. Reaching an untranslated instruction
 stops with its address and word.
+
+### Threads and atomics (step 3)
+
+| Part | What it does |
+|---|---|
+| Guest memory | One allocation with a base pointer, shared by every thread. Every access is a host atomic (relaxed, of its own width when aligned, byte by byte when not), so concurrent guest threads are sound Rust. A range outside guest memory stops with its address |
+| `lwarx`/`stwcx.`, `ldarx`/`stdcx.` | The load records the value; the conditional store is a host compare-and-swap against it. An unaligned reserved store stops with its address, where the console raises an alignment interrupt |
+| Barriers | `sync` is a full fence, `lwsync` an acquire/release fence, `isync` an acquire fence, `eieio` a release fence |
+| Threads | `Runtime::spawn` (optionally suspended), `join` (exit value in r3; a panic in the thread continues in the joiner), `suspend`/`resume`, `current_thread` |
+| Kernel objects | `Event` (manual and auto reset), `Semaphore` (with maximum), `CriticalSection` (recursive), each wait with an optional timeout; `Runtime::object` finds the host object for a guest object's address |
+| Call point | `Runtime::call` also counts calls against a per-thread `call_budget`, calls an optional `trace`, and is where a suspended thread stops |
+
+Tests in `crates/cpu-tests/tests/threads.rs` run translated guest code (atomic
+32- and 64-bit counters, a spin lock guarding plain stores) and hook-based
+programs (a critical section, an event wake-up, a producer/consumer queue with
+two semaphores, suspend and resume) on up to eight threads at once. Thread order
+changes between runs, so tests check results that hold for every order.
+
+Not covered yet: the kernel calls themselves (step 4 maps them onto these
+objects), waiting on several objects at once, alertable waits and APCs, ending
+a thread from deep inside guest code, thread priorities and processor
+affinity, and the guest address layout (the image sits at `0x82000000`, so the
+full 4 GB guest address range needs reserving rather than allocating). A
+compare-and-swap succeeds where the console would fail a store whose word was
+written back with the same value in between; locks and counters do not
+depend on that.
 
 ### Design notes
 
