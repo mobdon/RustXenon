@@ -1864,9 +1864,10 @@ impl Drawer {
             return Ok(());
         }
         if dest_bytes == 4 {
+            self.resolve_gpu(r, rect, format, &tex, mem)?;
             self.resolved_endian
                 .insert(r.dest_base & PHYSICAL_MASK, r.dest_endian);
-            return self.resolve_gpu(r, rect, format, &tex, mem);
+            return Ok(());
         }
         let mut t = Instant::now();
         self.wait_idle()?;
@@ -1935,7 +1936,10 @@ impl Drawer {
             TargetFormat::Rgba8 => 0,
             TargetFormat::Rgb10a2 => 1,
             TargetFormat::Float7e3 => 2,
-            _ => 3,
+            TargetFormat::Rgba16Float => 3,
+            TargetFormat::D24S8 | TargetFormat::D24FS8 => {
+                return unsupported("GPU resolve from a depth format")
+            }
         };
         let params = [
             rect.x0,
