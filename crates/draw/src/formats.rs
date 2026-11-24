@@ -23,6 +23,7 @@ use crate::TargetFormat;
 pub const DEST_8_8_8_8: u32 = 6;
 pub const DEST_2_10_10_10: u32 = 7;
 pub const DEST_16_16_16_16_FLOAT: u32 = 32;
+pub const DEST_32_FLOAT: u32 = 36;
 
 /// Largest 7e3 value (exponent 7, mantissa 127).
 pub const FLOAT7E3_MAX: f32 = 31.875;
@@ -140,6 +141,7 @@ pub fn clear_color(format: TargetFormat, value: u64) -> [f32; 4] {
         // Xenia clears these through a uint view with the half bits; the
         // half -> f32 -> half round trip of the clear shader is exact.
         TargetFormat::Rgba16Float => [0, 16, 32, 48].map(|s| half_to_f32(field(s, 16) as u16)),
+        TargetFormat::Float32 => [f32::from_bits(value as u32), 0.0, 0.0, 0.0],
         TargetFormat::D24S8 | TargetFormat::D24FS8 => [0.0; 4],
     }
 }
@@ -183,6 +185,8 @@ pub fn edram_rgba(format: TargetFormat, texel: &[u8]) -> [f32; 4] {
             [q(half(0)), q(half(1)), q(half(2)), a2 as f32 * (1.0 / 3.0)]
         }
         TargetFormat::Rgba16Float => [half(0), half(1), half(2), half(3)],
+        // XeResolveUnpack32bpp: red only.
+        TargetFormat::Float32 => [f32::from_bits(word(0)), 0.0, 0.0, 0.0],
         TargetFormat::D24S8 | TargetFormat::D24FS8 => [0.0; 4],
     }
 }
@@ -191,7 +195,7 @@ pub fn edram_rgba(format: TargetFormat, texel: &[u8]) -> [f32; 4] {
 /// drawer cannot write it.
 pub fn dest_bytes(dest_format: u32) -> Option<usize> {
     match dest_format {
-        DEST_8_8_8_8 | DEST_2_10_10_10 => Some(4),
+        DEST_8_8_8_8 | DEST_2_10_10_10 | DEST_32_FLOAT => Some(4),
         DEST_16_16_16_16_FLOAT => Some(8),
         _ => None,
     }
@@ -223,6 +227,8 @@ pub fn resolve_pixel(rgba: [f32; 4], exp_bias: i32, swap: bool, dest_format: u32
                 | (unorm(p[3], 3.0) << 30);
             out.copy_from_slice(&w.to_le_bytes());
         }
+        // XePack32bpp: the red channel's bits, not saturated.
+        DEST_32_FLOAT => out.copy_from_slice(&p[0].to_bits().to_le_bytes()),
         DEST_16_16_16_16_FLOAT => {
             for (i, c) in p.iter().enumerate() {
                 out[2 * i..2 * i + 2].copy_from_slice(&f32_to_half(*c).to_le_bytes());
