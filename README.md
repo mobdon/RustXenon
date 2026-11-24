@@ -20,6 +20,10 @@ owns runs as a native program.
 > objects, files on the player's unpacked game folder, content and profile
 > stubs, input and network stubs), with a headless GPU command processor,
 > checked with synthetic tests.
+> multi-thread programs). Step 5 groundwork has started: the GPU command
+> recorder, texture decoding, shader translation to WGSL and a headless wgpu
+> drawer work on synthetic command streams (unit tested, run on a software
+> Vulkan driver; nothing has run in a game yet).
 
 ## You need your own copy
 
@@ -35,6 +39,10 @@ See [DATA-RULES.md](DATA-RULES.md).
 | `crates/rt` | `xenon-rt`: guest CPU state, big-endian guest memory, call dispatch and overrides. Kept tiny so generated code rebuilds rarely |
 | `crates/cpu-tests` | Per-instruction tests: hand-assembled words, reference results as text, no game bytes |
 | `tools/ppc-oracle` | Regenerates the reference results on a CPU emulator (needs LLVM and QEMU; CI does not) |
+| `crates/gpu` | `xenon-gpu`: GPU command recorder: PM4 packets from guest memory to a typed command list, register file |
+| `crates/texture` | `xenon-texture`: texture fetch constants, tiling, endian swaps, texel formats to RGBA8 |
+| `crates/shader` | `xenon-shader`: GPU shader microcode decoder, assembler for tests, translation to WGSL |
+| `crates/draw` | `xenon-draw`: headless wgpu drawer: replays recorded commands into offscreen render targets, resolves, PNG frames |
 | `crates/host` | `xenon-host`: loads the player's files, runs recompiled code, replaces system calls; later graphics, input and audio |
 | `games/<sha256>/hooks.toml` | Per-game hook addresses with role names. The only per-game file in git |
 | `third_party/licenses` | Licence texts for credited sources |
@@ -214,6 +222,39 @@ Not covered yet: structured exception handling (not reached so far), asynchronou
 routines and APCs, alertable waits, physical memory mirrors at `0xC0000000`
 and `0xE0000000`, timer completion routines, the audio render callback, and
 rendering.
+### GPU (step 5)
+
+| Crate | Covers |
+|---|---|
+| `xenon-gpu` | PM4 packet types 0 to 3 from a ring or buffer in guest memory, indirect buffers (depth and work bounded), predication, register writes and constant loads, shader loads, draws (auto, DMA and immediate indices), resolves (copy-mode draws, with the copy registers decoded), swaps, memory writes, waits, events; a packet builder for tests |
+| `xenon-texture` | The texture fetch constant, 32x32 tiling and its inverse, endian swaps, base level decode of 1D and 2D textures (slice 0 of stacked and cube) in the common uncompressed, packed and DXT/DXN formats to RGBA8, fetch swizzle |
+| `xenon-shader` | Control-flow, ALU and fetch instruction decoding and encoding, translation of vertex and pixel programs to WGSL (loops, calls, predicates, relative addressing, vertex fetch with endian swap and format decode, 2D texture fetch with LOD bias, colour exports) |
+| `xenon-draw` | Headless wgpu device (Vulkan or GL, software drivers fine), replay of a command list: register file, shader translation and pipeline caching, guest vertex window and constants per the shader binding contract, textures from fetch constants, DMA and auto indices (byte-swapped, 24-bit, primitive reset in strips), point/line/triangle lists and strips, triangle fans and quad lists by index expansion, viewport transform (`PA_CL_VTE_CNTL`, `PA_CL_VPORT_*`, window offset, half-pixel centre) in a WGSL epilogue, scissor, cull mode, colour write mask, blending, depth test; render targets per EDRAM base, pitch and format (`8_8_8_8`, `D24S8`, `D24FS8`); resolves of `8_8_8_8` to tiled guest memory with the destination endian, colour and depth clears; swaps to RGBA8 frames and PNG |
+
+Tests build every command stream, shader and texture by hand; the drawer
+tests run end to end on lavapipe (Mesa's software Vulkan) and check exact
+pixels.
+
+Not covered yet: textures beyond the base level of 1D and 2D (mips, the
+packed mip tail, 3D, cube faces other than the first, stacked slices past 0),
+the fetch constant's sign, exponent bias, gamma and border colour, and the
+border and mirror-once clamp modes; texture fetch filter overrides, 1D/3D/cube
+fetches, fetches with register LOD or gradients; depth export and memory
+export; the point size export; maxa's ordering against the scalar operands
+and the NaN result of `max4` (both differ slightly from Xenia); resolves of
+anything other than 8_8_8_8 colour to 8_8_8_8 (other colour formats, depth,
+exponent bias, 3D destinations, MSAA sample selection); MSAA; render targets
+other than 8_8_8_8, D24S8 and D24FS8; render targets 1 to 3; EDRAM aliasing
+between targets that overlap in EDRAM; rectangle lists (the fourth corner is
+made after the vertex shader); the piecewise-linear gamma of `8_8_8_8_GAMMA`
+(drawn as plain 8_8_8_8); stencil, alpha test, alpha to coverage, polygon
+offset, user clip planes, OpenGL clip space, primitive reset outside strips,
+the `VGT_MIN_VTX_INDX` / `VGT_MAX_VTX_INDX` clamp, tessellation and immediate
+indices; texture caching (textures are decoded for every draw);
+and the fences the guest waits on (register-to-memory writes, event writes,
+conditional writes are recorded but not applied). The front buffer of a swap
+is read as tiled 8_8_8_8 with red in the low byte, the layout the drawer's
+resolve writes.
 
 ### Design notes
 

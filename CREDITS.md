@@ -172,6 +172,50 @@ Licence texts are kept in [`third_party/licenses/`](third_party/licenses/).
 - From `src/xenia/base/math.h`: a cross-check of the console's half-float
   range.
 
+## Xenia: ported code in `xenon-draw`
+
+- Licence: BSD 3-Clause, Copyright (c) 2015 Ben Vanik and Xenia project
+  contributors. Full text:
+  [`third_party/licenses/Xenia-LICENSE.txt`](third_party/licenses/Xenia-LICENSE.txt)
+- Studied at commit `95a5c3ee250f80c3b9d139658649d9ffb6db3eec`. Logic is
+  rewritten in Rust; each file names its sources at the top.
+- From `src/xenia/gpu/`:
+  - `registers.h`: the bitfields of `PA_SU_SC_MODE_CNTL`, `PA_SU_VTX_CNTL`,
+    `PA_CL_VTE_CNTL`, the window and screen scissors,
+    `RB_COLOR_MASK`, `RB_BLENDCONTROL`, `RB_DEPTHCONTROL`, `RB_COLOR_INFO`,
+    `RB_DEPTH_INFO` and `RB_SURFACE_INFO`.
+  - `xenos.h`: blend factor, blend operation, compare function, colour and
+    depth render target format and pixel centre values.
+  - `xenos.cc` (`Float20e4To32`) and `xenos.h` (`UNorm24To32`): the 20e4
+    and 24-bit unorm depth clear values.
+  - `d3d12/pipeline_cache.cc`: depth writes only while the depth test is
+    enabled; `draw_util.h` (`IsClearingColor`): depth resolves do not clear
+    colour; `registers.h` (`VGT_DRAW_INITIATOR`, `VGT_INDX_OFFSET`,
+    `VGT_MULTI_PRIM_IB_RESET_INDX`): 16-bit index counts, 24-bit indices and
+    primitive reset.
+  - `draw_util.cc`: the scissor (`GetScissor`), the window offset and
+    half-pixel offset of the viewport (`GetHostViewportInfo`), and the
+    resolve rectangle and destination addressing (`GetResolveInfo`: three
+    vertices in vertex fetch constant 0, 16.8 rounding, scissor clamp,
+    8-pixel alignment, pitch clamp, `Tiled2D` destination offsets).
+  - `spirv_shader_translator.cc` and `vulkan/vulkan_command_processor.cc`:
+    the vertex position epilogue (`PA_CL_VTE_CNTL` W, XY and Z formats, then
+    NDC scale and offset).
+  - `primitive_processor.cc` and `primitive_processor.h`: guest index byte
+    order (including the 32-bit swap modes on 16-bit indices), the 24-bit
+    index mask and reset compare, and the triangle fan and quad list to
+    triangle list orders.
+  - `shaders/pixel_formats.xesli`, `d3d12/d3d12_render_target_cache.cc`:
+    the 8_8_8_8 EDRAM packing (red in the low byte) used for colour clears
+    and resolves.
+
+## Rust crates
+
+Dependencies from crates.io keep their own licences and are not copied into
+this repository, so no licence files are added for them. `xenon-draw` uses
+`wgpu` and its `naga` shader compiler (MIT or Apache-2.0), `png` (MIT or
+Apache-2.0) and `pollster` (MIT or Apache-2.0).
+
 ## LibertyRecomp, LibertyRecompAndroid and XHYN-IV-recomp
 
 - Projects: https://github.com/OZORDI/LibertyRecomp,
