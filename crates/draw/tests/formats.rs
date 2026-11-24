@@ -445,3 +445,90 @@ fn front_buffer_follows_resolve_endian() {
         synthetic_frame(endian, false);
     }
 }
+
+/// The GPU resolve of 32bpp destinations matches the CPU reference
+/// conversion ([`xenon_draw::formats::edram_rgba`] and
+/// [`xenon_draw::formats::resolve_pixel`], then
+/// [`xenon_draw::resolve::write_tiled_texels`]) byte for byte, over a
+/// gradient of every source format, both destination formats, exponent
+/// biases, the red/blue swap and every endian.
+#[test]
+fn gpu_resolve_matches_cpu_reference() {
+    use xenon_draw::{formats, resolve};
+    let Some(mut d) = drawer() else { return };
+    let (w2, h2) = ((2 * W) as f32, (2 * H) as f32);
+    let verts = color_verts(&[
+        (0.0, 0.0, 0.0, [0, 0, 0, 0]),
+        (w2, 0.0, 0.0, [255, 128, 3, 255]),
+        (0.0, h2, 0.0, [7, 255, 255, 64]),
+    ]);
+    let cases = [
+        (DEST_8_8_8_8, 0, false, 0),
+        (DEST_8_8_8_8, 3, true, 1),
+        (DEST_8_8_8_8, -2, false, 2),
+        (DEST_2_10_10_10, 1, false, 3),
+        (DEST_2_10_10_10, -5, true, 2),
+    ];
+    for (rt, format) in [
+        (0, TargetFormat::Rgba8),
+        (RT_2_10_10_10, TargetFormat::Rgb10a2),
+        (RT_2_10_10_10_FLOAT_AS_16_16_16_16, TargetFormat::Float7e3),
+        (RT_16_16_16_16_FLOAT, TargetFormat::Rgba16Float),
+    ] {
+        let mut mem = memory();
+        mem.write_words(VERTS, &verts);
+        let mut s = Stream::default();
+        s.setup()
+            .regs(RB_COLOR_INFO, &[rt << 16])
+            .shader(false, &vs_color())
+            .shader(true, &ps_interp())
+            .vertex_fetch(0, VERTS, 12)
+            .draw_auto(PRIM_TRI_LIST, 3);
+        let dest = |i: usize| DEST + 0x1_0000 * i as u32;
+        for (i, &(dest_format, bias, swap, endian)) in cases.iter().enumerate() {
+            s.resolve_with(
+                &mut mem,
+                (W, H),
+                COPY_CONVERT,
+                (
+                    dest(i),
+                    W | (H << 16),
+                    (dest_info(dest_format, bias, swap) & !3) | endian,
+                ),
+                [0; 3],
+            );
+        }
+        let report = run(&mut d, &s, &mut mem);
+        assert_eq!(report.resolves, cases.len() as u32, "{report:?}");
+        assert!(report.unsupported.is_empty(), "{report:?}");
+        let raw = d.read_render_target_raw(key(format), 0, 0, W, H).unwrap();
+        let src_bytes = raw.len() / (W * H) as usize;
+        let mut expected = memory();
+        for (i, &(dest_format, bias, swap, endian)) in cases.iter().enumerate() {
+            let mut out = vec![0; (W * H * 4) as usize];
+            for (src, dst) in raw.chunks_exact(src_bytes).zip(out.chunks_exact_mut(4)) {
+                let rgba = formats::edram_rgba(format, src);
+                formats::resolve_pixel(rgba, bias, swap, dest_format, dst);
+            }
+            let rect = resolve::Rect {
+                x0: 0,
+                y0: 0,
+                x1: W,
+                y1: H,
+            };
+            resolve::write_tiled_texels(&mut expected, dest(i), W, rect, &out, 2, endian).unwrap();
+            let range = dest(i) as usize..(dest(i) + W * H * 4) as usize;
+            let distinct: std::collections::HashSet<_> =
+                mem.data[range.clone()].chunks(4).collect();
+            assert!(
+                distinct.len() > 200,
+                "{format:?} case {i}: {}",
+                distinct.len()
+            );
+            assert!(
+                mem.data[range.clone()] == expected.data[range],
+                "{format:?} case {i}"
+            );
+        }
+    }
+}
