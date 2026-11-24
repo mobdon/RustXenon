@@ -267,6 +267,7 @@ fn rgba16f_target_clear_and_resolves() {
     let Some(mut d) = drawer() else { return };
     let mut mem = memory();
     let dest2 = DEST + 0x2_0000;
+    let dest3 = DEST + 0x4_0000;
     let mut s = Stream::default();
     s.setup()
         .regs(RB_COLOR_INFO, &[RT_16_16_16_16_FLOAT << 16])
@@ -295,9 +296,21 @@ fn rgba16f_target_clear_and_resolves() {
             COPY_CONVERT,
             (dest2, W | (H << 16), dest_info(DEST_8_8_8_8, 0, false)),
             [0; 3],
+        )
+        .resolve_with(
+            &mut mem,
+            (W, H),
+            COPY_CONVERT,
+            (
+                dest3,
+                W | (H << 16),
+                // Endian 4, 8in64.
+                (dest_info(DEST_16_16_16_16_FLOAT, 0, false) & !7) | 4,
+            ),
+            [0; 3],
         );
     let report = run(&mut d, &s, &mut mem);
-    assert_eq!(report.resolves, 3, "{report:?}");
+    assert_eq!(report.resolves, 4, "{report:?}");
     assert!(report.unsupported.is_empty(), "{report:?}");
     let raw = d
         .read_render_target_raw(key(TargetFormat::Rgba16Float), 0, 0, W, H)
@@ -308,6 +321,13 @@ fn rgba16f_target_clear_and_resolves() {
     assert_eq!(detiled(&mem, DEST, W, H, W, 8), raw);
     let img = detiled(&mem, dest2, W, H, W, 4);
     assert!(img.chunks_exact(4).all(|p| p == [255, 128, 0, 255]));
+    // 8in64 reverses all 8 bytes; `detiled` undoes the 8in32 part, which
+    // leaves the two 32-bit words swapped.
+    let swapped: Vec<u8> = raw
+        .chunks_exact(8)
+        .flat_map(|t| [&t[4..], &t[..4]].concat())
+        .collect();
+    assert_eq!(detiled(&mem, dest3, W, H, W, 8), swapped);
 }
 
 /// A frame shaped like the one a game draws: a draw before the first

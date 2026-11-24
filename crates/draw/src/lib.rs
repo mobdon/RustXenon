@@ -1342,6 +1342,19 @@ impl Drawer {
         } else {
             Variant::Plain
         };
+        let (blend_rgba, exact) = state::blend_constant(
+            self.regs.get(regs::RB_BLENDCONTROL0),
+            [
+                regs::RB_BLEND_RED,
+                regs::RB_BLEND_GREEN,
+                regs::RB_BLEND_BLUE,
+                regs::RB_BLEND_ALPHA,
+            ]
+            .map(|r| f32::from_bits(self.regs.get(r))),
+        );
+        if blend.is_some() && !exact {
+            report.warn("blend uses the constant colour and its alpha in the colour channel; drawn with the colour");
+        }
         let mask = state::write_mask(self.regs.get(regs::RB_COLOR_MASK), 0);
 
         let mut idx =
@@ -1566,12 +1579,11 @@ impl Drawer {
             pass.set_index_buffer(index_buf.slice(..), wgpu::IndexFormat::Uint32);
             pass.set_viewport(0.0, 0.0, w as f32, h as f32, 0.0, 1.0);
             pass.set_scissor_rect(sx, sy, sw, sh);
-            let c = |reg| f64::from(f32::from_bits(self.regs.get(reg)));
             pass.set_blend_constant(wgpu::Color {
-                r: c(regs::RB_BLEND_RED),
-                g: c(regs::RB_BLEND_GREEN),
-                b: c(regs::RB_BLEND_BLUE),
-                a: c(regs::RB_BLEND_ALPHA),
+                r: f64::from(blend_rgba[0]),
+                g: f64::from(blend_rgba[1]),
+                b: f64::from(blend_rgba[2]),
+                a: f64::from(blend_rgba[3]),
             });
             if rect_list {
                 pass.draw(0..idx.len() as u32 * 2, 0..1);
@@ -1819,7 +1831,9 @@ impl Drawer {
         if r.dest_array {
             return unsupported("resolve copy to a 3D / array destination");
         }
-        if r.dest_endian > 3 {
+        // 8in64 is the one endian past 16in32 that write_tiled_texels
+        // handles, and only for 64bpp texels.
+        if r.dest_endian > 3 && !(dest_bytes == 8 && r.dest_endian == 4) {
             return unsupported(format!("resolve destination endian {}", r.dest_endian));
         }
         if r.dest_pitch == 0 {
