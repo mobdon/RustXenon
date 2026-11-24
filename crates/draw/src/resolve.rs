@@ -130,31 +130,47 @@ pub fn write_tiled(
     rgba8: &[u8],
     dest_endian: u32,
 ) -> Result<(), String> {
+    write_tiled_texels(mem, dest_base, dest_pitch, rect, rgba8, 2, dest_endian)
+}
+
+/// [`write_tiled`] for texels of `1 << bytes_log2` bytes (4 or 8), each
+/// already packed as little-endian words; `dest_endian` swaps within each
+/// 32-bit word.
+pub fn write_tiled_texels(
+    mem: &mut dyn crate::GuestMemory,
+    dest_base: u32,
+    dest_pitch: u32,
+    rect: Rect,
+    texels: &[u8],
+    bytes_log2: u32,
+    dest_endian: u32,
+) -> Result<(), String> {
+    let bytes = 1usize << bytes_log2;
     if rect.is_empty()
-        || rgba8.len() as u64 != u64::from(rect.width()) * u64::from(rect.height()) * 4
+        || texels.len() as u64 != u64::from(rect.width()) * u64::from(rect.height()) * bytes as u64
     {
         return Err(format!(
             "resolve: {} bytes for a {}x{} rectangle",
-            rgba8.len(),
+            texels.len(),
             rect.x1.saturating_sub(rect.x0),
             rect.y1.saturating_sub(rect.y0)
         ));
     }
     let pitch = tile::align_to_tile(dest_pitch);
-    let extent = tile::tiled_extent_2d(rect.x1, rect.y1, pitch, 4)
+    let extent = tile::tiled_extent_2d(rect.x1, rect.y1, pitch, bytes as u32)
         .map_err(|e| format!("resolve destination: {e}"))?;
     let mut buf = mem
         .read_bytes(dest_base, extent as usize)
         .ok_or_else(|| format!("resolve destination 0x{dest_base:08X} is not readable"))?;
     let e = xenon_texture::Endian::from_bits(dest_endian);
     let width = rect.width() as usize;
-    for (i, px) in rgba8.chunks_exact(4).enumerate() {
+    for (i, px) in texels.chunks_exact(bytes).enumerate() {
         let x = rect.x0 + (i % width) as u32;
         let y = rect.y0 + (i / width) as u32;
-        let at = tile::tiled_offset_2d(x, y, pitch, 2) as usize;
-        let mut t = [px[0], px[1], px[2], px[3]];
-        endian::swap_in_place(&mut t, e);
-        buf[at..at + 4].copy_from_slice(&t);
+        let at = tile::tiled_offset_2d(x, y, pitch, bytes_log2) as usize;
+        let dst = &mut buf[at..at + bytes];
+        dst.copy_from_slice(px);
+        endian::swap_in_place(dst, e);
     }
     if mem.write_bytes(dest_base, &buf) {
         Ok(())
