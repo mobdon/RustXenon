@@ -59,16 +59,20 @@ pub fn guest_indices(
         IndexSource::Auto => Ok((0..count).collect()),
         IndexSource::Dma {
             address,
+            buffer_indices,
             format,
             endian,
-            ..
         } => {
             use xenon_gpu::Endian as E;
             let size = format.bytes() as usize;
+            // Only VGT_DMA_SIZE indices come from the buffer; past it the
+            // console fetches zero indices (Xenia notes this and truncates
+            // the draw instead).
+            let in_buffer = count.min(*buffer_indices);
             let bytes = mem
-                .read_bytes(*address, count as usize * size)
+                .read_bytes(*address, in_buffer as usize * size)
                 .ok_or_else(|| format!("index buffer at 0x{address:08X} is not readable"))?;
-            Ok(match format {
+            let mut indices: Vec<u32> = match format {
                 // 32-bit swap modes on 16-bit indices: Xenia treats 8in32 as
                 // 8in16 and 16in32 as none rather than swapping across
                 // adjacent indices.
@@ -88,7 +92,9 @@ pub fn guest_indices(
                     .chunks_exact(4)
                     .map(|c| endian.from_guest_bytes([c[0], c[1], c[2], c[3]]) & 0xFF_FFFF)
                     .collect(),
-            })
+            };
+            indices.resize(count as usize, 0);
+            Ok(indices)
         }
         IndexSource::Immediate { .. } => Err("immediate index source".into()),
     }
@@ -161,7 +167,16 @@ mod tests {
             endian: xenon_gpu::Endian::E8in32,
         };
         assert_eq!(guest_indices(&mem, &src, 2), Ok(vec![5, 0x02_0304]));
-        assert!(guest_indices(&mem, &src, 3).is_err());
+        // Indices past VGT_DMA_SIZE are zero, not the memory after it.
+        let mem = SliceMemory::from_words(0x100, &[5, 0x0102_0304, 9]);
+        assert_eq!(guest_indices(&mem, &src, 4), Ok(vec![5, 0x02_0304, 0, 0]));
+        let long = IndexSource::Dma {
+            address: 0x100,
+            buffer_indices: 4,
+            format: IndexFormat::Int32,
+            endian: xenon_gpu::Endian::E8in32,
+        };
+        assert!(guest_indices(&mem, &long, 4).is_err());
     }
 
     #[test]
