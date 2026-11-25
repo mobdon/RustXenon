@@ -1085,6 +1085,9 @@ pub struct Drawer {
     /// drop the entries whose range they write, so later draws skip reading
     /// and hashing the guest bytes of the others.
     texture_memo: HashMap<[u32; 6], (wgpu::TextureView, u64, u64)>,
+    /// Guest texture bytes are read into this buffer, kept across lookups:
+    /// a fresh one per texture costs zeroing and page faults every frame.
+    texture_scratch: Vec<u8>,
     samplers: HashMap<([u8; 3], u8, u8, u8, u32), wgpu::Sampler>,
     /// Draws recorded but not yet submitted (see [`Batch`]).
     batch: Option<Batch>,
@@ -1309,11 +1312,20 @@ fn decode_key(c: [u32; 6]) -> [u32; 6] {
 
 fn hash_bytes(bytes: &[u8]) -> u64 {
     const K: u64 = 0x517c_c1b7_2722_0a95;
-    let mut chunks = bytes.chunks_exact(8);
-    let mut h = bytes.len() as u64;
+    // Four independent lanes: one lane's multiply chain held the hash to
+    // about 70% of the speed the CPU reads memory at (textures hash every
+    // frame).
+    let mut chunks = bytes.chunks_exact(32);
+    let mut lanes = [bytes.len() as u64, 1, 2, 3];
     for c in &mut chunks {
-        h = (h.rotate_left(5) ^ u64::from_le_bytes(c.try_into().unwrap())).wrapping_mul(K);
+        for (i, h) in lanes.iter_mut().enumerate() {
+            let w = u64::from_le_bytes(c[i * 8..][..8].try_into().unwrap());
+            *h = (h.rotate_left(5) ^ w).wrapping_mul(K);
+        }
     }
+    let mut h = lanes
+        .iter()
+        .fold(0, |a: u64, &x| (a.rotate_left(5) ^ x).wrapping_mul(K));
     for &b in chunks.remainder() {
         h = (h.rotate_left(5) ^ u64::from(b)).wrapping_mul(K);
     }
@@ -1773,6 +1785,7 @@ impl Drawer {
             texture_evicted: HashSet::new(),
             replays: 0,
             texture_memo: HashMap::new(),
+            texture_scratch: Vec::new(),
             samplers: HashMap::new(),
             batch: None,
             texture_groups: HashMap::new(),
@@ -3955,18 +3968,34 @@ impl Drawer {
         report: &mut Report,
     ) -> Result<wgpu::TextureView, String> {
         let addr = fetch.base_address & PHYSICAL_MASK;
-        let bytes = xenon_texture::bytes_needed(fetch)
-            .and_then(|len| {
-                mem.read_bytes(addr, len)
-                    .ok_or(xenon_texture::Error::TooShort {
-                        needed: len,
-                        got: 0,
-                    })
-            })
-            .map_err(|e| e.to_string())?;
+        let len = xenon_texture::bytes_needed(fetch).map_err(|e| e.to_string())?;
+        let mut bytes = std::mem::take(&mut self.texture_scratch);
+        bytes.resize(len, 0);
+        let view = if mem.read_into(addr, &mut bytes) {
+            self.texture_from(n, fetch, &bytes, report)
+        } else {
+            Err(xenon_texture::Error::TooShort {
+                needed: len,
+                got: 0,
+            }
+            .to_string())
+        };
+        self.texture_scratch = bytes;
+        view
+    }
+
+    /// [`Self::guest_texture`] from the guest bytes `bytes` of `fetch`.
+    fn texture_from(
+        &mut self,
+        n: u32,
+        fetch: &xenon_texture::TextureFetch,
+        bytes: &[u8],
+        report: &mut Report,
+    ) -> Result<wgpu::TextureView, String> {
+        let addr = fetch.base_address & PHYSICAL_MASK;
         report.timings.hashed_bytes += bytes.len() as u64;
         let constant = self.regs.fetch_constant(n);
-        let key = (decode_key(constant), hash_bytes(&bytes));
+        let key = (decode_key(constant), hash_bytes(bytes));
         let range = (u64::from(addr), u64::from(addr) + bytes.len() as u64);
         if let Some((view, _, used)) = self.texture_cache.get_mut(&key) {
             *used = self.replays;
@@ -3978,7 +4007,7 @@ impl Drawer {
         let signed = fetch.sign.contains(&1);
         let mut host = host_texture_format(fetch.format, fetch.sign, self.float32_filterable);
         let bc = if self.bc_textures && !signed {
-            bc_blocks(fetch, &bytes).map_err(|e| e.to_string())?
+            bc_blocks(fetch, bytes).map_err(|e| e.to_string())?
         } else {
             None
         };
@@ -3986,11 +4015,11 @@ impl Drawer {
             host = format;
             (fetch.width(), fetch.height(), blocks)
         } else if host == wgpu::TextureFormat::Rgba8Unorm {
-            let img = xenon_texture::decode_base_level(fetch, &bytes).map_err(|e| e.to_string())?;
+            let img = xenon_texture::decode_base_level(fetch, bytes).map_err(|e| e.to_string())?;
             (img.width, img.height, img.rgba8)
         } else {
             let img =
-                xenon_texture::decode_base_level_f32(fetch, &bytes).map_err(|e| e.to_string())?;
+                xenon_texture::decode_base_level_f32(fetch, bytes).map_err(|e| e.to_string())?;
             let data = if host == wgpu::TextureFormat::Rgba32Float {
                 img.rgba.iter().flat_map(|v| v.to_le_bytes()).collect()
             } else {
@@ -5504,6 +5533,21 @@ fn host_texture_format(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every byte, in every lane and in the tail, and the length change
+    /// the hash.
+    #[test]
+    fn hash_sees_every_byte() {
+        let base: Vec<u8> = (0..77u8).collect();
+        let h = hash_bytes(&base);
+        for i in 0..base.len() {
+            let mut b = base.clone();
+            b[i] ^= 1;
+            assert_ne!(hash_bytes(&b), h, "byte {i}");
+        }
+        assert_ne!(hash_bytes(&base[..76]), h);
+        assert_ne!(hash_bytes(&[0; 32]), hash_bytes(&[0; 64]));
+    }
 
     /// The constants block holds each register of its four blocks in
     /// order, then the window base and the index offset.
