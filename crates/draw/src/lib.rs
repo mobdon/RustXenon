@@ -181,6 +181,31 @@ pub trait GuestMemory: GuestRead {
     fn write_bytes(&mut self, addr: u32, bytes: &[u8]) -> bool;
 }
 
+/// Guest memory that remembers the ranges written through it, so the
+/// textures read from them are looked up again.
+struct Tracked<'a> {
+    mem: &'a mut dyn GuestMemory,
+    /// Physical `[start, end)` ranges written since the last drain.
+    written: Vec<(u64, u64)>,
+}
+
+impl GuestRead for Tracked<'_> {
+    fn read_u32(&self, addr: u32) -> Option<u32> {
+        self.mem.read_u32(addr)
+    }
+    fn read_bytes(&self, addr: u32, len: usize) -> Option<Vec<u8>> {
+        self.mem.read_bytes(addr, len)
+    }
+}
+
+impl GuestMemory for Tracked<'_> {
+    fn write_bytes(&mut self, addr: u32, bytes: &[u8]) -> bool {
+        let start = u64::from(addr & PHYSICAL_MASK);
+        self.written.push((start, start + bytes.len() as u64));
+        self.mem.write_bytes(addr, bytes)
+    }
+}
+
 impl GuestMemory for SliceMemory {
     fn write_bytes(&mut self, addr: u32, bytes: &[u8]) -> bool {
         let Some(start) = addr.checked_sub(self.base).map(|s| s as usize) else {
@@ -601,10 +626,12 @@ pub struct Drawer {
     /// guest bytes they read, so an unchanged texture is not decoded again.
     texture_cache: HashMap<([u32; 6], u64), wgpu::TextureView>,
     texture_cache_bytes: u64,
-    /// Textures already looked up this replay by fetch constant. Guest
+    /// Textures already looked up this replay by fetch constant, with the
+    /// physical `[start, end)` guest range they were read from. Guest
     /// memory only changes at a resolve or MEM_WRITE during a replay, which
-    /// clear it, so later draws skip reading and hashing the guest bytes.
-    texture_memo: HashMap<[u32; 6], wgpu::TextureView>,
+    /// drop the entries whose range they write, so later draws skip reading
+    /// and hashing the guest bytes of the others.
+    texture_memo: HashMap<[u32; 6], (wgpu::TextureView, u64, u64)>,
     samplers: HashMap<([u8; 3], u8, u8), wgpu::Sampler>,
     /// Draws recorded but not yet submitted (see [`Batch`]).
     batch: Option<Batch>,
@@ -1060,7 +1087,11 @@ impl Drawer {
         let mut report = Report::default();
         self.timings = Timings::default();
         self.texture_memo.clear();
-        let done = self.replay_commands(commands, mem, &mut report);
+        let mut mem = Tracked {
+            mem,
+            written: Vec::new(),
+        };
+        let done = self.replay_commands(commands, &mut mem, &mut report);
         // On an error the batch is dropped unsubmitted.
         let done = done.and_then(|()| {
             self.flush().map_err(|e| match e {
@@ -1092,10 +1123,11 @@ impl Drawer {
     fn replay_commands(
         &mut self,
         commands: &[Command],
-        mem: &mut dyn GuestMemory,
+        tracked: &mut Tracked,
         report: &mut Report,
     ) -> Result<(), Error> {
         for c in commands {
+            let mem: &mut dyn GuestMemory = tracked;
             let done = match c {
                 Command::WriteRegisters { base, values } => {
                     for (i, &v) in values.iter().enumerate() {
@@ -1127,13 +1159,9 @@ impl Drawer {
                 Command::Draw(d) => self.draw(d, mem, report).map(|drawn| {
                     report.draws += u32::from(drawn);
                 }),
-                Command::Resolve(r) => {
-                    let done = self.resolve(r, mem, report).map(|done| {
-                        report.resolves += u32::from(done);
-                    });
-                    self.texture_memo.clear();
-                    done
-                }
+                Command::Resolve(r) => self.resolve(r, mem, report).map(|done| {
+                    report.resolves += u32::from(done);
+                }),
                 Command::Swap {
                     signature_ok,
                     frontbuffer,
@@ -1157,7 +1185,6 @@ impl Drawer {
                     endian,
                     values,
                 } => {
-                    self.texture_memo.clear();
                     for (i, &v) in values.iter().enumerate() {
                         let a = addr.wrapping_add(4 * i as u32);
                         if !mem.write_bytes(a, &endian.to_guest_bytes(v)) {
@@ -1168,6 +1195,10 @@ impl Drawer {
                 }
                 _ => Ok(()),
             };
+            for (lo, hi) in tracked.written.drain(..) {
+                self.texture_memo
+                    .retain(|_, &mut (_, a, b)| b <= lo || hi <= a);
+            }
             match done {
                 Ok(()) => {}
                 Err(Skip::Unsupported(why)) => report.unsupported(why),
@@ -1997,7 +2028,7 @@ impl Drawer {
             return Ok((self.zero_texture.clone(), self.zero_sampler.clone()));
         }
         let sampler = self.sampler(&fetch, report);
-        if let Some(view) = self.texture_memo.get(&self.regs.fetch_constant(n)) {
+        if let Some((view, ..)) = self.texture_memo.get(&self.regs.fetch_constant(n)) {
             return Ok((view.clone(), sampler));
         }
         let view = self
@@ -2033,8 +2064,10 @@ impl Drawer {
             .map_err(|e| e.to_string())?;
         report.timings.hashed_bytes += bytes.len() as u64;
         let key = (self.regs.fetch_constant(n), hash_bytes(&bytes));
+        let range = (u64::from(addr), u64::from(addr) + bytes.len() as u64);
         if let Some(view) = self.texture_cache.get(&key) {
-            self.texture_memo.insert(key.0, view.clone());
+            self.texture_memo
+                .insert(key.0, (view.clone(), range.0, range.1));
             return Ok(view.clone());
         }
         let signed = fetch.sign.contains(&1);
@@ -2098,7 +2131,8 @@ impl Drawer {
         }
         self.texture_cache_bytes += len;
         self.texture_cache.insert(key, view.clone());
-        self.texture_memo.insert(key.0, view.clone());
+        self.texture_memo
+            .insert(key.0, (view.clone(), range.0, range.1));
         Ok(view)
     }
 

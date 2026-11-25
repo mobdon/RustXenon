@@ -155,6 +155,39 @@ fn resolve_into_a_texture_is_sampled_by_later_draws() {
     assert_eq!(px(&img, W, 40, 40), RED);
 }
 
+/// A resolve to memory that no texture of the replay reads keeps their
+/// lookups: the texture is read and hashed once for the draws on both
+/// sides of it, and both draw it.
+#[test]
+fn resolve_elsewhere_keeps_the_texture_lookup() {
+    let Some(mut d) = drawer() else { return };
+    let mut mem = memory();
+    let fetch = green_texture_quad(&mut mem);
+    let mut s = Stream::default();
+    s.setup()
+        .shader(false, &vs_uv())
+        .shader(true, &ps_texture(1))
+        .regs(SHADER_CONSTANT_FETCH + 6, &fetch)
+        .vertex_fetch(0, VERTS + 0x100, 20)
+        .draw_auto(PRIM_QUAD_LIST, 4)
+        .resolve(&mut mem, W, H, true, Some((rgba(BLUE), 0)))
+        .vertex_fetch(0, VERTS + 0x100, 20)
+        .draw_auto(PRIM_QUAD_LIST, 4);
+    let report = run(&mut d, &s, &mut mem);
+    assert_eq!((report.draws, report.resolves), (2, 1), "{report:?}");
+    assert_eq!(
+        report.timings.hashed_bytes,
+        u64::from(W * H * 4),
+        "{report:?}"
+    );
+    let img = d.read_render_target(COLOR_KEY, 0, 0, W, H).unwrap();
+    // The resolve cleared to blue; the second draw drew green over it.
+    assert_eq!(px(&img, W, 10, 10), BLUE);
+    assert_eq!(px(&img, W, 40, 40), GREEN);
+    let resolved = detiled(&mem, DEST, W, H, W, 4);
+    assert_eq!(px(&resolved, W, 40, 40), GREEN);
+}
+
 /// A MEM_WRITE over a texture's guest memory between two draws with the
 /// same fetch constant shows the new texels: the memo is dropped there too.
 #[test]
