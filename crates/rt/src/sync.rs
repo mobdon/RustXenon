@@ -162,17 +162,25 @@ impl CriticalSection {
     /// Leaves once. Stops if the calling thread does not own the lock, which
     /// is a guest bug worth seeing.
     pub fn leave(&self) {
-        let mut g = self.state.lock().unwrap();
-        assert_eq!(
-            g.0,
-            Some(thread::current().id()),
+        assert!(
+            self.try_leave(),
             "critical section left by a thread that does not own it"
         );
+    }
+
+    /// Leaves once if the calling thread owns the lock; false (and no
+    /// change) otherwise, for callers that report it to the guest.
+    pub fn try_leave(&self) -> bool {
+        let mut g = self.state.lock().unwrap();
+        if g.0 != Some(thread::current().id()) {
+            return false;
+        }
         g.1 -= 1;
         if g.1 == 0 {
             g.0 = None;
             self.cv.notify_one();
         }
+        true
     }
 }
 
@@ -226,5 +234,23 @@ mod tests {
         })
         .join()
         .unwrap());
+    }
+
+    #[test]
+    fn try_leave_refuses_a_thread_that_does_not_own_it() {
+        let cs = std::sync::Arc::new(CriticalSection::new());
+        assert!(!cs.try_leave(), "unowned");
+        assert!(cs.enter(None));
+        let other = cs.clone();
+        assert!(!std::thread::spawn(move || other.try_leave())
+            .join()
+            .unwrap());
+        // Still held by this thread: another thread cannot take it.
+        let other = cs.clone();
+        assert!(!std::thread::spawn(move || other.try_enter())
+            .join()
+            .unwrap());
+        assert!(cs.try_leave());
+        assert!(!cs.try_leave());
     }
 }

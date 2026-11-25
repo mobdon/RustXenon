@@ -278,6 +278,9 @@ pub mod capture {
 
     /// Writes the drawer's frame number `n` when it was asked for.
     pub fn frame_done(n: u32, f: &xenon_draw::Frame) {
+        if let Some(w) = super::super::input::WINDOW.get() {
+            w.show(f.width, f.height, f.rgba8.clone());
+        }
         let Some((dir, want)) = FRAMES.get() else {
             return;
         };
@@ -417,22 +420,44 @@ pub mod capture {
                     }
                     let _ = writeln!(
                         list,
-                        "draw {draws}: {:?} x{} {}",
+                        "draw {draws}: {:?} x{} {} | {}",
                         d.primitive,
                         d.index_count,
-                        used.join(" ")
+                        used.join(" "),
+                        state(&regs)
                     );
                 }
                 Command::Resolve(r) => {
+                    // The rectangle's three corners at vertex fetch 0 (six
+                    // floats, read big-endian as Direct3D writes them).
+                    let f0 = regs.fetch_constant(0);
+                    let rect: Vec<String> = Physical(rt)
+                        .read_bytes(f0[0] & 0x1FFF_FFFC, 24)
+                        .map(|b| {
+                            b.chunks_exact(4)
+                                .map(|c| {
+                                    f32::from_be_bytes(c.try_into().unwrap_or([0; 4])).to_string()
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
                     let _ = writeln!(
                         list,
-                        "resolve: source {} format {}, destination format {} pitch {} height {}, {:?}",
+                        "resolve: source {} format {}, destination format {} pitch {} height {}, {:?} | edram base {} pitch {} msaa {} dest 0x{:08x} rect [{}] copy_control {:08x} dest_info {:08x} | {}",
                         if r.is_depth { "depth" } else { "colour" },
                         r.src_format,
                         r.dest_format,
                         r.dest_pitch,
                         r.dest_height,
-                        r.copy_command
+                        r.copy_command,
+                        r.src_edram_base,
+                        r.surface_pitch,
+                        r.msaa_samples,
+                        r.dest_base,
+                        rect.join(" "),
+                        r.copy_control,
+                        r.dest_info,
+                        state(&regs)
                     );
                 }
                 Command::Swap { width, height, .. } => {
@@ -443,6 +468,34 @@ pub mod capture {
         }
         std::fs::write(dir.join("draws.txt"), list)?;
         Ok((draws, written))
+    }
+
+    /// Render state that places a draw or resolve in EDRAM and on screen,
+    /// raw register values in hex: surface, colour targets 0..3, depth,
+    /// mode, window offset, window and screen scissors, mode control,
+    /// viewport transform control, depth control and colour mask.
+    fn state(regs: &RegisterFile) -> String {
+        use xenon_gpu::regs::*;
+        let r = |a: u32| regs.get(a);
+        format!(
+            "surf {:x} rt {:x} {:x} {:x} {:x} depth {:x} mode {:x} woff {:x} wsc {:x}-{:x} ssc {:x}-{:x} sc_mode {:x} vte {:x} zc {:x} mask {:x}",
+            r(RB_SURFACE_INFO),
+            r(RB_COLOR_INFO_RT[0]),
+            r(RB_COLOR_INFO_RT[1]),
+            r(RB_COLOR_INFO_RT[2]),
+            r(RB_COLOR_INFO_RT[3]),
+            r(RB_DEPTH_INFO),
+            r(RB_MODECONTROL),
+            r(PA_SC_WINDOW_OFFSET),
+            r(PA_SC_WINDOW_SCISSOR_TL),
+            r(PA_SC_WINDOW_SCISSOR_TL + 1),
+            r(PA_SC_SCREEN_SCISSOR_TL),
+            r(PA_SC_SCREEN_SCISSOR_TL + 1),
+            r(PA_SU_SC_MODE_CNTL),
+            r(PA_CL_VTE_CNTL),
+            r(RB_DEPTHCONTROL),
+            r(RB_COLOR_MASK),
+        )
     }
 
     /// An uncompressed 32-bit BMP, rows top to bottom.

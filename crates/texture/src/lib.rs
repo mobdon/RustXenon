@@ -24,7 +24,7 @@ pub mod tile;
 
 use std::fmt;
 
-pub use convert::{apply_swizzle, to_rgba8, to_rgba_f32};
+pub use convert::{apply_swizzle, apply_swizzle_f32, to_rgba8, to_rgba_f32};
 pub use endian::Endian;
 pub use fetch::{Dimension, TextureFetch};
 pub use format::{FormatInfo, TextureFormat};
@@ -63,6 +63,16 @@ pub struct Image {
     pub width: u32,
     pub height: u32,
     pub rgba8: Vec<u8>,
+}
+
+/// A decoded base level as floats: `rgba` is `width * height * 4` values,
+/// rows top to bottom, R G B A per texel, after the fetch constant's swizzle.
+/// Float formats are unclamped and depth keeps its 24 bits of precision.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ImageF32 {
+    pub width: u32,
+    pub height: u32,
+    pub rgba: Vec<f32>,
 }
 
 /// Base-level geometry in blocks, shared by [`bytes_needed`] and
@@ -132,6 +142,34 @@ pub fn bytes_needed(fetch: &TextureFetch) -> Result<usize, Error> {
 /// unsigned normalized (or float) values, and the translated shader applies
 /// them to the sampled value (see `xenon-shader`).
 pub fn decode_base_level(fetch: &TextureFetch, guest_bytes: &[u8]) -> Result<Image, Error> {
+    let linear = linear_base_level(fetch, guest_bytes)?;
+    let (width, height) = (fetch.width(), fetch.height());
+    let mut rgba8 = to_rgba8(fetch.format, &linear, width, height)?;
+    apply_swizzle(&mut rgba8, fetch.swizzle);
+    Ok(Image {
+        width,
+        height,
+        rgba8,
+    })
+}
+
+/// [`decode_base_level`] to floats ([`to_rgba_f32`]), for formats whose
+/// values do not fit 8-bit unorm (depth, 16- and 32-bit, float).
+pub fn decode_base_level_f32(fetch: &TextureFetch, guest_bytes: &[u8]) -> Result<ImageF32, Error> {
+    let linear = linear_base_level(fetch, guest_bytes)?;
+    let (width, height) = (fetch.width(), fetch.height());
+    let mut rgba = to_rgba_f32(fetch.format, &linear, width, height)?;
+    apply_swizzle_f32(&mut rgba, fetch.swizzle);
+    Ok(ImageF32 {
+        width,
+        height,
+        rgba,
+    })
+}
+
+/// Endian swap and detile (or pitch-linear copy) of slice 0's base level to
+/// tightly packed rows of blocks.
+fn linear_base_level(fetch: &TextureFetch, guest_bytes: &[u8]) -> Result<Vec<u8>, Error> {
     let layout = base_layout(fetch)?;
     if !fetch.format.can_convert() {
         return Err(Error::UnsupportedFormat(fetch.format));
@@ -145,30 +183,21 @@ pub fn decode_base_level(fetch: &TextureFetch, guest_bytes: &[u8]) -> Result<Ima
     let mut raw = guest_bytes[..layout.slice_extent].to_vec();
     endian::swap_in_place(&mut raw, fetch.endian);
     let row_bytes = (layout.width_blocks * layout.bytes_per_block) as usize;
-    let linear = if fetch.tiled {
-        tile::detile_2d(
+    if fetch.tiled {
+        return tile::detile_2d(
             &raw,
             layout.width_blocks,
             layout.height_blocks,
             layout.pitch_blocks,
             layout.bytes_per_block,
-        )?
-    } else {
-        let pitch_bytes = (layout.pitch_blocks * layout.bytes_per_block) as usize;
-        let mut out = Vec::with_capacity(row_bytes * layout.height_blocks as usize);
-        for row in 0..layout.height_blocks as usize {
-            out.extend_from_slice(&raw[row * pitch_bytes..][..row_bytes]);
-        }
-        out
-    };
-    let (width, height) = (fetch.width(), fetch.height());
-    let mut rgba8 = to_rgba8(fetch.format, &linear, width, height)?;
-    apply_swizzle(&mut rgba8, fetch.swizzle);
-    Ok(Image {
-        width,
-        height,
-        rgba8,
-    })
+        );
+    }
+    let pitch_bytes = (layout.pitch_blocks * layout.bytes_per_block) as usize;
+    let mut out = Vec::with_capacity(row_bytes * layout.height_blocks as usize);
+    for row in 0..layout.height_blocks as usize {
+        out.extend_from_slice(&raw[row * pitch_bytes..][..row_bytes]);
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -359,6 +388,46 @@ mod tests {
         let img = decode_base_level(&fetch, &guest).unwrap();
         assert_eq!((img.width, img.height), (48, 1));
         assert_eq!(&img.rgba8[47 * 4..], &[47; 4]);
+    }
+
+    #[test]
+    fn f32_decode_keeps_depth_and_hdr() {
+        // 2x1 k_24_8_FLOAT, guest words big-endian (k8in32), swizzle RRRR
+        // after the decode's XXXX gives the same depth in every channel.
+        let fetch = TextureFetch::decode(fetch_words(
+            TextureFormat::K24_8Float,
+            Endian::K8in32,
+            false,
+            2,
+            1,
+            32,
+            RGBA,
+        ));
+        let mut guest = Vec::new();
+        for d in [(14u32 << 20) | (1 << 19), 15 << 20] {
+            guest.extend_from_slice(&((d << 8) | 0xFF).to_be_bytes());
+        }
+        let img = decode_base_level_f32(&fetch, &guest).unwrap();
+        assert_eq!((img.width, img.height), (2, 1));
+        assert_eq!(img.rgba, [0.75, 0.75, 0.75, 0.75, 1.0, 1.0, 1.0, 1.0]);
+
+        // k_16_16_16_16_FLOAT above 1 stays unclamped; swizzle WZYX.
+        let fetch = TextureFetch::decode(fetch_words(
+            TextureFormat::K16_16_16_16Float,
+            Endian::None,
+            false,
+            1,
+            1,
+            32,
+            3 | (2 << 3) | (1 << 6),
+        ));
+        // 4.0, -2.0, 0.5, 1.0
+        let guest: Vec<u8> = [0x4400u16, 0xC000, 0x3800, 0x3C00]
+            .iter()
+            .flat_map(|h| h.to_le_bytes())
+            .collect();
+        let img = decode_base_level_f32(&fetch, &guest).unwrap();
+        assert_eq!(img.rgba, [1.0, 0.5, -2.0, 4.0]);
     }
 
     #[test]
