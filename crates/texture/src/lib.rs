@@ -352,6 +352,23 @@ mod tests {
         // No mip address: base only, whatever the levels say.
         let none = TextureFetch::decode([words[0], words[1], words[2], words[3], 3 << 6, 1 << 9]);
         assert_eq!(none.mip_range(), (0, 0));
+        // Only the physical page counts: a mip address in the 512 MB mirror
+        // of page 0 is none either.
+        let mirror = [
+            words[0],
+            words[1],
+            words[2],
+            words[3],
+            3 << 6,
+            0x2000_0000 | (1 << 9),
+        ];
+        assert_eq!(TextureFetch::decode(mirror).mip_range(), (0, 0));
+        // No base page: sampling starts at level 1, unless there are no mips.
+        let no_base = |w4| {
+            TextureFetch::decode([words[0], words[1] & 0xFFF, words[2], words[3], w4, words[5]])
+        };
+        assert_eq!(no_base(3 << 6).mip_range(), (1, 3));
+        assert_eq!(no_base(0).mip_range(), (0, 0));
         // A non-power-of-two base: strides from 512x256, sizes from 300x200;
         // linear rows of 256 bytes at least.
         let mut w = fetch_words(
