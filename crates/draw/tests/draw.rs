@@ -30,6 +30,9 @@ fn resolve_clear_fills_render_target() {
     assert!(img.chunks_exact(4).all(|p| p == CLEAR));
     let m = d.memory_line();
     assert!(m.contains("targets 1 MB in 2,"), "{m}");
+    // wgpu's own counters are live: the targets above are counted.
+    assert!(m.contains("; wgpu live: textures 1 MB,"), "{m}");
+    assert!(m.contains(" MB reserved in "), "{m}");
 }
 
 /// Clears, then draws a triangle with per-vertex colours through the
