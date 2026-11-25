@@ -229,7 +229,7 @@ impl Tracked<'_> {
     }
 }
 
-/// Guest bytes that 32bpp GPU resolves wrote, kept in a GPU buffer so that
+/// Guest bytes that GPU resolves wrote, kept in a GPU buffer so that
 /// textures fetched from them are decoded on the GPU instead of read back,
 /// hashed, decoded and uploaded. The buffer always holds what guest memory
 /// holds (or, for the `dirty` range, will hold once written back) over
@@ -375,7 +375,7 @@ pub struct Timings {
     pub pipelines_created: u32,
     pub textures_uploaded: u32,
     /// Command buffer submissions for draws, clears, EDRAM transfers and
-    /// 32bpp resolves.
+    /// GPU resolves.
     pub submits: u32,
     pub texture_bytes: u64,
     pub guest_bytes: u64,
@@ -884,7 +884,7 @@ pub struct Drawer {
     /// Whether `Rgba32Float` textures can be sampled with filtering; without
     /// it wide formats are uploaded as `Rgba16Float`.
     float32_filterable: bool,
-    /// Compute pipeline of resolve.wgsl, made on the first 32bpp resolve.
+    /// Compute pipeline of resolve.wgsl, made on the first GPU resolve.
     /// Colour, depth and depth + stencil entry points of resolve.wgsl.
     resolve_pipelines: [Option<wgpu::ComputePipeline>; 3],
     /// kD24FS8 is hosted as `Depth32FloatStencil8` (else `Depth32Float`).
@@ -899,8 +899,8 @@ pub struct Drawer {
     half_luts: HashMap<(TargetFormat, i32), Option<Vec<[u16; 2]>>>,
     /// Resolve destinations kept on the GPU, disjoint and not adjacent.
     mirrors: Vec<Mirror>,
-    /// Entry point decode_8888 of resolve.wgsl.
-    decode_pipeline: Option<wgpu::ComputePipeline>,
+    /// Entry points decode_8888 and decode_float of resolve.wgsl.
+    decode_pipelines: [Option<wgpu::ComputePipeline>; 2],
     /// Leave resolve results on the GPU at the end of a replay instead of
     /// writing them to guest memory (default false). The drawer still writes
     /// them back before it reads those bytes itself (a texture it cannot
@@ -1357,7 +1357,7 @@ impl Drawer {
             snorm16_blend,
             half_luts: HashMap::new(),
             mirrors: Vec::new(),
-            decode_pipeline: None,
+            decode_pipelines: [None, None],
             skip_resolve_writeback: false,
             texture_cache_limit: TEXTURE_CACHE_LIMIT,
             bc_textures: required_features.contains(wgpu::Features::TEXTURE_COMPRESSION_BC),
@@ -1390,6 +1390,15 @@ impl Drawer {
     /// `Rgba32Float` (full precision) rather than `Rgba16Float`.
     pub fn float32_textures(&self) -> bool {
         self.float32_filterable
+    }
+
+    /// Uploads those textures as `Rgba16Float` from now on, as on a host
+    /// without filterable 32-bit floats, so tests can reach that path on
+    /// any adapter. Call it before the first replay: cached textures keep
+    /// their format.
+    #[doc(hidden)]
+    pub fn disable_float32_textures(&mut self) {
+        self.float32_filterable = false;
     }
 
     /// What the drawer holds, for the run log: cached textures, render
@@ -2844,8 +2853,9 @@ impl Drawer {
     /// The texture of `fetch` decoded on the GPU from a kept resolve holding
     /// all of its guest bytes `[addr, end)`, as [`Self::guest_texture`]
     /// would decode them; `None` for the guest path. Only tiled 2D
-    /// k_8_8_8_8 layouts (any endian, swizzle and resolve format, as the
-    /// bytes are the guest's) that host as `Rgba8Unorm` are decoded here.
+    /// k_8_8_8_8 layouts that host as `Rgba8Unorm`, k_32_FLOAT and
+    /// k_16_16_16_16_FLOAT (any endian, swizzle and resolve format, as the
+    /// bytes are the guest's) are decoded here.
     fn kept_texture(
         &mut self,
         fetch: &xenon_texture::TextureFetch,
@@ -2862,14 +2872,22 @@ impl Drawer {
         else {
             return Ok(None);
         };
+        use wgpu::TextureFormat as H;
         let (w, h) = (fetch.width(), fetch.height());
         let pitch = xenon_texture::tile::align_to_tile(fetch.pitch_texels());
+        let host = host_texture_format(fetch.format, fetch.sign, self.float32_filterable);
+        // (decode_float mode or None for decode_8888, guest bytes and host
+        // bytes per texel)
+        let (mode, guest_bytes, host_bytes) = match (fetch.format.data_format(), host) {
+            (F::K8_8_8_8, H::Rgba8Unorm) => (None, 4, 4),
+            (F::K32Float, H::Rgba32Float) => (Some(0), 4, 16),
+            (F::K32Float, H::Rgba16Float) => (Some(1), 4, 8),
+            (F::K16_16_16_16Float, H::Rgba16Float) => (Some(2), 8, 8),
+            _ => return Ok(None),
+        };
         if !fetch.tiled
-            || fetch.format.data_format() != F::K8_8_8_8
             || fetch.dimension != Dimension::D2OrStacked
             || fetch.stacked
-            || host_texture_format(fetch.format, fetch.sign, self.float32_filterable)
-                != wgpu::TextureFormat::Rgba8Unorm
             || !(addr - self.mirrors[i].lo).is_multiple_of(4)
             || pitch < w
             || w > self.max_dim
@@ -2888,7 +2906,7 @@ impl Drawer {
             },
             None => (0, h),
         };
-        let row_words = (w * 4).next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT) / 4;
+        let row_words = (w * host_bytes).next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT) / 4;
         let rows = y1 - y0;
         let params = [
             w,
@@ -2899,6 +2917,10 @@ impl Drawer {
             ((addr - self.mirrors[i].lo) / 4) as u32,
             row_words,
             y0,
+            mode.unwrap_or(0),
+            0,
+            0,
+            0,
         ];
         let uniform = self.buffer(
             "decode params",
@@ -2923,29 +2945,31 @@ impl Drawer {
                 mip_level_count: 1,
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
-                format: wgpu::TextureFormat::Rgba8Unorm,
+                format: host,
                 usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
                 view_formats: &[],
             }),
         };
         let scope = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
         let device = &self.device;
-        let pipeline = self.decode_pipeline.get_or_insert_with(|| {
-            let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-                label: Some("resolve"),
-                source: wgpu::ShaderSource::Wgsl(include_str!("resolve.wgsl").into()),
+        let entry = ["decode_8888", "decode_float"][usize::from(mode.is_some())];
+        let pipeline =
+            self.decode_pipelines[usize::from(mode.is_some())].get_or_insert_with(|| {
+                let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                    label: Some("resolve"),
+                    source: wgpu::ShaderSource::Wgsl(include_str!("resolve.wgsl").into()),
+                });
+                device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                    label: Some(entry),
+                    layout: None,
+                    module: &module,
+                    entry_point: Some(entry),
+                    compilation_options: Default::default(),
+                    cache: None,
+                })
             });
-            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some("decode_8888"),
-                layout: None,
-                module: &module,
-                entry_point: Some("decode_8888"),
-                compilation_options: Default::default(),
-                cache: None,
-            })
-        });
         let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("decode_8888"),
+            label: Some(entry),
             layout: &pipeline.get_bind_group_layout(0),
             entries: &[
                 wgpu::BindGroupEntry {
@@ -3003,7 +3027,7 @@ impl Drawer {
                 view: view.clone(),
                 lo: addr,
                 hi: end,
-                block: u64::from(pitch) * 32 * 4,
+                block: u64::from(pitch) * 32 * guest_bytes,
                 stale: None,
             },
         );
@@ -3933,13 +3957,21 @@ impl Drawer {
         if rect.is_empty() {
             return Ok(());
         }
-        // shortcut: 16_16_FLOAT colour copies take the CPU path (WGSL's
-        // pack2x16float does not promise rounding); port f32_to_half to
-        // resolve.wgsl if they show up in profiles.
-        if dest_bytes == 4 && (r.is_depth || r.dest_format != formats::DEST_16_16_FLOAT) {
-            self.resolve_gpu(r, rect, format, &tex, mem)?;
-            self.resolved_endian
-                .insert(r.dest_base & PHYSICAL_MASK, r.dest_endian);
+        // shortcut: 16_16_FLOAT copies, and 64bpp copies but
+        // 16_16_16_16_FLOAT from 7e3 / 16_16_16_16_FLOAT sources, take the
+        // CPU path; add them to resolve.wgsl if they show up in profiles.
+        let gpu = if dest_bytes == 4 {
+            r.is_depth || r.dest_format != formats::DEST_16_16_FLOAT
+        } else {
+            r.dest_format == formats::DEST_16_16_16_16_FLOAT
+                && matches!(format, TargetFormat::Float7e3 | TargetFormat::Rgba16Float)
+        };
+        if gpu {
+            self.resolve_gpu(r, rect, format, dest_bytes as u32, &tex, mem)?;
+            if dest_bytes == 4 {
+                self.resolved_endian
+                    .insert(r.dest_base & PHYSICAL_MASK, r.dest_endian);
+            }
             return Ok(());
         }
         // write_tiled_texels reads and writes the whole tiled extent.
@@ -4000,7 +4032,8 @@ impl Drawer {
         done
     }
 
-    /// 32bpp colour copy on the GPU: resolve.wgsl converts, tiles and
+    /// 32bpp (or 16_16_16_16_FLOAT, `dest_bytes` 8) colour copy on the
+    /// GPU: resolve.wgsl converts, tiles and
     /// swaps each pixel into the destination's guest bytes kept on the GPU
     /// (see [`Mirror`]). Same result as the CPU path in
     /// [`Self::resolve_copy`]. Nothing waits here: the bytes reach guest
@@ -4010,6 +4043,7 @@ impl Drawer {
         r: &Resolve,
         rect: resolve::Rect,
         format: TargetFormat,
+        dest_bytes: u32,
         tex: &wgpu::Texture,
         mem: &mut Tracked,
     ) -> Result<(), Skip> {
@@ -4031,7 +4065,7 @@ impl Drawer {
             return unsupported(format!("resolve destination 0x{base:08X} not word aligned"));
         }
         let pitch = xenon_texture::tile::align_to_tile(r.dest_pitch);
-        let extent = xenon_texture::tile::tiled_extent_2d(rect.x1, rect.y1, pitch, 4)
+        let extent = xenon_texture::tile::tiled_extent_2d(rect.x1, rect.y1, pitch, dest_bytes)
             .map_err(|e| Skip::Unsupported(format!("resolve destination: {e}")))?;
         if u64::from(extent) > self.max_storage {
             return unsupported(format!("resolve destination of {extent} bytes"));
@@ -4069,6 +4103,7 @@ impl Drawer {
                 formats::DEST_8_8_8_8 => 0,
                 formats::DEST_2_10_10_10 => 1,
                 formats::DEST_16_16 => 3,
+                formats::DEST_16_16_16_16_FLOAT => 4,
                 _ => 2,
             },
             u32::from(r.dest_swap),
@@ -4161,7 +4196,7 @@ impl Drawer {
         m.dirty.push((a, b));
         m.dirty.sort_unstable();
         for k in m.views.values_mut().filter(|k| lo < k.hi && k.lo < hi) {
-            // Tiled 32bpp rows 32n..32n+32 are bytes block*n..block*(n+1).
+            // Tiled rows 32n..32n+32 are bytes block*n..block*(n+1).
             let y0 = (lo.saturating_sub(k.lo) / k.block * 32) as u32;
             let y1 = ((hi - k.lo).div_ceil(k.block) * 32).min(u64::from(k.tex.height())) as u32;
             k.stale = Some(k.stale.map_or((y0, y1), |(a, b)| (a.min(y0), b.max(y1))));
