@@ -377,12 +377,12 @@ pub struct Timings {
     /// Counts: pipelines and shader modules created, textures uploaded.
     pub pipelines_created: u32,
     pub textures_uploaded: u32,
-    /// Command buffer submissions for draws and clears, EDRAM transfers and
-    /// GPU resolves.
+    /// Command buffer submissions made during the replay.
     pub submits: u32,
-    /// `submits` by where they come from: GPU resolve copies, EDRAM
-    /// transfers, kept resolve texture decodes, and batch flushes and
-    /// resolve write-backs. Resolve clears are recorded into the next batch.
+    /// `submits` by where they come from: resolve copies (GPU copies and
+    /// CPU resolve readbacks), EDRAM transfers, kept resolve texture
+    /// decodes, and batch flushes and resolve write-backs. Resolve clears
+    /// are recorded into the next batch.
     pub submits_by_site: [u32; 4],
     pub texture_bytes: u64,
     /// Guest vertex window bytes read (not those of reused windows).
@@ -4131,6 +4131,7 @@ impl Drawer {
         self.wait_idle()?;
         self.timings.gpu_wait += lap(&mut t);
         let px = self.read_texture(&tex, rect.x0, rect.y0, rect.width(), rect.height())?;
+        self.submitted(Site::Resolve);
         self.timings.readback += lap(&mut t);
         self.timings.readback_bytes += px.len() as u64;
         let src_bytes = px.len() / (rect.width() * rect.height()) as usize;

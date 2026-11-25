@@ -452,3 +452,31 @@ fn resolve_clears_join_the_next_batch() {
     assert_eq!(t.submits_by_site, [2, 0, 0, 5], "{t:?}");
     assert_eq!(t.submits, 7, "{t:?}");
 }
+
+/// A resolve copy taken on the CPU (16_16_FLOAT destination) counts its
+/// readback submit as a resolve submit.
+#[test]
+fn cpu_resolve_readback_counts_as_resolve_submit() {
+    let Some(mut d) = drawer() else { return };
+    let mut mem = memory();
+    let wf = W as f32;
+    rect(&mut mem, VERTS, wf, wf, RED);
+    let mut s = Stream::default();
+    s.setup()
+        .shader(false, &vs_color())
+        .shader(true, &ps_interp())
+        .vertex_fetch(0, VERTS, 12)
+        .draw_auto(PRIM_RECT_LIST, 3)
+        .resolve_with(
+            &mut mem,
+            (W, H),
+            COPY_RAW,
+            (DEST, W | (H << 16), dest_info(31, 0, false)),
+            [0; 3],
+        );
+    let report = run(&mut d, &s, &mut mem);
+    assert_eq!((report.draws, report.resolves), (1, 1), "{report:?}");
+    let t = &report.timings;
+    assert_eq!(t.submits_by_site.iter().sum::<u32>(), t.submits, "{t:?}");
+    assert_eq!(t.submits_by_site[0], 1, "{t:?}");
+}
