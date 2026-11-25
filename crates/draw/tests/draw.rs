@@ -942,3 +942,94 @@ fn get_gradients_pixel_shader_draws() {
         px(&img, W, 8, 8)
     );
 }
+
+/// Pixel shader: oC0 = r1 * c0, with c0 = (1/64, 1/64, 0, 0) set by
+/// `param_gen_stream`, so red and green show r1.xy / 64 (0 when negative).
+fn ps_param_gen_scaled() -> Vec<u32> {
+    use xenon_shader::asm::*;
+    use xenon_shader::ucode::*;
+    let mul = AluInstr::vector(
+        VectorOp::Mul,
+        0,
+        mask("xyzw"),
+        &[AluSrc::temp(1, SWZ_XYZW), AluSrc::constant(0, SWZ_XYZW)],
+    )
+    .exported(0);
+    assemble(&[exec(0, 1, true)], &[Instr::Alu(mul)])
+}
+
+/// A stream with SQ_PROGRAM_CNTL `program_cntl` (bit 18 is param_gen) and
+/// SQ_CONTEXT_MISC param_gen_pos 1, drawing `count` vertices of `prim` from VERTS.
+fn param_gen_stream(
+    mem: &mut xenon_gpu::SliceMemory,
+    mode: u32,
+    program_cntl: u32,
+    prim: u32,
+    count: u32,
+) -> Stream {
+    let mut s = Stream::default();
+    s.setup()
+        .resolve(mem, W, H, false, Some((rgba(CLEAR), 0)))
+        .shader(false, &vs_color())
+        .shader(true, &ps_param_gen_scaled())
+        .vertex_fetch(0, VERTS, 4 * count)
+        .regs(
+            SHADER_CONSTANT_FLOAT + 256 * 4,
+            &[f(1.0 / 64.0), f(1.0 / 64.0), f(0.0), f(0.0)],
+        )
+        .regs(SQ_PROGRAM_CNTL, &[program_cntl])
+        .regs(SQ_CONTEXT_MISC, &[1 << 8])
+        .regs(PA_SU_SC_MODE_CNTL, &[mode])
+        .draw_auto(prim, count);
+    s
+}
+
+/// SQ_PROGRAM_CNTL.param_gen: the pixel shader's r1 is the pixel position
+/// rounded down, with the sign of x set on back faces (Xenia's PsParamGen).
+#[test]
+fn pixel_param_gen_position_and_face() {
+    let Some(mut d) = drawer() else { return };
+    // Unorm of v / 64.
+    let u = |v: u32| (v as f32 / 64.0 * 255.0).round() as u8;
+    // PA_SU_SC_MODE_CNTL face bit 2: front CCW (top-left `a` front, `b`
+    // back), then front CW.
+    for (mode, a_front) in [(0, true), (4, false)] {
+        let mut mem = memory();
+        mem.write_words(VERTS, &winding_pair());
+        let s = param_gen_stream(&mut mem, mode, 1 << 18, PRIM_TRI_LIST, 6);
+        let report = run(&mut d, &s, &mut mem);
+        assert_eq!(report.draws, 1, "{report:?}");
+        let img = d.read_render_target(COLOR_KEY, 0, 0, W, H).unwrap();
+        let want = |front: bool, x, y| [if front { u(x) } else { 0 }, u(y), 0, 0];
+        for (x, y, front) in [
+            (4, 4, a_front),
+            (20, 8, a_front),
+            (36, 36, !a_front),
+            (40, 50, !a_front),
+        ] {
+            let p = px(&img, W, x, y);
+            assert!(
+                near(p, want(front, x, y), 1),
+                "mode {mode} ({x}, {y}): {p:?}"
+            );
+        }
+    }
+}
+
+/// A point sets the sign of y (and never the facing sign of x). The same
+/// shaders first draw without param_gen (r1 is then a zero interpolator),
+/// so the cached pipeline must not be reused.
+#[test]
+fn pixel_param_gen_point_flag() {
+    let Some(mut d) = drawer() else { return };
+    for (program_cntl, want) in [(0, [0, 0, 0, 0]), (1 << 18, [40, 0, 0, 0])] {
+        let mut mem = memory();
+        mem.write_words(VERTS, &color_verts(&[(10.5, 20.5, 0.0, RED)]));
+        let s = param_gen_stream(&mut mem, 0, program_cntl, 1, 1);
+        let report = run(&mut d, &s, &mut mem);
+        assert_eq!(report.draws, 1, "{report:?}");
+        let img = d.read_render_target(COLOR_KEY, 0, 0, W, H).unwrap();
+        let p = px(&img, W, 10, 20);
+        assert!(near(p, want, 1), "SQ_PROGRAM_CNTL {program_cntl:#x}: {p:?}");
+    }
+}

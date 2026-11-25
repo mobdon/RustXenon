@@ -59,7 +59,10 @@
 //! - Pixel stage: entry `ps_main`. Inputs are `@location(i)` vec4 for each
 //!   bit of [`ShaderInfo::interpolators_read`], copied to r<i> on entry;
 //!   outputs are `@location(0..4)` vec4 for the colour exports in
-//!   [`ShaderInfo::colour_targets_written`].
+//!   [`ShaderInfo::colour_targets_written`]. With [`translate_with`] and a
+//!   [`ParamGen`], the pixel parameters (position, facing, primitive flags)
+//!   are written to their register on entry from `@builtin(position)` and
+//!   `@builtin(front_facing)`, after the interpolators are copied.
 //!
 //! Depth export and memory export fail with [`Error::Unsupported`]; the
 //! point size / kill-vertex export is dropped and reported in
@@ -86,6 +89,6 @@ pub mod ucode;
 mod wgsl;
 
 pub use wgsl::{
-    translate, Error, ShaderInfo, ShaderStage, Translated, PIXEL_FLOAT_CONST_BASE, TEMP_REGISTERS,
-    WATCHDOG_STEPS,
+    translate, translate_with, Error, ParamGen, ParamGenPrimitive, ShaderInfo, ShaderStage,
+    Translated, PIXEL_FLOAT_CONST_BASE, TEMP_REGISTERS, WATCHDOG_STEPS,
 };

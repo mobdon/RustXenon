@@ -3,7 +3,10 @@
 // spirv_shader_translator_fetch.cc, shader_translator.cc and
 // shader_interpreter.cc (BSD 3-Clause, see CREDITS.md), cross-checked with
 // XenosRecomp shader_recompiler.cpp (MIT), whose pc-switch layout for
-// non-structured control flow this follows.
+// non-structured control flow this follows. Pixel parameter generation
+// follows Xenia's PsParamGen in spirv_shader_translator.cc and
+// dxbc_shader_translator.cc, with the register layout documented at
+// SQ_CONTEXT_MISC::param_gen_pos in registers.h.
 
 //! Microcode to WGSL translation. See the crate docs for the binding contract.
 
@@ -15,6 +18,34 @@ use std::fmt::{self, Write as _};
 pub enum ShaderStage {
     Vertex,
     Pixel,
+}
+
+/// Pixel parameter generation (SQ_PROGRAM_CNTL.param_gen): the pixel
+/// program finds the pixel's parameters in interpolator `register` instead
+/// of a vertex shader output.
+///
+/// - |x|, |y|: the pixel position in render target pixels, rounded down
+///   (0, 1, 2, ..., no half-pixel offset), as the Direct3D 9 VPOS.
+/// - sign of x: set for a back-facing polygon.
+/// - sign of y: set for a point.
+/// - z: -0.0 for a line, else 0.0; w: 0.0.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ParamGen {
+    /// SQ_CONTEXT_MISC.param_gen_pos; 16 and above write nothing.
+    pub register: u32,
+    pub primitive: ParamGenPrimitive,
+}
+
+/// The primitive class the sign bits of [`ParamGen`] report (Xenia's
+/// IsPrimitivePolygonal and IsPrimitiveLine).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ParamGenPrimitive {
+    /// Triangles, quads and fans: the facing goes into the sign of x.
+    Polygon,
+    Line,
+    Point,
+    /// Rectangle lists: no flag set.
+    Other,
 }
 
 /// Translation failure. Nothing is ever silently mistranslated: anything not
@@ -286,15 +317,31 @@ fn xe_tfetch_sign_bias(v: vec4<f32>, w0: u32, w3: u32) -> vec4<f32> {
 /// Translates one vertex or pixel program to a WGSL module with entry point
 /// `vs_main` or `ps_main`.
 pub fn translate(words: &[u32], stage: ShaderStage) -> Result<Translated, Error> {
+    translate_with(words, stage, None)
+}
+
+/// [`translate`] with pixel parameter generation (ignored for the vertex
+/// stage). The generated register is not an input: its bit is left out of
+/// [`ShaderInfo::interpolators_read`].
+pub fn translate_with(
+    words: &[u32],
+    stage: ShaderStage,
+    param_gen: Option<ParamGen>,
+) -> Result<Translated, Error> {
     let prog = Program::parse(words)?;
+    let param_gen = param_gen.filter(|p| stage == ShaderStage::Pixel && p.register < 16);
     let mut g = Gen {
         stage,
         info: ShaderInfo::default(),
         body: String::new(),
         last_full_vfetch: None,
         float_min_max: None,
+        param_gen,
     };
     g.info.interpolators_read = prog.interpolators_read(stage);
+    if let Some(p) = param_gen {
+        g.info.interpolators_read &= !(1 << p.register);
+    }
     for (k, cf) in prog.cf.iter().enumerate() {
         g.cf(k as u32, cf, &prog)?;
     }
@@ -303,6 +350,34 @@ pub fn translate(words: &[u32], stage: ShaderStage) -> Result<Translated, Error>
         wgsl: g.finish(prog.cf.len() as u32),
         info: g.info,
     })
+}
+
+/// The statement writing the pixel parameters to their register. The host
+/// fragment position is the pixel centre (x.5), so rounding down gives
+/// Xenia's .0 position. The flags are set as sign bits with bitcasts so a
+/// zero coordinate keeps its sign.
+fn param_gen_wgsl(p: ParamGen) -> String {
+    const SIGN: &str = "0x80000000u";
+    let x = match p.primitive {
+        ParamGenPrimitive::Polygon => {
+            format!("bitcast<f32>(bitcast<u32>(xy.x) | select({SIGN}, 0u, input.xe_front_facing))")
+        }
+        _ => "xy.x".into(),
+    };
+    let y = match p.primitive {
+        // shortcut: points are one host pixel without sprite coordinates
+        // (zw stay 0); expand points to sprites when a game draws them.
+        ParamGenPrimitive::Point => format!("bitcast<f32>(bitcast<u32>(xy.y) | {SIGN})"),
+        _ => "xy.y".into(),
+    };
+    let z = match p.primitive {
+        ParamGenPrimitive::Line => format!("bitcast<f32>({SIGN})"),
+        _ => "0.0".into(),
+    };
+    format!(
+        "    {{\n        let xy = floor(input.xe_frag_coord.xy);\n        r[{}] = vec4<f32>({x}, {y}, {z}, 0.0);\n    }}\n",
+        p.register
+    )
 }
 
 struct Program {
@@ -432,6 +507,7 @@ struct Gen {
     /// following vfetch_mini reuses (as Xenia tracks it).
     last_full_vfetch: Option<u32>,
     float_min_max: Option<(u32, u32)>,
+    param_gen: Option<ParamGen>,
 }
 
 fn comp(c: u32) -> char {
@@ -1219,11 +1295,19 @@ fn cnst(i: i32) -> vec4<f32> {{
             ShaderStage::Pixel => {
                 s.push_str("var<private> o_col: array<vec4<f32>, 4>;\n\n");
                 let reads = self.info.interpolators_read;
-                if reads != 0 {
+                let pg = self.param_gen;
+                let has_input = reads != 0 || pg.is_some();
+                if has_input {
                     s.push_str("struct PsIn {\n");
                     for i in 0..16 {
                         if reads & (1 << i) != 0 {
                             let _ = writeln!(s, "    @location({i}) i{i}: vec4<f32>,");
+                        }
+                    }
+                    if let Some(p) = pg {
+                        s.push_str("    @builtin(position) xe_frag_coord: vec4<f32>,\n");
+                        if p.primitive == ParamGenPrimitive::Polygon {
+                            s.push_str("    @builtin(front_facing) xe_front_facing: bool,\n");
                         }
                     }
                     s.push_str("}\n\n");
@@ -1244,13 +1328,16 @@ fn cnst(i: i32) -> vec4<f32> {{
                 }
                 let mut entry = format!(
                     "@fragment\nfn ps_main({}){} {{\n",
-                    if reads != 0 { "input: PsIn" } else { "" },
+                    if has_input { "input: PsIn" } else { "" },
                     if cols != 0 { " -> PsOut" } else { "" }
                 );
                 for i in 0..16 {
                     if reads & (1 << i) != 0 {
                         let _ = writeln!(entry, "    r[{i}] = input.i{i};");
                     }
+                }
+                if let Some(p) = pg {
+                    entry.push_str(&param_gen_wgsl(p));
                 }
                 (entry, ret)
             }
