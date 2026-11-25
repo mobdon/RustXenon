@@ -134,7 +134,8 @@ impl DrawStats {
              guest data {:.0}, textures {:.0}, submit {:.0}, gpu wait {:.0}, readback {:.0}, \
              resolve cpu {:.0}, clears {:.0}, swap {:.0} (transfers {:.0}); per {per}: {} draws, \
              {} resolves, {} submits, {} transfers ({} passes), readback {:.1} MB, \
-             hashed {:.1} MB, {} textures uploaded ({:.1} MB), {} pipelines created",
+             hashed {:.1} MB, {} textures uploaded ({:.1} MB), {} from kept resolves, \
+             {} pipelines created",
             window.as_secs_f64(),
             self.frames,
             self.replays,
@@ -158,6 +159,7 @@ impl DrawStats {
             mb(t.hashed_bytes),
             t.textures_uploaded / n,
             mb(t.texture_bytes),
+            t.textures_kept / n,
             t.pipelines_created / n,
         )
     }

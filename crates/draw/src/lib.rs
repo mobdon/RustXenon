@@ -214,6 +214,51 @@ impl GuestMemory for Tracked<'_> {
     }
 }
 
+impl Tracked<'_> {
+    /// Writes bytes the drawer already holds on the GPU (a kept resolve's),
+    /// without recording them as a change.
+    fn write_back(&mut self, addr: u32, bytes: &[u8]) -> bool {
+        self.mem.write_bytes(addr, bytes)
+    }
+}
+
+/// Guest bytes that 32bpp GPU resolves wrote, kept in a GPU buffer so that
+/// textures fetched from them are decoded on the GPU instead of read back,
+/// hashed, decoded and uploaded. The buffer always holds what guest memory
+/// holds (or, for the `dirty` range, will hold once written back) over
+/// `[lo, hi)`: it starts as a copy of guest memory, resolves write into it,
+/// and any other write to the range drops it.
+struct Mirror {
+    lo: u64,
+    hi: u64,
+    buf: wgpu::Buffer,
+    /// Physical range written by resolves and not yet written back to guest
+    /// memory.
+    dirty: Option<(u64, u64)>,
+    /// Hash of guest memory over `[lo, hi)` as the last replay left it, to
+    /// notice CPU writes between replays; `None` until computed.
+    hash: Option<u64>,
+    /// Checked against guest memory (or made from it) this replay.
+    verified: bool,
+    /// Textures decoded from the buffer, by fetch constant.
+    views: HashMap<[u32; 6], Kept>,
+}
+
+/// A texture decoded from a [`Mirror`].
+struct Kept {
+    tex: wgpu::Texture,
+    view: wgpu::TextureView,
+    /// Guest bytes it was decoded from, and the bytes of one 32-row block.
+    lo: u64,
+    hi: u64,
+    block: u64,
+    /// Rows written by resolves since it was decoded, to decode again.
+    stale: Option<(u32, u32)>,
+}
+
+/// Kept resolve buffers are written back and dropped past this many bytes.
+const MIRROR_LIMIT: u64 = 256 << 20;
+
 impl GuestMemory for SliceMemory {
     fn write_bytes(&mut self, addr: u32, bytes: &[u8]) -> bool {
         let Some(start) = addr.checked_sub(self.base).map(|s| s as usize) else {
@@ -328,6 +373,15 @@ pub struct Timings {
     pub readback_bytes: u64,
     /// Guest texture bytes read and hashed to look up the texture cache.
     pub hashed_bytes: u64,
+    /// Texture lookups served from a resolve kept on the GPU (decoded
+    /// there, or decoded earlier), each one a guest read, hash, decode and
+    /// upload avoided; and the guest texture bytes they did not read.
+    pub textures_kept: u32,
+    pub kept_bytes: u64,
+    /// Bytes hashed to check that guest memory under the kept resolves did
+    /// not change between replays (at write-back, and at first use in the
+    /// next replay).
+    pub kept_hashed_bytes: u64,
 }
 
 impl std::ops::AddAssign<&Timings> for Timings {
@@ -352,6 +406,9 @@ impl std::ops::AddAssign<&Timings> for Timings {
         self.transfer_passes += t.transfer_passes;
         self.readback_bytes += t.readback_bytes;
         self.hashed_bytes += t.hashed_bytes;
+        self.textures_kept += t.textures_kept;
+        self.kept_bytes += t.kept_bytes;
+        self.kept_hashed_bytes += t.kept_hashed_bytes;
     }
 }
 
@@ -685,6 +742,21 @@ pub struct Drawer {
     /// [`formats::half_lut`] tables by source format and exponent bias, for
     /// CPU resolves to 16-bit float destinations.
     half_luts: HashMap<(TargetFormat, i32), Option<Vec<[u16; 2]>>>,
+    /// Resolve destinations kept on the GPU, disjoint and not adjacent.
+    mirrors: Vec<Mirror>,
+    /// Entry point decode_8888 of resolve.wgsl.
+    decode_pipeline: Option<wgpu::ComputePipeline>,
+    /// Leave resolve results on the GPU at the end of a replay instead of
+    /// writing them to guest memory (default false). The drawer still writes
+    /// them back before it reads those bytes itself (a texture it cannot
+    /// decode on the GPU, vertices, a front buffer, a MEM_WRITE or CPU
+    /// resolve over them), but the guest CPU never sees them.
+    ///
+    /// Unsafe for games whose CPU reads resolved surfaces (a screenshot,
+    /// a luminance readback, a resolve to vertex data read by the CPU): they
+    /// read stale bytes. A CPU write to such a destination between replays
+    /// drops the GPU copy (its pixels are lost).
+    pub skip_resolve_writeback: bool,
     timings: Timings,
     uncaptured: Arc<Mutex<Vec<String>>>,
     max_dim: u32,
@@ -1082,6 +1154,9 @@ impl Drawer {
             snorm16,
             snorm16_blend,
             half_luts: HashMap::new(),
+            mirrors: Vec::new(),
+            decode_pipeline: None,
+            skip_resolve_writeback: false,
             timings: Timings::default(),
             uncaptured,
             max_dim: limits.max_texture_dimension_2d,
@@ -1115,12 +1190,21 @@ impl Drawer {
             texel * u64::from(e.width * e.height * e.depth_or_array_layers * t.sample_count())
         };
         let rt: u64 = self.targets.values().map(bytes).sum();
+        let kept: u64 = self.mirrors.iter().map(|m| m.buf.size()).sum::<u64>()
+            + self
+                .mirrors
+                .iter()
+                .flat_map(|m| m.views.values())
+                .map(|k| bytes(&k.tex))
+                .sum::<u64>();
         format!(
-            "draw: textures {} MB in {}, targets {} MB in {}, arena {} MB, staged {} MB, pipelines {}, shaders {}",
+            "draw: textures {} MB in {}, targets {} MB in {}, kept resolves {} MB in {}, arena {} MB, staged {} MB, pipelines {}, shaders {}",
             self.texture_cache_bytes >> 20,
             self.texture_cache.len(),
             rt >> 20,
             self.targets.len(),
+            kept >> 20,
+            self.mirrors.len(),
             self.arena.as_ref().map_or(0, |b| b.size()) >> 20,
             self.staged.capacity() >> 20,
             self.pipelines.len() + self.clear_pipelines.len(),
@@ -1144,6 +1228,9 @@ impl Drawer {
         let mut report = Report::default();
         self.timings = Timings::default();
         self.texture_memo.clear();
+        for m in &mut self.mirrors {
+            m.verified = false;
+        }
         let mut mem = Tracked {
             mem,
             written: Vec::new(),
@@ -1158,22 +1245,15 @@ impl Drawer {
         });
         self.batch = None;
         self.staged.clear();
+        // Resolves done before an error still reach guest memory.
+        let kept = self.finish_mirrors(&mut mem);
         done?;
-        // Counts made where only the report is mutable.
-        let t = &report.timings;
-        let (uploaded, tex_bytes, guest_bytes, hashed_bytes) = (
-            t.textures_uploaded,
-            t.texture_bytes,
-            t.guest_bytes,
-            t.hashed_bytes,
-        );
-        report.timings = Timings {
-            textures_uploaded: uploaded,
-            texture_bytes: tex_bytes,
-            guest_bytes,
-            hashed_bytes,
-            ..std::mem::take(&mut self.timings)
-        };
+        kept?;
+        // Counts made where only the report is mutable (durations there
+        // are zero).
+        let mut t = std::mem::take(&mut self.timings);
+        t += &report.timings;
+        report.timings = t;
         Ok(report)
     }
 
@@ -1184,7 +1264,7 @@ impl Drawer {
         report: &mut Report,
     ) -> Result<(), Error> {
         for c in commands {
-            let mem: &mut dyn GuestMemory = tracked;
+            let mem = &mut *tracked;
             let done = match c {
                 Command::WriteRegisters { base, values } => {
                     for (i, &v) in values.iter().enumerate() {
@@ -1232,8 +1312,9 @@ impl Drawer {
                     let frame = self.front_buffer(*frontbuffer, *width, *height, mem);
                     self.timings.swap += t.elapsed();
                     match frame {
-                        Ok(f) => report.frames.push(f),
-                        Err(e) => report.warn(e),
+                        Ok(Ok(f)) => report.frames.push(f),
+                        Ok(Err(e)) => report.warn(e),
+                        Err(e) => return Err(e),
                     }
                     Ok(())
                 }
@@ -1242,6 +1323,8 @@ impl Drawer {
                     endian,
                     values,
                 } => {
+                    let a = u64::from(addr & PHYSICAL_MASK);
+                    self.sync(mem, a, a + 4 * values.len() as u64)?;
                     for (i, &v) in values.iter().enumerate() {
                         let a = addr.wrapping_add(4 * i as u32);
                         if !mem.write_bytes(a, &endian.to_guest_bytes(v)) {
@@ -1253,8 +1336,13 @@ impl Drawer {
                 _ => Ok(()),
             };
             for (lo, hi) in tracked.written.drain(..) {
-                self.texture_memo
-                    .retain(|_, &mut (_, a, b)| b <= lo || hi <= a);
+                self.forget_guest(lo, hi);
+                // Any write but a resolve's makes a kept copy stale; the
+                // writer wrote it back first (see `sync`).
+                self.mirrors.retain(|m| {
+                    debug_assert!(m.hi <= lo || hi <= m.lo || m.dirty.is_none());
+                    m.hi <= lo || hi <= m.lo
+                });
             }
             match done {
                 Ok(()) => {}
@@ -1264,6 +1352,172 @@ impl Drawer {
             self.check_uncaptured()?;
         }
         Ok(())
+    }
+
+    /// Drops the textures looked up this replay from guest bytes in
+    /// `[lo, hi)`, which just changed.
+    fn forget_guest(&mut self, lo: u64, hi: u64) {
+        self.texture_memo
+            .retain(|_, &mut (_, a, b)| b <= lo || hi <= a);
+    }
+
+    /// Hash of guest memory over `[lo, hi)`, if readable.
+    fn guest_hash(&mut self, mem: &Tracked, lo: u64, hi: u64) -> Option<u64> {
+        let b = mem.read_bytes(lo as u32, (hi - lo) as usize)?;
+        self.timings.kept_hashed_bytes += b.len() as u64;
+        Some(hash_bytes(&b))
+    }
+
+    /// Whether kept resolve `i` still matches guest memory, which the CPU
+    /// may have written since the last replay. A mismatch drops it (in
+    /// `skip_resolve_writeback` mode with its unwritten pixels, as the CPU
+    /// wrote after them).
+    fn verify(&mut self, i: usize, mem: &Tracked) -> bool {
+        if self.mirrors[i].verified {
+            return true;
+        }
+
+        let (lo, hi) = (self.mirrors[i].lo, self.mirrors[i].hi);
+        let now = self.guest_hash(mem, lo, hi);
+        let m = &mut self.mirrors[i];
+        if now.is_some() && now == m.hash {
+            m.verified = true;
+            return true;
+        }
+        self.mirrors.remove(i);
+        false
+    }
+
+    /// Writes back to guest memory every kept resolve over `[lo, hi)` that
+    /// has unwritten bytes, before the drawer reads or writes that range
+    /// itself. One GPU wait for all of them.
+    fn sync(&mut self, mem: &mut Tracked, lo: u64, hi: u64) -> Result<(), Error> {
+        let mut i = 0;
+        let mut copies = Vec::new();
+        let mut enc = None;
+        while i < self.mirrors.len() {
+            let m = &self.mirrors[i];
+            if m.hi <= lo || hi <= m.lo || m.dirty.is_none() {
+                i += 1;
+                continue;
+            }
+            // A failed check removed mirror i; the next one moved to i.
+            if !self.verify(i, mem) {
+                continue;
+            }
+            let m = &self.mirrors[i];
+            let (a, b) = m.dirty.expect("dirty");
+            let buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("resolve write-back"),
+                size: b - a,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            });
+            enc.get_or_insert_with(|| self.device.create_command_encoder(&Default::default()))
+                .copy_buffer_to_buffer(&m.buf, a - m.lo, &buf, 0, b - a);
+            copies.push((m.lo, a, buf));
+            i += 1;
+        }
+        let Some(enc) = enc else {
+            return Ok(());
+        };
+        let mut t = Instant::now();
+        self.wait_idle()?;
+        self.timings.gpu_wait += lap(&mut t);
+        let index = self.queue.submit([enc.finish()]);
+        self.timings.submits += 1;
+        for (m_lo, a, buf) in copies {
+            let data = self.map_read(&buf, index.clone())?;
+            self.timings.readback += lap(&mut t);
+            self.timings.readback_bytes += data.len() as u64;
+            let ok = mem.write_back(a as u32, &data);
+            let Some(i) = self.mirrors.iter().position(|m| m.lo == m_lo) else {
+                continue;
+            };
+            let m = &mut self.mirrors[i];
+            m.dirty = None;
+            if !ok {
+                // Readable when made, so not expected; the pixels are lost.
+                self.mirrors.remove(i);
+            } else if (m.lo, m.hi) == (a, a + data.len() as u64) {
+                m.hash = Some(hash_bytes(&data));
+                self.timings.kept_hashed_bytes += data.len() as u64;
+            } else {
+                let (lo, hi) = (m.lo, m.hi);
+                self.mirrors[i].hash = self.guest_hash(mem, lo, hi);
+            }
+            self.timings.resolve_cpu += lap(&mut t);
+        }
+        Ok(())
+    }
+
+    /// End of a replay: writes back every kept resolve (unless
+    /// `skip_resolve_writeback`), and hashes guest memory under the ones
+    /// made this replay for the next replay's check.
+    fn finish_mirrors(&mut self, mem: &mut Tracked) -> Result<(), Error> {
+        if !self.skip_resolve_writeback {
+            self.sync(mem, 0, u64::MAX)?;
+        }
+        for i in 0..self.mirrors.len() {
+            if self.mirrors[i].hash.is_none() {
+                let (lo, hi) = (self.mirrors[i].lo, self.mirrors[i].hi);
+                self.mirrors[i].hash = self.guest_hash(mem, lo, hi);
+            }
+        }
+        Ok(())
+    }
+
+    /// Index of the kept resolve buffer holding `[lo, hi)`, made from guest
+    /// memory if there is none. Kept buffers it overlaps or touches are
+    /// written back and merged into it, so a texture over several resolves
+    /// (tiles, one under the other) is in one buffer.
+    fn mirror(&mut self, mem: &mut Tracked, lo: u64, hi: u64) -> Result<Option<usize>, Error> {
+        if let Some(i) = self.mirrors.iter().position(|m| m.lo <= lo && hi <= m.hi) {
+            if self.verify(i, mem) {
+                return Ok(Some(i));
+            }
+        }
+        let near = |m: &Mirror| m.lo <= hi && lo <= m.hi;
+        let (mut a, mut b) = (lo, hi);
+        for m in self.mirrors.iter().filter(|m| near(m)) {
+            (a, b) = (a.min(m.lo), b.max(m.hi));
+        }
+        if b - a > self.max_storage {
+            (a, b) = (lo, hi);
+        }
+        let total: u64 = self.mirrors.iter().map(|m| m.hi - m.lo).sum();
+        // shortcut: past the limit every kept resolve is written back and
+        // dropped, not the least recently used; track use if a capture
+        // keeps more than 256 MB of resolve destinations.
+        let all = total + (b - a) > MIRROR_LIMIT;
+        let (sa, sb) = if all { (0, u64::MAX) } else { (a, b) };
+        // Those touching [sa, sb) too.
+        self.sync(mem, sa.saturating_sub(1), sb.saturating_add(1))?;
+        self.mirrors.retain(|m| !all && (m.hi < sa || sb < m.lo));
+        let Some(bytes) = mem.read_bytes(a as u32, (b - a) as usize) else {
+            return Ok(None);
+        };
+        // Without write-back guest memory keeps these bytes; else the
+        // write-back hashes them.
+        let hash = self.skip_resolve_writeback.then(|| {
+            self.timings.kept_hashed_bytes += bytes.len() as u64;
+            hash_bytes(&bytes)
+        });
+        let buf = self.buffer(
+            "kept resolve",
+            &bytes,
+            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        );
+        self.mirrors.push(Mirror {
+            lo: a,
+            hi: b,
+            buf,
+            dirty: None,
+            hash,
+            verified: true,
+            views: HashMap::new(),
+        });
+        Ok(Some(self.mirrors.len() - 1))
     }
 
     /// Submits the batched draws, with their staged buffers.
@@ -2037,9 +2291,9 @@ impl Drawer {
     /// Uploads the guest memory the vertex fetch constants in `mask` point
     /// at, as one window. Returns the buffer and the window's base address.
     fn guest_window(
-        &self,
+        &mut self,
         mask: u128,
-        mem: &dyn GuestMemory,
+        mem: &mut Tracked,
         report: &mut Report,
     ) -> Result<(Vec<u8>, u32), Skip> {
         let (mut lo, mut hi) = (u64::MAX, 0u64);
@@ -2063,6 +2317,7 @@ impl Drawer {
                     hi - lo
                 ));
             }
+            self.sync(mem, lo, hi)?;
             let Some(b) = mem.read_bytes(lo as u32, (hi - lo) as usize) else {
                 return unsupported(format!(
                     "vertex data at 0x{lo:08X}..0x{hi:08X} not readable"
@@ -2107,7 +2362,7 @@ impl Drawer {
     fn texture(
         &mut self,
         n: u32,
-        mem: &dyn GuestMemory,
+        mem: &mut Tracked,
         report: &mut Report,
     ) -> Result<(wgpu::TextureView, wgpu::Sampler), Skip> {
         let fetch = xenon_texture::TextureFetch::decode(self.regs.fetch_constant(n));
@@ -2116,16 +2371,199 @@ impl Drawer {
             return Ok((self.zero_texture.clone(), self.zero_sampler.clone()));
         }
         let sampler = self.sampler(&fetch, report);
-        if let Some((view, ..)) = self.texture_memo.get(&self.regs.fetch_constant(n)) {
+        let constant = self.regs.fetch_constant(n);
+        if let Some((view, ..)) = self.texture_memo.get(&constant) {
             return Ok((view.clone(), sampler));
         }
+        let addr = u64::from(fetch.base_address & PHYSICAL_MASK);
+        if let Ok(len) = xenon_texture::bytes_needed(&fetch) {
+            let end = addr + len as u64;
+            if let Some(view) = self.kept_texture(&fetch, constant, addr, end, mem)? {
+                self.timings.textures_kept += 1;
+                self.timings.kept_bytes += len as u64;
+                self.texture_memo
+                    .insert(constant, (view.clone(), addr, end));
+                return Ok((view, sampler));
+            }
+            self.sync(mem, addr, end)?;
+        }
         let view = self
-            .guest_texture(n, &fetch, mem, report)
+            .guest_texture(n, &fetch, &*mem, report)
             .unwrap_or_else(|why| {
                 report.warn(format!("{why}; drawn with zeros"));
                 self.zero_texture.clone()
             });
         Ok((view, sampler))
+    }
+
+    /// The texture of `fetch` decoded on the GPU from a kept resolve holding
+    /// all of its guest bytes `[addr, end)`, as [`Self::guest_texture`]
+    /// would decode them; `None` for the guest path. Only tiled 2D
+    /// k_8_8_8_8 layouts (any endian, swizzle and resolve format, as the
+    /// bytes are the guest's) that host as `Rgba8Unorm` are decoded here.
+    fn kept_texture(
+        &mut self,
+        fetch: &xenon_texture::TextureFetch,
+        constant: [u32; 6],
+        addr: u64,
+        end: u64,
+        mem: &Tracked,
+    ) -> Result<Option<wgpu::TextureView>, Skip> {
+        use xenon_texture::{Dimension, TextureFormat as F};
+        let Some(i) = self
+            .mirrors
+            .iter()
+            .position(|m| m.lo <= addr && end <= m.hi)
+        else {
+            return Ok(None);
+        };
+        let (w, h) = (fetch.width(), fetch.height());
+        let pitch = xenon_texture::tile::align_to_tile(fetch.pitch_texels());
+        let signed = fetch.sign.contains(&1);
+        if !fetch.tiled
+            || fetch.format.data_format() != F::K8_8_8_8
+            || fetch.dimension != Dimension::D2OrStacked
+            || fetch.stacked
+            || host_texture_format(fetch.format, signed, self.float32_filterable)
+                != wgpu::TextureFormat::Rgba8Unorm
+            || !(addr - self.mirrors[i].lo).is_multiple_of(4)
+            || pitch < w
+            || w > self.max_dim
+            || h > self.max_dim
+            || !self.verify(i, mem)
+        {
+            return Ok(None);
+        }
+        // Only the rows resolves wrote since the last decode are decoded
+        // again. Nothing in the open batch samples the old texels: the
+        // resolve flushed it, and dropped this texture from the memo.
+        let (y0, y1) = match self.mirrors[i].views.get(&constant) {
+            Some(k) => match k.stale {
+                None => return Ok(Some(k.view.clone())),
+                Some(rows) => rows,
+            },
+            None => (0, h),
+        };
+        let row_words = (w * 4).next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT) / 4;
+        let rows = y1 - y0;
+        let params = [
+            w,
+            rows,
+            pitch,
+            fetch.endian as u32,
+            u32::from(fetch.swizzle),
+            ((addr - self.mirrors[i].lo) / 4) as u32,
+            row_words,
+            y0,
+        ];
+        let uniform = self.buffer(
+            "decode params",
+            &to_bytes(&params),
+            wgpu::BufferUsages::UNIFORM,
+        );
+        let texels = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("decoded texels"),
+            size: u64::from(row_words) * 4 * u64::from(rows),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let tex = match self.mirrors[i].views.get(&constant) {
+            Some(k) => k.tex.clone(),
+            None => self.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("kept resolve texture"),
+                size: wgpu::Extent3d {
+                    width: w,
+                    height: h,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8Unorm,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            }),
+        };
+        let scope = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let device = &self.device;
+        let pipeline = self.decode_pipeline.get_or_insert_with(|| {
+            let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("resolve"),
+                source: wgpu::ShaderSource::Wgsl(include_str!("resolve.wgsl").into()),
+            });
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("decode_8888"),
+                layout: None,
+                module: &module,
+                entry_point: Some("decode_8888"),
+                compilation_options: Default::default(),
+                cache: None,
+            })
+        });
+        let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("decode_8888"),
+            layout: &pipeline.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: self.mirrors[i].buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: texels.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 7,
+                    resource: uniform.as_entire_binding(),
+                },
+            ],
+        });
+        let mut enc = self.device.create_command_encoder(&Default::default());
+        {
+            let mut pass = enc.begin_compute_pass(&Default::default());
+            pass.set_pipeline(pipeline);
+            pass.set_bind_group(0, &bg, &[]);
+            pass.dispatch_workgroups(w.div_ceil(8), rows.div_ceil(8), 1);
+        }
+        enc.copy_buffer_to_texture(
+            wgpu::TexelCopyBufferInfo {
+                buffer: &texels,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(row_words * 4),
+                    rows_per_image: Some(rows),
+                },
+            },
+            wgpu::TexelCopyTextureInfo {
+                texture: &tex,
+                mip_level: 0,
+                origin: wgpu::Origin3d { x: 0, y: y0, z: 0 },
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::Extent3d {
+                width: w,
+                height: rows,
+                depth_or_array_layers: 1,
+            },
+        );
+        self.queue.submit([enc.finish()]);
+        self.timings.submits += 1;
+        if let Some(e) = block_on(scope.pop()) {
+            return Err(Skip::Fatal(Error::Gpu(e.to_string())));
+        }
+        let view = tex.create_view(&Default::default());
+        self.mirrors[i].views.insert(
+            constant,
+            Kept {
+                tex,
+                view: view.clone(),
+                lo: addr,
+                hi: end,
+                block: u64::from(pitch) * 32 * 4,
+                stale: None,
+            },
+        );
+        Ok(Some(view))
     }
 
     /// Host texture of fetch constant slot `n`, from the cache or decoded.
@@ -2279,7 +2717,7 @@ impl Drawer {
     }
 
     /// Draws `d`; Ok(false) when the state makes it draw nothing.
-    fn draw(&mut self, d: &Draw, mem: &dyn GuestMemory, report: &mut Report) -> Result<bool, Skip> {
+    fn draw(&mut self, d: &Draw, mem: &mut Tracked, report: &mut Report) -> Result<bool, Skip> {
         let color_on = match self.regs.get(regs::RB_MODECONTROL) & 7 {
             4 => true,
             5 => false,
@@ -2427,8 +2865,17 @@ impl Drawer {
             report.warn("blend uses the constant colour and its alpha in the colour channel; drawn with the colour");
         }
 
-        let mut idx =
-            indices::guest_indices(mem, &d.source, d.index_count).map_err(Skip::Unsupported)?;
+        let mut idx = {
+            if let xenon_gpu::IndexSource::Dma {
+                address, format, ..
+            } = &d.source
+            {
+                let a = u64::from(*address);
+                let len = u64::from(d.index_count) * format.bytes() as u64;
+                self.sync(mem, a, a + len)?;
+            }
+            indices::guest_indices(&*mem, &d.source, d.index_count).map_err(Skip::Unsupported)?
+        };
         let strip = matches!(
             topology,
             wgpu::PrimitiveTopology::TriangleStrip | wgpu::PrimitiveTopology::LineStrip
@@ -2802,11 +3249,13 @@ impl Drawer {
     fn resolve(
         &mut self,
         r: &Resolve,
-        mem: &mut dyn GuestMemory,
+        mem: &mut Tracked,
         report: &mut Report,
     ) -> Result<bool, Skip> {
         // The copy and clears see every draw before them.
         self.flush()?;
+        let v = u64::from(r.vertex_fetch0.address & PHYSICAL_MASK);
+        self.sync(mem, v, v + 24)?;
         if r.msaa_samples != 0 {
             report.warn("MSAA surfaces drawn and resolved single-sampled");
         }
@@ -2878,7 +3327,7 @@ impl Drawer {
         &mut self,
         r: &Resolve,
         rect: resolve::Rect,
-        mem: &mut dyn GuestMemory,
+        mem: &mut Tracked,
         report: &mut Report,
     ) -> Result<(), Skip> {
         let format = if r.is_depth {
@@ -2940,6 +3389,13 @@ impl Drawer {
                 .insert(r.dest_base & PHYSICAL_MASK, r.dest_endian);
             return Ok(());
         }
+        // write_tiled_texels reads and writes the whole tiled extent.
+        let base = u64::from(r.dest_base & PHYSICAL_MASK);
+        if let Ok(extent) =
+            xenon_texture::tile::tiled_extent_2d(rect.x1, rect.y1, pitch, dest_bytes as u32)
+        {
+            self.sync(mem, base, base + u64::from(extent))?;
+        }
         let mut t = Instant::now();
         self.wait_idle()?;
         self.timings.gpu_wait += lap(&mut t);
@@ -2992,16 +3448,17 @@ impl Drawer {
     }
 
     /// 32bpp colour copy on the GPU: resolve.wgsl converts, tiles and
-    /// swaps each pixel into a copy of the destination's guest bytes, which
-    /// is read back once and written to guest memory. Same result as the CPU
-    /// path in [`Self::resolve_copy`].
+    /// swaps each pixel into the destination's guest bytes kept on the GPU
+    /// (see [`Mirror`]). Same result as the CPU path in
+    /// [`Self::resolve_copy`]. Nothing waits here: the bytes reach guest
+    /// memory at the end of the replay, or before the drawer reads them.
     fn resolve_gpu(
         &mut self,
         r: &Resolve,
         rect: resolve::Rect,
         format: TargetFormat,
         tex: &wgpu::Texture,
-        mem: &mut dyn GuestMemory,
+        mem: &mut Tracked,
     ) -> Result<(), Skip> {
         if rect.y1 > tex.height() {
             return Err(Error::Unsupported(format!(
@@ -3015,19 +3472,19 @@ impl Drawer {
             ))
             .into());
         }
-        // Waiting here only splits the rendering from the resolve in the
-        // timings: the readback waits for it anyway.
         let mut t = Instant::now();
-        self.wait_idle()?;
-        self.timings.gpu_wait += lap(&mut t);
         let base = r.dest_base & PHYSICAL_MASK;
+        if !base.is_multiple_of(4) {
+            return unsupported(format!("resolve destination 0x{base:08X} not word aligned"));
+        }
         let pitch = xenon_texture::tile::align_to_tile(r.dest_pitch);
         let extent = xenon_texture::tile::tiled_extent_2d(rect.x1, rect.y1, pitch, 4)
             .map_err(|e| Skip::Unsupported(format!("resolve destination: {e}")))?;
         if u64::from(extent) > self.max_storage {
             return unsupported(format!("resolve destination of {extent} bytes"));
         }
-        let Some(guest) = mem.read_bytes(base, extent as usize) else {
+        let (lo, hi) = (u64::from(base), u64::from(base) + u64::from(extent));
+        let Some(i) = self.mirror(mem, lo, hi)? else {
             return unsupported(format!("resolve destination 0x{base:08X} is not readable"));
         };
         let src_format = match format {
@@ -3064,25 +3521,14 @@ impl Drawer {
             u32::from(r.dest_swap),
             r.dest_endian,
             2f32.powi(r.dest_exp_bias).to_bits(),
-            0,
+            ((lo - self.mirrors[i].lo) / 4) as u32,
             0,
         ];
-        let dest = self.buffer(
-            "resolve destination",
-            &guest,
-            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-        );
         let uniform = self.buffer(
             "resolve params",
             &to_bytes(&params),
             wgpu::BufferUsages::UNIFORM,
         );
-        let readback = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("resolve readback"),
-            size: dest.size(),
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-            mapped_at_creation: false,
-        });
         let scope = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
         let device = &self.device;
         let pipeline = self.resolve_pipelines[entry].get_or_insert_with(|| {
@@ -3123,7 +3569,7 @@ impl Drawer {
         entries.extend([
             wgpu::BindGroupEntry {
                 binding: 1,
-                resource: dest.as_entire_binding(),
+                resource: self.mirrors[i].buf.as_entire_binding(),
             },
             wgpu::BindGroupEntry {
                 binding: 2,
@@ -3142,19 +3588,23 @@ impl Drawer {
             pass.set_bind_group(0, &bg, &[]);
             pass.dispatch_workgroups(rect.width().div_ceil(8), rect.height().div_ceil(8), 1);
         }
-        enc.copy_buffer_to_buffer(&dest, 0, &readback, 0, dest.size());
-        let index = self.queue.submit([enc.finish()]);
+        self.timings.resolve_cpu += lap(&mut t);
+        self.queue.submit([enc.finish()]);
         self.timings.submits += 1;
         if let Some(e) = block_on(scope.pop()) {
             return Err(Skip::Fatal(Error::Gpu(e.to_string())));
         }
-        let mut out = self.map_read(&readback, index)?;
-        self.timings.readback += lap(&mut t);
-        self.timings.readback_bytes += out.len() as u64;
-        out.truncate(extent as usize);
-        if !mem.write_bytes(base, &out) {
-            return unsupported(format!("resolve destination 0x{base:08X} is not writable"));
+        // A software driver finishes the rendering before it here.
+        self.timings.gpu_wait += lap(&mut t);
+        let m = &mut self.mirrors[i];
+        m.dirty = Some(m.dirty.map_or((lo, hi), |(a, b)| (a.min(lo), b.max(hi))));
+        for k in m.views.values_mut().filter(|k| lo < k.hi && k.lo < hi) {
+            // Tiled 32bpp rows 32n..32n+32 are bytes block*n..block*(n+1).
+            let y0 = (lo.saturating_sub(k.lo) / k.block * 32) as u32;
+            let y1 = ((hi - k.lo).div_ceil(k.block) * 32).min(u64::from(k.tex.height())) as u32;
+            k.stale = Some(k.stale.map_or((y0, y1), |(a, b)| (a.min(y0), b.max(y1))));
         }
+        self.forget_guest(lo, hi);
         self.timings.resolve_cpu += lap(&mut t);
         Ok(())
     }
@@ -3164,19 +3614,36 @@ impl Drawer {
     /// endian of the last resolve to that address (a game may resolve with
     /// any of them), else k8in32.
     fn front_buffer(
+        &mut self,
+        addr: u32,
+        width: u32,
+        height: u32,
+        mem: &mut Tracked,
+    ) -> Result<Result<Frame, String>, Error> {
+        use xenon_texture::tile;
+        if width == 0 || height == 0 || width > 8192 || height > 8192 {
+            return Ok(Err(format!("front buffer size {width}x{height}")));
+        }
+        let pitch = tile::align_to_tile(width);
+        let extent = match tile::tiled_extent_2d(width, height, pitch, 4) {
+            Ok(e) => e,
+            Err(e) => return Ok(Err(e.to_string())),
+        };
+        let addr = addr & PHYSICAL_MASK;
+        self.sync(mem, u64::from(addr), u64::from(addr) + u64::from(extent))?;
+        Ok(self.detile_front_buffer(addr, width, height, pitch, extent, mem))
+    }
+
+    fn detile_front_buffer(
         &self,
         addr: u32,
         width: u32,
         height: u32,
-        mem: &dyn GuestMemory,
+        pitch: u32,
+        extent: u32,
+        mem: &Tracked,
     ) -> Result<Frame, String> {
         use xenon_texture::tile;
-        if width == 0 || height == 0 || width > 8192 || height > 8192 {
-            return Err(format!("front buffer size {width}x{height}"));
-        }
-        let pitch = tile::align_to_tile(width);
-        let extent = tile::tiled_extent_2d(width, height, pitch, 4).map_err(|e| e.to_string())?;
-        let addr = addr & PHYSICAL_MASK;
         let mut raw = mem
             .read_bytes(addr, extent as usize)
             .ok_or_else(|| format!("front buffer at 0x{addr:08X} not readable"))?;
