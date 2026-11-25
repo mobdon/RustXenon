@@ -424,7 +424,7 @@ pub struct Timings {
     /// Draws whose constants block equals the last one staged in the same
     /// batch, bound from there instead of staged again.
     pub consts_reused: u32,
-    /// Draws that bound a texture bind group made earlier in their batch.
+    /// Draws that bound a texture bind group made earlier in their replay.
     pub texture_groups_reused: u32,
 }
 
@@ -913,9 +913,11 @@ pub struct Drawer {
     samplers: HashMap<([u8; 3], u8, u8, u8, u32), wgpu::Sampler>,
     /// Draws recorded but not yet submitted (see [`Batch`]).
     batch: Option<Batch>,
-    /// Texture bind groups made in the batch, by texture slot mask and the
-    /// slots' views and samplers. Cleared with the batch, so they keep
-    /// nothing alive past the batch that already holds them.
+    /// Texture bind groups by texture slot mask and the slots' views and
+    /// samplers. Kept across flushes (a new texture has a new view, so a
+    /// stale entry never matches); cleared at the end of a replay, when
+    /// textures are evicted and past [`TEXTURE_GROUP_CAP`], so they keep
+    /// evicted textures alive no longer than that.
     texture_groups: HashMap<TextureGroupKey, wgpu::BindGroup>,
     /// Group 0 bind groups over `arena`, by the sizes of the four slices
     /// they bind (at dynamic offsets). Cleared when the arena is replaced.
@@ -1054,6 +1056,9 @@ type PassKey = ([Option<RenderTargetKey>; 4], Option<RenderTargetKey>);
 
 /// Group 0 bind groups kept for the arena, one per set of slice sizes.
 const ARENA_GROUP_CAP: usize = 4096;
+
+/// Texture bind groups kept between evictions and replay ends.
+const TEXTURE_GROUP_CAP: usize = 4096;
 
 /// Smallest draw upload arena; it grows to fit a larger draw.
 const ARENA_MIN: u64 = 16 << 20;
@@ -2197,7 +2202,6 @@ impl Drawer {
     fn flush(&mut self) -> Result<(), Skip> {
         // The arena upload counts as submit time too.
         let t = Instant::now();
-        self.texture_groups.clear();
         if let (Some(arena), false) = (&self.arena, self.staged.is_empty()) {
             // Ordered on the queue after the work already submitted, which
             // reads only bytes before `staged_base` (or before a wrap).
@@ -3623,6 +3627,8 @@ impl Drawer {
             .map(|(k, &(_, len, used))| (used, len, *k))
             .collect();
         by_age.sort_unstable_by_key(|e| e.0);
+        // Groups hold their views; drop them so evicted textures go too.
+        self.texture_groups.clear();
         // shortcut: the evicted-key set only feeds a counter; cleared
         // when large, which undercounts re-uploads after that.
         if self.texture_evicted.len() > 1 << 16 {
@@ -4179,6 +4185,9 @@ impl Drawer {
                 })
             })
             .clone();
+        if self.texture_groups.len() >= TEXTURE_GROUP_CAP {
+            self.texture_groups.clear();
+        }
         let g1 = match self.texture_groups.entry((tex_mask, textures)) {
             Entry::Occupied(g) => {
                 self.timings.texture_groups_reused += 1;

@@ -627,3 +627,27 @@ fn cpu_resolve_readback_counts_as_resolve_submit() {
     assert_eq!(t.submits_by_site.iter().sum::<u32>(), t.submits, "{t:?}");
     assert_eq!(t.submits_by_site[0], 1, "{t:?}");
 }
+
+/// A texture bind group outlives the batch: draws on either side of a
+/// resolve that sample the same texture share it.
+#[test]
+fn texture_bind_group_is_reused_across_a_resolve() {
+    let Some(mut d) = drawer() else { return };
+    let mut mem = memory();
+    let green = green_texture_quad(&mut mem);
+    let mut s = Stream::default();
+    s.setup()
+        .shader(false, &vs_uv())
+        .shader(true, &ps_texture(1))
+        .regs(SHADER_CONSTANT_FETCH + 6, &green)
+        .vertex_fetch(0, VERTS + 0x100, 20)
+        .draw_auto(PRIM_QUAD_LIST, 4)
+        .resolve(&mut mem, W, H, true, None)
+        .draw_auto(PRIM_QUAD_LIST, 4);
+    let report = run(&mut d, &s, &mut mem);
+    assert_eq!((report.draws, report.resolves), (2, 1), "{report:?}");
+    assert!(report.unsupported.is_empty(), "{report:?}");
+    assert_eq!(report.timings.texture_groups_reused, 1, "{report:?}");
+    let img = d.read_render_target(COLOR_KEY, 0, 0, W, H).unwrap();
+    assert_eq!(px(&img, W, 40, 40), GREEN);
+}
