@@ -397,6 +397,14 @@ pub struct Timings {
     /// evicted, and the textures it evicted.
     pub textures_reuploaded: u32,
     pub textures_evicted: u32,
+    /// `textures_uploaded` and `texture_bytes` by host format: `Rgba8Unorm`,
+    /// BC blocks, `Rgba16Float`, `Rgba32Float`, other.
+    pub uploads_by_format: [(u32, u64); 5],
+    /// Draws whose vertex window lies in one already staged in the same
+    /// batch, bound from there instead of read and staged again; and the
+    /// guest bytes of their windows.
+    pub windows_reused: u32,
+    pub reused_bytes: u64,
 }
 
 impl std::ops::AddAssign<&Timings> for Timings {
@@ -426,6 +434,12 @@ impl std::ops::AddAssign<&Timings> for Timings {
         self.kept_hashed_bytes += t.kept_hashed_bytes;
         self.textures_reuploaded += t.textures_reuploaded;
         self.textures_evicted += t.textures_evicted;
+        for (a, b) in self.uploads_by_format.iter_mut().zip(t.uploads_by_format) {
+            a.0 += b.0;
+            a.1 += b.1;
+        }
+        self.windows_reused += t.windows_reused;
+        self.reused_bytes += t.reused_bytes;
     }
 }
 
@@ -771,7 +785,15 @@ fn texture_bytes(t: &wgpu::Texture) -> u64 {
         u64::from,
     );
     let e = t.size();
-    texel * u64::from(e.width * e.height * e.depth_or_array_layers * t.sample_count())
+    // Block-compressed formats count bytes per block, not per texel.
+    let (bw, bh) = f.block_dimensions();
+    texel
+        * u64::from(
+            e.width.div_ceil(bw)
+                * e.height.div_ceil(bh)
+                * e.depth_or_array_layers
+                * t.sample_count(),
+        )
 }
 
 /// Bound on the host memory of render targets (EDRAM is 10 MB; host
@@ -783,7 +805,8 @@ const TARGET_CAP: u64 = 256 << 20;
 pub struct Drawer {
     device: wgpu::Device,
     queue: wgpu::Queue,
-    /// Adapter name and backend, for logs.
+    /// Adapter name, backend and device type (a software one is `Cpu`),
+    /// for logs.
     pub adapter: String,
     /// Bound on every GPU wait and buffer map.
     pub timeout: Duration,
@@ -848,6 +871,10 @@ pub struct Drawer {
     staged: Vec<u8>,
     arena: Option<wgpu::Buffer>,
     arena_align: u64,
+    /// Vertex windows staged in the batch: guest physical `[lo, hi)` and
+    /// their (offset, size) in `arena`. Cleared at each flush, as the next
+    /// batch overwrites the arena, and dropped where guest memory changes.
+    window_memo: Vec<(u64, u64, (u64, u64))>,
     max_buffer: u64,
     /// 1x1 texture of zeros bound for a slot without a usable texture.
     zero_texture: wgpu::TextureView,
@@ -886,6 +913,10 @@ pub struct Drawer {
     /// Bytes of decoded guest textures the texture cache keeps before
     /// evicting the least recently used ones (default 256 MiB).
     pub texture_cache_limit: u64,
+    /// Upload unsigned DXT textures as BC blocks for the host to decode
+    /// (default: whether the adapter has BC textures). Turning it on
+    /// without them makes those uploads fail.
+    pub bc_textures: bool,
     timings: Timings,
     uncaptured: Arc<Mutex<Vec<String>>>,
     max_dim: u32,
@@ -1140,14 +1171,15 @@ fn filter(f: u8) -> wgpu::FilterMode {
 }
 
 impl Drawer {
-    /// Opens a headless device: Vulkan or GL, default power preference,
-    /// first without and then with `force_fallback_adapter`.
+    /// Opens a headless device: Vulkan or GL, preferring the discrete GPU
+    /// (a desktop's integrated one would otherwise be picked first), first
+    /// without and then with `force_fallback_adapter`.
     pub fn new() -> Result<Drawer, Error> {
         let mut desc = wgpu::InstanceDescriptor::new_without_display_handle();
         desc.backends = wgpu::Backends::VULKAN | wgpu::Backends::GL;
         let instance = wgpu::Instance::new(desc);
         let options = |force_fallback_adapter| wgpu::RequestAdapterOptions {
-            power_preference: wgpu::PowerPreference::default(),
+            power_preference: wgpu::PowerPreference::HighPerformance,
             force_fallback_adapter,
             compatible_surface: None,
             apply_limit_buckets: false,
@@ -1187,7 +1219,8 @@ impl Drawer {
         });
         let snorm16_blend = snorm16
             && snorm16_all(&|f| f.flags.contains(wgpu::TextureFormatFeatureFlags::BLENDABLE));
-        let mut required_features = adapter.features() & wgpu::Features::FLOAT32_FILTERABLE;
+        let mut required_features = adapter.features()
+            & (wgpu::Features::FLOAT32_FILTERABLE | wgpu::Features::TEXTURE_COMPRESSION_BC);
         required_features.set(wgpu::Features::DEPTH32FLOAT_STENCIL8, float_stencil);
         required_features.set(snorm16_features, snorm16);
         let (device, queue) = block_on(adapter.request_device(&wgpu::DeviceDescriptor {
@@ -1259,7 +1292,7 @@ impl Drawer {
         Ok(Drawer {
             device,
             queue,
-            adapter: format!("{} ({:?})", info.name, info.backend),
+            adapter: format!("{} ({:?}, {:?})", info.name, info.backend, info.device_type),
             timeout: DEFAULT_TIMEOUT,
             regs: RegisterFile::default(),
             vs: None,
@@ -1292,6 +1325,7 @@ impl Drawer {
             batch: None,
             staged: Vec::new(),
             arena: None,
+            window_memo: Vec::new(),
             arena_align: u64::from(
                 limits
                     .min_uniform_buffer_offset_alignment
@@ -1310,6 +1344,7 @@ impl Drawer {
             decode_pipeline: None,
             skip_resolve_writeback: false,
             texture_cache_limit: TEXTURE_CACHE_LIMIT,
+            bc_textures: required_features.contains(wgpu::Features::TEXTURE_COMPRESSION_BC),
             timings: Timings::default(),
             uncaptured,
             max_dim: limits.max_texture_dimension_2d,
@@ -1368,6 +1403,35 @@ impl Drawer {
             self.modules.len(),
             wgsl.len(),
             wgsl.iter().sum::<usize>().div_ceil(1024),
+        ) + &self.wgpu_line()
+    }
+
+    /// What wgpu itself holds: live objects (a count that keeps rising is a
+    /// leak) and the GPU allocator's reserved against allocated bytes (a gap
+    /// that keeps widening is memory kept after frees).
+    fn wgpu_line(&self) -> String {
+        let h = self.device.get_internal_counters().hal;
+        let alloc = self.device.generate_allocator_report().map_or_else(
+            || "no allocator report".to_string(),
+            |r| {
+                format!(
+                    "GPU memory {} MB used of {} MB reserved in {} blocks",
+                    r.total_allocated_bytes >> 20,
+                    r.total_reserved_bytes >> 20,
+                    r.blocks.len()
+                )
+            },
+        );
+        format!(
+            "; wgpu live: textures {} MB, buffers {} ({} MB), views {}, bind groups {}, pipelines {}, shaders {}; {alloc}",
+            // hal's texture count misses some textures on Vulkan; its bytes do not.
+            h.texture_memory.read() >> 20,
+            h.buffers.read(),
+            h.buffer_memory.read() >> 20,
+            h.texture_views.read(),
+            h.bind_groups.read(),
+            h.render_pipelines.read() + h.compute_pipelines.read(),
+            h.shader_modules.read(),
         )
     }
 
@@ -1447,6 +1511,7 @@ impl Drawer {
         });
         self.batch = None;
         self.staged.clear();
+        self.window_memo.clear();
         // Resolves done before an error still reach guest memory.
         let kept = self.finish_mirrors(&mut mem);
         done?;
@@ -1562,6 +1627,7 @@ impl Drawer {
     fn forget_guest(&mut self, lo: u64, hi: u64) {
         self.texture_memo
             .retain(|_, &mut (_, a, b)| b <= lo || hi <= a);
+        self.window_memo.retain(|&(a, b, _)| b <= lo || hi <= a);
     }
 
     /// Hash of one [`KEPT_BLOCK`] of a kept resolve.
@@ -1764,6 +1830,7 @@ impl Drawer {
 
     /// Submits the batched draws, with their staged buffers.
     fn flush(&mut self) -> Result<(), Skip> {
+        self.window_memo.clear();
         if let (Some(arena), false) = (&self.arena, self.staged.is_empty()) {
             self.queue.write_buffer(arena, 0, &self.staged);
             self.staged.clear();
@@ -1824,6 +1891,16 @@ impl Drawer {
             self.staged.resize(end.next_multiple_of(align) as usize, 0);
         }
         Ok(out)
+    }
+
+    /// Whether `parts` can be staged without submitting the batch first.
+    fn fits(&self, parts: &[&[u8]]) -> bool {
+        let size = |p: &[u8]| (p.len() as u64).max(4).next_multiple_of(4);
+        let need: u64 = parts
+            .iter()
+            .map(|p| size(p).next_multiple_of(self.arena_align))
+            .sum();
+        self.staged.len() as u64 + need <= self.arena.as_ref().map_or(0, |b| b.size())
     }
 
     /// The batch's render pass, begun on `key`'s targets unless the current
@@ -2592,14 +2669,17 @@ impl Drawer {
             .clone()
     }
 
-    /// Uploads the guest memory the vertex fetch constants in `mask` point
-    /// at, as one window. Returns the buffer and the window's base address.
+    /// Reads the guest memory the vertex fetch constants in `mask` point
+    /// at, as one window. Returns its bytes (none for no window) and base
+    /// address; or, when a window staged in this batch holds it, no bytes,
+    /// that window's base and its memo entry, with this window's size.
+    #[allow(clippy::type_complexity)]
     fn guest_window(
         &mut self,
         mask: u128,
         mem: &mut Tracked,
         report: &mut Report,
-    ) -> Result<(Vec<u8>, u32), Skip> {
+    ) -> Result<(Vec<u8>, u32, Option<((u64, u64, (u64, u64)), u64)>), Skip> {
         let (mut lo, mut hi) = (u64::MAX, 0u64);
         for k in (0..96).filter(|k| mask & (1u128 << k) != 0) {
             let vf = self.regs.vertex_fetch(k);
@@ -2613,8 +2693,12 @@ impl Drawer {
         }
         report.timings.guest_bytes += hi.saturating_sub(lo);
         let (base, bytes) = if lo >= hi {
-            (0, vec![0; 4])
+            (0, Vec::new())
         } else {
+            let mut memo = self.window_memo.iter().rev();
+            if let Some(&w) = memo.find(|&&(a, b, _)| a <= lo && hi <= b) {
+                return Ok((Vec::new(), w.0 as u32, Some((w, hi - lo))));
+            }
             if hi - lo > self.max_storage {
                 return unsupported(format!(
                     "vertex data window of {} bytes is larger than the storage buffer limit",
@@ -2629,7 +2713,7 @@ impl Drawer {
             };
             (lo as u32, b)
         };
-        Ok((bytes, base))
+        Ok((bytes, base, None))
     }
 
     fn buffer(&self, label: &str, bytes: &[u8], usage: wgpu::BufferUsages) -> wgpu::Buffer {
@@ -2723,12 +2807,11 @@ impl Drawer {
         };
         let (w, h) = (fetch.width(), fetch.height());
         let pitch = xenon_texture::tile::align_to_tile(fetch.pitch_texels());
-        let signed = fetch.sign.contains(&1);
         if !fetch.tiled
             || fetch.format.data_format() != F::K8_8_8_8
             || fetch.dimension != Dimension::D2OrStacked
             || fetch.stacked
-            || host_texture_format(fetch.format, signed, self.float32_filterable)
+            || host_texture_format(fetch.format, fetch.sign, self.float32_filterable)
                 != wgpu::TextureFormat::Rgba8Unorm
             || !(addr - self.mirrors[i].lo).is_multiple_of(4)
             || pitch < w
@@ -2872,7 +2955,8 @@ impl Drawer {
 
     /// Host texture of fetch constant slot `n`, from the cache or decoded.
     /// Formats whose values do not fit 8-bit unorm, and fetches with a signed
-    /// component, upload as floats. The cache key holds the whole fetch
+    /// component, upload as floats; unsigned DXT1..5 as BC blocks where
+    /// [`bc_blocks`] takes them. The cache key holds the whole fetch
     /// constant (sign bits included), so signed and unsigned views of the
     /// same bytes are separate textures.
     fn guest_texture(
@@ -2904,8 +2988,16 @@ impl Drawer {
             return Ok(view);
         }
         let signed = fetch.sign.contains(&1);
-        let host = host_texture_format(fetch.format, signed, self.float32_filterable);
-        let (width, height, data) = if host == wgpu::TextureFormat::Rgba8Unorm {
+        let mut host = host_texture_format(fetch.format, fetch.sign, self.float32_filterable);
+        let bc = if self.bc_textures && !signed {
+            bc_blocks(fetch, &bytes).map_err(|e| e.to_string())?
+        } else {
+            None
+        };
+        let (width, height, data) = if let Some((format, blocks)) = bc {
+            host = format;
+            (fetch.width(), fetch.height(), blocks)
+        } else if host == wgpu::TextureFormat::Rgba8Unorm {
             let img = xenon_texture::decode_base_level(fetch, &bytes).map_err(|e| e.to_string())?;
             (img.width, img.height, img.rgba8)
         } else {
@@ -2931,6 +3023,18 @@ impl Drawer {
         };
         report.timings.textures_uploaded += 1;
         report.timings.texture_bytes += data.len() as u64;
+        let bucket = match host {
+            wgpu::TextureFormat::Rgba8Unorm => 0,
+            _ if host.is_compressed() => 1,
+            wgpu::TextureFormat::Rgba16Float => 2,
+            wgpu::TextureFormat::Rgba32Float => 3,
+            _ => 4,
+        };
+        let by = &mut report.timings.uploads_by_format[bucket];
+        by.0 += 1;
+        by.1 += data.len() as u64;
+        // Rows of blocks: a BC row holds four rows of texels.
+        let rows = height / host.block_dimensions().1;
         let tex = self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("guest texture"),
             size,
@@ -2951,8 +3055,8 @@ impl Drawer {
             &data,
             wgpu::TexelCopyBufferLayout {
                 offset: 0,
-                bytes_per_row: Some(data.len() as u32 / height),
-                rows_per_image: Some(height),
+                bytes_per_row: Some(data.len() as u32 / rows),
+                rows_per_image: Some(rows),
             },
             size,
         );
@@ -3351,7 +3455,7 @@ impl Drawer {
         };
         self.timings.shaders += lap(&mut t);
 
-        let (window, window_base) = self.guest_window(vf_mask, mem, report)?;
+        let (mut window, window_base, staged) = self.guest_window(vf_mask, mem, report)?;
         let consts = self.consts(window_base);
         let epi = to_bytes(&state::epilogue(&self.regs, w, h));
         self.timings.guest_data += lap(&mut t);
@@ -3364,7 +3468,35 @@ impl Drawer {
         // draw 6 host vertices per rectangle without an index buffer.
         let idx_bytes = to_bytes(&idx);
         let rect_indices: &[u8] = if rect_list { &idx_bytes } else { &[] };
-        let slices = self.stage(&[&window, &consts, &epi, rect_indices, &idx_bytes])?;
+        let rest = [&consts[..], &epi, rect_indices, &idx_bytes];
+        let slices = match staged {
+            // Unless the batch was submitted since (the arena is then
+            // overwritten) or would be to stage the rest.
+            Some((w, len)) if self.window_memo.contains(&w) && self.fits(&rest) => {
+                self.timings.windows_reused += 1;
+                self.timings.reused_bytes += len;
+                let mut s = vec![w.2];
+                s.extend(self.stage(&rest)?);
+                s
+            }
+            _ => {
+                if let Some(((lo, hi, _), _)) = staged {
+                    self.sync(mem, lo, hi)?;
+                    let Some(b) = mem.read_bytes(lo as u32, (hi - lo) as usize) else {
+                        return unsupported(format!("vertex data at 0x{lo:08X} not readable"));
+                    };
+                    window = b;
+                }
+                let mut parts = vec![&window[..]];
+                parts.extend(rest);
+                let s = self.stage(&parts)?;
+                if !window.is_empty() {
+                    let lo = u64::from(window_base);
+                    self.window_memo.push((lo, lo + window.len() as u64, s[0]));
+                }
+                s
+            }
+        };
         let arena = self.arena.clone().expect("staged");
         let binding = |i: usize| {
             let (offset, size) = slices[i];
@@ -4022,6 +4154,59 @@ impl Drawer {
     }
 }
 
+/// The base level of an unsigned DXT1, DXT2/3 or DXT4/5 `fetch` as linear
+/// BC1, BC2 or BC3 blocks (endian swapped and detiled, as the CPU decoder
+/// reads them), which the host decodes to the CPU decoder's texels (up to
+/// its rounding of interpolated ones); `None` for the CPU path. Only the
+/// identity swizzle passes (a wgpu view cannot swizzle), and only whole
+/// blocks: a padded host texture would move normalised coordinates and
+/// clamping. DXN stays on the CPU path, which repeats Y into Z and W where
+/// BC5 gives 0 and 1.
+fn bc_blocks(
+    fetch: &xenon_texture::TextureFetch,
+    bytes: &[u8],
+) -> Result<Option<(wgpu::TextureFormat, Vec<u8>)>, xenon_texture::Error> {
+    use xenon_texture::{tile, TextureFormat as F};
+    let (format, bpb) = match fetch.format.data_format() {
+        F::Dxt1 => (wgpu::TextureFormat::Bc1RgbaUnorm, 8),
+        F::Dxt2_3 => (wgpu::TextureFormat::Bc2RgbaUnorm, 16),
+        F::Dxt4_5 => (wgpu::TextureFormat::Bc3RgbaUnorm, 16),
+        _ => return Ok(None),
+    };
+    const IDENTITY: u16 = (1 << 3) | (2 << 6) | (3 << 9);
+    let (w, h) = (fetch.width(), fetch.height());
+    if fetch.swizzle & 0xFFF != IDENTITY || w % 4 != 0 || h % 4 != 0 {
+        return Ok(None);
+    }
+    let (wb, hb) = (w / 4, h / 4);
+    let pitch = tile::align_to_tile(fetch.pitch_texels().div_ceil(4));
+    let extent = if fetch.tiled {
+        tile::tiled_extent_2d(wb, hb, pitch, bpb)? as usize
+    } else {
+        ((pitch * (hb - 1) + wb) * bpb) as usize
+    };
+    let Some(raw) = bytes.get(..extent) else {
+        return Err(xenon_texture::Error::TooShort {
+            needed: extent,
+            got: bytes.len(),
+        });
+    };
+    let mut raw = raw.to_vec();
+    xenon_texture::endian::swap_in_place(&mut raw, fetch.endian);
+    let blocks = if fetch.tiled {
+        tile::detile_2d(&raw, wb, hb, pitch, bpb)?
+    } else {
+        // Index rows rather than chunk by pitch: a single linear row may have
+        // a pitch below its width, even 0.
+        let (row, pitch) = ((wb * bpb) as usize, (pitch * bpb) as usize);
+        (0..hb as usize)
+            .flat_map(|y| &raw[y * pitch..][..row])
+            .copied()
+            .collect()
+    };
+    Ok(Some((format, blocks)))
+}
+
 /// Host format of a guest texture: `Rgba16Float` for half floats,
 /// `Rgba32Float` for depth, 16-bit unorm and 32-bit floats (16-bit unorm and
 /// 24-bit depth need more than a half's 11 bits), `Rgba8Unorm` for the rest.
@@ -4031,16 +4216,21 @@ impl Drawer {
 /// a magnitude of 65520 or more become infinity and values below about 2^-25
 /// flush to zero.
 ///
-/// `signed` (a fetch sign of 1 on any component) moves the 8-bit formats to
-/// the wide float format too: the decoder writes signed values in -1..1,
-/// which the host then filters directly, and the texture's unsigned
-/// components keep their 8-bit values exactly (a half would not).
+/// A fetch sign of 1 (signed) on any component moves the 8-bit formats to
+/// a float format too: the decoder writes signed values in -1..1, which the
+/// host then filters directly. With every component signed that is
+/// `Rgba16Float`: n/127 (and the other fields of 11 bits or less) round by
+/// at most 2^-12 relative, far below a step. Otherwise it is the wide
+/// format, so the texture's unsigned components keep their 8-bit values
+/// exactly (a half would not, and the biased and gamma conversions in the
+/// shader would carry the rounding to the result).
 fn host_texture_format(
     format: xenon_texture::TextureFormat,
-    signed: bool,
+    sign: [u8; 4],
     float32: bool,
 ) -> wgpu::TextureFormat {
     use xenon_texture::TextureFormat as F;
+    let signed = sign.contains(&1);
     let wide = if float32 {
         wgpu::TextureFormat::Rgba32Float
     } else {
@@ -4057,6 +4247,7 @@ fn host_texture_format(
         | F::K32_32Float
         | F::K32_32_32Float
         | F::K32_32_32_32Float => wide,
+        _ if sign == [1; 4] => wgpu::TextureFormat::Rgba16Float,
         _ if signed => wide,
         _ => wgpu::TextureFormat::Rgba8Unorm,
     }
@@ -4228,24 +4419,39 @@ mod tests {
     fn host_texture_formats() {
         use wgpu::TextureFormat as H;
         use xenon_texture::TextureFormat as F;
-        assert_eq!(host_texture_format(F::K8_8_8_8, false, true), H::Rgba8Unorm);
-        assert_eq!(host_texture_format(F::K8_8_8_8, true, true), H::Rgba32Float);
-        assert_eq!(host_texture_format(F::Dxt1, true, false), H::Rgba16Float);
-        assert_eq!(host_texture_format(F::Dxt1, false, true), H::Rgba8Unorm);
+        let (unsigned, signed, mixed) = ([0; 4], [1; 4], [1, 0, 3, 1]);
         assert_eq!(
-            host_texture_format(F::K16Expand, false, true),
+            host_texture_format(F::K8_8_8_8, unsigned, true),
+            H::Rgba8Unorm
+        );
+        assert_eq!(
+            host_texture_format(F::K8_8_8_8, signed, true),
             H::Rgba16Float
         );
         assert_eq!(
-            host_texture_format(F::K24_8Float, false, true),
+            host_texture_format(F::K8_8_8_8, mixed, true),
+            H::Rgba32Float
+        );
+        assert_eq!(host_texture_format(F::Dxt1, signed, true), H::Rgba16Float);
+        assert_eq!(host_texture_format(F::Dxt1, mixed, false), H::Rgba16Float);
+        assert_eq!(host_texture_format(F::Dxt1, unsigned, true), H::Rgba8Unorm);
+        assert_eq!(
+            host_texture_format(F::K16Expand, unsigned, true),
+            H::Rgba16Float
+        );
+        assert_eq!(
+            host_texture_format(F::K24_8Float, unsigned, true),
             H::Rgba32Float
         );
         assert_eq!(
-            host_texture_format(F::K24_8Float, false, false),
+            host_texture_format(F::K24_8Float, unsigned, false),
             H::Rgba16Float
         );
-        assert_eq!(host_texture_format(F::K16_16, false, true), H::Rgba32Float);
-        assert_eq!(host_texture_format(F::K16_16, true, true), H::Rgba32Float);
+        assert_eq!(
+            host_texture_format(F::K16_16, unsigned, true),
+            H::Rgba32Float
+        );
+        assert_eq!(host_texture_format(F::K16_16, signed, true), H::Rgba32Float);
     }
 
     #[test]
