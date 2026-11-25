@@ -508,18 +508,24 @@ pub fn run(sha256: &str, regs: &[fn(&mut Runtime)]) -> ExitCode {
 
     let guarded = args.iter().any(|a| a == "--guard-memory")
         || std::env::var_os("XENON_GUARD_MEMORY").is_some();
+    // Write watch is on unless XENON_WRITE_WATCH=0; where the OS cannot
+    // watch, memory is allocated as before.
+    let watch_env = std::env::var_os("XENON_WRITE_WATCH");
+    let watch = watch_env.as_ref().map_or(true, |v| v != "0");
     let mem = if guarded {
         log("guarded guest memory: a never-allocated address stops the run");
-        if std::env::var_os("XENON_WRITE_WATCH").is_some_and(|v| v != "0") {
+        if watch_env.is_some() && watch {
             log("XENON_WRITE_WATCH: not used with guarded guest memory");
         }
         GuestMemory::new_guarded(GUEST_MEMORY)
-    } else if std::env::var_os("XENON_WRITE_WATCH").is_some_and(|v| v != "0") {
+    } else if watch {
         let mem = GuestMemory::new_watched(GUEST_MEMORY);
         if mem.watched() {
-            log("watched guest memory: the drawer re-reads only what the CPU wrote");
+            log("watched guest memory: the drawer re-reads only what the CPU wrote (XENON_WRITE_WATCH=0 turns it off)");
         } else {
-            log("XENON_WRITE_WATCH: the OS could not watch guest memory, ignored");
+            if watch_env.is_some() {
+                log("XENON_WRITE_WATCH: the OS could not watch guest memory, ignored");
+            }
             GUEST_IN_HEAP.store(GUEST_MEMORY, Ordering::Relaxed);
         }
         mem
