@@ -7,6 +7,7 @@
 
 use super::video::GPU_REGS;
 use super::*;
+use std::sync::Arc;
 use xenon_gpu::{Command, Endian, EventKind, GuestRead, Recorder, WaitRegMem};
 
 pub const CP_RB_RPTR: u32 = 0x01C4;
@@ -38,13 +39,16 @@ impl GuestRead for Physical<'_> {
         Some(self.0.mem.read_u32(gpu_to_cpu(addr)))
     }
     fn read_bytes(&self, addr: u32, len: usize) -> Option<Vec<u8>> {
-        let a = gpu_to_cpu(addr);
-        if a as u64 + len as u64 > 0xC000_0000 {
-            return None;
-        }
         let mut b = vec![0; len];
-        self.0.mem.read_bytes(a, &mut b);
-        Some(b)
+        self.read_into(addr, &mut b).then_some(b)
+    }
+    fn read_into(&self, addr: u32, out: &mut [u8]) -> bool {
+        let a = gpu_to_cpu(addr);
+        if a as u64 + out.len() as u64 > 0xC000_0000 {
+            return false;
+        }
+        self.0.mem.read_bytes(a, out);
+        true
     }
 }
 
@@ -80,12 +84,56 @@ pub struct Gpu {
     pub vblanks: u32,
     /// When set, applied commands are also kept here (see [`capture`]).
     pub keep: Option<Vec<Command>>,
-    /// Renders every command when set (`--render`).
-    pub drawer: Option<xenon_draw::Drawer>,
-    /// The newest frame the drawer produced, and how many it produced.
-    pub last_frame: Option<xenon_draw::Frame>,
-    pub frames_drawn: u32,
+    /// Renders every command when set (`--render`), see [`Gpu::set_drawer`].
+    draw: Option<Draw>,
+    /// The newest frame the drawer produced.
+    pub last_frame: Arc<Mutex<Option<xenon_draw::Frame>>>,
+}
+
+enum Draw {
+    Inline(Box<DrawSide>),
+    /// Batches go to the draw thread through this queue.
+    Thread(Arc<xenon_gpu::ahead::Ahead<Vec<Command>>>),
+}
+
+/// The drawer and what it reports, on the GPU thread or the draw thread.
+struct DrawSide {
+    drawer: xenon_draw::Drawer,
     stats: DrawStats,
+    frames_drawn: u32,
+    last_frame: Arc<Mutex<Option<xenon_draw::Frame>>>,
+}
+
+impl DrawSide {
+    /// Replays one ring span; false once the drawer stopped.
+    fn replay(&mut self, rt: &Runtime, cmds: &[Command]) -> bool {
+        // Every 30 s, what the drawer holds, to tell cache growth from a leak.
+        static NEXT: AtomicU32 = AtomicU32::new(0);
+        let now = crate::ms();
+        if now >= NEXT.load(Ordering::Relaxed) {
+            NEXT.store(now + 30_000, Ordering::Relaxed);
+            crate::log(&self.drawer.memory_line());
+        }
+        let start = std::time::Instant::now();
+        match self.drawer.replay(cmds, &mut Physical(rt)) {
+            Ok(r) => {
+                self.stats.add(&r, start.elapsed());
+                for u in r.unsupported.iter().chain(&r.warnings) {
+                    capture::note(u);
+                }
+                for f in r.frames {
+                    self.frames_drawn += 1;
+                    capture::frame_done(self.frames_drawn, &f);
+                    *self.last_frame.lock().unwrap() = Some(f);
+                }
+                true
+            }
+            Err(e) => {
+                crate::log(&format!("[draw] stopped: {e}"));
+                false
+            }
+        }
+    }
 }
 
 /// Drawer replays summed over a window, logged every [`DrawStats::EVERY`].
@@ -137,9 +185,9 @@ impl DrawStats {
             "[draw] {:.1} s: {} frames, {} replays; ms per {per}: drawer {:.0} = shaders {:.0}, \
              guest data {:.0}, textures {:.0}, submit {:.0}, gpu wait {:.0}, readback {:.0}, \
              resolve cpu {:.0}, clears {:.0}, swap {:.0} (transfers {:.0}); per {per}: {} draws, \
-             {} resolves, {} submits, {} transfers ({} passes), readback {:.1} MB, \
+             {} resolves, {} submits ({} resolve, {} transfer, {} decode, {} flush/other), {} transfers ({} passes), readback {:.1} MB, \
              hashed {:.1} MB (kept resolves {:.1} MB), {} textures uploaded ({:.1} MB, {} evicted before), \
-             {} evicted, {} from kept resolves, {} pipelines created; guest data {:.1} MB; \
+             {} evicted, {} from kept resolves, {} pipelines created; guest data {:.1} MB ({} windows reused, {:.1} MB); \
              uploads by format: rgba8 {}, bc {}, f16 {}, f32 {}, other {}",
             window.as_secs_f64(),
             self.frames,
@@ -158,6 +206,10 @@ impl DrawStats {
             self.draws / n,
             self.resolves / n,
             t.submits / n,
+            t.submits_by_site[0] / n,
+            t.submits_by_site[1] / n,
+            t.submits_by_site[2] / n,
+            t.submits_by_site[3] / n,
             t.transfers / n,
             t.transfer_passes / n,
             mb(t.readback_bytes),
@@ -170,6 +222,8 @@ impl DrawStats {
             t.textures_kept / n,
             t.pipelines_created / n,
             mb(t.guest_bytes),
+            t.windows_reused / n,
+            mb(t.reused_bytes),
             by(0),
             by(1),
             by(2),
@@ -180,6 +234,51 @@ impl DrawStats {
 }
 
 impl Gpu {
+    /// Draws with `drawer` from now on. `XENON_DRAW_AHEAD=<frames>` (1 or
+    /// more) runs it on a thread of its own, the command processor going on
+    /// up to that many swaps ahead of it; unset or 0 draws inline. Ahead, a
+    /// title may reuse a buffer the drawer has not read yet, since fences
+    /// are written when the command processor passes them.
+    pub fn set_drawer(&mut self, rt: &Arc<Runtime>, drawer: xenon_draw::Drawer) {
+        let mut side = DrawSide {
+            drawer,
+            stats: DrawStats::default(),
+            frames_drawn: 0,
+            last_frame: self.last_frame.clone(),
+        };
+        let ahead = std::env::var("XENON_DRAW_AHEAD")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .unwrap_or(0);
+        if ahead == 0 {
+            self.draw = Some(Draw::Inline(Box::new(side)));
+            return;
+        }
+        // 256 ring spans between swaps bound what the queue holds.
+        let q = Arc::new(xenon_gpu::ahead::Ahead::<Vec<Command>>::new(ahead, 256));
+        let (q2, rt) = (q.clone(), rt.clone());
+        let spawned = std::thread::Builder::new()
+            .name("draw".into())
+            .spawn(move || {
+                while let Some((cmds, swaps)) = q2.pop() {
+                    let ok = side.replay(&rt, &cmds);
+                    q2.done(swaps);
+                    if !ok {
+                        q2.close();
+                    }
+                }
+            });
+        match spawned {
+            Ok(_) => {
+                crate::log(&format!(
+                    "[draw] on its own thread, up to {ahead} frames behind"
+                ));
+                self.draw = Some(Draw::Thread(q));
+            }
+            Err(e) => crate::log(&format!("[draw] no draw thread: {e}")),
+        }
+    }
+
     fn write_reg(&mut self, rt: &Runtime, i: u32, v: u32) {
         let mut v = v;
         if (SCRATCH_REG0..SCRATCH_REG0 + 8).contains(&i) {
@@ -228,32 +327,24 @@ impl Gpu {
         for c in &cmds {
             self.apply(rt, c, idle);
         }
-        if let Some(d) = self.drawer.as_mut() {
-            // Every 30 s, what the drawer holds, to tell cache growth from a leak.
-            static NEXT: AtomicU32 = AtomicU32::new(0);
-            let now = crate::ms();
-            if now >= NEXT.load(Ordering::Relaxed) {
-                NEXT.store(now + 30_000, Ordering::Relaxed);
-                crate::log(&d.memory_line());
+        let mut cmds = cmds;
+        let going = match &mut self.draw {
+            Some(Draw::Inline(d)) => d.replay(rt, &cmds),
+            Some(Draw::Thread(q)) => {
+                let swaps = cmds
+                    .iter()
+                    .filter(|c| matches!(c, Command::Swap { .. }))
+                    .count() as u32;
+                let batch = match self.keep {
+                    Some(_) => cmds.clone(),
+                    None => std::mem::take(&mut cmds),
+                };
+                q.push(batch, swaps)
             }
-            let start = std::time::Instant::now();
-            match d.replay(&cmds, &mut Physical(rt)) {
-                Ok(r) => {
-                    self.stats.add(&r, start.elapsed());
-                    for u in r.unsupported.iter().chain(&r.warnings) {
-                        capture::note(u);
-                    }
-                    for f in r.frames {
-                        self.frames_drawn += 1;
-                        capture::frame_done(self.frames_drawn, &f);
-                        self.last_frame = Some(f);
-                    }
-                }
-                Err(e) => {
-                    crate::log(&format!("[draw] stopped: {e}"));
-                    self.drawer = None;
-                }
-            }
+            None => true,
+        };
+        if !going {
+            self.draw = None;
         }
         if let Some(k) = self.keep.as_mut() {
             k.extend(cmds);
@@ -462,7 +553,8 @@ pub mod capture {
             }
             let frame = &kept[swaps[0] + 1..=swaps[1]];
             let out = dir.join(format!("t{}", t / 1000));
-            if let Some(f) = &g.last_frame {
+            // With the draw thread this frame can be up to its frames behind.
+            if let Some(f) = &*g.last_frame.lock().unwrap() {
                 let _ = std::fs::create_dir_all(&out);
                 match f.write_png(out.join("frame.png")) {
                     Ok(()) => crate::log(&format!(
@@ -647,6 +739,10 @@ mod tests {
         s.t.transfer_passes = 60;
         s.t.readback_bytes = 80_000_000;
         s.t.guest_bytes = 9_000_000;
+        s.t.submits = 280;
+        s.t.submits_by_site = [88, 38, 34, 120];
+        s.t.windows_reused = 900;
+        s.t.reused_bytes = 3_000_000;
         s.t.uploads_by_format = [(600, 200_000_000), (40, 8_000_000), (6, 0), (0, 0), (0, 0)];
         let line = s.line(ms(5000));
         assert!(
@@ -659,7 +755,8 @@ mod tests {
             "42 resolves",
             "6 transfers (30 passes)",
             "readback 40.0 MB",
-            "guest data 4.5 MB",
+            "140 submits (44 resolve, 19 transfer, 17 decode, 60 flush/other)",
+            "guest data 4.5 MB (450 windows reused, 1.5 MB)",
             "rgba8 300 (100.0 MB), bc 20 (4.0 MB), f16 3 (0.0 MB), f32 0 (0.0 MB), other 0",
         ] {
             assert!(line.contains(part), "{part}: {line}");

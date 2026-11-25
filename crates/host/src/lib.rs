@@ -411,7 +411,9 @@ what the kernel hands out, so a wild pointer stops the run with its address
 and every thread's last calls instead of reading zeros. XENON_CPU_PROFILE=1
 logs, every 5 s, the ms per frame each guest thread spends in its own code,
 in kernel calls and waiting, the top kernel calls by time, and a frame rate
-bound with drawing free; run it without --render to keep drawing off.";
+bound with drawing free; run it without --render to keep drawing off.
+XENON_DRAW_AHEAD=<frames> (with --render) draws on a thread of its own so the
+GPU command processor runs up to that many frames ahead of drawing.";
 
 fn opt(args: &[String], name: &str) -> Option<String> {
     args.iter()
@@ -510,6 +512,7 @@ pub fn run(sha256: &str, regs: &[fn(&mut Runtime)]) -> ExitCode {
         log("guarded guest memory: a never-allocated address stops the run");
         GuestMemory::new_guarded(GUEST_MEMORY)
     } else {
+        GUEST_IN_HEAP.store(GUEST_MEMORY, Ordering::Relaxed);
         GuestMemory::new(GUEST_MEMORY)
     };
     xenon_rt::guard::commit(image.base, image.data.len() as u32);
@@ -590,8 +593,6 @@ pub fn run(sha256: &str, regs: &[fn(&mut Runtime)]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// Counts that grow if something is never released: open handles, live
-/// guest threads and host resident memory.
 /// The system allocator, counting the bytes Rust code holds, so the run
 /// log can tell Rust heap growth from memory a driver or C library takes.
 struct Counting;
@@ -631,11 +632,17 @@ unsafe impl std::alloc::GlobalAlloc for Counting {
 #[global_allocator]
 static ALLOC: Counting = Counting;
 
+/// Bytes of guest memory allocated on the Rust heap (unguarded memory is
+/// one heap block; guarded memory is reserved outside it).
+static GUEST_IN_HEAP: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 /// Bytes the Rust heap holds now.
 pub fn rust_heap() -> usize {
     RUST_HEAP.load(Ordering::Relaxed)
 }
 
+/// Counts that grow if something is never released: open handles, live
+/// guest threads and host resident memory.
 fn growth_line() -> String {
     let kx = kernel::k();
     let started = kx.threads.lock().map(|t| t.len()).unwrap_or(0) as u32;
@@ -643,10 +650,10 @@ fn growth_line() -> String {
     let rss = host_rss().map_or("?".into(), |b| (b >> 20).to_string());
     let r = |i: usize| kernel::files::READS[i].load(Ordering::Relaxed);
     format!(
-        "handles {}, threads {} live, host {rss} MB (Rust heap {} MB), file reads {} ({} MB, {} ms), {}",
+        "handles {}, threads {} live, host {rss} MB (Rust heap {} MB besides guest memory), file reads {} ({} MB, {} ms), {}",
         kx.handle_count(),
         started.saturating_sub(ended),
-        rust_heap() >> 20,
+        rust_heap().saturating_sub(GUEST_IN_HEAP.load(Ordering::Relaxed)) >> 20,
         r(0),
         r(1) >> 20,
         r(2) / 1000,

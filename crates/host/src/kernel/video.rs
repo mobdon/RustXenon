@@ -191,7 +191,7 @@ pub fn start(rt: std::sync::Arc<Runtime>) {
                 match xenon_draw::Drawer::new() {
                     Ok(d) => {
                         crate::log(&format!("[draw] adapter: {}", d.adapter));
-                        gpu.drawer = Some(d);
+                        gpu.set_drawer(&rt, d);
                     }
                     Err(e) => crate::log(&format!("[draw] no drawer: {e}")),
                 }
