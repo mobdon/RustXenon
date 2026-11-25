@@ -858,19 +858,22 @@ fn paint_mip(s: &mut Stream, mem: &mut SliceMemory, paint: fn(&mut Stream) -> &m
 /// build blurred chains. The mip lives in the same kept resolve and is
 /// decoded with the base: a fetch that starts at level 1 samples only
 /// blue, and one that starts at level 0 (texel for texel, so LOD 0) still
-/// samples the base exactly as the guest path does.
+/// samples the base exactly as the guest path does. The
+/// packed mips bit changes nothing: a 64x64 chain packs from level 2.
 #[test]
 fn kept_mip_level_is_sampled() {
     let case = &HALF4;
     let mut outputs = Vec::new();
-    for min in [0, 1] {
+    for (min, packed) in [(0, 0), (1, 0), (1, 1 << 11)] {
         let Some(mut d) = case.drawer() else { return };
         let mut mem = memory();
         vertices(&mut mem);
         let mut s = Stream::default();
         case.paint_and_resolve(s.setup(), &mut mem, 2);
         paint_mip(&mut s, &mut mem, paint_small);
-        case.sample(&mut s, mip_fetch(min));
+        let mut f = mip_fetch(min);
+        f[5] |= packed;
+        case.sample(&mut s, f);
         let r = run(&mut d, &s, &mut mem);
         assert!(r.unsupported.is_empty(), "{r:?}");
         let t = &r.timings;
@@ -885,6 +888,7 @@ fn kept_mip_level_is_sampled() {
         );
     }
     let half = |t: &[u8], c: usize| u16::from_le_bytes([t[2 * c], t[2 * c + 1]]);
+    assert!(outputs[2] == outputs[1], "packed bit");
     let mip: std::collections::HashSet<_> = outputs[1].chunks(8).collect();
     assert_eq!(mip.len(), 1, "level 1 is one blue");
     let blue = mip.into_iter().next().unwrap();

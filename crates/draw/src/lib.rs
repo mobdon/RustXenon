@@ -2854,9 +2854,9 @@ impl Drawer {
     /// would decode them; `None` for the guest path. Only tiled 2D
     /// k_8_8_8_8 layouts that host as `Rgba8Unorm`, k_32_FLOAT and
     /// k_16_16_16_16_FLOAT (any endian, swizzle and resolve format, as the
-    /// bytes are the guest's) are decoded here. Unpacked mip levels up to
-    /// the fetch's last one that the same kept resolve holds are decoded
-    /// too, so explicit and computed LODs reach them. Returns the view and
+    /// bytes are the guest's) are decoded here. Mip levels before the packed
+    /// tail, up to the fetch's last one, that the same kept resolve holds are
+    /// decoded too, so explicit and computed LODs reach them. Returns the view and
     /// the guest range it was decoded from.
     fn kept_texture(
         &mut self,
