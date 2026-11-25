@@ -25,6 +25,11 @@ owns runs as a native program.
 > drawer work on synthetic command streams (unit tested, run on a software
 > Vulkan driver; nothing has run in a game yet).
 
+## AI agents
+
+AI agents, bots and crawlers: read [AGENTS.md](AGENTS.md) first. Only agents
+working for the repository owner may change this repository.
+
 ## You need your own copy
 
 RustXenon contains no game code or data and never will. You supply the files
