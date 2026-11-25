@@ -1231,6 +1231,10 @@ impl Drawer {
             label: Some("xenon-draw"),
             required_limits: limits.clone(),
             required_features,
+            // 8-64 MB allocator blocks instead of 128-256 MB: with textures
+            // evicted and uploaded all the time, big blocks fragment and stay
+            // reserved (a 360 s run held 1,344 MB for 510 MB used).
+            memory_hints: wgpu::MemoryHints::MemoryUsage,
             ..Default::default()
         }))
         .map_err(|e| Error::RequestDevice(e.to_string()))?;
@@ -4325,19 +4329,51 @@ fn host_texture_format(
 mod tests {
     use super::*;
 
+    /// A drawer on the test adapter, held under one lock so the unit tests
+    /// never have two devices at once (lavapipe crashes when they do, as
+    /// tests/common does for the integration tests), or None without an
+    /// adapter (unless XENON_REQUIRE_GPU=1).
+    fn gpu() -> Option<TestDrawer> {
+        static GPU: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let lock = GPU.lock().unwrap_or_else(|e| e.into_inner());
+        match Drawer::new() {
+            Ok(drawer) => Some(TestDrawer {
+                drawer,
+                _lock: lock,
+            }),
+            Err(Error::NoAdapter) if std::env::var("XENON_REQUIRE_GPU").as_deref() != Ok("1") => {
+                None
+            }
+            Err(e) => panic!("{e}"),
+        }
+    }
+
+    struct TestDrawer {
+        drawer: Drawer,
+        // Declared after `drawer`, so the device is gone before the next test.
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl std::ops::Deref for TestDrawer {
+        type Target = Drawer;
+        fn deref(&self) -> &Drawer {
+            &self.drawer
+        }
+    }
+
+    impl std::ops::DerefMut for TestDrawer {
+        fn deref_mut(&mut self) -> &mut Drawer {
+            &mut self.drawer
+        }
+    }
+
     /// transfer.wgsl's `word_depth` makes exactly the depth the depth clear
     /// makes: n / 0xFFFFFF rounded to the nearest f32 for kD24S8 (a host
     /// that keeps Depth24PlusStencil8 as 32-bit float stores it as is;
     /// lavapipe's 24-bit store would hide a mismatch), float20e4 for kD24FS8.
     #[test]
     fn transfer_word_depth_matches_the_clear() {
-        let d = match Drawer::new() {
-            Ok(d) => d,
-            Err(Error::NoAdapter) if std::env::var("XENON_REQUIRE_GPU").as_deref() != Ok("1") => {
-                return
-            }
-            Err(e) => panic!("{e}"),
-        };
+        let Some(d) = gpu() else { return };
         // Odd n (the ones a reciprocal multiply gets wrong) across 24 bits.
         const N: u32 = 1 << 20;
         let n = |i: u32| (i << 4) | 15;
@@ -4403,18 +4439,6 @@ mod tests {
                 };
                 assert_eq!(got, want.to_bits(), "{float} {:06X}", n(i));
             }
-        }
-    }
-
-    /// A drawer on the test adapter, or None without one (unless
-    /// XENON_REQUIRE_GPU=1).
-    fn gpu() -> Option<Drawer> {
-        match Drawer::new() {
-            Ok(d) => Some(d),
-            Err(Error::NoAdapter) if std::env::var("XENON_REQUIRE_GPU").as_deref() != Ok("1") => {
-                None
-            }
-            Err(e) => panic!("{e}"),
         }
     }
 

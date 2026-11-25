@@ -33,6 +33,14 @@ fn resolve_clear_fills_render_target() {
     // wgpu's own counters are live: the targets above are counted.
     assert!(m.contains("; wgpu live: textures 1 MB,"), "{m}");
     assert!(m.contains(" MB reserved in "), "{m}");
+    // Small allocator blocks: a 1 MB target does not reserve 64 MB or more.
+    let reserved: u64 = m
+        .split(" MB reserved")
+        .next()
+        .and_then(|s| s.rsplit(' ').next())
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(u64::MAX);
+    assert!(reserved < 64, "{m}");
 }
 
 /// Clears, then draws a triangle with per-vertex colours through the

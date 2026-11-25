@@ -7,6 +7,7 @@
 //! A generated game crate calls [`run`] with the SHA-256 it was built from
 //! and the register functions of its code crates.
 
+pub mod cpu_profile;
 pub mod heap;
 pub mod kernel;
 
@@ -197,6 +198,20 @@ pub fn set_runtime(rt: Arc<Runtime>) {
 /// import counts.
 pub fn install_trace(rt: &mut Runtime) {
     rt.trace = Some(trace);
+    if cpu_profile::on() {
+        rt.after = Some(after);
+    }
+}
+
+fn is_thunk(addr: u32) -> bool {
+    (THUNKS.0.load(Ordering::Relaxed)..=THUNKS.1.load(Ordering::Relaxed)).contains(&addr)
+}
+
+/// The return hook, installed only for `XENON_CPU_PROFILE`.
+fn after(_: &Context, addr: u32) {
+    if is_thunk(addr) {
+        cpu_profile::leave(addr);
+    }
 }
 
 pub fn set_thunk_range(lo: u32, hi: u32) {
@@ -335,7 +350,10 @@ fn trace(c: &Context, addr: u32) {
         m.call.store(addr, Ordering::Relaxed);
         m.sp.store(c.r[1] as u32, Ordering::Relaxed);
     });
-    if (THUNKS.0.load(Ordering::Relaxed)..=THUNKS.1.load(Ordering::Relaxed)).contains(&addr) {
+    if is_thunk(addr) {
+        if cpu_profile::on() {
+            cpu_profile::enter(addr);
+        }
         MINE.with(|m| {
             m.import.store(addr, Ordering::Relaxed);
             m.arg0.store(c.r[3] as u32, Ordering::Relaxed);
@@ -390,7 +408,10 @@ sound is decoded through an LGPL FFmpeg found at run time (XENON_FFMPEG_DIR),
 silence without one. Nothing is ever played. --guard-memory (or
 XENON_GUARD_MEMORY=1) reserves guest memory without access and commits only
 what the kernel hands out, so a wild pointer stops the run with its address
-and every thread's last calls instead of reading zeros.";
+and every thread's last calls instead of reading zeros. XENON_CPU_PROFILE=1
+logs, every 5 s, the ms per frame each guest thread spends in its own code,
+in kernel calls and waiting, the top kernel calls by time, and a frame rate
+bound with drawing free; run it without --render to keep drawing off.";
 
 fn opt(args: &[String], name: &str) -> Option<String> {
     args.iter()
@@ -498,7 +519,7 @@ pub fn run(sha256: &str, regs: &[fn(&mut Runtime)]) -> ExitCode {
     for r in regs {
         r(&mut rt);
     }
-    rt.trace = Some(trace);
+    install_trace(&mut rt);
     kernel::install(
         &mut rt,
         &kernel::Setup {
@@ -539,6 +560,7 @@ pub fn run(sha256: &str, regs: &[fn(&mut Runtime)]) -> ExitCode {
     while t0.elapsed() < Duration::from_secs(seconds) {
         std::thread::sleep(Duration::from_secs(1));
         let swaps = kernel::k().swaps.load(Ordering::Relaxed);
+        cpu_profile::tick(swaps);
         log(&format!(
             "frames {swaps} (+{}), {}, {}",
             swaps - last,
