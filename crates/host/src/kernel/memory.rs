@@ -5,6 +5,34 @@ use super::*;
 const MEM_RELEASE: u32 = 0x8000;
 const MEM_LARGE_PAGES: u32 = 0x2000_0000;
 
+/// Frees of addresses no heap handed out (a double free or a stale
+/// pointer), for the run report.
+pub static UNKNOWN_FREES: AtomicU32 = AtomicU32::new(0);
+
+/// `XENON_TRACE_ALLOC`: one line per allocate or free import with heap, size,
+/// address and caller. Failed allocations and frees of unknown blocks are
+/// always logged (the first 20), since both look like something else later.
+fn note(c: &Context, what: &str, heap: &str, addr: u32, size: u32, ok: bool) {
+    static ON: OnceLock<bool> = OnceLock::new();
+    static ODD: AtomicU32 = AtomicU32::new(0);
+    let on = *ON.get_or_init(|| std::env::var_os("XENON_TRACE_ALLOC").is_some());
+    if !ok && what == "free" {
+        UNKNOWN_FREES.fetch_add(1, Ordering::Relaxed);
+    }
+    if on || (!ok && ODD.fetch_add(1, Ordering::Relaxed) < 20) {
+        crate::log(&format!(
+            "[alloc] {} {what} {heap} {size:#x} at {addr:#010x} from {:#010x}{}",
+            std::thread::current().name().unwrap_or("?"),
+            c.lr as u32,
+            match (ok, what) {
+                (true, _) => "",
+                (false, "free") => ": not a live block (double free or stale pointer)",
+                _ => ": FAILED",
+            }
+        ));
+    }
+}
+
 fn take(rt: &Runtime, h: &Mutex<crate::heap::Heap>, size: u32, align: u32) -> Option<u32> {
     let r = h.lock().unwrap().alloc(size, align);
     let (a, reused) = r?;
@@ -41,6 +69,14 @@ pub fn nt_allocate_virtual_memory(rt: &Runtime, c: &mut Context) {
     } else {
         take(rt, &kx.virt, size, page)
     };
+    note(
+        c,
+        "allocate",
+        "virtual",
+        got.unwrap_or(want),
+        size,
+        got.is_some(),
+    );
     match got {
         Some(a) => {
             rt.mem.write_u32(base_p, a);
@@ -58,7 +94,9 @@ pub fn nt_free_virtual_memory(rt: &Runtime, c: &mut Context) {
     if ty & MEM_RELEASE == 0 {
         return ret(c, STATUS_SUCCESS);
     }
-    match k().virt.lock().unwrap().free(a) {
+    let freed = k().virt.lock().unwrap().free(a);
+    note(c, "free", "virtual", a, freed.unwrap_or(0), freed.is_some());
+    match freed {
         Some(n) => {
             if size_p != 0 {
                 rt.mem.write_u32(size_p, n);
@@ -92,11 +130,14 @@ pub fn nt_query_virtual_memory(rt: &Runtime, c: &mut Context) {
 pub fn mm_allocate_physical_memory_ex(rt: &Runtime, c: &mut Context) {
     let (size, align) = (arg(rt, c, 1), arg(rt, c, 5));
     let a = take(rt, &k().phys, size, align.max(0x1000)).unwrap_or(0);
+    note(c, "allocate", "physical", a, size, a != 0);
     ret(c, a);
 }
 
 pub fn mm_free_physical_memory(rt: &Runtime, c: &mut Context) {
-    k().phys.lock().unwrap().free(arg(rt, c, 1));
+    let a = arg(rt, c, 1);
+    let n = k().phys.lock().unwrap().free(a);
+    note(c, "free", "physical", a, n.unwrap_or(0), n.is_some());
 }
 
 pub fn mm_get_physical_address(rt: &Runtime, c: &mut Context) {
@@ -124,12 +165,16 @@ pub fn mm_query_allocation_size(rt: &Runtime, c: &mut Context) {
 }
 
 pub fn ex_allocate_pool_type_with_tag(rt: &Runtime, c: &mut Context) {
-    let a = take(rt, &k().pool, arg(rt, c, 0), 16).unwrap_or(0);
+    let size = arg(rt, c, 0);
+    let a = take(rt, &k().pool, size, 16).unwrap_or(0);
+    note(c, "allocate", "pool", a, size, a != 0);
     ret(c, a);
 }
 
 pub fn ex_free_pool(rt: &Runtime, c: &mut Context) {
-    k().pool.lock().unwrap().free(arg(rt, c, 0));
+    let a = arg(rt, c, 0);
+    let n = k().pool.lock().unwrap().free(a);
+    note(c, "free", "pool", a, n.unwrap_or(0), n.is_some());
 }
 
 /// A physical allocation for the host's own use (zeroed); panics when

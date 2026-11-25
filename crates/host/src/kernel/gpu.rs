@@ -213,6 +213,13 @@ impl Gpu {
             self.apply(rt, c, idle);
         }
         if let Some(d) = self.drawer.as_mut() {
+            // Every 30 s, what the drawer holds, to tell cache growth from a leak.
+            static NEXT: AtomicU32 = AtomicU32::new(0);
+            let now = crate::ms();
+            if now >= NEXT.load(Ordering::Relaxed) {
+                NEXT.store(now + 30_000, Ordering::Relaxed);
+                crate::log(&d.memory_line());
+            }
             let start = std::time::Instant::now();
             match d.replay(&cmds, &mut Physical(rt)) {
                 Ok(r) => {

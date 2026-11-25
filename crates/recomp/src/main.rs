@@ -34,7 +34,7 @@ scan    Loads the executable (applying the title update in memory), finds
         never commit it.
 
 build   Writes the executable as a Cargo workspace under --out (one crate
-        per --range bytes of guest code, default 0x40000; functions longer
+        per --range bytes of guest code, default 0x10000; functions longer
         than --max-part instructions, default 4000, are split; parallel
         jobs capped at --mem-gb / 3, default from 16). Files are rewritten
         only when their text changes. Then build with `cargo build` in --out.
@@ -176,7 +176,7 @@ fn build(exe: &str, args: &[String]) -> Result<(), String> {
     let out = opt(args, "--out").ok_or("build needs --out <dir>")?;
     let (sha, img, _, a) = load(exe, args)?;
     let cpus = std::thread::available_parallelism().map_or(1, |n| n.get());
-    let range = num(args, "--range", 0x40000)? as u32;
+    let range = num(args, "--range", codegen::DEFAULT_RANGE as u64)? as u32;
     if range == 0 || range % 4 != 0 {
         return Err("--range must be a positive multiple of 4".into());
     }
