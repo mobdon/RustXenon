@@ -226,12 +226,15 @@ pub fn xam_get_system_version(_: &Runtime, c: &mut Context) {
 pub fn xam_alloc(rt: &Runtime, c: &mut Context) {
     let (size, out) = (arg(rt, c, 1), arg(rt, c, 2));
     let a = k().pool_alloc(rt, size);
+    super::memory::note(c, "allocate", "pool (XamAlloc)", a, size, true);
     rt.mem.write_u32(out, a);
     ret(c, ERROR_SUCCESS);
 }
 
 pub fn xam_free(rt: &Runtime, c: &mut Context) {
-    k().pool.lock().unwrap().free(arg(rt, c, 0));
+    let a = arg(rt, c, 0);
+    let n = k().pool.lock().unwrap().free(a);
+    super::memory::note(c, "free", "pool (XamFree)", a, n.unwrap_or(0), n.is_some());
     ret(c, ERROR_SUCCESS);
 }
 
