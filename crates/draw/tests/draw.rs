@@ -1409,7 +1409,7 @@ fn pipeline_cache_persists_across_drawers() {
 }
 
 /// Guest memory that lists the ranges written to it, as watched memory
-/// does: `None` until set, then whatever the test says was written.
+/// does: whatever the test says was written since the last replay.
 struct Watched {
     mem: xenon_gpu::SliceMemory,
     written: Option<Vec<(u64, u64)>>,
@@ -1434,8 +1434,8 @@ impl xenon_draw::GuestMemory for Watched {
 }
 
 /// With guest memory listing its writes, a texture looked up in one replay
-/// is used in the next without reading its bytes again, until its bytes
-/// are written.
+/// is used in the next without reading its bytes again, and vertices stay
+/// staged, until their bytes are written.
 #[test]
 fn listed_writes_keep_textures_across_replays() {
     let Some(mut d) = drawer() else { return };
@@ -1480,28 +1480,36 @@ fn listed_writes_keep_textures_across_replays() {
     let mut rec = xenon_gpu::Recorder::new();
     rec.record_buffer(&mem, CMD, s.0.len() as u32).unwrap();
     let cmds = rec.commands;
-    let mut w = Watched { mem, written: None };
+    let mut w = Watched {
+        mem,
+        written: Some(vec![]),
+    };
     let replay = |d: &mut xenon_draw::Drawer, w: &mut Watched| {
         let r = d
             .replay(&cmds, w as &mut dyn xenon_draw::GuestMemory)
             .unwrap();
         let img = d.read_render_target(COLOR_KEY, 0, 0, W, H).unwrap();
-        (r.timings.hashed_bytes, px(&img, W, 3, 3)[0])
+        let t = &r.timings;
+        (t.hashed_bytes, t.guest_bytes > 0, px(&img, W, 3, 3)[0])
     };
-    assert_eq!(replay(&mut d, &mut w), (len, 200));
-    // Nothing written: no guest bytes read.
-    assert_eq!(replay(&mut d, &mut w), (0, 200));
+    assert_eq!(replay(&mut d, &mut w), (len, true, 200));
+    // Nothing written: no guest bytes read, vertices stay staged.
+    assert_eq!(replay(&mut d, &mut w), (0, false, 200));
     // Writes elsewhere change nothing.
-    w.written = Some(vec![(0, u64::from(TEXTURE))]);
-    assert_eq!(replay(&mut d, &mut w), (0, 200));
+    let far = u64::from(TEXTURE) + 0x10_0000;
+    w.written = Some(vec![(far, far + 4096)]);
+    assert_eq!(replay(&mut d, &mut w), (0, false, 200));
+    // A write to the vertices stages them again.
+    w.written = Some(vec![(u64::from(VERTS), u64::from(VERTS) + 4)]);
+    assert_eq!(replay(&mut d, &mut w), (0, true, 200));
     // A write to the texture: read and drawn again.
     put_texture(&mut w.mem, 90);
     w.written = Some(vec![(
         u64::from(TEXTURE) + len - 1,
         u64::from(TEXTURE) + len + 4096,
     )]);
-    assert_eq!(replay(&mut d, &mut w), (len, 90));
+    assert_eq!(replay(&mut d, &mut w), (len, false, 90));
     // Writes not listed: everything is read again.
     w.written = None;
-    assert_eq!(replay(&mut d, &mut w), (len, 90));
+    assert_eq!(replay(&mut d, &mut w), (len, true, 90));
 }
