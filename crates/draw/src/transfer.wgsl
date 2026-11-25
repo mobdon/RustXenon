@@ -9,8 +9,13 @@
 // The two targets may differ in pitch and sample count while covering the
 // same tiles (a 4x MSAA surface at half the pitch of a 2x one): `p.x0` and
 // `p.y0` are the destination's samples per pixel across and down, `p.w`
-// and `p.h` the source's, so a destination pixel reads the source pixel
-// holding its first sample.
+// and `p.h` the source's, `p.pitch` the source's pitch, so a destination
+// pixel reads the source pixel holding its first sample.
+//
+// Depth tiles store the two 40-sample halves of each 80x16-sample tile
+// swapped against colour (Xenia xenos.h, edram.xesli; games pre-swap when
+// they restore depth through colour), so a transfer between colour and
+// depth reads the other half of the tile.
 
 // The depth target is kD24FS8 (20e4), else kD24S8 (24-bit unorm).
 override transfer_20e4: bool = false;
@@ -23,24 +28,34 @@ fn transfer_vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
     return vec4<f32>(uv * 2.0 - 1.0, 0.0, 1.0);
 }
 
-// The source pixel under destination pixel `pos`.
-fn src_at(pos: vec4<f32>) -> vec2<u32> {
-    return vec2<u32>(pos.xy) * vec2<u32>(p.x0, p.y0) / vec2<u32>(p.w, p.h);
+// The source pixel under destination pixel `pos`, `swap` between colour
+// and depth. A sample past the source's row (rows not a whole number of
+// tiles wide) is not hosted: the destination keeps its pixel.
+fn src_at(pos: vec4<f32>, swap: bool) -> vec2<u32> {
+    var s = vec2<u32>(pos.xy) * vec2<u32>(p.x0, p.y0);
+    if swap {
+        s.x = s.x - s.x % 80u + (s.x % 80u + 40u) % 80u;
+    }
+    let at = s / vec2<u32>(p.w, p.h);
+    if at.x >= p.pitch {
+        discard;
+    }
+    return at;
 }
 
 // The colour texel as its EDRAM word: red in the low byte.
-fn color_word(pos: vec4<f32>) -> u32 {
-    return pack4x8unorm(textureLoad(src, src_at(pos), 0));
+fn color_word(pos: vec4<f32>, swap: bool) -> u32 {
+    return pack4x8unorm(textureLoad(src, src_at(pos, swap), 0));
 }
 
 // The depth texel as its EDRAM word, stencil 0 (no host stencil).
-fn depth_word_at(pos: vec4<f32>) -> u32 {
-    let at = src_at(pos);
+fn depth_word_at(pos: vec4<f32>, swap: bool) -> u32 {
+    let at = src_at(pos, swap);
     return depth_word(at.x, at.y);
 }
 
-fn depth_stencil_word(pos: vec4<f32>) -> u32 {
-    let at = src_at(pos);
+fn depth_stencil_word(pos: vec4<f32>, swap: bool) -> u32 {
+    let at = src_at(pos, swap);
     return depth_word(at.x, at.y) | (textureLoad(stencil_src, at, 0).r & 0xFFu);
 }
 
@@ -81,17 +96,17 @@ fn word_depth(d: u32) -> f32 {
 
 @fragment
 fn color_to_depth(@builtin(position) pos: vec4<f32>) -> @builtin(frag_depth) f32 {
-    return word_depth(color_word(pos) >> 8u);
+    return word_depth(color_word(pos, true) >> 8u);
 }
 
 @fragment
 fn depth_to_depth(@builtin(position) pos: vec4<f32>) -> @builtin(frag_depth) f32 {
-    return word_depth(depth_word_at(pos) >> 8u);
+    return word_depth(depth_word_at(pos, false) >> 8u);
 }
 
 @fragment
 fn depth_stencil_to_depth(@builtin(position) pos: vec4<f32>) -> @builtin(frag_depth) f32 {
-    return word_depth(depth_stencil_word(pos) >> 8u);
+    return word_depth(depth_stencil_word(pos, false) >> 8u);
 }
 
 // wgpu has no stencil export: one pass per stencil bit after the stencil
@@ -99,29 +114,29 @@ fn depth_stencil_to_depth(@builtin(position) pos: vec4<f32>) -> @builtin(frag_de
 // (Xenia's fallback without shader stencil export).
 @fragment
 fn color_to_stencil(@builtin(position) pos: vec4<f32>) {
-    if (color_word(pos) & (1u << transfer_bit)) == 0u {
+    if (color_word(pos, true) & (1u << transfer_bit)) == 0u {
         discard;
     }
 }
 
 @fragment
 fn depth_stencil_to_stencil(@builtin(position) pos: vec4<f32>) {
-    if (depth_stencil_word(pos) & (1u << transfer_bit)) == 0u {
+    if (depth_stencil_word(pos, false) & (1u << transfer_bit)) == 0u {
         discard;
     }
 }
 
 @fragment
 fn color_to_color(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
-    return unpack4x8unorm(color_word(pos));
+    return unpack4x8unorm(color_word(pos, false));
 }
 
 @fragment
 fn depth_to_color(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
-    return unpack4x8unorm(depth_word_at(pos));
+    return unpack4x8unorm(depth_word_at(pos, true));
 }
 
 @fragment
 fn depth_stencil_to_color(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
-    return unpack4x8unorm(depth_stencil_word(pos));
+    return unpack4x8unorm(depth_stencil_word(pos, true));
 }

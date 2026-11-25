@@ -529,3 +529,41 @@ fn write_back_mid_block_keeps_the_bytes_beside_it() {
     };
     assert_eq!(around(&mem), around(&before));
 }
+
+/// A resolve into a destination twice as wide as the rectangle, sampled
+/// with that pitch: the kept texture is the target's pixels column for
+/// column, as the guest path draws them.
+#[test]
+fn wider_destination_pitch_keeps_the_columns() {
+    let mut wide = fetch(6, 2, IDENTITY);
+    wide[0] = (wide[0] & !(0x1FF << 22)) | (((2 * W) >> 5) << 22);
+    let Some(mut d) = drawer() else { return };
+    let mut mem = memory();
+    vertices(&mut mem);
+    let mut s = Stream::default();
+    paint(s.setup());
+    let (wf, hf) = (W as f32, H as f32);
+    mem.write_words(RECT, &[f(0.0), f(0.0), f(wf), f(0.0), f(wf), f(hf)]);
+    s.vertex_fetch(0, RECT, 6)
+        .regs(RB_MODECONTROL, &[6])
+        .regs(
+            RB_COPY_CONTROL,
+            &[
+                COPY_CONVERT,
+                DEST,
+                (2 * W) | (H << 16),
+                dest_info(6, 0, false),
+            ],
+        )
+        .draw_auto(PRIM_RECT_LIST, 3)
+        .regs(RB_MODECONTROL, &[4]);
+    sample(&mut s, wide);
+    let r = run(&mut d, &s, &mut mem);
+    assert!(r.unsupported.is_empty(), "{r:?}");
+    assert_eq!(r.timings.textures_kept, 1, "{r:?}");
+    let painted = d.read_render_target(COLOR_KEY, 0, 0, W, H).unwrap();
+    let kept = d.read_render_target(OUT, 0, 0, W, H).unwrap();
+    drop(d);
+    assert_eq!(kept, painted);
+    assert_eq!(kept, guest_path(&mem, wide));
+}
