@@ -805,7 +805,6 @@ const TARGET_CAP: u64 = 256 << 20;
 
 /// Replays recorded command lists on a headless wgpu device.
 pub struct Drawer {
-    instance: wgpu::Instance,
     device: wgpu::Device,
     queue: wgpu::Queue,
     /// Adapter name, backend and device type (a software one is `Cpu`),
@@ -924,6 +923,8 @@ pub struct Drawer {
     uncaptured: Arc<Mutex<Vec<String>>>,
     max_dim: u32,
     max_storage: u64,
+    /// Last, so it drops after the device and every resource made from it.
+    instance: wgpu::Instance,
 }
 
 /// Draws recorded into one command encoder, in one render pass while the
