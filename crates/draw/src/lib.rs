@@ -498,6 +498,13 @@ impl std::ops::AddAssign<&Timings> for Timings {
     }
 }
 
+/// Copies queued out of kept resolves: the submission, and per kept
+/// resolve its start, dirty ranges, buffer spans and readback buffer.
+type WriteBack = (
+    wgpu::SubmissionIndex,
+    Vec<(u64, Vec<(u64, u64)>, Vec<(u64, u64)>, wgpu::Buffer)>,
+);
+
 /// Finishes and submits flushed batches on a thread of its own, one at a
 /// time in order, so the drawer records the next batch meanwhile: wgpu
 /// encodes the recorded passes for the driver at `finish`, and the driver
@@ -1156,6 +1163,13 @@ pub struct Drawer {
     /// read stale bytes. A CPU write to such a destination between replays
     /// drops the GPU copy (its pixels are lost).
     pub skip_resolve_writeback: bool,
+    /// Queue the end-of-replay write-back of kept resolves without waiting
+    /// for it, and write it to guest memory when the next replay starts:
+    /// the CPU sees resolve output one frame late, in exchange for no GPU
+    /// wait at the end of every replay. `XENON_RESOLVE_WRITEBACK=late`
+    /// turns it on at [`Drawer::new`].
+    pub late_writeback: bool,
+    late: Option<(Vec<Vec<Option<u64>>>, WriteBack)>,
     /// Bytes of decoded guest textures the texture cache keeps before
     /// evicting the least recently used ones (default 256 MiB).
     pub texture_cache_limit: u64,
@@ -1789,6 +1803,8 @@ impl Drawer {
             mirrors: Vec::new(),
             decode_pipelines: [None, None],
             skip_resolve_writeback: false,
+            late_writeback: std::env::var("XENON_RESOLVE_WRITEBACK").as_deref() == Ok("late"),
+            late: None,
             texture_cache_limit: TEXTURE_CACHE_LIMIT,
             bc_textures: required_features.contains(wgpu::Features::TEXTURE_COMPRESSION_BC),
             texture_log: std::env::var("XENON_TEXTURE_LOG")
@@ -2130,6 +2146,9 @@ impl Drawer {
             mem,
             written: Vec::new(),
         };
+        if let Some((before, w)) = self.late.take() {
+            self.end_writeback(&mut mem, w, Some(before))?;
+        }
         let done = self.replay_commands(commands, &mut mem, &mut report);
         // Submitted on an error too: the batch can hold resolve clears of
         // targets that outlive the failed replay, and the first error wins.
@@ -2299,6 +2318,20 @@ impl Drawer {
     /// has unwritten bytes, before the drawer reads or writes that range
     /// itself. One GPU wait for all of them.
     fn sync(&mut self, mem: &mut Tracked, lo: u64, hi: u64) -> Result<(), Error> {
+        match self.start_writeback(mem, lo, hi)? {
+            Some(w) => self.end_writeback(mem, w, None),
+            None => Ok(()),
+        }
+    }
+
+    /// Queues copies out of every kept resolve over `[lo, hi)` with
+    /// unwritten bytes, for [`Drawer::end_writeback`].
+    fn start_writeback(
+        &mut self,
+        mem: &mut Tracked,
+        lo: u64,
+        hi: u64,
+    ) -> Result<Option<WriteBack>, Error> {
         let mut i = 0;
         let mut copies = Vec::new();
         let mut enc = None;
@@ -2346,7 +2379,7 @@ impl Drawer {
             i += 1;
         }
         let Some(enc) = enc else {
-            return Ok(());
+            return Ok(None);
         };
         if self.resolve_pending {
             self.flush().map_err(|e| match e {
@@ -2356,12 +2389,49 @@ impl Drawer {
         }
         // No wait for idle first: the copies are queued after the work
         // that wrote the buffers, and the first map waits for them.
-        let mut t = Instant::now();
         self.timings.writebacks += 1;
         let index = self.submit_now([enc.finish()]);
         self.submitted(Site::Other);
+        Ok(Some((index, copies)))
+    }
+
+    /// Hashes of guest memory under each copy's dirty ranges, to tell at
+    /// a late write-back whether the CPU wrote there meanwhile.
+    fn guest_hashes(&mut self, mem: &Tracked, w: &WriteBack) -> Vec<Vec<Option<u64>>> {
+        w.1.iter()
+            .map(|(_, dirty, _, _)| {
+                dirty
+                    .iter()
+                    .map(|&(a, b)| {
+                        mem.read_bytes(a as u32, (b - a) as usize)
+                            .map(|b| self.block_hash(&b))
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// Waits for the copies of `w` and writes them to guest memory. With
+    /// `before` (a late write-back: the guest hashes when it was queued),
+    /// a copy whose ranges the CPU has written since is dropped with its
+    /// kept resolve.
+    fn end_writeback(
+        &mut self,
+        mem: &mut Tracked,
+        w: WriteBack,
+        before: Option<Vec<Vec<Option<u64>>>>,
+    ) -> Result<(), Error> {
+        let now = before.as_ref().map(|_| self.guest_hashes(mem, &w));
+        let (index, copies) = w;
+        let mut t = Instant::now();
         let mut first = true;
-        for (m_lo, dirty, spans, buf) in copies {
+        for (k, (m_lo, dirty, spans, buf)) in copies.into_iter().enumerate() {
+            if let (Some(before), Some(now)) = (&before, &now) {
+                if before[k].iter().any(Option::is_none) || before[k] != now[k] {
+                    self.mirrors.retain(|m| m.lo != m_lo);
+                    continue;
+                }
+            }
             let data = self.map_read(&buf, index.clone())?;
             if std::mem::take(&mut first) {
                 self.timings.gpu_wait += lap(&mut t);
@@ -2404,11 +2474,19 @@ impl Drawer {
     /// `skip_resolve_writeback`). A block left unhashed, made for a resolve
     /// that failed before writing to it, fails its next check: hashing
     /// guest memory now could miss a CPU write made after it was filled.
+    /// With `late_writeback`, the copies are only queued, and the next
+    /// replay writes them to guest memory when it starts.
     fn finish_mirrors(&mut self, mem: &mut Tracked) -> Result<(), Error> {
-        if !self.skip_resolve_writeback {
-            self.sync(mem, 0, u64::MAX)?;
+        if self.skip_resolve_writeback {
+            return Ok(());
         }
-        Ok(())
+        if self.late_writeback {
+            self.late = self
+                .start_writeback(mem, 0, u64::MAX)?
+                .map(|w| (self.guest_hashes(mem, &w), w));
+            return Ok(());
+        }
+        self.sync(mem, 0, u64::MAX)
     }
 
     /// Index of the kept resolve buffer holding `[lo, hi)`, which a resolve

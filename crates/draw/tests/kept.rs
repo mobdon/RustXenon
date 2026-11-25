@@ -1102,3 +1102,58 @@ fn resolve_into_a_kept_mip_decodes_it_again() {
     let distinct: std::collections::HashSet<_> = out.chunks(8).collect();
     assert!(distinct.len() > 16, "{}", distinct.len());
 }
+
+/// Late write-back: guest memory gets the resolve when the next replay
+/// starts, not at the end of its own, and then matches the exact mode.
+#[test]
+fn late_write_back_lands_at_the_next_replay() {
+    let exact = {
+        let Some(mut d) = drawer() else { return };
+        let mut mem = memory();
+        vertices(&mut mem);
+        let mut s = Stream::default();
+        paint(s.setup());
+        resolve(&mut s, &mut mem, W, H);
+        run(&mut d, &s, &mut mem);
+        mem.data[DEST as usize..][..(W * H * 4) as usize].to_vec()
+    };
+    let Some(mut d) = drawer() else { return };
+    d.late_writeback = true;
+    let mut mem = memory();
+    vertices(&mut mem);
+    let before = mem.data[DEST as usize..][..(W * H * 4) as usize].to_vec();
+    assert_ne!(before, exact);
+    let mut s = Stream::default();
+    paint(s.setup());
+    resolve(&mut s, &mut mem, W, H);
+    let r = run(&mut d, &s, &mut mem);
+    assert_eq!(r.timings.writebacks, 1, "{r:?}");
+    assert_eq!(mem.data[DEST as usize..][..before.len()], before[..]);
+    run(&mut d, Stream::default().setup(), &mut mem);
+    assert_eq!(mem.data[DEST as usize..][..exact.len()], exact[..]);
+}
+
+/// Late write-back after a CPU write between the replays: the CPU's bytes
+/// stay and the kept resolve is dropped.
+#[test]
+fn late_write_back_keeps_a_cpu_write() {
+    let Some(mut d) = drawer() else { return };
+    d.late_writeback = true;
+    let mut mem = memory();
+    vertices(&mut mem);
+    let mut s = Stream::default();
+    paint(s.setup());
+    resolve(&mut s, &mut mem, W, H);
+    run(&mut d, &s, &mut mem);
+    mem.data[DEST as usize..][..256].fill(0x55);
+    let f = fetch(6, 2, IDENTITY);
+    let mut s = Stream::default();
+    sample(s.setup(), f);
+    let r = run(&mut d, &s, &mut mem);
+    assert!(mem.data[DEST as usize..][..256].iter().all(|&b| b == 0x55));
+    assert_eq!(
+        (r.timings.textures_kept, r.timings.textures_uploaded),
+        (0, 1),
+        "{r:?}"
+    );
+}
