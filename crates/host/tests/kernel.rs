@@ -1099,6 +1099,28 @@ fn saves_are_created_listed_and_reopened() {
         &[en, 0, 0xFA00, 0x134, 0xF908, 0],
     );
     assert_eq!((r, rt.mem.read_u32(0xF908)), (18, 0));
+    // With a request block, as titles scan: the record and its count, then
+    // success with zero at the end.
+    call(
+        rt,
+        &mut c,
+        xam::xam_content_create_enumerator,
+        &[0, 0, 1, 0, 4, 0xF900, 0xF904],
+    );
+    let en = rt.mem.read_u32(0xF904) as u64;
+    for want in [1, 0] {
+        let r = call(
+            rt,
+            &mut c,
+            xam::xam_enumerate,
+            &[en, 0, 0xFA00, 4 * 0x134, 0, 0xFB00],
+        );
+        assert_eq!(r, 997);
+        assert_eq!(
+            (rt.mem.read_u32(0xFB00), rt.mem.read_u32(0xFB04)),
+            (0, want)
+        );
+    }
     // Another type lists nothing.
     call(
         rt,
