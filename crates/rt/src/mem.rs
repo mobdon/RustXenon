@@ -109,6 +109,14 @@ fn byte<'a>(p: *mut u8, i: usize) -> &'a AtomicU8 {
     unsafe { AtomicU8::from_ptr(p.add(i)) }
 }
 
+/// For `n` bytes at `p`: the bytes before the first 8-byte aligned one
+/// (all of them when none is in range), and the whole aligned words after.
+#[inline]
+fn split(p: *mut u8, n: usize) -> (usize, usize) {
+    let head = p.align_offset(8).min(n);
+    (head, (n - head) / 8)
+}
+
 impl GuestMemory {
     /// Allocates `size` bytes of zeroed guest memory.
     pub fn new(size: usize) -> Self {
@@ -232,8 +240,22 @@ impl GuestMemory {
             return;
         }
         let p = self.at(addr, out.len());
-        for (i, x) in out.iter_mut().enumerate() {
+        // Bytewise up to the first 8-byte boundary and after the last one,
+        // relaxed 8-byte loads between: the bytes are the same, only
+        // tearing against a concurrent store is per word.
+        let (head, words) = split(p, out.len());
+        for (i, x) in out[..head].iter_mut().enumerate() {
             *x = byte(p, i).load(Relaxed);
+        }
+        let (mid, tail) = out[head..].split_at_mut(words * 8);
+        for (i, x) in mid.chunks_exact_mut(8).enumerate() {
+            // SAFETY: in bounds and 8-byte aligned (see `split`).
+            let w = unsafe { AtomicU64::from_ptr(p.add(head + 8 * i).cast()) };
+            x.copy_from_slice(&w.load(Relaxed).to_ne_bytes());
+        }
+        let at = head + words * 8;
+        for (i, x) in tail.iter_mut().enumerate() {
+            *x = byte(p, at + i).load(Relaxed);
         }
     }
 
@@ -246,8 +268,20 @@ impl GuestMemory {
             return;
         }
         let p = self.at(addr, data.len());
-        for (i, &x) in data.iter().enumerate() {
+        // As in `read_bytes`.
+        let (head, words) = split(p, data.len());
+        for (i, &x) in data[..head].iter().enumerate() {
             byte(p, i).store(x, Relaxed);
+        }
+        let (mid, tail) = data[head..].split_at(words * 8);
+        for (i, x) in mid.chunks_exact(8).enumerate() {
+            // SAFETY: in bounds and 8-byte aligned (see `split`).
+            let w = unsafe { AtomicU64::from_ptr(p.add(head + 8 * i).cast()) };
+            w.store(u64::from_ne_bytes(x.try_into().unwrap()), Relaxed);
+        }
+        let at = head + words * 8;
+        for (i, &x) in tail.iter().enumerate() {
+            byte(p, at + i).store(x, Relaxed);
         }
     }
 
@@ -342,6 +376,48 @@ mod tests {
         let mut b = [0; 6];
         m.read_bytes(0xFFFF_EFFC, &mut b);
         assert_eq!(b, [1, 2, 3, 4, 5, 6]);
+        // A longer odd range over the wrap, written through the folded view
+        // and read back through the first.
+        let fill: Vec<u8> = (1..=45).collect();
+        m.write_bytes(0xFFFF_EFE3, &fill);
+        let mut b = [0; 45];
+        m.read_bytes(0xBFFF_FFE3, &mut b[..29]);
+        m.read_bytes(0xA000_0000, &mut b[29..]);
+        assert_eq!(b[..], fill[..]);
+        m.read_bytes(0xFFFF_EFE3, &mut b);
+        assert_eq!(b[..], fill[..]);
+    }
+
+    /// Byte ranges of every alignment and length up to a few words copy
+    /// the same bytes as single-byte accesses, in and out.
+    #[test]
+    fn byte_ranges_match_single_bytes() {
+        let m = GuestMemory::new(128);
+        let fill: Vec<u8> = (0..128u32).map(|i| (i * 37 + 11) as u8).collect();
+        for addr in 0..24u32 {
+            for len in 0..40usize {
+                m.write_bytes(0, &[0; 128]);
+                m.write_bytes(addr, &fill[..len]);
+                for i in 0..128u32 {
+                    let want = if (addr..addr + len as u32).contains(&i) {
+                        fill[(i - addr) as usize]
+                    } else {
+                        0
+                    };
+                    assert_eq!(m.read_u8(i), want, "write at {addr} len {len} byte {i}");
+                }
+                for i in 0..128u32 {
+                    m.write_u8(i, fill[i as usize]);
+                }
+                let mut out = vec![0xEE; len];
+                m.read_bytes(addr, &mut out);
+                assert_eq!(
+                    out,
+                    fill[addr as usize..][..len],
+                    "read at {addr} len {len}"
+                );
+            }
+        }
     }
 
     #[test]

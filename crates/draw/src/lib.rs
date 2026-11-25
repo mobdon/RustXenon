@@ -211,6 +211,9 @@ impl GuestRead for Tracked<'_> {
     fn read_bytes(&self, addr: u32, len: usize) -> Option<Vec<u8>> {
         self.mem.read_bytes(addr, len)
     }
+    fn read_into(&self, addr: u32, out: &mut [u8]) -> bool {
+        self.mem.read_into(addr, out)
+    }
 }
 
 impl GuestMemory for Tracked<'_> {
@@ -374,10 +377,15 @@ pub struct Timings {
     /// Counts: pipelines and shader modules created, textures uploaded.
     pub pipelines_created: u32,
     pub textures_uploaded: u32,
-    /// Command buffer submissions for draws, clears, EDRAM transfers and
-    /// GPU resolves.
+    /// Command buffer submissions made during the replay.
     pub submits: u32,
+    /// `submits` by where they come from: resolve copies (GPU copies and
+    /// CPU resolve readbacks), EDRAM transfers, kept resolve texture
+    /// decodes, and batch flushes and resolve write-backs. Resolve clears
+    /// are recorded into the next batch.
+    pub submits_by_site: [u32; 4],
     pub texture_bytes: u64,
+    /// Guest vertex window bytes read (not those of reused windows).
     pub guest_bytes: u64,
     /// EDRAM transfers and their render passes.
     pub transfers: u32,
@@ -407,6 +415,9 @@ pub struct Timings {
     /// guest bytes of their windows.
     pub windows_reused: u32,
     pub reused_bytes: u64,
+    /// Draws whose constants block equals the last one staged in the same
+    /// batch, bound from there instead of staged again.
+    pub consts_reused: u32,
 }
 
 impl std::ops::AddAssign<&Timings> for Timings {
@@ -425,6 +436,9 @@ impl std::ops::AddAssign<&Timings> for Timings {
         self.pipelines_created += t.pipelines_created;
         self.textures_uploaded += t.textures_uploaded;
         self.submits += t.submits;
+        for (a, b) in self.submits_by_site.iter_mut().zip(t.submits_by_site) {
+            *a += b;
+        }
         self.texture_bytes += t.texture_bytes;
         self.guest_bytes += t.guest_bytes;
         self.transfers += t.transfers;
@@ -442,6 +456,7 @@ impl std::ops::AddAssign<&Timings> for Timings {
         }
         self.windows_reused += t.windows_reused;
         self.reused_bytes += t.reused_bytes;
+        self.consts_reused += t.consts_reused;
     }
 }
 
@@ -877,6 +892,10 @@ pub struct Drawer {
     /// their (offset, size) in `arena`. Cleared at each flush, as the next
     /// batch overwrites the arena, and dropped where guest memory changes.
     window_memo: Vec<(u64, u64, (u64, u64))>,
+    /// The last `Consts` block staged in the batch and its (offset, size)
+    /// in `arena`, bound again by a draw with the same bytes. Cleared with
+    /// `window_memo` at each flush.
+    staged_consts: Option<(Vec<u8>, (u64, u64))>,
     max_buffer: u64,
     /// 1x1 texture of zeros bound for a slot without a usable texture.
     zero_texture: wgpu::TextureView,
@@ -935,13 +954,41 @@ pub struct Drawer {
 }
 
 /// Draws recorded into one command encoder, in one render pass while the
-/// render targets stay the same. Submitted by [`Drawer::flush`] before
-/// anything that reads or writes the targets outside the batch (resolves,
-/// clears and EDRAM transfers) and at the end of a replay.
+/// render targets stay the same, and the resolve clears between them, each
+/// in a pass of its own. Submitted by [`Drawer::flush`] before anything
+/// that reads or writes the targets outside the batch (resolves and EDRAM
+/// transfers) and at the end of a replay.
 struct Batch {
     /// Dropped (ended) before `enc` is finished.
     pass: Option<(PassKey, wgpu::RenderPass<'static>)>,
     enc: wgpu::CommandEncoder,
+}
+
+/// One buffer of a draw's staged data: bytes, or `len` guest bytes at
+/// `addr` read straight into the staging area.
+#[derive(Clone, Copy)]
+enum Part<'a> {
+    Bytes(&'a [u8]),
+    Guest(u32, usize),
+}
+
+impl Part<'_> {
+    fn len(&self) -> usize {
+        match *self {
+            Part::Bytes(b) => b.len(),
+            Part::Guest(_, len) => len,
+        }
+    }
+}
+
+/// Where a queue submission comes from: the index of
+/// [`Timings::submits_by_site`].
+#[derive(Clone, Copy)]
+enum Site {
+    Resolve,
+    Transfer,
+    Decode,
+    Other,
 }
 
 /// Colour and depth targets of a render pass.
@@ -1004,6 +1051,29 @@ const TEXTURE_CACHE_LIMIT: u64 = 256 << 20;
 
 fn to_bytes(words: &[u32]) -> Vec<u8> {
     words.iter().flat_map(|w| w.to_le_bytes()).collect()
+}
+
+/// The `Consts` uniform of the shader binding contract: float, fetch, bool
+/// and loop constants, then the window base and the index offset.
+fn consts(r: &regs::RegisterFile, window_base: u32) -> Vec<u8> {
+    // Float and fetch constants are adjacent, and so are bool and loop.
+    const _: () = assert!(regs::SHADER_CONSTANT_FLOAT + 2048 == regs::SHADER_CONSTANT_FETCH);
+    const _: () = assert!(regs::SHADER_CONSTANT_BOOL + 8 == regs::SHADER_CONSTANT_LOOP);
+    let tail = [window_base, r.get(regs::VGT_INDX_OFFSET), 0, 0];
+    let blocks = [
+        r.slice(regs::SHADER_CONSTANT_FLOAT, 2048 + 192),
+        r.slice(regs::SHADER_CONSTANT_BOOL, 8 + 32),
+        &tail,
+    ];
+    let mut b = vec![0; 4 * (2048 + 192 + 8 + 32 + 4)];
+    let mut at = 0;
+    for block in blocks {
+        for (o, w) in b[at..][..4 * block.len()].chunks_exact_mut(4).zip(block) {
+            o.copy_from_slice(&w.to_le_bytes());
+        }
+        at += 4 * block.len();
+    }
+    b
 }
 
 /// Adds the epilogue and the extra outputs to a translated vertex shader.
@@ -1342,6 +1412,7 @@ impl Drawer {
             staged: Vec::new(),
             arena: None,
             window_memo: Vec::new(),
+            staged_consts: None,
             arena_align: u64::from(
                 limits
                     .min_uniform_buffer_offset_alignment
@@ -1556,16 +1627,17 @@ impl Drawer {
             written: Vec::new(),
         };
         let done = self.replay_commands(commands, &mut mem, &mut report);
-        // On an error the batch is dropped unsubmitted.
-        let done = done.and_then(|()| {
-            self.flush().map_err(|e| match e {
-                Skip::Fatal(e) => e,
-                Skip::Unsupported(why) => Error::Gpu(why),
-            })
+        // Submitted on an error too: the batch can hold resolve clears of
+        // targets that outlive the failed replay, and the first error wins.
+        let flushed = self.flush().map_err(|e| match e {
+            Skip::Fatal(e) => e,
+            Skip::Unsupported(why) => Error::Gpu(why),
         });
+        let done = done.and(flushed);
         self.batch = None;
         self.staged.clear();
         self.window_memo.clear();
+        self.staged_consts = None;
         // Resolves done before an error still reach guest memory.
         let kept = self.finish_mirrors(&mut mem);
         done?;
@@ -1775,7 +1847,7 @@ impl Drawer {
         self.wait_idle()?;
         self.timings.gpu_wait += lap(&mut t);
         let index = self.queue.submit([enc.finish()]);
-        self.timings.submits += 1;
+        self.submitted(Site::Other);
         for (m_lo, dirty, spans, buf) in copies {
             let data = self.map_read(&buf, index.clone())?;
             self.timings.readback += lap(&mut t);
@@ -1882,21 +1954,30 @@ impl Drawer {
         Ok(Some(self.mirrors.len() - 1))
     }
 
+    /// Counts one queue submission, made by `site`.
+    fn submitted(&mut self, site: Site) {
+        self.timings.submits += 1;
+        self.timings.submits_by_site[site as usize] += 1;
+    }
+
     /// Submits the batched draws, with their staged buffers.
     fn flush(&mut self) -> Result<(), Skip> {
+        // The arena upload counts as submit time too.
+        let t = Instant::now();
         self.window_memo.clear();
+        self.staged_consts = None;
         if let (Some(arena), false) = (&self.arena, self.staged.is_empty()) {
             self.queue.write_buffer(arena, 0, &self.staged);
             self.staged.clear();
         }
         let Some(mut batch) = self.batch.take() else {
+            self.timings.submit += t.elapsed();
             return Ok(());
         };
-        let t = Instant::now();
         let scope = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
         drop(batch.pass.take());
         self.queue.submit([batch.enc.finish()]);
-        self.timings.submits += 1;
+        self.submitted(Site::Other);
         self.timings.submit += t.elapsed();
         match block_on(scope.pop()) {
             Some(e) => Err(Skip::Fatal(Error::Gpu(e.to_string()))),
@@ -1908,8 +1989,8 @@ impl Drawer {
     /// aligned for uniform and storage bindings, and returns their
     /// (offset, size) in the arena. Submits the batch first when the arena
     /// is full, and grows the arena when one draw does not fit.
-    fn stage(&mut self, parts: &[&[u8]]) -> Result<Vec<(u64, u64)>, Skip> {
-        let size = |p: &[u8]| (p.len() as u64).max(4).next_multiple_of(4);
+    fn stage(&mut self, mem: &dyn GuestRead, parts: &[Part]) -> Result<Vec<(u64, u64)>, Skip> {
+        let size = |p: &Part| (p.len() as u64).max(4).next_multiple_of(4);
         let align = self.arena_align;
         let need: u64 = parts.iter().map(|p| size(p).next_multiple_of(align)).sum();
         let have = self.arena.as_ref().map_or(0, |b| b.size());
@@ -1938,7 +2019,19 @@ impl Drawer {
         let mut out = Vec::with_capacity(parts.len());
         for p in parts {
             let off = self.staged.len() as u64;
-            self.staged.extend_from_slice(p);
+            match *p {
+                Part::Bytes(b) => self.staged.extend_from_slice(b),
+                Part::Guest(addr, len) => {
+                    self.staged.resize(off as usize + len, 0);
+                    if !mem.read_into(addr, &mut self.staged[off as usize..]) {
+                        self.staged.truncate(off as usize);
+                        let end = u64::from(addr) + len as u64;
+                        return unsupported(format!(
+                            "vertex data at 0x{addr:08X}..0x{end:08X} not readable"
+                        ));
+                    }
+                }
+            }
             self.staged.resize((off + size(p)) as usize, 0);
             out.push((off, size(p)));
             let end = self.staged.len() as u64;
@@ -1948,8 +2041,8 @@ impl Drawer {
     }
 
     /// Whether `parts` can be staged without submitting the batch first.
-    fn fits(&self, parts: &[&[u8]]) -> bool {
-        let size = |p: &[u8]| (p.len() as u64).max(4).next_multiple_of(4);
+    fn fits(&self, parts: &[Part]) -> bool {
+        let size = |p: &Part| (p.len() as u64).max(4).next_multiple_of(4);
         let need: u64 = parts
             .iter()
             .map(|p| size(p).next_multiple_of(self.arena_align))
@@ -2583,7 +2676,7 @@ impl Drawer {
             }
         }
         self.queue.submit([enc.finish()]);
-        self.timings.submits += 1;
+        self.submitted(Site::Transfer);
         self.timings.transfers += 1;
         self.timings.transfer_passes += pipelines.len() as u32;
         match block_on(scope.pop()) {
@@ -2735,17 +2828,25 @@ impl Drawer {
             .clone()
     }
 
-    /// Reads the guest memory the vertex fetch constants in `mask` point
-    /// at, as one window. Returns its bytes (none for no window) and base
-    /// address; or, when a window staged in this batch holds it, no bytes,
-    /// that window's base and its memo entry, with this window's size.
+    /// The guest memory the vertex fetch constants in `mask` point at, as
+    /// one window, made ready to read (kept resolves under it written
+    /// back). Returns its physical `[lo, hi)` (none for no window) and base
+    /// address; or, when a window staged in this batch holds it, none, that
+    /// window's base and its memo entry, with this window's size.
     #[allow(clippy::type_complexity)]
     fn guest_window(
         &mut self,
         mask: u128,
         mem: &mut Tracked,
         report: &mut Report,
-    ) -> Result<(Vec<u8>, u32, Option<((u64, u64, (u64, u64)), u64)>), Skip> {
+    ) -> Result<
+        (
+            Option<(u64, u64)>,
+            u32,
+            Option<((u64, u64, (u64, u64)), u64)>,
+        ),
+        Skip,
+    > {
         let (mut lo, mut hi) = (u64::MAX, 0u64);
         for k in (0..96).filter(|k| mask & (1u128 << k) != 0) {
             let vf = self.regs.vertex_fetch(k);
@@ -2757,29 +2858,21 @@ impl Drawer {
             lo = lo.min(a);
             hi = hi.max(a + 4 * u64::from(vf.size_dwords));
         }
-        report.timings.guest_bytes += hi.saturating_sub(lo);
-        let (base, bytes) = if lo >= hi {
-            (0, Vec::new())
-        } else {
-            let mut memo = self.window_memo.iter().rev();
-            if let Some(&w) = memo.find(|&&(a, b, _)| a <= lo && hi <= b) {
-                return Ok((Vec::new(), w.0 as u32, Some((w, hi - lo))));
-            }
-            if hi - lo > self.max_storage {
-                return unsupported(format!(
-                    "vertex data window of {} bytes is larger than the storage buffer limit",
-                    hi - lo
-                ));
-            }
-            self.sync(mem, lo, hi)?;
-            let Some(b) = mem.read_bytes(lo as u32, (hi - lo) as usize) else {
-                return unsupported(format!(
-                    "vertex data at 0x{lo:08X}..0x{hi:08X} not readable"
-                ));
-            };
-            (lo as u32, b)
-        };
-        Ok((bytes, base, None))
+        if lo >= hi {
+            return Ok((None, 0, None));
+        }
+        let mut memo = self.window_memo.iter().rev();
+        if let Some(&w) = memo.find(|&&(a, b, _)| a <= lo && hi <= b) {
+            return Ok((None, w.0 as u32, Some((w, hi - lo))));
+        }
+        if hi - lo > self.max_storage {
+            return unsupported(format!(
+                "vertex data window of {} bytes is larger than the storage buffer limit",
+                hi - lo
+            ));
+        }
+        self.sync(mem, lo, hi)?;
+        Ok((Some((lo, hi)), lo as u32, None))
     }
 
     fn buffer(&self, label: &str, bytes: &[u8], usage: wgpu::BufferUsages) -> wgpu::Buffer {
@@ -2798,15 +2891,7 @@ impl Drawer {
 
     /// The `Consts` uniform of the shader binding contract.
     fn consts(&self, window_base: u32) -> Vec<u8> {
-        let r = &self.regs;
-        let block = |base: u32, n: u32| (0..n).map(move |i| r.get(base + i));
-        let mut v: Vec<u32> = block(regs::SHADER_CONSTANT_FLOAT, 2048)
-            .chain(block(regs::SHADER_CONSTANT_FETCH, 192))
-            .chain(block(regs::SHADER_CONSTANT_BOOL, 8))
-            .chain(block(regs::SHADER_CONSTANT_LOOP, 32))
-            .collect();
-        v.extend([window_base, r.get(regs::VGT_INDX_OFFSET), 0, 0]);
-        to_bytes(&v)
+        consts(&self.regs, window_base)
     }
 
     /// Texture and sampler for fetch constant slot `n`. A slot without a
@@ -3015,7 +3100,7 @@ impl Drawer {
             },
         );
         self.queue.submit([enc.finish()]);
-        self.timings.submits += 1;
+        self.submitted(Site::Decode);
         if let Some(e) = block_on(scope.pop()) {
             return Err(Skip::Fatal(Error::Gpu(e.to_string())));
         }
@@ -3536,10 +3621,97 @@ impl Drawer {
         };
         self.timings.shaders += lap(&mut t);
 
-        let (mut window, window_base, staged) = self.guest_window(vf_mask, mem, report)?;
+        let (mut read, window_base, staged) = self.guest_window(vf_mask, mem, report)?;
         let consts = self.consts(window_base);
         let epi = to_bytes(&state::epilogue(&self.regs, w, h));
-        self.timings.guest_data += lap(&mut t);
+        // Rectangle lists read their guest indices in the vertex shader and
+        // draw 6 host vertices per rectangle without an index buffer.
+        let idx_bytes = to_bytes(&idx);
+        let rect_indices: &[u8] = if rect_list { &idx_bytes } else { &[] };
+        let rest = [&epi[..], rect_indices, &idx_bytes].map(Part::Bytes);
+        // The window and constants staged earlier in this batch are bound
+        // again, unless the batch was submitted since (the arena is then
+        // overwritten) or would be to stage the rest.
+        let mut kept_window = staged.filter(|(w, _)| self.window_memo.contains(w));
+        let mut kept_consts = (self.staged_consts.as_ref())
+            .filter(|(b, _)| *b == consts)
+            .map(|&(_, s)| s);
+        fn parts<'a>(
+            w: Option<Part<'a>>,
+            c: Option<&'a [u8]>,
+            rest: [Part<'a>; 3],
+        ) -> Vec<Part<'a>> {
+            w.into_iter()
+                .chain(c.map(Part::Bytes))
+                .chain(rest)
+                .collect()
+        }
+        // The window's size is all `fits` needs of it.
+        let window_size = Part::Guest(0, read.map_or(0, |(lo, hi)| (hi - lo) as usize));
+        if (kept_window.is_some() || kept_consts.is_some())
+            && !self.fits(&parts(
+                kept_window.is_none().then_some(window_size),
+                kept_consts.is_none().then_some(&consts),
+                rest,
+            ))
+        {
+            // Staging all of it submits the batch in `stage`; a kept window
+            // is read again below.
+            (kept_window, kept_consts) = (None, None);
+        }
+        if let (Some(((lo, hi, _), _)), None) = (staged, kept_window) {
+            self.sync(mem, lo, hi)?;
+            read = Some((lo, hi));
+        }
+        let window = match read {
+            Some((lo, hi)) => {
+                report.timings.guest_bytes += hi - lo;
+                Part::Guest(lo as u32, (hi - lo) as usize)
+            }
+            None => Part::Bytes(&[]),
+        };
+        // A full arena submits the batch in `stage`: submit time, not guest data.
+        let submit = self.timings.submit;
+        let mut fresh = (self.stage(
+            &*mem,
+            &parts(
+                kept_window.is_none().then_some(window),
+                kept_consts.is_none().then_some(&consts),
+                rest,
+            ),
+        )?)
+        .into_iter();
+        let window_slice = match kept_window {
+            Some((w, len)) => {
+                self.timings.windows_reused += 1;
+                self.timings.reused_bytes += len;
+                w.2
+            }
+            None => {
+                let s = fresh.next().expect("staged window");
+                if let Some((lo, hi)) = read {
+                    self.window_memo.push((lo, hi, s));
+                }
+                s
+            }
+        };
+        let consts_slice = match kept_consts {
+            Some(s) => {
+                self.timings.consts_reused += 1;
+                s
+            }
+            None => {
+                let s = fresh.next().expect("staged constants");
+                self.staged_consts = Some((consts, s));
+                s
+            }
+        };
+        let slices: Vec<(u64, u64)> = [window_slice, consts_slice]
+            .into_iter()
+            .chain(fresh)
+            .collect();
+        let flushed = self.timings.submit - submit;
+        self.timings.guest_data += lap(&mut t).saturating_sub(flushed);
         if self
             .texture_log
             .is_some_and(|h| h.is_none_or(|h| h == ps.hash))
@@ -3557,39 +3729,6 @@ impl Drawer {
             textures.push((n, self.texture(n, mem, report)?));
         }
         self.timings.textures += lap(&mut t);
-        // Rectangle lists read their guest indices in the vertex shader and
-        // draw 6 host vertices per rectangle without an index buffer.
-        let idx_bytes = to_bytes(&idx);
-        let rect_indices: &[u8] = if rect_list { &idx_bytes } else { &[] };
-        let rest = [&consts[..], &epi, rect_indices, &idx_bytes];
-        let slices = match staged {
-            // Unless the batch was submitted since (the arena is then
-            // overwritten) or would be to stage the rest.
-            Some((w, len)) if self.window_memo.contains(&w) && self.fits(&rest) => {
-                self.timings.windows_reused += 1;
-                self.timings.reused_bytes += len;
-                let mut s = vec![w.2];
-                s.extend(self.stage(&rest)?);
-                s
-            }
-            _ => {
-                if let Some(((lo, hi, _), _)) = staged {
-                    self.sync(mem, lo, hi)?;
-                    let Some(b) = mem.read_bytes(lo as u32, (hi - lo) as usize) else {
-                        return unsupported(format!("vertex data at 0x{lo:08X} not readable"));
-                    };
-                    window = b;
-                }
-                let mut parts = vec![&window[..]];
-                parts.extend(rest);
-                let s = self.stage(&parts)?;
-                if !window.is_empty() {
-                    let lo = u64::from(window_base);
-                    self.window_memo.push((lo, lo + window.len() as u64, s[0]));
-                }
-                s
-            }
-        };
         let arena = self.arena.clone().expect("staged");
         let binding = |i: usize| {
             let (offset, size) = slices[i];
@@ -3781,9 +3920,18 @@ impl Drawer {
             resolve_target: None,
             ops: keep_color,
         })];
-        let mut enc = self.device.create_command_encoder(&Default::default());
+        // Recorded into the batch, which the resolve copy before it was
+        // submitted ahead of: the clear ends the batch's render pass, so it
+        // lands after the draws before it and under those after it, and
+        // anything else that reads the target flushes the batch first.
+        let device = &self.device;
+        let batch = self.batch.get_or_insert_with(|| Batch {
+            pass: None,
+            enc: device.create_command_encoder(&Default::default()),
+        });
+        batch.pass = None;
         {
-            let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+            let mut pass = batch.enc.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("clear"),
                 color_attachments: if is_depth { &[] } else { &color_attachment },
                 depth_stencil_attachment: is_depth.then(|| {
@@ -3804,8 +3952,6 @@ impl Drawer {
             pass.set_stencil_reference(stencil);
             pass.draw(0..3, 0..1);
         }
-        self.queue.submit([enc.finish()]);
-        self.timings.submits += 1;
         if let Some(e) = block_on(scope.pop()) {
             return Err(Skip::Fatal(Error::Gpu(e.to_string())));
         }
@@ -3985,6 +4131,7 @@ impl Drawer {
         self.wait_idle()?;
         self.timings.gpu_wait += lap(&mut t);
         let px = self.read_texture(&tex, rect.x0, rect.y0, rect.width(), rect.height())?;
+        self.submitted(Site::Resolve);
         self.timings.readback += lap(&mut t);
         self.timings.readback_bytes += px.len() as u64;
         let src_bytes = px.len() / (rect.width() * rect.height()) as usize;
@@ -4178,7 +4325,7 @@ impl Drawer {
         }
         self.timings.resolve_cpu += lap(&mut t);
         self.queue.submit([enc.finish()]);
-        self.timings.submits += 1;
+        self.submitted(Site::Resolve);
         if let Some(e) = block_on(scope.pop()) {
             return Err(Skip::Fatal(Error::Gpu(e.to_string())));
         }
@@ -4407,6 +4554,26 @@ fn host_texture_format(
 mod tests {
     use super::*;
 
+    /// The constants block holds each register of its four blocks in
+    /// order, then the window base and the index offset.
+    #[test]
+    fn consts_block_is_the_registers_in_order() {
+        let mut r = regs::RegisterFile::default();
+        for i in 0x3F00..0x4A00 {
+            r.set(i, i.wrapping_mul(0x9E37_79B9));
+        }
+        r.set(regs::VGT_INDX_OFFSET, 77);
+        let r = &r;
+        let block = |base: u32, n: u32| (0..n).map(move |i| r.get(base + i));
+        let mut want: Vec<u32> = block(regs::SHADER_CONSTANT_FLOAT, 2048)
+            .chain(block(regs::SHADER_CONSTANT_FETCH, 192))
+            .chain(block(regs::SHADER_CONSTANT_BOOL, 8))
+            .chain(block(regs::SHADER_CONSTANT_LOOP, 32))
+            .collect();
+        want.extend([0x1234_5678, 77, 0, 0]);
+        assert_eq!(consts(r, 0x1234_5678), to_bytes(&want));
+    }
+
     /// A drawer on the test adapter, held under one lock so the unit tests
     /// never have two devices at once (lavapipe crashes when they do, as
     /// tests/common does for the integration tests), or None without an
@@ -4525,9 +4692,11 @@ mod tests {
     #[test]
     fn staged_capacity_stays_within_the_arena() {
         let Some(mut d) = gpu() else { return };
+        let mem = SliceMemory::default();
         let part = vec![7u8; 3 << 20];
+        let part = [Part::Bytes(&part)];
         for _ in 0..12 {
-            d.stage(&[&part]).unwrap();
+            d.stage(&mem, &part).unwrap();
             let arena = d.arena.as_ref().unwrap().size();
             assert!(
                 d.staged.capacity() as u64 <= arena,
@@ -4536,8 +4705,8 @@ mod tests {
             );
         }
         let big = vec![1u8; 20 << 20];
-        d.stage(&[&big]).unwrap();
-        d.stage(&[&part]).unwrap();
+        d.stage(&mem, &[Part::Bytes(&big)]).unwrap();
+        d.stage(&mem, &part).unwrap();
         assert_eq!(d.arena.as_ref().unwrap().size(), 32 << 20);
         assert!(d.staged.capacity() <= 32 << 20, "{}", d.staged.capacity());
         d.flush().unwrap();

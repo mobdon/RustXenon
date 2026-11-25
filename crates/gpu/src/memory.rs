@@ -18,6 +18,18 @@ pub trait GuestRead {
     fn read_u32(&self, addr: u32) -> Option<u32>;
     /// `len` raw bytes from `addr`, or None if any byte is unmapped.
     fn read_bytes(&self, addr: u32, len: usize) -> Option<Vec<u8>>;
+    /// Fills `out` with the raw bytes from `addr`; false (`out` then
+    /// unspecified) if any byte is unmapped. The default goes through
+    /// [`Self::read_bytes`]; memories that can copy in place override it.
+    fn read_into(&self, addr: u32, out: &mut [u8]) -> bool {
+        match self.read_bytes(addr, out.len()) {
+            Some(b) => {
+                out.copy_from_slice(&b);
+                true
+            }
+            None => false,
+        }
+    }
 }
 
 /// Reads `count` big-endian dwords from `addr`.
@@ -70,6 +82,20 @@ impl GuestRead for SliceMemory {
         let end = start.checked_add(len)?;
         self.data.get(start..end).map(<[u8]>::to_vec)
     }
+
+    fn read_into(&self, addr: u32, out: &mut [u8]) -> bool {
+        let Some(start) = addr.checked_sub(self.base).map(|s| s as usize) else {
+            return false;
+        };
+        let Some(src) = start
+            .checked_add(out.len())
+            .and_then(|end| self.data.get(start..end))
+        else {
+            return false;
+        };
+        out.copy_from_slice(src);
+        true
+    }
 }
 
 #[cfg(test)]
@@ -87,5 +113,33 @@ mod tests {
         assert_eq!(mem.read_u32(0x0FFF), None);
         assert_eq!(mem.read_bytes(0x1004, 1), Some(vec![0x9A]));
         assert_eq!(read_words(&mem, 0x1000, 1), Some(vec![0x1234_5678]));
+        let mut b = [0; 2];
+        assert!(mem.read_into(0x1003, &mut b));
+        assert_eq!(b, [0x78, 0x9A]);
+        assert!(!mem.read_into(0x1004, &mut b));
+        assert!(!mem.read_into(0x0FFF, &mut b));
+        assert!(mem.read_into(0x1005, &mut []));
+    }
+
+    /// A memory with only `read_bytes` fills `read_into` from it.
+    #[test]
+    fn read_into_defaults_to_read_bytes() {
+        struct Bytes(SliceMemory);
+        impl GuestRead for Bytes {
+            fn read_u32(&self, addr: u32) -> Option<u32> {
+                self.0.read_u32(addr)
+            }
+            fn read_bytes(&self, addr: u32, len: usize) -> Option<Vec<u8>> {
+                self.0.read_bytes(addr, len)
+            }
+        }
+        let mem = Bytes(SliceMemory {
+            base: 0x10,
+            data: vec![1, 2, 3],
+        });
+        let mut b = [0; 2];
+        assert!(mem.read_into(0x11, &mut b));
+        assert_eq!(b, [2, 3]);
+        assert!(!mem.read_into(0x12, &mut b));
     }
 }
