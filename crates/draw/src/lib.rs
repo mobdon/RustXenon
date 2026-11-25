@@ -51,7 +51,8 @@
 //! the depth clear and the depth resolve) by the fullscreen passes of
 //! `transfer.wgsl`, each destination pixel reading the source pixel of its
 //! first sample, in the other 40-sample half of its tile between colour and
-//! depth (Xenos stores depth tiles with their halves swapped). Depth destinations take `frag_depth`, then, without
+//! depth (Xenos stores depth tiles with their halves swapped). Depth
+//! destinations take `frag_depth`, then, without
 //! shader stencil export, the stencil one bit per pass as Xenia does.
 //! Other aliasing is not modelled: each key keeps its own pixels. A newer
 //! target on the same tiles that cannot be transferred (a colour format
@@ -1330,9 +1331,8 @@ impl Drawer {
     /// targets (bytes estimated from their size and format), the draw upload
     /// arena and its host staging copy, pipeline counts (with the distinct
     /// vertex and pixel shader pairs of the draw pipelines and how many were
-    /// dropped), shader module counts, the translated shaders with the
-    /// bytes of their WGSL, and what wgpu's allocator holds (to tell host
-    /// memory growth inside wgpu from growth outside it).
+    /// dropped), shader module counts and the translated shaders with the
+    /// bytes of their WGSL.
     pub fn memory_line(&self) -> String {
         let rt: u64 = self.targets.values().map(texture_bytes).sum();
         let kept: u64 = self.mirrors.iter().map(|m| m.buf.size()).sum::<u64>()
@@ -1351,7 +1351,7 @@ impl Drawer {
             .map(|t| t.wgsl.len())
             .collect();
         format!(
-            "draw: textures {} MB in {}, targets {} MB in {}, {} dropped, kept resolves {} MB in {}, arena {} MB, staged {} MB, pipelines {} ({} vs/ps pairs, {} dropped), shaders {}, translated {} ({} KB WGSL), wgpu {} MB allocated",
+            "draw: textures {} MB in {}, targets {} MB in {}, {} dropped, kept resolves {} MB in {}, arena {} MB, staged {} MB, pipelines {} ({} vs/ps pairs, {} dropped), shaders {}, translated {} ({} KB WGSL)",
             self.texture_cache_bytes >> 20,
             self.texture_cache.len(),
             rt >> 20,
@@ -1367,7 +1367,6 @@ impl Drawer {
             self.modules.len(),
             wgsl.len(),
             wgsl.iter().sum::<usize>().div_ceil(1024),
-            self.gpu_live().0.map_or("?".into(), |b| (b >> 20).to_string()),
         )
     }
 
