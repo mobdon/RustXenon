@@ -420,6 +420,7 @@ pub fn run(sha256: &str, regs: &[fn(&mut Runtime)]) -> ExitCode {
     );
     let rt = rt.share();
     set_runtime(rt.clone());
+    log(&format!("call table: {} MB", rt.table_bytes() >> 20));
 
     std::panic::set_hook(Box::new(|info| {
         let recent = RECENT.with(|r| r.get());
