@@ -543,6 +543,15 @@ fn tiled_frame_takes_the_half_pitch_msaa_clear() {
     for dest in (0..4).map(|i| DEST + 0x2_0000 * i) {
         assert_eq!(word_at(&mem, dest, 56, 20).to_le_bytes(), BLUE);
     }
+    // The second frame's restored depth (0.5) passes the draw at 0.25
+    // LESS; the tiles' resolve clear (0) would fail it.
+    let key = RenderTargetKey {
+        base_tiles: 300,
+        pitch: W,
+        format: TargetFormat::Rgba8,
+    };
+    let img = d.read_render_target(key, 0, 0, W, H).unwrap();
+    assert_eq!(px(&img, W, 10, 10), RED);
 }
 
 /// kD24S8 and kD24FS8 at one EDRAM base and pitch share the 32-bit word:
@@ -566,4 +575,49 @@ fn d24s8_and_d24fs8_reinterpret_the_word() {
     let stencil = if d.float_stencil() { 0x78 } else { 0 };
     assert_eq!(word_at(&mem, DEST2, 5, 5), 0x4000_0000 | stencil);
     assert_eq!(word_at(&mem, DEST3, 5, 5), 0x2345_6700);
+}
+
+/// The depth restore of a tiled frame, as drawn after the tiles: the
+/// k_8_8_8_8 words are drawn at the depth base, a 4x MSAA draw at half the
+/// pitch z tests against them without writing (its target takes a
+/// resampled copy, as new as the words), then the depth target is used
+/// single-sampled. It must take the words, not the copy, which holds one
+/// pixel of every two columns: column 32 is word B, column 33 word A.
+#[test]
+fn depth_restore_takes_the_words_not_a_resampled_copy() {
+    const A: u32 = 0xD333_3300;
+    const B: u32 = 0x4000_0000;
+    let Some(mut d) = drawer() else { return };
+    let mut mem = memory();
+    let mut s = Stream::default();
+    s.setup().regs(RB_DEPTH_INFO, &[D24FS8_AT_0]);
+    clear_depth(&mut s, &mut mem, 0);
+    draw_word(&mut s, &mut mem, 64.0, A);
+    let at = VERTS + 0x400;
+    let c = [0; 4];
+    mem.write_words(
+        at,
+        &color_verts(&[(0.0, 0.0, 0.0, c), (33.0, 0.0, 0.0, c), (0.0, 64.0, 0.0, c)]),
+    );
+    s.regs(SHADER_CONSTANT_FLOAT + 256 * 4, &word_color(B).map(f))
+        .vertex_fetch(0, at, 12)
+        .draw_auto(PRIM_RECT_LIST, 3);
+    // z ALWAYS without z write, colour at tile 200.
+    s.regs(RB_SURFACE_INFO, &[(W / 2) | (2 << 16)])
+        .regs(RB_COLOR_INFO, &[200])
+        .regs(RB_DEPTHCONTROL, &[2 | (7 << 4)])
+        .draw_auto(PRIM_RECT_LIST, 3)
+        .regs(RB_DEPTHCONTROL, &[0])
+        .regs(RB_SURFACE_INFO, &[W]);
+    resolve_words(&mut s, &mut mem, true, DEST2);
+    let report = run(&mut d, &s, &mut mem);
+    assert_eq!((report.draws, report.resolves), (3, 2), "{report:?}");
+    assert!(
+        !report.warnings.iter().any(|w| w.contains("aliases")),
+        "{report:?}"
+    );
+    for y in [4, 33] {
+        assert_eq!(word_at(&mem, DEST2, 32, y), B, "row {y}");
+        assert_eq!(word_at(&mem, DEST2, 33, y), A, "row {y}");
+    }
 }
