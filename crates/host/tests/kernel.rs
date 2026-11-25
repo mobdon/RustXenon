@@ -954,3 +954,31 @@ fn guarded_memory_commits_what_the_kernel_hands_out() {
     );
     call(rt, &mut c, memory::mm_free_physical_memory, &[0, p as u64]);
 }
+
+#[test]
+fn pool_block_freed_as_physical_stays_live() {
+    use std::sync::atomic::Ordering::Relaxed;
+    let e = env();
+    let rt = &e.rt;
+    let mut c = ctx(0x1_F000);
+    let a = call(
+        rt,
+        &mut c,
+        memory::ex_allocate_pool_type_with_tag,
+        &[0x30, 0, 0],
+    );
+    let before = memory::UNKNOWN_FREES.load(Relaxed);
+    // The wrong call: counted (and logged with the pool block it hit), ignored.
+    call(rt, &mut c, memory::mm_free_physical_memory, &[0, a]);
+    assert!(memory::UNKNOWN_FREES.load(Relaxed) > before);
+    assert_eq!(
+        call(rt, &mut c, memory::mm_query_allocation_size, &[a]),
+        0x30,
+        "still live"
+    );
+    call(rt, &mut c, memory::ex_free_pool, &[a]);
+    assert!(
+        call(rt, &mut c, memory::mm_query_allocation_size, &[a]) == 0,
+        "pool block freed by the right call"
+    );
+}
