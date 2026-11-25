@@ -1235,7 +1235,8 @@ pub struct Drawer {
     /// a luminance readback, a resolve to vertex data read by the CPU): they
     /// read stale bytes. A CPU write to such a destination between replays
     /// drops the GPU copy (its pixels are lost).
-    /// `XENON_RESOLVE_WRITEBACK=skip` turns it on at [`Drawer::new`].
+    /// `XENON_RESOLVE_WRITEBACK=skip` turns it on at [`Drawer::new`]; the
+    /// host turns it on unless that variable is `on` or `late`.
     pub skip_resolve_writeback: bool,
     /// Queue the end-of-replay write-back of kept resolves without waiting
     /// for it, and write it to guest memory when the next replay starts:
