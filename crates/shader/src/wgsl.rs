@@ -164,6 +164,7 @@ const PRELUDE: &str = "struct Consts {
     vertex_base: u32,
     _pad0: u32,
     _pad1: u32,
+    vf_rebase: array<vec4<i32>, 24>,
 }
 
 @group(0) @binding(1) var<uniform> consts: Consts;
@@ -1153,7 +1154,8 @@ impl Gen {
                 ));
                 let _ = write!(addr, " + idx * {}", f.stride);
             }
-            self.line(&format!("vf_addr = {addr};"));
+            let rebase = format!("consts.vf_rebase[{}u][{}u]", fc / 4, fc % 4);
+            self.line(&format!("vf_addr = {addr} + {rebase};"));
         }
         self.line(&format!("let e = {} & 3u;", fetch_dword(fc * 2 + 1)));
         for w in 0..words {

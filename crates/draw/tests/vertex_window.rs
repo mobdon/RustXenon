@@ -91,3 +91,42 @@ fn index_offset_moves_the_window() {
         assert_eq!(bytes, 48);
     }
 }
+
+/// Positions (3 floats) through vertex fetch constant 0 and colours
+/// (8_8_8_8) through constant 1, each with its own stride.
+fn vs_two_buffers() -> Vec<u32> {
+    use xenon_shader::asm::*;
+    use xenon_shader::ucode::*;
+    let mut pos = VertexFetch::full(1, 0, 0, VertexFormat::F32_32_32_FLOAT, 3, 0);
+    pos.dest_swizzle = fetch_dest_swz("xyz1");
+    let col = VertexFetch::full(2, 0, 1, VertexFormat::F8_8_8_8, 1, 0);
+    let fetch = |v| Instr::Fetch(FetchInstr::Vertex(v));
+    let r = |n| AluSrc::temp(n, SWZ_XYZW);
+    assemble(
+        &[exec(0, 4, true)],
+        &[fetch(pos), fetch(col), export(62, r(1)), export(0, r(2))],
+    )
+}
+
+/// Two buffers megabytes apart upload their vertices, not the gap, in
+/// either address order.
+#[test]
+fn far_apart_buffers_upload_only_their_vertices() {
+    for colours in [0x3F_0000, 0x8_0000] {
+        let mut mem = big_memory();
+        let (wf, hf) = (W as f32, H as f32);
+        let pos = [0.0, 0.0, 0.0, wf, 0.0, 0.0, 0.0, hf, 0.0].map(f);
+        mem.write_words(BIG, &pos);
+        mem.write_words(colours, &[rgba(RED); 3]);
+        let mut s = Stream::default();
+        s.setup()
+            .shader(false, &vs_two_buffers())
+            .shader(true, &ps_interp())
+            .vertex_fetch(0, BIG, BIG_DWORDS)
+            .vertex_fetch(1, colours, 0x1000)
+            .draw_auto(PRIM_RECT_LIST, 3);
+        if let Some(bytes) = draw(&mut mem, &s) {
+            assert_eq!(bytes, 36 + 12, "colours at 0x{colours:X}");
+        }
+    }
+}

@@ -1114,6 +1114,10 @@ fn index_range(indices: &[u32], offset: u32) -> Option<(u32, u32)> {
     (lo <= hi && lo >> 24 == hi >> 24).then_some((lo & 0xFF_FFFF, hi & 0xFF_FFFF))
 }
 
+/// Vertex data ranges closer than this share one window part; farther
+/// ranges are staged apart, so the gap between them is not uploaded.
+const WINDOW_GAP: u64 = 4096;
+
 /// Cached textures are dropped wholesale past this many bytes.
 const TEXTURE_CACHE_LIMIT: u64 = 256 << 20;
 
@@ -1122,18 +1126,21 @@ fn to_bytes(words: &[u32]) -> Vec<u8> {
 }
 
 /// The `Consts` uniform of the shader binding contract: float, fetch, bool
-/// and loop constants, then the window base and the index offset.
-fn consts(r: &regs::RegisterFile, window_base: u32) -> Vec<u8> {
+/// and loop constants, then the window base, the index offset and the 96
+/// vertex fetch constants' rebase words.
+fn consts(r: &regs::RegisterFile, window_base: u32, rebase: &[i32; 96]) -> Vec<u8> {
     // Float and fetch constants are adjacent, and so are bool and loop.
     const _: () = assert!(regs::SHADER_CONSTANT_FLOAT + 2048 == regs::SHADER_CONSTANT_FETCH);
     const _: () = assert!(regs::SHADER_CONSTANT_BOOL + 8 == regs::SHADER_CONSTANT_LOOP);
     let tail = [window_base, r.get(regs::VGT_INDX_OFFSET), 0, 0];
+    let rebase = rebase.map(|w| w as u32);
     let blocks = [
         r.slice(regs::SHADER_CONSTANT_FLOAT, 2048 + 192),
         r.slice(regs::SHADER_CONSTANT_BOOL, 8 + 32),
         &tail,
+        &rebase,
     ];
-    let mut b = vec![0; 4 * (2048 + 192 + 8 + 32 + 4)];
+    let mut b = vec![0; 4 * (2048 + 192 + 8 + 32 + 4 + 96)];
     let mut at = 0;
     for block in blocks {
         for (o, w) in b[at..][..4 * block.len()].chunks_exact_mut(4).zip(block) {
@@ -2911,10 +2918,14 @@ impl Drawer {
 
     /// The guest memory the vertex fetch constants in `mask` point at, as
     /// far as `reach` reads with vertex indices in `indices` (see
-    /// [`fetch_range`]), as one window, made ready to read (kept resolves under it written
-    /// back). Returns its physical `[lo, hi)` (none for no window) and base
-    /// address; or, when a window staged in this batch holds it, none, that
-    /// window's base and its memo entry, with this window's size.
+    /// [`fetch_range`]), made ready to read (kept resolves under it written
+    /// back). Ranges less than [`WINDOW_GAP`] apart share one part; the
+    /// parts are staged one after the other as one window. Returns the
+    /// parts' physical `[lo, hi)` (none for no window), the window base and
+    /// each constant's rebase words (see the shader binding contract); or,
+    /// when the window is one part and a window staged in this batch holds
+    /// it, no parts, that window's base and its memo entry, with this
+    /// window's size.
     #[allow(clippy::type_complexity)]
     fn guest_window(
         &mut self,
@@ -2925,13 +2936,14 @@ impl Drawer {
         report: &mut Report,
     ) -> Result<
         (
-            Option<(u64, u64)>,
+            Vec<(u64, u64)>,
             u32,
+            [i32; 96],
             Option<((u64, u64, (u64, u64)), u64)>,
         ),
         Skip,
     > {
-        let (mut lo, mut hi) = (u64::MAX, 0u64);
+        let mut ranges = Vec::new();
         for k in (0..96).filter(|k| mask & (1u128 << k) != 0) {
             let vf = self.regs.vertex_fetch(k);
             if vf.fetch_type != FetchConstantType::Vertex {
@@ -2939,27 +2951,55 @@ impl Drawer {
             }
             // Physical, as the translated shader masks fetch addresses.
             let a = u64::from(vf.address & PHYSICAL_MASK);
-            let (a_lo, a_hi) = fetch_range(a, vf.size_dwords, k, reach, indices);
-            if a_lo < a_hi {
-                lo = lo.min(a_lo);
-                hi = hi.max(a_hi);
+            let (lo, hi) = fetch_range(a, vf.size_dwords, k, reach, indices);
+            if lo < hi {
+                ranges.push((lo, hi, k));
             }
         }
-        if lo >= hi {
-            return Ok((None, 0, None));
+        ranges.sort_unstable();
+        let mut parts: Vec<(u64, u64)> = Vec::new();
+        let mut part_of = Vec::new();
+        for &(lo, hi, k) in &ranges {
+            match parts.last_mut() {
+                Some(p) if lo <= p.1 + WINDOW_GAP => p.1 = p.1.max(hi),
+                _ => parts.push((lo, hi)),
+            }
+            part_of.push((k, parts.len() - 1));
         }
-        let mut memo = self.window_memo.iter().rev();
-        if let Some(&w) = memo.find(|&&(a, b, _)| a <= lo && hi <= b) {
-            return Ok((None, w.0 as u32, Some((w, hi - lo))));
+        let mut rebase = [0; 96];
+        let Some(&(lo, hi)) = parts.first() else {
+            return Ok((parts, 0, rebase, None));
+        };
+        if parts.len() == 1 {
+            let mut memo = self.window_memo.iter().rev();
+            if let Some(&w) = memo.find(|&&(a, b, _)| a <= lo && hi <= b) {
+                return Ok((Vec::new(), w.0 as u32, rebase, Some((w, hi - lo))));
+            }
         }
-        if hi - lo > self.max_storage {
+        // Where each part lands in the window, as `stage` lays them out.
+        let mut at = Vec::with_capacity(parts.len());
+        let mut next = 0;
+        for &(lo, hi) in &parts {
+            at.push(next);
+            next += (hi - lo)
+                .max(4)
+                .next_multiple_of(4)
+                .next_multiple_of(self.arena_align);
+        }
+        let (last_lo, last_hi) = parts[parts.len() - 1];
+        let size = at[at.len() - 1] + last_hi - last_lo;
+        if size > self.max_storage {
             return unsupported(format!(
-                "vertex data window of {} bytes is larger than the storage buffer limit",
-                hi - lo
+                "vertex data window of {size} bytes is larger than the storage buffer limit"
             ));
         }
-        self.sync(mem, lo, hi)?;
-        Ok((Some((lo, hi)), lo as u32, None))
+        for (k, p) in part_of {
+            rebase[k as usize] = ((lo + at[p]) as i64 - parts[p].0 as i64) as i32 / 4;
+        }
+        for &(lo, hi) in &parts {
+            self.sync(mem, lo, hi)?;
+        }
+        Ok((parts, lo as u32, rebase, None))
     }
 
     fn buffer(&self, label: &str, bytes: &[u8], usage: wgpu::BufferUsages) -> wgpu::Buffer {
@@ -2977,8 +3017,8 @@ impl Drawer {
     }
 
     /// The `Consts` uniform of the shader binding contract.
-    fn consts(&self, window_base: u32) -> Vec<u8> {
-        consts(&self.regs, window_base)
+    fn consts(&self, window_base: u32, rebase: &[i32; 96]) -> Vec<u8> {
+        consts(&self.regs, window_base, rebase)
     }
 
     /// Texture and sampler for fetch constant slot `n`. A slot without a
@@ -3779,9 +3819,9 @@ impl Drawer {
             .copied()
             .collect();
         let indices = index_range(&idx, self.regs.get(regs::VGT_INDX_OFFSET));
-        let (mut read, window_base, staged) =
+        let (mut read, window_base, rebase, staged) =
             self.guest_window(vf_mask, &reach, indices, mem, report)?;
-        let consts = self.consts(window_base);
+        let consts = self.consts(window_base, &rebase);
         let epi = to_bytes(&state::epilogue(&self.regs, w, h));
         // Rectangle lists read their guest indices in the vertex shader and
         // draw 6 host vertices per rectangle without an index buffer.
@@ -3796,20 +3836,27 @@ impl Drawer {
             .filter(|(b, _)| *b == consts)
             .map(|&(_, s)| s);
         fn parts<'a>(
-            w: Option<Part<'a>>,
+            w: Option<Vec<Part<'a>>>,
             c: Option<&'a [u8]>,
             rest: [Part<'a>; 3],
         ) -> Vec<Part<'a>> {
-            w.into_iter()
+            (w.into_iter().flatten())
                 .chain(c.map(Part::Bytes))
                 .chain(rest)
                 .collect()
         }
-        // The window's size is all `fits` needs of it.
-        let window_size = Part::Guest(0, read.map_or(0, |(lo, hi)| (hi - lo) as usize));
+        // The window's parts, or one empty part for no window.
+        let window = |read: &[(u64, u64)]| -> Vec<Part<'static>> {
+            if read.is_empty() {
+                return vec![Part::Bytes(&[])];
+            }
+            (read.iter())
+                .map(|&(lo, hi)| Part::Guest(lo as u32, (hi - lo) as usize))
+                .collect()
+        };
         if (kept_window.is_some() || kept_consts.is_some())
             && !self.fits(&parts(
-                kept_window.is_none().then_some(window_size),
+                kept_window.is_none().then(|| window(&read)),
                 kept_consts.is_none().then_some(&consts),
                 rest,
             ))
@@ -3820,21 +3867,17 @@ impl Drawer {
         }
         if let (Some(((lo, hi, _), _)), None) = (staged, kept_window) {
             self.sync(mem, lo, hi)?;
-            read = Some((lo, hi));
+            read = vec![(lo, hi)];
         }
-        let window = match read {
-            Some((lo, hi)) => {
-                report.timings.guest_bytes += hi - lo;
-                Part::Guest(lo as u32, (hi - lo) as usize)
-            }
-            None => Part::Bytes(&[]),
-        };
+        if kept_window.is_none() {
+            report.timings.guest_bytes += read.iter().map(|(lo, hi)| hi - lo).sum::<u64>();
+        }
         // A full arena submits the batch in `stage`: submit time, not guest data.
         let submit = self.timings.submit;
         let mut fresh = (self.stage(
             &*mem,
             &parts(
-                kept_window.is_none().then_some(window),
+                kept_window.is_none().then(|| window(&read)),
                 kept_consts.is_none().then_some(&consts),
                 rest,
             ),
@@ -3847,11 +3890,16 @@ impl Drawer {
                 w.2
             }
             None => {
-                let s = fresh.next().expect("staged window");
-                if let Some((lo, hi)) = read {
-                    self.window_memo.push((lo, hi, s));
+                let first = fresh.next().expect("staged window");
+                // The parts after the first end the window's binding.
+                let last = (read.iter().skip(1))
+                    .map(|_| fresh.next().expect("staged window part"))
+                    .last()
+                    .unwrap_or(first);
+                if let [(lo, hi)] = read[..] {
+                    self.window_memo.push((lo, hi, first));
                 }
-                s
+                (first.0, last.0 + last.1 - first.0)
             }
         };
         let consts_slice = match kept_consts {
@@ -4758,7 +4806,9 @@ mod tests {
             .chain(block(regs::SHADER_CONSTANT_LOOP, 32))
             .collect();
         want.extend([0x1234_5678, 77, 0, 0]);
-        assert_eq!(consts(r, 0x1234_5678), to_bytes(&want));
+        let rebase = std::array::from_fn(|k| k as i32 - 3);
+        want.extend(rebase.map(|w: i32| w as u32));
+        assert_eq!(consts(r, 0x1234_5678, &rebase), to_bytes(&want));
     }
 
     /// A drawer on the test adapter, held under one lock so the unit tests

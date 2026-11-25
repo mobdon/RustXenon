@@ -15,7 +15,10 @@
 //!   so the shader byte-swaps each word by the vertex fetch constant's endian
 //!   field (0 none, 1 8in16, 2 8in32, 3 16in32). Fetch addresses are masked
 //!   to physical (`& 0x1FFFFFFF`), so `window_base` is a physical address:
-//!   guest byte address `A` is word `(A - consts.window_base) / 4`; words outside the window read as 0.
+//!   guest byte address `A` of vertex fetch constant `k` is word
+//!   `(A - consts.window_base) / 4 + vf_rebase[k / 4][k % 4]`; words outside
+//!   the window read as 0. The rebase lets the drawer upload far-apart
+//!   parts of guest memory next to each other.
 //! - `@group(0) @binding(1) var<uniform> consts: Consts` with
 //!
 //!   ```text
@@ -28,6 +31,7 @@
 //!       vertex_base: u32,
 //!       _pad0: u32,
 //!       _pad1: u32,
+//!       vf_rebase: array<vec4<i32>, 24>,
 //!   }
 //!   ```
 //!

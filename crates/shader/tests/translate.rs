@@ -80,7 +80,7 @@ fn passthrough_vertex_shader() {
     has(&t, "let idx = i32(floor(r[0].x));");
     has(
         &t,
-        "vf_addr = i32((consts.fetch[0u][0u] >> 2u) & 0x07FFFFFFu) + idx * 4;",
+        "vf_addr = i32((consts.fetch[0u][0u] >> 2u) & 0x07FFFFFFu) + idx * 4 + consts.vf_rebase[0u][0u];",
     );
     has(&t, "let e = consts.fetch[0u][1u] & 3u;");
     has(&t, "r[1].w = 1.0;");
@@ -103,6 +103,7 @@ fn vertex_fetch_constant_layout() {
     let t = ok(&words, Vertex);
     has(&t, "consts.fetch[3u][2u] >> 2u");
     has(&t, "consts.fetch[3u][3u] & 3u");
+    has(&t, "+ consts.vf_rebase[1u][3u];");
     assert_eq!(t.info.vertex_fetch_consts, 1 << 7);
 }
 
@@ -883,7 +884,7 @@ fn every_vertex_format() {
     assert!(!t.wgsl.contains("let idx"));
     has(
         &t,
-        "vf_addr = i32((consts.fetch[0u][0u] >> 2u) & 0x07FFFFFFu);",
+        "vf_addr = i32((consts.fetch[0u][0u] >> 2u) & 0x07FFFFFFu) + consts.vf_rebase[0u][0u];",
     );
 }
 
