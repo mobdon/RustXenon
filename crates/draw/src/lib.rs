@@ -614,6 +614,22 @@ fn transferable(a: TargetFormat, b: TargetFormat) -> bool {
     word(a) && word(b)
 }
 
+/// Draw pipelines kept: a long run made about 300, each with its shaders
+/// about 1.6 MB of driver memory.
+const PIPELINE_CAP: usize = 1024;
+
+/// Key of a shader module: program hash, vertex stage, extra vertex
+/// outputs, variant and pixel parameter generation.
+type ModuleKey = (u64, bool, u16, Variant, Option<ParamGen>);
+
+/// The vertex and pixel shader modules a pipeline is made from.
+fn module_keys(k: &PipelineKey) -> [ModuleKey; 2] {
+    [
+        (k.vs, true, k.vs_extra, k.vs_variant, None),
+        (k.ps, false, 0, k.ps_variant, k.ps_param_gen),
+    ]
+}
+
 /// `blend` as the pipeline needs it with colour write mask `mask`: a
 /// component whose channels are not written is left as replace, and a
 /// state that is all replace is no blending.
@@ -704,8 +720,13 @@ pub struct Drawer {
     /// Keyed by program hash, stage, extra vertex outputs, variant (the
     /// rectangle list wrapper or the pixel output bias and clamp) and pixel parameter
     /// generation.
-    modules: HashMap<(u64, bool, u16, Variant, Option<ParamGen>), wgpu::ShaderModule>,
-    pipelines: HashMap<PipelineKey, wgpu::RenderPipeline>,
+    modules: HashMap<ModuleKey, wgpu::ShaderModule>,
+    /// With the use that last drew with each, for least recently used
+    /// eviction past `pipeline_cap`.
+    pipelines: HashMap<PipelineKey, (wgpu::RenderPipeline, u64)>,
+    pipeline_uses: u64,
+    pipeline_cap: usize,
+    pipeline_drops: u64,
     texture_layouts: HashMap<u32, (wgpu::BindGroupLayout, wgpu::PipelineLayout)>,
     group0: wgpu::BindGroupLayout,
     clear_layout: wgpu::BindGroupLayout,
@@ -1131,6 +1152,9 @@ impl Drawer {
             translated: HashMap::new(),
             modules: HashMap::new(),
             pipelines: HashMap::new(),
+            pipeline_uses: 0,
+            pipeline_cap: PIPELINE_CAP,
+            pipeline_drops: 0,
             texture_layouts: HashMap::new(),
             group0,
             clear_layout,
@@ -1185,11 +1209,15 @@ impl Drawer {
 
     /// What the drawer holds, for the run log: cached textures, render
     /// targets (bytes estimated from their size and format), the draw upload
-    /// arena and its host staging copy, and pipeline and shader counts.
+    /// arena and its host staging copy, pipeline counts (with the distinct
+    /// vertex and pixel shader pairs of the draw pipelines and how many were
+    /// dropped) and shader module counts.
     pub fn memory_line(&self) -> String {
         let rt: u64 = self.targets.values().map(texture_bytes).sum();
+        let pairs: std::collections::HashSet<(u64, u64)> =
+            self.pipelines.keys().map(|k| (k.vs, k.ps)).collect();
         format!(
-            "draw: textures {} MB in {}, targets {} MB in {}, {} dropped, arena {} MB, staged {} MB, pipelines {}, shaders {}",
+            "draw: textures {} MB in {}, targets {} MB in {}, {} dropped, arena {} MB, staged {} MB, pipelines {} ({} vs/ps pairs, {} dropped), shaders {}",
             self.texture_cache_bytes >> 20,
             self.texture_cache.len(),
             rt >> 20,
@@ -1198,8 +1226,49 @@ impl Drawer {
             self.arena.as_ref().map_or(0, |b| b.size()) >> 20,
             self.staged.capacity() >> 20,
             self.pipelines.len() + self.clear_pipelines.len(),
+            pairs.len(),
+            self.pipeline_drops,
             self.modules.len(),
         )
+    }
+
+    /// Sets how many draw pipelines are kept (least recently used ones
+    /// past it are dropped, with the shaders only they used). For tests.
+    #[doc(hidden)]
+    pub fn set_pipeline_cap(&mut self, pipelines: usize) {
+        self.pipeline_cap = pipelines;
+        self.drop_pipelines();
+    }
+
+    /// Drops the least recently used draw pipelines past the cap, and the
+    /// shader modules and translations no kept pipeline uses.
+    fn drop_pipelines(&mut self) {
+        while self.pipelines.len() > self.pipeline_cap {
+            let Some(old) = self
+                .pipelines
+                .iter()
+                .min_by_key(|(_, (_, used))| *used)
+                .map(|(k, _)| k.clone())
+            else {
+                break;
+            };
+            self.pipelines.remove(&old);
+            self.pipeline_drops += 1;
+            for m in module_keys(&old) {
+                if self.pipelines.keys().any(|k| module_keys(k).contains(&m)) {
+                    continue;
+                }
+                self.modules.remove(&m);
+                let (hash, vertex, _, _, param_gen) = m;
+                if !self
+                    .modules
+                    .keys()
+                    .any(|n| (n.0, n.1, n.4) == (hash, vertex, param_gen))
+                {
+                    self.translated.remove(&(hash, vertex, param_gen));
+                }
+            }
+        }
     }
 
     /// Keys of every render target created so far.
@@ -2642,8 +2711,12 @@ impl Drawer {
             cull: (if facing { cull.0 } else { wgpu::FrontFace::Ccw }, cull.1),
             textures: tex_mask,
         };
-        let pipeline = match self.pipelines.get(&key) {
-            Some(p) => p.clone(),
+        self.pipeline_uses += 1;
+        let pipeline = match self.pipelines.get_mut(&key) {
+            Some((p, used)) => {
+                *used = self.pipeline_uses;
+                p.clone()
+            }
             None => {
                 let k = key.clone();
                 let p = self.validated("render pipeline", |dev| {
@@ -2689,8 +2762,9 @@ impl Drawer {
                         cache: None,
                     })
                 })?;
-                self.pipelines.insert(key, p.clone());
+                self.pipelines.insert(key, (p.clone(), self.pipeline_uses));
                 self.timings.pipelines_created += 1;
+                self.drop_pipelines();
                 p
             }
         };
