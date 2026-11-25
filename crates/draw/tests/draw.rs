@@ -28,6 +28,8 @@ fn resolve_clear_fills_render_target() {
     assert!(report.unsupported.is_empty(), "{report:?}");
     let img = d.read_render_target(COLOR_KEY, 0, 0, W, H).unwrap();
     assert!(img.chunks_exact(4).all(|p| p == CLEAR));
+    let m = d.memory_line();
+    assert!(m.contains("targets 1 MB in 2,"), "{m}");
 }
 
 /// Clears, then draws a triangle with per-vertex colours through the
