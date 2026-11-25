@@ -69,9 +69,13 @@ pub fn drawer() -> Option<TestDrawer> {
 #[allow(dead_code)]
 pub fn drawer_with_gpu_timestamps() -> Option<TestDrawer> {
     let gpu = GPU.lock().unwrap_or_else(|e| e.into_inner());
+    let before = std::env::var_os("XENON_GPU_TIMESTAMPS");
     std::env::set_var("XENON_GPU_TIMESTAMPS", "1");
     let d = test_drawer(gpu);
-    std::env::remove_var("XENON_GPU_TIMESTAMPS");
+    match before {
+        Some(v) => std::env::set_var("XENON_GPU_TIMESTAMPS", v),
+        None => std::env::remove_var("XENON_GPU_TIMESTAMPS"),
+    }
     d
 }
 
