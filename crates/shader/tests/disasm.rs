@@ -130,3 +130,19 @@ fn export_components_in_both_masks_list_as_one() {
         d.text
     );
 }
+
+#[test]
+fn abs_constants_applies_to_both_scalar_constant_op_operands() {
+    let mut a = AluInstr::scalar(
+        ScalarOp::Mulsc0,
+        1,
+        mask("w"),
+        AluSrc::constant(5, swz("xyzw")),
+    );
+    a.abs_constants = true;
+    let temp = a.scalar_const_op_temp_reg();
+    let words = assemble(&[CfInstr::Exec(Exec::new(0, 1, true))], &[Instr::Alu(a)]);
+    let d = disassemble(&words, ShaderStage::Vertex);
+    let want = format!("mulsc0 r1.___w, |c5|.w, |r{temp}|.x");
+    assert!(d.text.contains(&want), "missing {want:?} in\n{}", d.text);
+}

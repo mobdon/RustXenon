@@ -431,10 +431,12 @@ impl Dis {
                     let s = a.src[2];
                     let c = self.constant(a, s.reg, 3);
                     let n = if s.negate { "-" } else { "" };
+                    // abs_constants applies to the temp operand too.
+                    let r = format!("r{}", a.scalar_const_op_temp_reg());
+                    let r = if a.abs_constants { format!("|{r}|") } else { r };
                     format!(
-                        "{n}{c}.{}, {n}r{}.{}",
+                        "{n}{c}.{}, {n}{r}.{}",
                         COMP[alu_swizzle_component(s.swizzle, 3) as usize],
-                        a.scalar_const_op_temp_reg(),
                         COMP[alu_swizzle_component(s.swizzle, 0) as usize]
                     )
                 }
