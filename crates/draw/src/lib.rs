@@ -36,22 +36,30 @@
 //! EDRAM holds 2048 rows of 1280 32-bit pixels).
 //!
 //! Each target records when it was last written (draw or clear; a transfer
-//! gives the target its source's stamp, so neither is transferred back).
-//! When a draw, clear or resolve uses a target and a `k_8_8_8_8` colour
-//! and a depth target at the same base and pitch were written later by
-//! the other one, that one's pixels are first transferred into it, as
-//! Xenia's render target cache transfers EDRAM ownership: they are drawn
-//! as the shared 32-bit EDRAM word (colour `r | g << 8 | b << 16 | a <<
-//! 24`; depth `depth24 << 8 | stencil`, converted like the depth clear and
-//! the depth resolve) by the fullscreen passes of `transfer.wgsl`. Colour
-//! to depth writes `frag_depth`, then, without shader stencil export, sets
-//! the stencil one bit per pass as Xenia does. Other aliasing is not
-//! modelled: each key keeps its own pixels. A newer target at the same
-//! base and pitch that cannot be transferred (depth to depth, or depth and
-//! a colour format other than `k_8_8_8_8`), or a newer target at another
-//! base or pitch whose tiles overlap (estimated from the rows written, one
-//! sample per pixel), is only reported in [`Report::warnings`]; colour
-//! targets of different formats at one base are not reported.
+//! gives the target its source's stamp, so neither is transferred back)
+//! and with how many samples per pixel. Two targets at one base are on the
+//! same EDRAM tiles when their rows are as wide in samples (pitch times
+//! samples across), whatever their sample counts: a 4x MSAA surface at
+//! half the pitch of a 2x one, as games clear a tile with a quarter of the
+//! pixels. When a draw, clear or resolve uses a target and the newest
+//! write to its tiles went to another such target, that one's pixels are
+//! first transferred into it, as Xenia's render target cache transfers
+//! EDRAM ownership: the EDRAM is one memory, so the newest write wins
+//! whatever its format. Between `k_8_8_8_8` colour, kD24S8 and kD24FS8
+//! the pixels are drawn as the shared 32-bit EDRAM word (colour `r | g <<
+//! 8 | b << 16 | a << 24`; depth `depth24 << 8 | stencil`, converted like
+//! the depth clear and the depth resolve) by the fullscreen passes of
+//! `transfer.wgsl`, each destination pixel reading the source pixel of its
+//! first sample. Depth destinations take `frag_depth`, then, without
+//! shader stencil export, the stencil one bit per pass as Xenia does.
+//! Other aliasing is not modelled: each key keeps its own pixels. A newer
+//! target on the same tiles that cannot be transferred (a colour format
+//! other than `k_8_8_8_8`), a newer target at the same base and pitch
+//! with rows of another width (64bpp), or a newer target at another base
+//! or row width whose tiles overlap
+//! (estimated from the rows written), is only reported in
+//! [`Report::warnings`]; colour targets of different formats at one base
+//! and pitch are not reported.
 //!
 //! Colour targets ([`TargetFormat`]; formats with one bit layout share a
 //! key):
@@ -501,29 +509,46 @@ struct Written {
     stamp: u64,
     /// Rows written so far, at least (scissor or rectangle bottom).
     rows: u32,
+    /// RB_SURFACE_INFO msaa_samples of that write (0 1x, 1 2x, 2 4x).
+    msaa: u32,
 }
 
-/// EDRAM tiles `[start, end)` that `k` covers down to row `rows`.
-// shortcut: one sample per pixel and no wrap past tile 2048; count MSAA
-// samples and wrap if a capture's overlap report needs to be exact.
-fn edram_range(k: RenderTargetKey, rows: u32) -> (u32, u32) {
-    let tile_width = if k.format == TargetFormat::Rgba16Float {
-        40
-    } else {
-        80
+/// Samples per pixel across and down for RB_SURFACE_INFO msaa_samples
+/// (2x stacks its samples vertically, 4x is 2 by 2).
+fn samples(msaa: u32) -> (u32, u32) {
+    match msaa {
+        0 => (1, 1),
+        1 => (1, 2),
+        _ => (2, 2),
+    }
+}
+
+/// Width of one EDRAM row of `k`'s tiles, in 32-bit samples.
+fn row_width(k: RenderTargetKey, msaa: u32) -> u32 {
+    let bytes = match k.format {
+        TargetFormat::Rgba16Float | TargetFormat::Rgba16Fixed | TargetFormat::Rg32Float => 2,
+        _ => 1,
     };
-    let len = k.pitch.div_ceil(tile_width) * rows.div_ceil(16);
+    k.pitch * samples(msaa).0 * bytes
+}
+
+/// EDRAM tiles `[start, end)` that `k`, drawn with `msaa`, covers down to
+/// row `rows`.
+// shortcut: no wrap past tile 2048; wrap if a capture's overlap report
+// needs to be exact.
+fn edram_range(k: RenderTargetKey, rows: u32, msaa: u32) -> (u32, u32) {
+    let len = row_width(k, msaa).div_ceil(80) * (rows * samples(msaa).1).div_ceil(16);
     (k.base_tiles, k.base_tiles + len)
 }
 
 /// Whether the EDRAM word of a target of format `a` can be transferred to
-/// one of format `b`: k_8_8_8_8 colour to or from depth.
-// shortcut: depth <-> depth (D24S8 / D24FS8) and depth <-> colour formats
-// other than k_8_8_8_8 (k_32_FLOAT, 2_10_10_10, ...) are not transferred,
-// only reported; add their word conversions to transfer.wgsl when a capture
-// aliases them.
+/// one of format `b`: between k_8_8_8_8 colour, kD24S8 and kD24FS8.
+// shortcut: colour formats other than k_8_8_8_8 (k_32_FLOAT, 2_10_10_10,
+// ...) are not transferred, only reported; add their word conversions to
+// transfer.wgsl when a capture aliases them.
 fn transferable(a: TargetFormat, b: TargetFormat) -> bool {
-    (a == TargetFormat::Rgba8 && b.is_depth()) || (a.is_depth() && b == TargetFormat::Rgba8)
+    let word = |f: TargetFormat| f == TargetFormat::Rgba8 || f.is_depth();
+    word(a) && word(b)
 }
 
 /// Replays recorded command lists on a headless wgpu device.
@@ -1439,15 +1464,16 @@ impl Drawer {
         Ok(out)
     }
 
-    /// The texture of render target `key`, made current first: when another
-    /// target at the same EDRAM base and pitch was written after it, that
-    /// target's pixels are transferred into it (the EDRAM holds one set of
-    /// bytes for both). `rows` is how far down this use reaches, for the
-    /// overlap report.
+    /// The texture of render target `key`, drawn with `msaa` samples, made
+    /// current first: when another target on the same EDRAM tiles was
+    /// written after it, the newest one's pixels are transferred into it
+    /// (the EDRAM holds one set of bytes for both). `rows` is how far down
+    /// this use reaches, for the overlap report.
     fn target(
         &mut self,
         key: RenderTargetKey,
         rows: u32,
+        msaa: u32,
         report: &mut Report,
     ) -> Result<wgpu::Texture, Skip> {
         if key.pitch == 0 || key.pitch > self.max_dim {
@@ -1485,22 +1511,31 @@ impl Drawer {
             })
             .clone();
         let own = self.written.get(&key).copied().unwrap_or_default();
-        let range = edram_range(key, rows.max(own.rows));
+        let range = edram_range(key, rows.max(own.rows), msaa);
         let mut newest: Option<(RenderTargetKey, Written)> = None;
         for (&k, &w) in &self.written {
             if w.stamp <= own.stamp || k == key {
                 continue;
             }
-            if k.base_tiles == key.base_tiles && k.pitch == key.pitch {
+            let same_tiles = row_width(k, w.msaa) == row_width(key, msaa);
+            if k.base_tiles == key.base_tiles && (k.pitch == key.pitch || same_tiles) {
                 // shortcut: colour targets of different formats at one base
-                // keep their own pixels, silently; transfer them too if a
-                // capture reinterprets colour in place.
+                // and pitch keep their own pixels, silently; transfer them
+                // too if a capture reinterprets colour in place.
                 let with_depth = k.format.is_depth() || key.format.is_depth();
-                if with_depth && newest.is_none_or(|(_, n)| w.stamp > n.stamp) {
+                if k.pitch == key.pitch && !with_depth {
+                    continue;
+                }
+                // A transfer leaves both with one stamp: the one at the
+                // same pitch holds the words without resampling.
+                if newest.is_none_or(|(n, nw)| {
+                    w.stamp > nw.stamp
+                        || (w.stamp == nw.stamp && k.pitch == key.pitch && n.pitch != key.pitch)
+                }) {
                     newest = Some((k, w));
                 }
             } else {
-                let other = edram_range(k, w.rows);
+                let other = edram_range(k, w.rows, w.msaa);
                 // shortcut: partial overlaps (another base or pitch) are only
                 // reported; transfer the overlapping tiles if a capture
                 // needs them.
@@ -1512,13 +1547,19 @@ impl Drawer {
             }
         }
         if let Some((src, w)) = newest {
-            if transferable(src.format, key.format) {
-                self.transfer(src, key, &tex, w.rows)?;
+            let same_tiles = row_width(src, w.msaa) == row_width(key, msaa);
+            if transferable(src.format, key.format) && same_tiles {
+                // The rows of `key` whose first sample row is in `src`'s.
+                let (src_down, dst_down) = (samples(w.msaa).1, samples(msaa).1);
+                let height = RENDER_TARGET_HEIGHT.min(self.max_dim);
+                let rows = (w.rows * src_down).div_ceil(dst_down).min(height);
+                self.transfer((src, w.msaa), (key, msaa), &tex, rows)?;
                 // Both now hold the same words: the source's stamp, so
                 // using the source again does not transfer them back.
                 let own = self.written.entry(key).or_default();
                 own.stamp = w.stamp;
-                own.rows = own.rows.max(w.rows);
+                own.rows = own.rows.max(rows);
+                own.msaa = msaa;
             } else {
                 report.warn(format!(
                     "{:?} render target aliases a newer {:?} one at its EDRAM base; not transferred",
@@ -1529,12 +1570,13 @@ impl Drawer {
         Ok(tex)
     }
 
-    /// Records a write to `key` down to row `rows`.
-    fn mark_written(&mut self, key: RenderTargetKey, rows: u32) {
+    /// Records a write to `key`, drawn with `msaa`, down to row `rows`.
+    fn mark_written(&mut self, key: RenderTargetKey, rows: u32, msaa: u32) {
         self.clock += 1;
         let w = self.written.entry(key).or_default();
         w.stamp = self.clock;
         w.rows = w.rows.max(rows);
+        w.msaa = msaa;
     }
 
     /// The transfer pipeline from host format `src` to `dst`; `bit` 0..8 is
@@ -1560,12 +1602,17 @@ impl Drawer {
             })
             .clone();
         let to_depth = dst.is_depth_stencil_format();
-        let entry = match (to_depth, bit) {
-            (true, 8) => "color_to_depth",
-            (true, _) => "color_to_stencil",
-            (false, _) if src.has_stencil_aspect() => "depth_stencil_to_color",
-            (false, _) => "depth_to_color",
+        let from = match src {
+            _ if !src.is_depth_stencil_format() => "color",
+            _ if src.has_stencil_aspect() => "depth_stencil",
+            _ => "depth",
         };
+        let to = match (to_depth, bit) {
+            (true, 8) => "depth",
+            (true, _) => "stencil",
+            (false, _) => "color",
+        };
+        let entry = format!("{from}_to_{to}");
         let float20e4 = dst != wgpu::TextureFormat::Depth24PlusStencil8;
         let constants = [
             ("transfer_20e4", if float20e4 { 1.0 } else { 0.0 }),
@@ -1615,7 +1662,7 @@ impl Drawer {
                 multisample: Default::default(),
                 fragment: Some(wgpu::FragmentState {
                     module,
-                    entry_point: Some(entry),
+                    entry_point: Some(&entry),
                     compilation_options: wgpu::PipelineCompilationOptions {
                         constants: if to_depth { &constants } else { &[] },
                         ..Default::default()
@@ -1630,15 +1677,17 @@ impl Drawer {
         Ok(p)
     }
 
-    /// EDRAM ownership transfer: draws the first `rows` rows of target
-    /// `src` into `dst` (same base and pitch, one k_8_8_8_8 and one depth)
-    /// as their shared 32-bit EDRAM word: colour `r | g << 8 | b << 16 |
-    /// a << 24`, depth `depth24 << 8 | stencil` (24-bit unorm for kD24S8,
-    /// 20e4 for kD24FS8, converted as the depth clear and resolve do).
+    /// EDRAM ownership transfer: draws target `src` into the first `rows`
+    /// rows of `dst` (same tiles; k_8_8_8_8, kD24S8 or kD24FS8, each with
+    /// its RB_SURFACE_INFO msaa_samples) as their shared 32-bit EDRAM
+    /// word: colour `r | g << 8 | b << 16 | a << 24`, depth `depth24 << 8
+    /// | stencil` (24-bit unorm for kD24S8, 20e4 for kD24FS8, converted as
+    /// the depth clear and resolve do). A `dst` pixel takes the `src`
+    /// pixel holding its first sample.
     fn transfer(
         &mut self,
-        src: RenderTargetKey,
-        dst: RenderTargetKey,
+        (src, src_msaa): (RenderTargetKey, u32),
+        (dst, dst_msaa): (RenderTargetKey, u32),
         dst_tex: &wgpu::Texture,
         rows: u32,
     ) -> Result<(), Skip> {
@@ -1652,13 +1701,22 @@ impl Drawer {
         self.flush()?;
         let (sf, df) = (self.host_format(src.format), self.host_format(dst.format));
         let to_depth = df.is_depth_stencil_format();
-        let bits = if df.has_stencil_aspect() { 0..8 } else { 0..0 };
+        // Without a source stencil the depth pass's stencil 0 is the word's.
+        let src_stencil = !sf.is_depth_stencil_format() || sf.has_stencil_aspect();
+        let bits = if df.has_stencil_aspect() && src_stencil {
+            0..8
+        } else {
+            0..0
+        };
         let mut pipelines = vec![self.transfer_pipeline(sf, df, 8)?];
         for bit in bits {
             pipelines.push(self.transfer_pipeline(sf, df, bit)?);
         }
-        // resolve.wgsl's depth_word reads only `src_format` of its params.
+        // transfer.wgsl reads the samples per pixel from x0, y0 (`dst`) and
+        // w, h (`src`); resolve.wgsl's depth_word reads `src_format`.
         let mut params = [0u32; 12];
+        (params[0], params[1]) = samples(dst_msaa);
+        (params[2], params[3]) = samples(src_msaa);
         params[5] = if src.format == TargetFormat::D24FS8 {
             6
         } else {
@@ -1675,7 +1733,7 @@ impl Drawer {
                 ..Default::default()
             })
         };
-        let views = if to_depth {
+        let views = if !sf.is_depth_stencil_format() {
             vec![(0, aspect(wgpu::TextureAspect::All))]
         } else if sf.has_stencil_aspect() {
             vec![
@@ -1696,12 +1754,10 @@ impl Drawer {
                         resource: wgpu::BindingResource::TextureView(view),
                     })
                     .collect();
-                if !to_depth {
-                    entries.push(wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: uniform.as_entire_binding(),
-                    });
-                }
+                entries.push(wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: uniform.as_entire_binding(),
+                });
                 self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                     label: Some("transfer"),
                     layout: &p.get_bind_group_layout(0),
@@ -2311,14 +2367,15 @@ impl Drawer {
         let (w, h) = (surface & 0x3FFF, RENDER_TARGET_HEIGHT.min(self.max_dim));
         let (sx, sy, sw, sh) = state::scissor(&self.regs, w, h);
         let rows = sy + sh;
+        let msaa = (surface >> 16) & 3;
         let mut color_tex: [Option<wgpu::Texture>; 4] = Default::default();
         for rt in 0..4 {
             color_tex[rt] = color[rt]
-                .map(|k| self.target(k, rows, report))
+                .map(|k| self.target(k, rows, msaa, report))
                 .transpose()?;
         }
         let depth_tex = depth_key
-            .map(|k| self.target(k, rows, report))
+            .map(|k| self.target(k, rows, msaa, report))
             .transpose()?;
         if sw == 0 || sh == 0 {
             return Ok(false);
@@ -2488,10 +2545,10 @@ impl Drawer {
         // Recorded, not yet submitted: everything else that touches the
         // targets flushes the batch first, so stamps follow submit order.
         for k in color.into_iter().flatten() {
-            self.mark_written(k, rows);
+            self.mark_written(k, rows, msaa);
         }
         if let Some(k) = depth_key.filter(|_| depth.write || stencil.is_some()) {
-            self.mark_written(k, rows);
+            self.mark_written(k, rows, msaa);
         }
         Ok(true)
     }
@@ -2566,18 +2623,18 @@ impl Drawer {
         Ok(p)
     }
 
-    /// Clears `rect` of a render target. `color` is RGBA 0..1; for depth
-    /// targets `depth` and `stencil` are used.
+    /// Clears `rect` of a render target drawn with `msaa` samples. `color`
+    /// is RGBA 0..1; for depth targets `depth` and `stencil` are used.
     fn clear(
         &mut self,
-        key: RenderTargetKey,
+        (key, msaa): (RenderTargetKey, u32),
         rect: resolve::Rect,
         color: [f32; 4],
         depth: f32,
         stencil: u32,
         report: &mut Report,
     ) -> Result<(), Skip> {
-        let tex = self.target(key, rect.y1, report)?;
+        let tex = self.target(key, rect.y1, msaa, report)?;
         let rect = resolve::Rect {
             x0: rect.x0.min(tex.width()),
             y0: rect.y0.min(tex.height()),
@@ -2645,7 +2702,7 @@ impl Drawer {
         if let Some(e) = block_on(scope.pop()) {
             return Err(Skip::Fatal(Error::Gpu(e.to_string())));
         }
-        self.mark_written(key, rect.y1);
+        self.mark_written(key, rect.y1, msaa);
         Ok(())
     }
 
@@ -2696,7 +2753,7 @@ impl Drawer {
             let value = formats::clear_value(r.color_clear, r.color_clear_lo);
             let t = Instant::now();
             self.clear(
-                key,
+                (key, r.msaa_samples),
                 rect,
                 formats::clear_color(key.format, value),
                 0.0,
@@ -2716,7 +2773,14 @@ impl Drawer {
                 _ => (f64::from(d) / f64::from(0xFF_FFFFu32)) as f32,
             };
             let t = Instant::now();
-            self.clear(key, rect, [0.0; 4], depth, r.depth_clear & 0xFF, report)?;
+            self.clear(
+                (key, r.msaa_samples),
+                rect,
+                [0.0; 4],
+                depth,
+                r.depth_clear & 0xFF,
+                report,
+            )?;
             self.timings.clears += t.elapsed();
         }
         copied.map(|()| true)
@@ -2775,7 +2839,7 @@ impl Drawer {
             pitch: r.surface_pitch,
             format,
         };
-        let tex = self.target(key, rect.y1, report)?;
+        let tex = self.target(key, rect.y1, r.msaa_samples, report)?;
         let pitch = xenon_texture::tile::align_to_tile(r.dest_pitch);
         let rect = resolve::Rect {
             x1: rect.x1.min(pitch).min(tex.width()),
