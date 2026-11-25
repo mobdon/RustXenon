@@ -361,8 +361,9 @@ pub struct Timings {
     pub textures: Duration,
     /// Encoding and submitting draws (the GPU runs them asynchronously).
     pub submit: Duration,
-    /// Of `submit`: writing the staged bytes to the arena and
-    /// `queue.submit` when a batch is flushed; the rest is recording draws.
+    /// Of `submit`: a flush, which writes the staged bytes to the arena,
+    /// finishes the encoders and calls `queue.submit`; the rest is
+    /// recording draws.
     pub queue: Duration,
     /// Waiting for queued GPU work before a resolve readback: where the
     /// rendering itself shows up.
@@ -2215,8 +2216,9 @@ impl Drawer {
         }
         let (pre, batch) = (self.pre.take(), self.batch.take());
         if pre.is_none() && batch.is_none() {
-            self.timings.submit += t.elapsed();
-            self.timings.queue += t.elapsed();
+            let e = t.elapsed();
+            self.timings.submit += e;
+            self.timings.queue += e;
             return Ok(());
         }
         let scope = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
@@ -2236,8 +2238,10 @@ impl Drawer {
             }));
         self.queue.submit(bufs);
         self.submitted(site);
-        self.timings.submit += t.elapsed();
-        self.timings.queue += t.elapsed();
+        // One reading for both, so `queue` never exceeds `submit`.
+        let e = t.elapsed();
+        self.timings.submit += e;
+        self.timings.queue += e;
         match block_on(scope.pop()) {
             Some(e) => Err(Skip::Fatal(Error::Gpu(e.to_string()))),
             None => Ok(()),
