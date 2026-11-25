@@ -45,6 +45,9 @@ pub struct Runtime {
     pub call_budget: u64,
     /// Called before every guest call with the caller's context and target.
     pub trace: Option<fn(&Context, u32)>,
+    /// Called after every guest call returns (not when it unwinds), with
+    /// the callee's context and the target; for timing calls.
+    pub after: Option<fn(&Context, u32)>,
     threads: Mutex<HashMap<u32, Arc<GuestThread>>>,
     next_thread: AtomicU32,
     /// Host-side objects (locks, events, semaphores) by guest address.
@@ -62,6 +65,7 @@ impl Runtime {
             table_base: 0,
             call_budget: u64::MAX,
             trace: None,
+            after: None,
             threads: Mutex::new(HashMap::new()),
             next_thread: AtomicU32::new(1),
             objects: Mutex::new(HashMap::new()),
@@ -149,6 +153,9 @@ impl Runtime {
             .lookup(addr)
             .unwrap_or_else(|| panic!("no guest function at {addr:#010x}{}", wild_hint(addr)));
         f(self, ctx);
+        if let Some(after) = self.after {
+            after(ctx, addr);
+        }
     }
 
     /// Starts a guest thread running the function at `entry` with `ctx`
