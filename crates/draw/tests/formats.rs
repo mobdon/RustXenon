@@ -16,9 +16,13 @@ const PRIM_RECT_LIST: u32 = 8;
 
 /// `xenos::ColorRenderTargetFormat` values.
 const RT_2_10_10_10: u32 = 2;
+const RT_16_16: u32 = 4;
+const RT_16_16_16_16: u32 = 5;
+const RT_16_16_FLOAT: u32 = 6;
 const RT_16_16_16_16_FLOAT: u32 = 7;
 const RT_2_10_10_10_FLOAT_AS_16_16_16_16: u32 = 12;
 const RT_32_FLOAT: u32 = 14;
+const RT_32_32_FLOAT: u32 = 15;
 
 /// `xenos::ColorFormat` destination values.
 const DEST_8_8_8_8: u32 = 6;
@@ -453,7 +457,7 @@ fn front_buffer_follows_resolve_endian() {
 /// conversion ([`xenon_draw::formats::edram_rgba`] and
 /// [`xenon_draw::formats::resolve_pixel`], then
 /// [`xenon_draw::resolve::write_tiled_texels`]) byte for byte, over a
-/// gradient of every source format, both destination formats, exponent
+/// gradient of every source format, every 32bpp destination format, exponent
 /// biases, the red/blue swap and every endian.
 #[test]
 fn gpu_resolve_matches_cpu_reference() {
@@ -471,13 +475,22 @@ fn gpu_resolve_matches_cpu_reference() {
         (DEST_8_8_8_8, -2, false, 2),
         (DEST_2_10_10_10, 1, false, 3),
         (DEST_2_10_10_10, -5, true, 2),
+        (formats::DEST_16_16, 0, true, 1),
     ];
+    let snorm16 = d.snorm16();
     for (rt, format) in [
         (0, TargetFormat::Rgba8),
         (RT_2_10_10_10, TargetFormat::Rgb10a2),
         (RT_2_10_10_10_FLOAT_AS_16_16_16_16, TargetFormat::Float7e3),
         (RT_16_16_16_16_FLOAT, TargetFormat::Rgba16Float),
-    ] {
+        (RT_16_16, TargetFormat::Rg16Fixed),
+        (RT_16_16_16_16, TargetFormat::Rgba16Fixed),
+        (RT_16_16_FLOAT, TargetFormat::Rg16Float),
+        (RT_32_32_FLOAT, TargetFormat::Rg32Float),
+    ]
+    .into_iter()
+    .filter(|(rt, _)| snorm16 || !matches!(*rt, RT_16_16 | RT_16_16_16_16))
+    {
         let mut mem = memory();
         mem.write_words(VERTS, &verts);
         let mut s = Stream::default();
@@ -816,6 +829,281 @@ fn float32_target_clear_draw_and_resolve() {
         &mut out,
     );
     assert_eq!(out, 3.25f32.to_le_bytes());
+}
+
+/// The 32-bit words of a `w`-wide image of `bytes`-byte texels at (x, y).
+fn words(img: &[u8], bytes: u32, x: u32, y: u32) -> Vec<u32> {
+    texel(img, W, bytes, x, y)
+        .chunks_exact(4)
+        .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+        .collect()
+}
+
+/// The 16-bit fields of a texel, low first.
+fn shorts(t: &[u8]) -> Vec<u16> {
+    t.chunks_exact(2)
+        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .collect()
+}
+
+/// A colour clear of the whole target, then `c0` drawn into the corner
+/// (0,0)-(16,16), then one Convert resolve per (dest address, format,
+/// exponent bias). `blend` turns additive blending on.
+fn clear_draw_resolve(
+    d: &mut xenon_draw::Drawer,
+    rt: u32,
+    clear: (u32, u32),
+    c: [f32; 4],
+    blend: bool,
+    resolves: &[(u32, u32, i32)],
+) -> (xenon_gpu::SliceMemory, xenon_draw::Report) {
+    let mut mem = memory();
+    mem.write_words(VERTS, &corner_triangle(16.0));
+    let mut s = Stream::default();
+    s.setup()
+        .regs(RB_COLOR_INFO, &[rt << 16])
+        .resolve_with(
+            &mut mem,
+            (W, H),
+            COPY_NULL | CLEAR_COLOR,
+            (DEST, W | (H << 16), 0),
+            [0, clear.0, clear.1],
+        )
+        .shader(false, &vs_color())
+        .shader(true, &ps_const())
+        .vertex_fetch(0, VERTS, 12);
+    if blend {
+        // ONE + ONE for colour and alpha.
+        s.regs(RB_BLENDCONTROL0, &[0x0101_0101]);
+    }
+    c0(&mut s, c).draw_auto(PRIM_TRI_LIST, 3);
+    for &(dest, format, bias) in resolves {
+        s.resolve_with(
+            &mut mem,
+            (W, H),
+            COPY_CONVERT,
+            (dest, W | (H << 16), dest_info(format, bias, false)),
+            [0; 3],
+        );
+    }
+    let report = run(d, &s, &mut mem);
+    (mem, report)
+}
+
+/// k_16_16 holds [-32, 32] as 16-bit fixed point; the snorm16 host target
+/// holds the shader output / 32. A clear writes the raw 16-bit values
+/// (0x7FFF is 32, 0xC000 is -16.0005), a resolve unpacks x * 32 / 32767
+/// floored at -1 (Xenia XeUnpackR16G16Edram) and packs it with the
+/// exponent bias: to 8_8_8_8 and 16_16 (unorm) and 32_FLOAT on the GPU,
+/// to 16_16_FLOAT on the CPU.
+#[test]
+fn fixed16_target_clear_draw_and_resolve() {
+    use xenon_draw::formats::*;
+    let Some(mut d) = drawer() else { return };
+    if !d.snorm16() {
+        eprintln!("SKIP: the host cannot render into 16-bit snorm");
+        return;
+    }
+    let dest = |i: u32| DEST + 0x1_0000 * i;
+    let (mem, report) = clear_draw_resolve(
+        &mut d,
+        RT_16_16,
+        (0xC000_7FFF, 0),
+        [3.0, -0.5, 7.0, 8.0],
+        false,
+        &[
+            (dest(0), DEST_8_8_8_8, -5),
+            (dest(1), DEST_16_16, -5),
+            (dest(2), DEST_32_FLOAT, 0),
+            (dest(3), DEST_16_16_FLOAT, 0),
+        ],
+    );
+    assert_eq!((report.draws, report.resolves), (1, 5), "{report:?}");
+    assert!(report.unsupported.is_empty(), "{report:?}");
+    let raw = d
+        .read_render_target_raw(key(TargetFormat::Rg16Fixed), 0, 0, W, H)
+        .unwrap();
+    // 3 / 32 * 32767 = 3071.9 and -0.5 / 32 * 32767 = -511.98, rounded.
+    assert_eq!(shorts(&texel(&raw, W, 4, 2, 2)), [0x0C00, 0xFE00]);
+    assert_eq!(shorts(&texel(&raw, W, 4, 40, 40)), [0x7FFF, 0xC000]);
+    // 3072 * 32 / 32767 = 3.0001, / 32 * 255 + 0.5 = 24.4; -16 floors at -1.
+    let img = detiled(&mem, dest(0), W, H, W, 4);
+    assert_eq!(px(&img, W, 2, 2), [24, 0, 0, 0]);
+    assert_eq!(px(&img, W, 40, 40), [255, 0, 0, 0]);
+    let img = detiled(&mem, dest(1), W, H, W, 4);
+    assert_eq!(shorts(&texel(&img, W, 4, 2, 2)), [6144, 0]);
+    assert_eq!(shorts(&texel(&img, W, 4, 40, 40)), [65535, 0]);
+    let img = detiled(&mem, dest(2), W, H, W, 4);
+    let r = 3072.0f32 * (32.0 / 32767.0);
+    assert_eq!(words(&img, 4, 2, 2), [r.to_bits()]);
+    assert_eq!(words(&img, 4, 40, 40), [32f32.to_bits()]);
+    // 3.0001 and -0.50002 round to the halves 3 and -0.5.
+    let img = detiled(&mem, dest(3), W, H, W, 4);
+    assert_eq!(shorts(&texel(&img, W, 4, 2, 2)), [0x4200, 0xB800]);
+    assert_eq!(shorts(&texel(&img, W, 4, 40, 40)), [0x5000, 0xBC00]);
+}
+
+/// k_16_16_16_16: as k_16_16 with four channels; -40 clamps to -32
+/// (0x8001), the 64-bit clear value fills blue and alpha from
+/// RB_COLOR_CLEAR_LO, and a resolve to 16_16_16_16 (unorm, CPU) and
+/// 8_8_8_8 (GPU) converts all four.
+#[test]
+fn fixed16x4_target_clear_draw_and_resolve() {
+    use xenon_draw::formats::*;
+    let Some(mut d) = drawer() else { return };
+    if !d.snorm16() {
+        eprintln!("SKIP: the host cannot render into 16-bit snorm");
+        return;
+    }
+    let dest = |i: u32| DEST + 0x2_0000 * i;
+    let (mem, report) = clear_draw_resolve(
+        &mut d,
+        RT_16_16_16_16,
+        (0x0000_7FFF, 0x7FFF_0400),
+        [3.0, -0.5, 1.0, -40.0],
+        false,
+        &[(dest(0), DEST_16_16_16_16, -5), (dest(1), DEST_8_8_8_8, -5)],
+    );
+    assert_eq!((report.draws, report.resolves), (1, 3), "{report:?}");
+    assert!(report.unsupported.is_empty(), "{report:?}");
+    let raw = d
+        .read_render_target_raw(key(TargetFormat::Rgba16Fixed), 0, 0, W, H)
+        .unwrap();
+    assert_eq!(
+        shorts(&texel(&raw, W, 8, 2, 2)),
+        [0x0C00, 0xFE00, 0x0400, 0x8001]
+    );
+    assert_eq!(
+        shorts(&texel(&raw, W, 8, 40, 40)),
+        [0x7FFF, 0, 0x0400, 0x7FFF]
+    );
+    // 1024 * 32 / 32767 / 32 * 65535 + 0.5 = 2048.5, truncated.
+    let img = detiled(&mem, dest(0), W, H, W, 8);
+    assert_eq!(shorts(&texel(&img, W, 8, 2, 2)), [6144, 0, 2048, 0]);
+    assert_eq!(shorts(&texel(&img, W, 8, 40, 40)), [65535, 0, 2048, 65535]);
+    let img = detiled(&mem, dest(1), W, H, W, 4);
+    assert_eq!(px(&img, W, 2, 2), [24, 0, 8, 0]);
+    assert_eq!(px(&img, W, 40, 40), [255, 0, 8, 255]);
+}
+
+/// Blending into k_16_16_16_16 works on the value / 32 (ONE + ONE adds
+/// the snorm texels) where the host blends snorm16, and is dropped with a
+/// warning, not the whole draw, where it cannot (lavapipe).
+#[test]
+fn fixed16_target_blends_or_draws_without_blending() {
+    let Some(mut d) = drawer() else { return };
+    if !d.snorm16() {
+        eprintln!("SKIP: the host cannot render into 16-bit snorm");
+        return;
+    }
+    let (_, report) = clear_draw_resolve(
+        &mut d,
+        RT_16_16_16_16,
+        (0x0400_0400, 0x0400_0400),
+        [1.0, -1.0, 8.0, 0.5],
+        true,
+        &[],
+    );
+    assert_eq!(report.draws, 1, "{report:?}");
+    assert!(report.unsupported.is_empty(), "{report:?}");
+    let dropped = report.warnings.iter().any(|w| w.contains("16-bit snorm"));
+    let raw = d
+        .read_render_target_raw(key(TargetFormat::Rgba16Fixed), 0, 0, W, H)
+        .unwrap();
+    let expected = if dropped {
+        [0x0400, 0xFC00, 0x2000, 0x0200]
+    } else {
+        [0x0800, 0x0000, 0x2400, 0x0600]
+    };
+    assert_eq!(shorts(&texel(&raw, W, 8, 2, 2)), expected, "{report:?}");
+}
+
+/// k_16_16_FLOAT as Rg16Float: a clear writes the two halves of
+/// RB_COLOR_CLEAR, a resolve to 16_16_FLOAT copies them, one to 8_8_8_8
+/// (GPU) gets blue and alpha 0 (Xenia unpacks only red and green).
+#[test]
+fn rg16f_target_clear_draw_and_resolve() {
+    use xenon_draw::formats::*;
+    let Some(mut d) = drawer() else { return };
+    let dest2 = DEST + 0x1_0000;
+    let (mem, report) = clear_draw_resolve(
+        &mut d,
+        RT_16_16_FLOAT,
+        (0x3800_3C00, 0),
+        [2.0, -1.5, 9.0, 9.0],
+        false,
+        &[(DEST, DEST_16_16_FLOAT, 0), (dest2, DEST_8_8_8_8, 0)],
+    );
+    assert_eq!((report.draws, report.resolves), (1, 3), "{report:?}");
+    assert!(report.unsupported.is_empty(), "{report:?}");
+    let raw = d
+        .read_render_target_raw(key(TargetFormat::Rg16Float), 0, 0, W, H)
+        .unwrap();
+    assert_eq!(shorts(&texel(&raw, W, 4, 2, 2)), [0x4000, 0xBE00]);
+    assert_eq!(shorts(&texel(&raw, W, 4, 40, 40)), [0x3C00, 0x3800]);
+    assert_eq!(detiled(&mem, DEST, W, H, W, 4), raw);
+    let img = detiled(&mem, dest2, W, H, W, 4);
+    assert_eq!(px(&img, W, 2, 2), [255, 0, 0, 0]);
+    assert_eq!(px(&img, W, 40, 40), [255, 128, 0, 0]);
+}
+
+/// k_32_32_FLOAT as Rg32Float: the 64-bit clear value is red | green <<
+/// 32, blending is dropped with a warning (no FLOAT32_BLENDABLE), a resolve
+/// to 32_32_FLOAT copies both floats and one to 32_FLOAT (GPU) keeps red
+/// with the exponent bias.
+#[test]
+fn rg32f_target_clear_draw_and_resolve() {
+    use xenon_draw::formats::*;
+    let Some(mut d) = drawer() else { return };
+    let dest2 = DEST + 0x2_0000;
+    let (mem, report) = clear_draw_resolve(
+        &mut d,
+        RT_32_32_FLOAT,
+        (0.25f32.to_bits(), (-3.0f32).to_bits()),
+        [6.5, 1e10, 1.0, 1.0],
+        true,
+        &[(DEST, DEST_32_32_FLOAT, 0), (dest2, DEST_32_FLOAT, -1)],
+    );
+    assert_eq!((report.draws, report.resolves), (1, 3), "{report:?}");
+    assert!(report.unsupported.is_empty(), "{report:?}");
+    assert!(
+        report.warnings.iter().any(|w| w.contains("32-bit float")),
+        "{report:?}"
+    );
+    let raw = d
+        .read_render_target_raw(key(TargetFormat::Rg32Float), 0, 0, W, H)
+        .unwrap();
+    let fw = |v: &[f32]| v.iter().map(|f| f.to_bits()).collect::<Vec<_>>();
+    assert_eq!(words(&raw, 8, 2, 2), fw(&[6.5, 1e10]));
+    assert_eq!(words(&raw, 8, 40, 40), fw(&[0.25, -3.0]));
+    assert_eq!(detiled(&mem, DEST, W, H, W, 8), raw);
+    let img = detiled(&mem, dest2, W, H, W, 4);
+    assert_eq!(words(&img, 4, 2, 2), fw(&[3.25]));
+    assert_eq!(words(&img, 4, 40, 40), fw(&[0.125]));
+}
+
+/// A resolve whose copy is unsupported (destination format 0) still
+/// clears, as Xenia does, and reports the copy.
+#[test]
+fn resolve_clears_when_the_copy_is_unsupported() {
+    let Some(mut d) = drawer() else { return };
+    let mut mem = memory();
+    let mut s = Stream::default();
+    s.setup().regs(RB_COLOR_INFO, &[0]).resolve_with(
+        &mut mem,
+        (W, H),
+        COPY_CONVERT | CLEAR_COLOR,
+        (DEST, W | (H << 16), dest_info(0, 0, false)),
+        [0, rgba([10, 20, 30, 40]), 0],
+    );
+    let report = run(&mut d, &s, &mut mem);
+    assert_eq!(
+        report.unsupported,
+        ["resolve copy to destination format 0"],
+        "{report:?}"
+    );
+    let img = d.read_render_target(COLOR_KEY, 0, 0, W, H).unwrap();
+    assert!(img.chunks_exact(4).all(|p| p == [10, 20, 30, 40]));
 }
 
 /// RB_COLOR_INFO's colour exponent bias (bits 20..25, signed) scales every
