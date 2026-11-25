@@ -279,6 +279,30 @@ fn untransferred_aliasing_is_reported() {
             .any(|w| w.contains("D24S8 render target aliases a newer Float32")),
         "{report:?}"
     );
+    // The snorm16 fixed-point and the 16/32-bit float formats are not
+    // transferred either (snorm16 only where the host renders it).
+    for (format, name) in [
+        (5, "Rgba16Fixed"),
+        (4, "Rg16Fixed"),
+        (6, "Rg16Float"),
+        (15, "Rg32Float"),
+    ] {
+        let mut s = Stream::default();
+        s.setup().regs(RB_COLOR_INFO, &[(format << 16) | 200]);
+        draw_word(&mut s, &mut mem, 64.0, 0);
+        s.regs(RB_DEPTH_INFO, &[200]);
+        clear_depth(&mut s, &mut mem, 0);
+        let report = run(&mut d, &s, &mut mem);
+        if !report.unsupported.is_empty() {
+            assert!(name.ends_with("Fixed"), "{report:?}");
+            continue;
+        }
+        let want = format!("D24S8 render target aliases a newer {name}");
+        assert!(
+            report.warnings.iter().any(|w| w.contains(&want)),
+            "{report:?}"
+        );
+    }
 }
 
 /// A transfer makes both targets current: reading the depth target's
@@ -326,4 +350,71 @@ fn transfer_does_not_bounce_back() {
     };
     let img = d.read_render_target(key, 0, 0, W, H).unwrap();
     assert_eq!(px(&img, W, 10, 10), RED);
+}
+
+/// Batched colour draws come before the transfer they feed: three
+/// rectangles of narrowing width (depth words 0x2.., 0x6.. and 0xA..,
+/// just over 0.125, 0.375 and 0.625) are recorded into one render pass on
+/// the colour target at tile 0, then a depth-tested draw makes the depth
+/// target at tile 0 current. The transfer must see all three, so the batch
+/// is submitted first: one submit for the colour draws, one for the
+/// transfer and one for the depth-tested draws.
+#[test]
+fn batched_colour_draws_reach_the_transfer() {
+    let Some(mut d) = drawer() else { return };
+    let mut mem = memory();
+    let mut s = Stream::default();
+    s.setup()
+        .regs(RB_DEPTH_INFO, &[D24S8_AT_0])
+        .regs(RB_DEPTHCONTROL, &[0])
+        .shader(false, &vs_color())
+        .shader(true, &ps_const());
+    let c = [0; 4];
+    for (i, (x1, word)) in [
+        (64.0, 0x2000_0000),
+        (32.0, 0x6000_0000),
+        (16.0, 0xA000_0000),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let at = VERTS + 48 * i as u32;
+        mem.write_words(
+            at,
+            &color_verts(&[(0.0, 0.0, 0.0, c), (x1, 0.0, 0.0, c), (0.0, 64.0, 0.0, c)]),
+        );
+        s.regs(SHADER_CONSTANT_FLOAT + 256 * 4, &word_color(word).map(f))
+            .vertex_fetch(0, at, 12)
+            .draw_auto(PRIM_RECT_LIST, 3);
+    }
+    // Into colour at tile 100, z LESS without z write: red at 0.25 passes
+    // over the last two rectangles, green at 0.5 over the last one only.
+    s.regs(RB_COLOR_INFO, &[100])
+        .shader(true, &ps_interp())
+        .regs(RB_DEPTHCONTROL, &[DEPTH_LESS]);
+    for (i, (z, colour)) in [(0.25, RED), (0.5, GREEN)].into_iter().enumerate() {
+        let at = VERTS + 48 * (3 + i as u32);
+        mem.write_words(
+            at,
+            &color_verts(&[
+                (0.0, 0.0, z, colour),
+                (64.0, 0.0, z, colour),
+                (0.0, 64.0, z, colour),
+            ]),
+        );
+        s.vertex_fetch(0, at, 24).draw_auto(PRIM_RECT_LIST, 3);
+    }
+    let report = run(&mut d, &s, &mut mem);
+    assert_eq!(report.draws, 5, "{report:?}");
+    assert!(report.warnings.is_empty(), "{report:?}");
+    assert_eq!(report.timings.submits, 3, "{report:?}");
+    let key = RenderTargetKey {
+        base_tiles: 100,
+        pitch: W,
+        format: TargetFormat::Rgba8,
+    };
+    let img = d.read_render_target(key, 0, 0, W, H).unwrap();
+    assert_eq!(px(&img, W, 8, 30), GREEN);
+    assert_eq!(px(&img, W, 24, 30), RED);
+    assert_eq!(px(&img, W, 48, 30), [0; 4]);
 }

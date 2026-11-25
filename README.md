@@ -45,6 +45,8 @@ See [DATA-RULES.md](DATA-RULES.md).
 | `crates/shader` | `xenon-shader`: GPU shader microcode decoder, assembler for tests, translation to WGSL |
 | `crates/draw` | `xenon-draw`: headless wgpu drawer: replays recorded commands into offscreen render targets, resolves, PNG frames |
 | `crates/host` | `xenon-host`: loads the player's files, runs recompiled code, replaces system calls; later graphics, input and audio |
+| `crates/input` | `xenon-input`: the pad state the game reads: keyboard layout, stick dead zones, merging controller and keyboard. No window or GPU |
+| `crates/window` | `xenon-window`: the game window (`--window`): shows drawn frames, reads an XInput controller and the keyboard |
 | `crates/compare` | `xenon-compare`: diff two frames with a tolerance (side-by-side sheet) and make a blink image. No window or GPU |
 | `crates/regress` | `xenon-regress`: runs game-level regression tests headless and reports pass or fail per frame with pictures. See `games/README.md` |
 | `games/<sha256>/hooks.toml` | Per-game hook addresses with role names. The only per-game file in git |
@@ -57,6 +59,33 @@ cargo build
 cargo test
 cargo run -p xenon-host -- --probe
 ```
+
+## Playing in a window
+
+Run the built game with `--window` (plus `--exe` and `--game` as usual). The
+window shows every frame the drawer makes, letterboxed, and the game runs until
+you close it. An Xbox controller (XInput, on Windows) and the keyboard both
+work at once and act as the pad on port 0; `--press` still replaces them with
+a script for tests, and `--no-controller` unplugs the pad.
+
+Default keys:
+
+| Pad | Key |
+|---|---|
+| Left stick | W A S D |
+| Left stick click | Left Shift |
+| Right stick | I J K L |
+| Right stick click | Right Shift |
+| D-pad | Arrow keys |
+| A, B, X, Y | Space, C, F, R |
+| LB, RB | Q, E |
+| LT, RT | Z, X |
+| Start | Enter or Escape |
+| Back | Backspace or Tab |
+
+Keys are physical positions, so they sit in the same place on any keyboard
+layout. Stick keys push the stick fully; controller sticks use XInput's
+standard dead zones.
 
 ## Plan
 
@@ -232,7 +261,7 @@ rendering.
 | `xenon-gpu` | PM4 packet types 0 to 3 from a ring or buffer in guest memory, indirect buffers (depth and work bounded), predication, register writes and constant loads, shader loads, draws (auto, DMA and immediate indices), resolves (copy-mode draws, with the copy registers decoded), swaps, memory writes, waits, events; a packet builder for tests |
 | `xenon-texture` | The texture fetch constant, 32x32 tiling and its inverse, endian swaps, base level decode of 1D and 2D textures (slice 0 of stacked and cube) in the common uncompressed, packed and DXT/DXN formats to RGBA8, and to f32 for the depth (`24_8` unorm, `24_8_FLOAT` 20e4; depth in every channel), 16-bit and float formats, fetch swizzle |
 | `xenon-shader` | Control-flow, ALU and fetch instruction decoding and encoding, translation of vertex and pixel programs to WGSL (loops, calls, predicates, relative addressing, vertex fetch with endian swap and format decode, 2D texture fetch with LOD bias, register LOD and register gradients, setTexLOD, setGradientH/V and getGradients, colour exports) |
-| `xenon-draw` | Headless wgpu device (Vulkan or GL, software drivers fine), replay of a command list: register file, shader translation and pipeline caching, guest vertex window and constants per the shader binding contract, textures from fetch constants (8-bit formats as RGBA8; depth, 16-bit and float formats as `Rgba32Float`, or `Rgba16Float` for half floats and on adapters without filterable 32-bit floats; a slot without a texture fetch constant or a decodable texture samples a 1x1 texture of zeros, Xenia's null image, with a warning), DMA and auto indices (byte-swapped, 24-bit, primitive reset in strips), point/line/triangle lists and strips, triangle fans and quad lists by index expansion, rectangle lists (fourth corner made after the vertex shader by a WGSL wrapper, Xenia's rule), viewport transform (`PA_CL_VTE_CNTL`, `PA_CL_VPORT_*`, window offset, half-pixel centre) in a WGSL epilogue, scissor, cull mode, colour write mask, blending, depth test; render targets per EDRAM base, pitch and format (`8_8_8_8`, `2_10_10_10`, the 7e3 `2_10_10_10_FLOAT` and `2_10_10_10_FLOAT_AS_16_16_16_16` as half floats with Xenia's output clamp, `16_16_16_16_FLOAT`, `D24S8`, `D24FS8`), with EDRAM ownership transfers between an `8_8_8_8` colour and a depth target at one base and pitch; resolves from those colour formats to `8_8_8_8`, `2_10_10_10` and `16_16_16_16_FLOAT` in tiled guest memory with Xenia's conversion (7e3 and 2-bit alpha quantisation, exponent bias, red/blue swap, saturate and round) and the destination endian, 32bpp destinations converted and tiled by a compute shader; decoded textures cached by fetch constant and a hash of their guest bytes; per-phase `Report::timings` and a frame benchmark (`examples/bench.rs`); colour clears per format from `RB_COLOR_CLEAR` / `RB_COLOR_CLEAR_LO`, depth clears; draws with surface pitch 0 skipped as Xenia does; swaps to RGBA8 frames and PNG |
+| `xenon-draw` | Headless wgpu device (Vulkan or GL, software drivers fine), replay of a command list: register file, shader translation and pipeline caching, guest vertex window and constants per the shader binding contract, textures from fetch constants (8-bit formats as RGBA8; depth, 16-bit and float formats as `Rgba32Float`, or `Rgba16Float` for half floats and on adapters without filterable 32-bit floats; a slot without a texture fetch constant or a decodable texture samples a 1x1 texture of zeros, Xenia's null image, with a warning), DMA and auto indices (byte-swapped, 24-bit, primitive reset in strips), point/line/triangle lists and strips, triangle fans and quad lists by index expansion, rectangle lists (fourth corner made after the vertex shader by a WGSL wrapper, Xenia's rule), viewport transform (`PA_CL_VTE_CNTL`, `PA_CL_VPORT_*`, window offset, half-pixel centre) in a WGSL epilogue, scissor, cull mode, colour write mask, blending, depth test, the fetch constant's sign, gamma and exponent adjust on texture fetches, `RB_COLOR_INFO`'s colour exponent bias; render targets per EDRAM base, pitch and format (`8_8_8_8`, `2_10_10_10`, the 7e3 `2_10_10_10_FLOAT` and `2_10_10_10_FLOAT_AS_16_16_16_16` as half floats with Xenia's output clamp, `16_16_16_16_FLOAT`, `16_16_FLOAT`, `32_FLOAT`, `32_32_FLOAT`, the [-32, 32] fixed-point `16_16` and `16_16_16_16` as snorm16 holding the value / 32 like Xenia, `D24S8`, `D24FS8`), with EDRAM ownership transfers between an `8_8_8_8` colour and a depth target at one base and pitch; resolves from those colour formats to `8_8_8_8`, `2_10_10_10`, `16_16`, `16_16_16_16`, `16_16_FLOAT`, `16_16_16_16_FLOAT`, `32_FLOAT` and `32_32_FLOAT` in tiled guest memory with Xenia's conversion (7e3 and 2-bit alpha quantisation, exponent bias, red/blue swap, saturate and round) and the destination endian, 32bpp destinations converted and tiled by a compute shader; decoded textures cached by fetch constant and a hash of their guest bytes; per-phase `Report::timings` and a frame benchmark (`examples/bench.rs`); colour clears per format from `RB_COLOR_CLEAR` / `RB_COLOR_CLEAR_LO`, depth clears; draws with surface pitch 0 skipped as Xenia does; swaps to RGBA8 frames and PNG |
 
 Tests build every command stream, shader and texture by hand; the drawer
 tests run end to end on lavapipe (Mesa's software Vulkan) and check exact
@@ -240,17 +269,18 @@ pixels.
 
 Not covered yet: textures beyond the base level of 1D and 2D (mips, the
 packed mip tail, 3D, cube faces other than the first, stacked slices past 0),
-the fetch constant's sign (16-bit snorm decodes as unorm), exponent bias, gamma and border colour, and the
+the fetch constant's border colour, signed texel components wider than 8
+bits or filtered (signed texels are reinterpreted from the unsigned decode
+after sampling), and the
 border and mirror-once clamp modes; texture fetch filter overrides, 1D/3D/cube
 fetches, the getCompTexLOD, getWeights and getBCF texture instructions;
 depth export and memory
 export; the point size export; maxa's ordering against the scalar operands
 and the NaN result of `max4` (both differ slightly from Xenia); resolves of
-depth, of the colour formats not listed above, to destination formats other
-than 8_8_8_8, 2_10_10_10 and 16_16_16_16_FLOAT, to 3D destinations, and MSAA
-sample selection; the `ConstantOne` copy command; MSAA; the colour render
-target formats `16_16`, `16_16_16_16`, `16_16_FLOAT`, `32_FLOAT` and
-`32_32_FLOAT`; clamping a 7e3 target's blend result to its range; render
+depth, to destination formats other than those listed above, to 3D
+destinations, and MSAA sample selection; the `ConstantOne` copy command;
+MSAA; `16_16` and `16_16_16_16` targets on hosts without renderable 16-bit
+snorm, and blending into them on hosts that cannot blend it; blending into `32_FLOAT` and `32_32_FLOAT`; clamping a 7e3 target's blend result to its range; render
 targets 1 to 3; EDRAM aliasing between targets that overlap in EDRAM other
 than an `8_8_8_8` colour and a depth target at one base and pitch (transferred
 like Xenia's ownership transfers; the rest is reported); the

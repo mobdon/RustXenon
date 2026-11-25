@@ -64,21 +64,32 @@
 //!   EDRAM emulation does. The blend result itself is not clamped and keeps
 //!   half precision until a resolve quantises it (see below).
 //! - `k_16_16_16_16_FLOAT` as `Rgba16Float`.
-//! - `k_32_FLOAT` as `R32Float`, drawn without blending (a warning) and
-//!   resolvable to `k_32_FLOAT` with its float bits kept, unsaturated.
+//! - `k_32_FLOAT` as `R32Float` and `k_32_32_FLOAT` as `Rg32Float`, drawn
+//!   without blending (a warning) and resolvable to `k_32_FLOAT` /
+//!   `k_32_32_FLOAT` with their float bits kept, unsaturated.
+//! - `k_16_16_FLOAT` as `Rg16Float`.
+//! - `k_16_16` and `k_16_16_16_16` (16-bit fixed point in [-32, 32]) as
+//!   `Rg16Snorm` / `Rgba16Snorm` holding the value / 32, Xenia's full-range
+//!   host path: the pixel shader's colour is divided by 32 (so blending
+//!   works on the value / 32, as in Xenia) and a resolve unpacks the 16
+//!   bits as `x * 32 / 32767`, floored at -1, like Xenia's resolve shader.
+//!   They need a host that renders into 16-bit snorm
+//!   ([`Drawer::snorm16`]) and are unsupported without one; where the
+//!   host cannot blend snorm16 they are drawn without blending (a warning).
 //!
 //! All four render targets (`RB_COLOR_INFO_RT[0..4]`) are drawn, each with
 //! its own `RB_COLOR_MASK` bits, `RB_BLENDCONTROL_RT` blend and output
 //! clamp; a target is skipped when the pixel shader does not export it.
+//! The pixel shader's colour is scaled by `2^color_exp_bias`
+//! (`RB_COLOR_INFO` bits 20..25, signed) before the output clamp, as Xenia
+//! does.
 //! MSAA surfaces are drawn and resolved with one sample per pixel (a
 //! warning).
 //! Resolve clears decode the 64-bit value `RB_COLOR_CLEAR |
 //! RB_COLOR_CLEAR_LO << 32` per format ([`formats::clear_color`]).
 //! Depth targets: `kD24S8` as `Depth24PlusStencil8` and `kD24FS8` as
 //! `Depth32FloatStencil8` where the host has it, else `Depth32Float` without
-//! stencil (the 20e4 float is stored at f32 precision). Anything
-//! else (`k_16_16`, `k_16_16_16_16`, `k_16_16_FLOAT`, `k_32_32_FLOAT`) is
-//! reported in [`Report::unsupported`].
+//! stencil (the 20e4 float is stored at f32 precision).
 //!
 //! # Resolves
 //!
@@ -87,10 +98,12 @@
 //! Xenia's dump of a host render target into EDRAM), applies the exponent
 //! bias `2^copy_dest_exp_bias` and the red/blue swap, packs it like Xenia's
 //! resolve shader (unorm: saturate, `x * max + 0.5` truncated) into
-//! `k_8_8_8_8`, `k_2_10_10_10` or `k_16_16_16_16_FLOAT`, and tiles it into
-//! guest memory with the destination endian. Copy commands are described at
-//! `Drawer::resolve` (`Raw` and `Convert` alike, `Null` clears only,
-//! `ConstantOne` unsupported).
+//! `k_8_8_8_8`, `k_2_10_10_10`, `k_16_16`, `k_16_16_16_16` (unorm),
+//! `k_16_16_FLOAT`, `k_16_16_16_16_FLOAT`, `k_32_FLOAT` or `k_32_32_FLOAT`,
+//! and tiles it into guest memory with the destination endian. A copy that
+//! cannot be done is reported and the resolve's clears still run. Copy
+//! commands are described at `Drawer::resolve` (`Raw` and `Convert` alike,
+//! `Null` clears only, `ConstantOne` unsupported).
 //!
 //! A depth copy writes the raw 32-bit EDRAM word whatever the destination
 //! format, as Xenia's fast resolve does: depth in bits 8..31 (`kD24S8` as
@@ -113,6 +126,13 @@
 //! wrapper around the translated vertex shader that makes the fourth corner
 //! from the three guest vertices after the vertex shader, as Xenia's
 //! geometry shader does (`rect_list_wgsl`); they are never face culled.
+//! Point lists draw one-pixel host points: `PA_SU_POINT_SIZE` is not
+//! applied.
+//!
+//! Draws are recorded into one command buffer, in one render pass while
+//! their render targets stay the same, with their buffers as slices of one
+//! upload arena; the batch is submitted before each resolve, before each
+//! EDRAM ownership transfer and at the end of [`Drawer::replay`].
 //!
 //! Draws while RB_SURFACE_INFO's pitch is 0 rasterize nothing, as in Xenia
 //! (`IsRasterizationPotentiallyDone`): Direct3D draws before its first
@@ -254,6 +274,9 @@ pub struct Timings {
     /// Counts: pipelines and shader modules created, textures uploaded.
     pub pipelines_created: u32,
     pub textures_uploaded: u32,
+    /// Command buffer submissions for draws, clears, EDRAM transfers and
+    /// 32bpp resolves.
+    pub submits: u32,
     pub texture_bytes: u64,
     pub guest_bytes: u64,
 }
@@ -293,6 +316,15 @@ pub enum TargetFormat {
     Rgba16Float,
     /// `k_32_FLOAT`, hosted as `R32Float`.
     Float32,
+    /// `k_16_16`: 16-bit fixed point in [-32, 32], hosted as `Rg16Snorm`
+    /// holding the value / 32 (Xenia's full-range snorm16 path).
+    Rg16Fixed,
+    /// `k_16_16_16_16`, as `Rg16Fixed` with four channels (`Rgba16Snorm`).
+    Rgba16Fixed,
+    /// `k_16_16_FLOAT`, hosted as `Rg16Float`.
+    Rg16Float,
+    /// `k_32_32_FLOAT`, hosted as `Rg32Float`.
+    Rg32Float,
 }
 
 impl TargetFormat {
@@ -304,6 +336,10 @@ impl TargetFormat {
             TargetFormat::Rgb10a2 => wgpu::TextureFormat::Rgb10a2Unorm,
             TargetFormat::Float7e3 | TargetFormat::Rgba16Float => wgpu::TextureFormat::Rgba16Float,
             TargetFormat::Float32 => wgpu::TextureFormat::R32Float,
+            TargetFormat::Rg16Fixed => wgpu::TextureFormat::Rg16Snorm,
+            TargetFormat::Rgba16Fixed => wgpu::TextureFormat::Rgba16Snorm,
+            TargetFormat::Rg16Float => wgpu::TextureFormat::Rg16Float,
+            TargetFormat::Rg32Float => wgpu::TextureFormat::Rg32Float,
         }
     }
 
@@ -314,13 +350,22 @@ impl TargetFormat {
             2 | 10 => TargetFormat::Rgb10a2,
             3 | 12 => TargetFormat::Float7e3,
             14 => TargetFormat::Float32,
+            4 => TargetFormat::Rg16Fixed,
+            5 => TargetFormat::Rgba16Fixed,
+            6 => TargetFormat::Rg16Float,
             7 => TargetFormat::Rgba16Float,
+            15 => TargetFormat::Rg32Float,
             _ => return None,
         })
     }
 
     fn is_depth(self) -> bool {
         matches!(self, TargetFormat::D24S8 | TargetFormat::D24FS8)
+    }
+
+    /// Hosted as 16-bit snorm, which needs an optional wgpu feature.
+    fn is_snorm16(self) -> bool {
+        matches!(self, TargetFormat::Rg16Fixed | TargetFormat::Rgba16Fixed)
     }
 }
 
@@ -390,9 +435,10 @@ enum Variant {
     Plain,
     /// Vertex shader wrapped to make rectangle list corners.
     RectList,
-    /// Pixel shader colour i clamped to [0, rgb] and [0, alpha] (f32 bits)
-    /// where entry i is set.
-    Clamp([Option<(u32, u32)>; 4]),
+    /// Pixel shader colour i scaled by 2^bias, clamped to [0, rgb] and
+    /// [0, alpha], then multiplied by scale (f32 bits; an infinite bound
+    /// does not clamp) where entry i is set.
+    Output([Option<(u32, u32, i8, u32)>; 4]),
 }
 
 #[derive(Clone, PartialEq, Eq, Hash)]
@@ -486,7 +532,7 @@ pub struct Drawer {
     ps: Option<Program>,
     translated: HashMap<(u64, bool), Result<Translated, String>>,
     /// Keyed by program hash, stage, extra vertex outputs and variant (the
-    /// rectangle list wrapper or the pixel output clamp).
+    /// rectangle list wrapper or the pixel output bias and clamp).
     modules: HashMap<(u64, bool, u16, Variant), wgpu::ShaderModule>,
     pipelines: HashMap<PipelineKey, wgpu::RenderPipeline>,
     texture_layouts: HashMap<u32, (wgpu::BindGroupLayout, wgpu::PipelineLayout)>,
@@ -512,6 +558,19 @@ pub struct Drawer {
     /// guest bytes they read, so an unchanged texture is not decoded again.
     texture_cache: HashMap<([u32; 6], u64), wgpu::TextureView>,
     texture_cache_bytes: u64,
+    /// Textures already looked up this replay by fetch constant. Guest
+    /// memory only changes at a resolve or MEM_WRITE during a replay, which
+    /// clear it, so later draws skip reading and hashing the guest bytes.
+    texture_memo: HashMap<[u32; 6], wgpu::TextureView>,
+    samplers: HashMap<([u8; 3], u8, u8), wgpu::Sampler>,
+    /// Draws recorded but not yet submitted (see [`Batch`]).
+    batch: Option<Batch>,
+    /// Draw buffers (guest window, constants, epilogue, indices) of the
+    /// batch, as slices of `arena`, written to it once at submit.
+    staged: Vec<u8>,
+    arena: Option<wgpu::Buffer>,
+    arena_align: u64,
+    max_buffer: u64,
     /// 1x1 texture of zeros bound for a slot without a usable texture.
     zero_texture: wgpu::TextureView,
     zero_sampler: wgpu::Sampler,
@@ -523,11 +582,32 @@ pub struct Drawer {
     resolve_pipelines: [Option<wgpu::ComputePipeline>; 3],
     /// kD24FS8 is hosted as `Depth32FloatStencil8` (else `Depth32Float`).
     float_stencil: bool,
+    /// `Rg16Snorm` and `Rgba16Snorm` can be render targets (k_16_16 and
+    /// k_16_16_16_16 are refused without them).
+    snorm16: bool,
+    /// The snorm16 targets blend (else their blending is dropped).
+    snorm16_blend: bool,
     timings: Timings,
     uncaptured: Arc<Mutex<Vec<String>>>,
     max_dim: u32,
     max_storage: u64,
 }
+
+/// Draws recorded into one command encoder, in one render pass while the
+/// render targets stay the same. Submitted by [`Drawer::flush`] before
+/// anything that reads or writes the targets outside the batch (resolves,
+/// clears and EDRAM transfers) and at the end of a replay.
+struct Batch {
+    /// Dropped (ended) before `enc` is finished.
+    pass: Option<(PassKey, wgpu::RenderPass<'static>)>,
+    enc: wgpu::CommandEncoder,
+}
+
+/// Colour and depth targets of a render pass.
+type PassKey = ([Option<RenderTargetKey>; 4], Option<RenderTargetKey>);
+
+/// Smallest draw upload arena; it grows to fit a larger draw.
+const ARENA_MIN: u64 = 16 << 20;
 
 /// Time since `t`, restarting `t`.
 fn lap(t: &mut Instant) -> Duration {
@@ -679,22 +759,47 @@ fn vs_main(@builtin(vertex_index) host_index: u32) -> VsOut {{
         ))
 }
 
-/// Clamps colour 0 of a translated pixel shader to [0, rgb] / [0, alpha].
-fn clamp_pixel_wgsl(ps: &str, rt: usize, rgb: f32, alpha: f32) -> Result<String, String> {
+/// Scales colour `rt` of a translated pixel shader by 2^`bias`
+/// (RB_COLOR_INFO's colour exponent bias, all four components, before the
+/// EDRAM format clamp), clamps it to [0, rgb] / [0, alpha], and multiplies
+/// it by `scale` (the host storage scale of the target format).
+fn output_pixel_wgsl(
+    ps: &str,
+    rt: usize,
+    bias: i8,
+    rgb: f32,
+    alpha: f32,
+    scale: f32,
+) -> Result<String, String> {
     let store = format!("    out.c{rt} = o_col[{rt}];\n");
     if !ps.contains(&store) {
         return Err(format!("pixel shader colour output {rt} not recognised"));
     }
-    // An infinite bound leaves the colour as it is (blending a 7e3 target
-    // takes the source colour unclamped, as a float).
-    let rgb = if rgb.is_finite() {
-        format!("clamp(o_col[{rt}].xyz, vec3<f32>(0.0), vec3<f32>({rgb:?}))")
+    let c = if bias == 0 {
+        format!("o_col[{rt}]")
     } else {
-        format!("o_col[{rt}].xyz")
+        format!("(o_col[{rt}] * {:?})", 2f32.powi(bias.into()))
+    };
+    // An infinite bound leaves the component as it is (blending a 7e3
+    // target takes the source colour unclamped, as a float).
+    let rgb = if rgb.is_finite() {
+        format!("clamp({c}.xyz, vec3<f32>(0.0), vec3<f32>({rgb:?}))")
+    } else {
+        format!("{c}.xyz")
+    };
+    let a = if alpha.is_finite() {
+        format!("clamp({c}.w, 0.0, {alpha:?})")
+    } else {
+        format!("{c}.w")
+    };
+    let scaled = if scale == 1.0 {
+        String::new()
+    } else {
+        format!(" * {scale:?}")
     };
     Ok(ps.replacen(
         &store,
-        &format!("    out.c{rt} = vec4<f32>({rgb}, clamp(o_col[{rt}].w, 0.0, {alpha:?}));\n"),
+        &format!("    out.c{rt} = vec4<f32>({rgb}, {a}){scaled};\n"),
         1,
     ))
 }
@@ -748,10 +853,28 @@ impl Drawer {
         let float_stencil = adapter
             .features()
             .contains(wgpu::Features::DEPTH32FLOAT_STENCIL8);
+        // k_16_16 and k_16_16_16_16 render into snorm16, which WebGPU
+        // only renders into with these features and the adapter's say-so.
+        let snorm16_features = wgpu::Features::TEXTURE_FORMAT_16BIT_NORM
+            | wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES;
+        let snorm16_all = |ok: &dyn Fn(wgpu::TextureFormatFeatures) -> bool| {
+            adapter.features().contains(snorm16_features)
+                && [
+                    wgpu::TextureFormat::Rg16Snorm,
+                    wgpu::TextureFormat::Rgba16Snorm,
+                ]
+                .iter()
+                .all(|&f| ok(adapter.get_texture_format_features(f)))
+        };
+        let snorm16 = snorm16_all(&|f| {
+            f.allowed_usages
+                .contains(wgpu::TextureUsages::RENDER_ATTACHMENT)
+        });
+        let snorm16_blend = snorm16
+            && snorm16_all(&|f| f.flags.contains(wgpu::TextureFormatFeatureFlags::BLENDABLE));
         let mut required_features = adapter.features() & wgpu::Features::FLOAT32_FILTERABLE;
-        if float_stencil {
-            required_features |= wgpu::Features::DEPTH32FLOAT_STENCIL8;
-        }
+        required_features.set(wgpu::Features::DEPTH32FLOAT_STENCIL8, float_stencil);
+        required_features.set(snorm16_features, snorm16);
         let (device, queue) = block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("xenon-draw"),
             required_limits: limits.clone(),
@@ -842,11 +965,24 @@ impl Drawer {
             resolved_endian: HashMap::new(),
             texture_cache: HashMap::new(),
             texture_cache_bytes: 0,
+            texture_memo: HashMap::new(),
+            samplers: HashMap::new(),
+            batch: None,
+            staged: Vec::new(),
+            arena: None,
+            arena_align: u64::from(
+                limits
+                    .min_uniform_buffer_offset_alignment
+                    .max(limits.min_storage_buffer_offset_alignment),
+            ),
+            max_buffer: limits.max_buffer_size,
             zero_texture,
             zero_sampler,
             float32_filterable: required_features.contains(wgpu::Features::FLOAT32_FILTERABLE),
             resolve_pipelines: [None, None, None],
             float_stencil,
+            snorm16,
+            snorm16_blend,
             timings: Timings::default(),
             uncaptured,
             max_dim: limits.max_texture_dimension_2d,
@@ -880,6 +1016,37 @@ impl Drawer {
     ) -> Result<Report, Error> {
         let mut report = Report::default();
         self.timings = Timings::default();
+        self.texture_memo.clear();
+        let done = self.replay_commands(commands, mem, &mut report);
+        // On an error the batch is dropped unsubmitted.
+        let done = done.and_then(|()| {
+            self.flush().map_err(|e| match e {
+                Skip::Fatal(e) => e,
+                Skip::Unsupported(why) => Error::Gpu(why),
+            })
+        });
+        self.batch = None;
+        self.staged.clear();
+        done?;
+        // Counts made where only the report is mutable.
+        let t = &report.timings;
+        let (uploaded, tex_bytes, guest_bytes) =
+            (t.textures_uploaded, t.texture_bytes, t.guest_bytes);
+        report.timings = Timings {
+            textures_uploaded: uploaded,
+            texture_bytes: tex_bytes,
+            guest_bytes,
+            ..std::mem::take(&mut self.timings)
+        };
+        Ok(report)
+    }
+
+    fn replay_commands(
+        &mut self,
+        commands: &[Command],
+        mem: &mut dyn GuestMemory,
+        report: &mut Report,
+    ) -> Result<(), Error> {
         for c in commands {
             let done = match c {
                 Command::WriteRegisters { base, values } => {
@@ -909,12 +1076,16 @@ impl Drawer {
                     }
                     Ok(())
                 }
-                Command::Draw(d) => self.draw(d, mem, &mut report).map(|drawn| {
+                Command::Draw(d) => self.draw(d, mem, report).map(|drawn| {
                     report.draws += u32::from(drawn);
                 }),
-                Command::Resolve(r) => self.resolve(r, mem, &mut report).map(|done| {
-                    report.resolves += u32::from(done);
-                }),
+                Command::Resolve(r) => {
+                    let done = self.resolve(r, mem, report).map(|done| {
+                        report.resolves += u32::from(done);
+                    });
+                    self.texture_memo.clear();
+                    done
+                }
                 Command::Swap {
                     signature_ok,
                     frontbuffer,
@@ -938,6 +1109,7 @@ impl Drawer {
                     endian,
                     values,
                 } => {
+                    self.texture_memo.clear();
                     for (i, &v) in values.iter().enumerate() {
                         let a = addr.wrapping_add(4 * i as u32);
                         if !mem.write_bytes(a, &endian.to_guest_bytes(v)) {
@@ -955,17 +1127,118 @@ impl Drawer {
             }
             self.check_uncaptured()?;
         }
-        // Counts made where only the report is mutable.
-        let t = &report.timings;
-        let (uploaded, tex_bytes, guest_bytes) =
-            (t.textures_uploaded, t.texture_bytes, t.guest_bytes);
-        report.timings = Timings {
-            textures_uploaded: uploaded,
-            texture_bytes: tex_bytes,
-            guest_bytes,
-            ..std::mem::take(&mut self.timings)
+        Ok(())
+    }
+
+    /// Submits the batched draws, with their staged buffers.
+    fn flush(&mut self) -> Result<(), Skip> {
+        if let (Some(arena), false) = (&self.arena, self.staged.is_empty()) {
+            self.queue.write_buffer(arena, 0, &self.staged);
+            self.staged.clear();
+        }
+        let Some(mut batch) = self.batch.take() else {
+            return Ok(());
         };
-        Ok(report)
+        let t = Instant::now();
+        let scope = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
+        drop(batch.pass.take());
+        self.queue.submit([batch.enc.finish()]);
+        self.timings.submits += 1;
+        self.timings.submit += t.elapsed();
+        match block_on(scope.pop()) {
+            Some(e) => Err(Skip::Fatal(Error::Gpu(e.to_string()))),
+            None => Ok(()),
+        }
+    }
+
+    /// Copies `parts` into the batch's staging area, each at an offset
+    /// aligned for uniform and storage bindings, and returns their
+    /// (offset, size) in the arena. Submits the batch first when the arena
+    /// is full, and grows the arena when one draw does not fit.
+    fn stage(&mut self, parts: &[&[u8]]) -> Result<Vec<(u64, u64)>, Skip> {
+        let size = |p: &[u8]| (p.len() as u64).max(4).next_multiple_of(4);
+        let align = self.arena_align;
+        let need: u64 = parts.iter().map(|p| size(p).next_multiple_of(align)).sum();
+        let have = self.arena.as_ref().map_or(0, |b| b.size());
+        if self.staged.len() as u64 + need > have {
+            self.flush()?;
+            if need > have {
+                if need > self.max_buffer {
+                    return unsupported(format!("{need} bytes of draw data"));
+                }
+                self.arena = Some(self.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("draw arena"),
+                    size: need.max(ARENA_MIN).next_power_of_two().min(self.max_buffer),
+                    usage: wgpu::BufferUsages::STORAGE
+                        | wgpu::BufferUsages::UNIFORM
+                        | wgpu::BufferUsages::INDEX
+                        | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                }));
+            }
+        }
+        let mut out = Vec::with_capacity(parts.len());
+        for p in parts {
+            let off = self.staged.len() as u64;
+            self.staged.extend_from_slice(p);
+            self.staged.resize((off + size(p)) as usize, 0);
+            out.push((off, size(p)));
+            let end = self.staged.len() as u64;
+            self.staged.resize(end.next_multiple_of(align) as usize, 0);
+        }
+        Ok(out)
+    }
+
+    /// The batch's render pass, begun on `key`'s targets unless the current
+    /// pass already draws to them.
+    fn pass(
+        &mut self,
+        key: PassKey,
+        color: &[Option<wgpu::Texture>; 4],
+        depth: Option<&wgpu::Texture>,
+    ) -> &mut wgpu::RenderPass<'static> {
+        let device = &self.device;
+        let batch = self.batch.get_or_insert_with(|| Batch {
+            pass: None,
+            enc: device.create_command_encoder(&Default::default()),
+        });
+        if batch.pass.as_ref().map(|p| &p.0) != Some(&key) {
+            batch.pass = None;
+            fn keep<V>() -> wgpu::Operations<V> {
+                wgpu::Operations {
+                    load: wgpu::LoadOp::Load,
+                    store: wgpu::StoreOp::Store,
+                }
+            }
+            let color_views = color
+                .each_ref()
+                .map(|t| t.as_ref().map(|t| t.create_view(&Default::default())));
+            let depth_view = depth.map(|t| (t.format(), t.create_view(&Default::default())));
+            let pass = batch
+                .enc
+                .begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("draw"),
+                    color_attachments: &color_views.each_ref().map(|v| {
+                        v.as_ref().map(|view| wgpu::RenderPassColorAttachment {
+                            view,
+                            depth_slice: None,
+                            resolve_target: None,
+                            ops: keep(),
+                        })
+                    }),
+                    depth_stencil_attachment: depth_view.as_ref().map(|(format, view)| {
+                        wgpu::RenderPassDepthStencilAttachment {
+                            view,
+                            depth_ops: Some(keep()),
+                            stencil_ops: format.has_stencil_aspect().then(keep),
+                        }
+                    }),
+                    ..Default::default()
+                })
+                .forget_lifetime();
+            batch.pass = Some((key, pass));
+        }
+        &mut batch.pass.as_mut().expect("pass begun").1
     }
 
     fn check_uncaptured(&self) -> Result<(), Error> {
@@ -1003,7 +1276,9 @@ impl Drawer {
     /// Reads `w` x `h` pixels at (`x`, `y`) of a colour render target as
     /// host texels, rows top to bottom, little-endian: 4 bytes per pixel for
     /// `Rgba8` (R first) and `Rgb10a2` (one word, R in bits 0..10), 8 for
-    /// `Float7e3` and `Rgba16Float` (four halves, R first).
+    /// `Float7e3` and `Rgba16Float` (four halves, R first); the other
+    /// formats as their wgpu texels (`Float32` 4, `Rg16Fixed` and
+    /// `Rg16Float` 4, `Rgba16Fixed` and `Rg32Float` 8, R first).
     pub fn read_render_target_raw(
         &self,
         key: RenderTargetKey,
@@ -1141,6 +1416,12 @@ impl Drawer {
     ) -> Result<wgpu::Texture, Skip> {
         if key.pitch == 0 || key.pitch > self.max_dim {
             return unsupported(format!("surface pitch {}", key.pitch));
+        }
+        if key.format.is_snorm16() && !self.snorm16 {
+            return unsupported(format!(
+                "{:?} render target: the host cannot render into 16-bit snorm",
+                key.format
+            ));
         }
         let host_format = self.host_format(key.format);
         let (device, height) = (&self.device, RENDER_TARGET_HEIGHT.min(self.max_dim));
@@ -1330,6 +1611,9 @@ impl Drawer {
         if rows == 0 {
             return Ok(());
         }
+        // The source's batched draws (and any reads of `dst` in the batch)
+        // come before the transfer, which is submitted on its own.
+        self.flush()?;
         let (sf, df) = (self.host_format(src.format), self.host_format(dst.format));
         let to_depth = df.is_depth_stencil_format();
         let bits = if df.has_stencil_aspect() { 0..8 } else { 0..0 };
@@ -1429,6 +1713,7 @@ impl Drawer {
             }
         }
         self.queue.submit([enc.finish()]);
+        self.timings.submits += 1;
         match block_on(scope.pop()) {
             Some(e) => Err(Skip::Fatal(Error::Gpu(e.to_string()))),
             None => Ok(()),
@@ -1440,6 +1725,12 @@ impl Drawer {
     /// target is skipped with a warning and resolves write stencil 0.
     pub fn float_stencil(&self) -> bool {
         self.float_stencil
+    }
+
+    /// Whether the host renders into 16-bit snorm, which `k_16_16` and
+    /// `k_16_16_16_16` targets need (they are unsupported without it).
+    pub fn snorm16(&self) -> bool {
+        self.snorm16
     }
 
     /// The host texture format of a render target.
@@ -1496,13 +1787,18 @@ impl Drawer {
             (true, Variant::RectList) => patch_vertex_wgsl(&t.wgsl, extra)
                 .and_then(|vs| rect_list_wgsl(&vs, t.info.interpolators_written | extra)),
             (true, _) => patch_vertex_wgsl(&t.wgsl, extra),
-            (false, Variant::Clamp(c)) => {
+            (false, Variant::Output(c)) => {
                 c.iter()
                     .enumerate()
                     .try_fold(t.wgsl.clone(), |ps, (rt, c)| match c {
-                        Some((rgb, a)) => {
-                            clamp_pixel_wgsl(&ps, rt, f32::from_bits(*rgb), f32::from_bits(*a))
-                        }
+                        Some((rgb, a, bias, k)) => output_pixel_wgsl(
+                            &ps,
+                            rt,
+                            *bias,
+                            f32::from_bits(*rgb),
+                            f32::from_bits(*a),
+                            f32::from_bits(*k),
+                        ),
                         None => Ok(ps),
                     })
             }
@@ -1565,7 +1861,7 @@ impl Drawer {
         mask: u128,
         mem: &dyn GuestMemory,
         report: &mut Report,
-    ) -> Result<(wgpu::Buffer, u32), Skip> {
+    ) -> Result<(Vec<u8>, u32), Skip> {
         let (mut lo, mut hi) = (u64::MAX, 0u64);
         for k in (0..96).filter(|k| mask & (1u128 << k) != 0) {
             let vf = self.regs.vertex_fetch(k);
@@ -1594,10 +1890,7 @@ impl Drawer {
             };
             (lo as u32, b)
         };
-        Ok((
-            self.buffer("guest window", &bytes, wgpu::BufferUsages::STORAGE),
-            base,
-        ))
+        Ok((bytes, base))
     }
 
     fn buffer(&self, label: &str, bytes: &[u8], usage: wgpu::BufferUsages) -> wgpu::Buffer {
@@ -1643,6 +1936,9 @@ impl Drawer {
             return Ok((self.zero_texture.clone(), self.zero_sampler.clone()));
         }
         let sampler = self.sampler(&fetch, report);
+        if let Some(view) = self.texture_memo.get(&self.regs.fetch_constant(n)) {
+            return Ok((view.clone(), sampler));
+        }
         let view = self
             .guest_texture(n, &fetch, mem, report)
             .unwrap_or_else(|why| {
@@ -1673,6 +1969,7 @@ impl Drawer {
             .map_err(|e| e.to_string())?;
         let key = (self.regs.fetch_constant(n), hash_bytes(&bytes));
         if let Some(view) = self.texture_cache.get(&key) {
+            self.texture_memo.insert(key.0, view.clone());
             return Ok(view.clone());
         }
         let host = host_texture_format(fetch.format, self.float32_filterable);
@@ -1735,10 +2032,15 @@ impl Drawer {
         }
         self.texture_cache_bytes += len;
         self.texture_cache.insert(key, view.clone());
+        self.texture_memo.insert(key.0, view.clone());
         Ok(view)
     }
 
-    fn sampler(&self, fetch: &xenon_texture::TextureFetch, report: &mut Report) -> wgpu::Sampler {
+    fn sampler(
+        &mut self,
+        fetch: &xenon_texture::TextureFetch,
+        report: &mut Report,
+    ) -> wgpu::Sampler {
         let mut addr_mode = |c: u8| {
             let (m, exact) = sampler_address(c);
             if !exact {
@@ -1746,15 +2048,22 @@ impl Drawer {
             }
             m
         };
-        self.device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("guest sampler"),
-            address_mode_u: addr_mode(fetch.clamp[0]),
-            address_mode_v: addr_mode(fetch.clamp[1]),
-            address_mode_w: addr_mode(fetch.clamp[2]),
-            mag_filter: filter(fetch.mag_filter),
-            min_filter: filter(fetch.min_filter),
-            ..Default::default()
-        })
+        let modes = fetch.clamp.map(&mut addr_mode);
+        let device = &self.device;
+        self.samplers
+            .entry((fetch.clamp, fetch.mag_filter, fetch.min_filter))
+            .or_insert_with(|| {
+                device.create_sampler(&wgpu::SamplerDescriptor {
+                    label: Some("guest sampler"),
+                    address_mode_u: modes[0],
+                    address_mode_v: modes[1],
+                    address_mode_w: modes[2],
+                    mag_filter: filter(fetch.mag_filter),
+                    min_filter: filter(fetch.min_filter),
+                    ..Default::default()
+                })
+            })
+            .clone()
     }
 
     /// Draws `d`; Ok(false) when the state makes it draw nothing.
@@ -1849,18 +2158,38 @@ impl Drawer {
                 .map_err(Skip::Unsupported)?;
             // shortcut: wgpu blends R32Float only with FLOAT32_BLENDABLE;
             // request it if a game blends into a 32-bit float target.
-            if blends[rt].is_some() && color[rt].map(|k| k.format) == Some(TargetFormat::Float32) {
+            if blends[rt].is_some()
+                && matches!(
+                    color[rt].map(|k| k.format),
+                    Some(TargetFormat::Float32 | TargetFormat::Rg32Float)
+                )
+            {
                 report.warn("blending into a 32-bit float render target drawn without blending");
                 blends[rt] = None;
             }
+            // shortcut: no blending into snorm16 where the host cannot (e.g.
+            // lavapipe); emulate it in the shader if a game relies on it.
+            if blends[rt].is_some()
+                && !self.snorm16_blend
+                && color[rt].is_some_and(|k| k.format.is_snorm16())
+            {
+                report.warn("blending into a 16-bit snorm render target drawn without blending");
+                blends[rt] = None;
+            }
         }
-        let clamps: [Option<(u32, u32)>; 4] = std::array::from_fn(|rt| {
-            color[rt]
-                .and_then(|k| formats::output_clamp(k.format, blends[rt].is_some()))
-                .map(|(rgb, a)| (rgb.to_bits(), a.to_bits()))
+        let outputs: [Option<(u32, u32, i8, u32)>; 4] = std::array::from_fn(|rt| {
+            let k = color[rt]?;
+            // RB_COLOR_INFO bits 20..25: signed colour exponent bias.
+            let bias = ((self.regs.get(regs::RB_COLOR_INFO_RT[rt]) << 6) as i32 >> 26) as i8;
+            let clamp = formats::output_clamp(k.format, blends[rt].is_some());
+            if bias == 0 && clamp.is_none() {
+                return None;
+            }
+            let (rgb, a, scale) = clamp.unwrap_or((f32::INFINITY, f32::INFINITY, 1.0));
+            Some((rgb.to_bits(), a.to_bits(), bias, scale.to_bits()))
         });
-        let ps_variant = if clamps.iter().any(Option::is_some) {
-            Variant::Clamp(clamps)
+        let ps_variant = if outputs.iter().any(Option::is_some) {
+            Variant::Output(outputs)
         } else {
             Variant::Plain
         };
@@ -2009,16 +2338,8 @@ impl Drawer {
         self.timings.shaders += lap(&mut t);
 
         let (window, window_base) = self.guest_window(vf_mask, mem, report)?;
-        let consts = self.buffer(
-            "consts",
-            &self.consts(window_base),
-            wgpu::BufferUsages::UNIFORM,
-        );
-        let epi = self.buffer(
-            "epilogue",
-            &to_bytes(&state::epilogue(&self.regs, w, h)),
-            wgpu::BufferUsages::UNIFORM,
-        );
+        let consts = self.consts(window_base);
+        let epi = to_bytes(&state::epilogue(&self.regs, w, h));
         self.timings.guest_data += lap(&mut t);
         let mut textures = Vec::new();
         for n in (0..32).filter(|n| tex_mask & (1 << n) != 0) {
@@ -2027,39 +2348,25 @@ impl Drawer {
         self.timings.textures += lap(&mut t);
         // Rectangle lists read their guest indices in the vertex shader and
         // draw 6 host vertices per rectangle without an index buffer.
-        let index_buf = self.buffer("indices", &to_bytes(&idx), wgpu::BufferUsages::INDEX);
-        let rect_indices = self.buffer(
-            "rectangle indices",
-            &if rect_list {
-                to_bytes(&idx)
-            } else {
-                Vec::new()
-            },
-            wgpu::BufferUsages::STORAGE,
-        );
-
-        let scope = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let idx_bytes = to_bytes(&idx);
+        let rect_indices: &[u8] = if rect_list { &idx_bytes } else { &[] };
+        let slices = self.stage(&[&window, &consts, &epi, rect_indices, &idx_bytes])?;
+        let arena = self.arena.clone().expect("staged");
+        let binding = |i: usize| {
+            let (offset, size) = slices[i];
+            wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                buffer: &arena,
+                offset,
+                size: wgpu::BufferSize::new(size),
+            })
+        };
         let g0 = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("draw group 0"),
             layout: &self.group0,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: window.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: consts.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: epi.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: rect_indices.as_entire_binding(),
-                },
-            ],
+            entries: &[0, 1, 2, 3].map(|i| wgpu::BindGroupEntry {
+                binding: i as u32,
+                resource: binding(i),
+            }),
         });
         let mut entries = Vec::new();
         for (n, (view, sampler)) in &textures {
@@ -2077,70 +2384,34 @@ impl Drawer {
             layout: &g1_layout,
             entries: &entries,
         });
-        let color_views = color_tex
-            .each_ref()
-            .map(|t| t.as_ref().map(|t| t.create_view(&Default::default())));
-        let depth_view = depth_tex
-            .as_ref()
-            .map(|t| t.create_view(&Default::default()));
-        let mut enc = self.device.create_command_encoder(&Default::default());
-        {
-            let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("draw"),
-                color_attachments: &color_views.each_ref().map(|v| {
-                    v.as_ref().map(|view| wgpu::RenderPassColorAttachment {
-                        view,
-                        depth_slice: None,
-                        resolve_target: None,
-                        ops: wgpu::Operations {
-                            load: wgpu::LoadOp::Load,
-                            store: wgpu::StoreOp::Store,
-                        },
-                    })
-                }),
-                depth_stencil_attachment: depth_view.as_ref().map(|view| {
-                    wgpu::RenderPassDepthStencilAttachment {
-                        view,
-                        depth_ops: Some(wgpu::Operations {
-                            load: wgpu::LoadOp::Load,
-                            store: wgpu::StoreOp::Store,
-                        }),
-                        stencil_ops: depth_format
-                            .is_some_and(|f| f.has_stencil_aspect())
-                            .then_some(wgpu::Operations {
-                                load: wgpu::LoadOp::Load,
-                                store: wgpu::StoreOp::Store,
-                            }),
-                    }
-                }),
-                ..Default::default()
-            });
-            pass.set_pipeline(&pipeline);
-            pass.set_bind_group(0, &g0, &[]);
-            pass.set_bind_group(1, &g1, &[]);
-            pass.set_index_buffer(index_buf.slice(..), wgpu::IndexFormat::Uint32);
-            pass.set_viewport(0.0, 0.0, w as f32, h as f32, 0.0, 1.0);
-            pass.set_scissor_rect(sx, sy, sw, sh);
-            if let Some((_, reference)) = &stencil {
-                pass.set_stencil_reference(*reference);
-            }
-            pass.set_blend_constant(wgpu::Color {
-                r: f64::from(blend_rgba[0]),
-                g: f64::from(blend_rgba[1]),
-                b: f64::from(blend_rgba[2]),
-                a: f64::from(blend_rgba[3]),
-            });
-            if rect_list {
-                pass.draw(0..idx.len() as u32 * 2, 0..1);
-            } else {
-                pass.draw_indexed(0..idx.len() as u32, 0, 0..1);
-            }
+        let pass = self.pass((color, depth_key), &color_tex, depth_tex.as_ref());
+        pass.set_pipeline(&pipeline);
+        pass.set_bind_group(0, &g0, &[]);
+        pass.set_bind_group(1, &g1, &[]);
+        let (offset, size) = slices[4];
+        pass.set_index_buffer(
+            arena.slice(offset..offset + size),
+            wgpu::IndexFormat::Uint32,
+        );
+        pass.set_viewport(0.0, 0.0, w as f32, h as f32, 0.0, 1.0);
+        pass.set_scissor_rect(sx, sy, sw, sh);
+        if let Some((_, reference)) = &stencil {
+            pass.set_stencil_reference(*reference);
         }
-        self.queue.submit([enc.finish()]);
+        pass.set_blend_constant(wgpu::Color {
+            r: f64::from(blend_rgba[0]),
+            g: f64::from(blend_rgba[1]),
+            b: f64::from(blend_rgba[2]),
+            a: f64::from(blend_rgba[3]),
+        });
+        if rect_list {
+            pass.draw(0..idx.len() as u32 * 2, 0..1);
+        } else {
+            pass.draw_indexed(0..idx.len() as u32, 0, 0..1);
+        }
         self.timings.submit += lap(&mut t);
-        if let Some(e) = block_on(scope.pop()) {
-            return Err(Skip::Fatal(Error::Gpu(e.to_string())));
-        }
+        // Recorded, not yet submitted: everything else that touches the
+        // targets flushes the batch first, so stamps follow submit order.
         for k in color.into_iter().flatten() {
             self.mark_written(k, rows);
         }
@@ -2295,6 +2566,7 @@ impl Drawer {
             pass.draw(0..3, 0..1);
         }
         self.queue.submit([enc.finish()]);
+        self.timings.submits += 1;
         if let Some(e) = block_on(scope.pop()) {
             return Err(Skip::Fatal(Error::Gpu(e.to_string())));
         }
@@ -2302,8 +2574,8 @@ impl Drawer {
         Ok(())
     }
 
-    /// Performs a resolve: copy, then the colour and depth clears. Ok(false)
-    /// when the rectangle is empty.
+    /// Performs a resolve: copy, then the colour and depth clears (also when
+    /// the copy is unsupported). Ok(false) when the rectangle is empty.
     ///
     /// Copy commands: `Raw` and `Convert` both convert from the source to
     /// the destination format, as in Xenia, whose resolve shaders do not
@@ -2318,6 +2590,8 @@ impl Drawer {
         mem: &mut dyn GuestMemory,
         report: &mut Report,
     ) -> Result<bool, Skip> {
+        // The copy and clears see every draw before them.
+        self.flush()?;
         if r.msaa_samples != 0 {
             report.warn("MSAA surfaces drawn and resolved single-sampled");
         }
@@ -2329,10 +2603,15 @@ impl Drawer {
         if rect.is_empty() {
             return Ok(false);
         }
-        match r.copy_command {
-            CopyCommand::Raw | CopyCommand::Convert => self.resolve_copy(r, rect, mem, report)?,
-            CopyCommand::Null => {}
+        let copied = match r.copy_command {
+            CopyCommand::Raw | CopyCommand::Convert => self.resolve_copy(r, rect, mem, report),
+            CopyCommand::Null => Ok(()),
             CopyCommand::ConstantOne => return unsupported("resolve copy command ConstantOne"),
+        };
+        // A copy this drawer cannot do still clears, as Xenia always would;
+        // the copy is reported after the clears.
+        if let Err(Skip::Fatal(_)) = copied {
+            return copied.map(|()| true);
         }
         // A depth resolve never clears colour (Xenia draw_util.h
         // IsClearingColor).
@@ -2365,7 +2644,7 @@ impl Drawer {
             self.clear(key, rect, [0.0; 4], depth, r.depth_clear & 0xFF, report)?;
             self.timings.clears += t.elapsed();
         }
-        Ok(true)
+        copied.map(|()| true)
     }
 
     /// Colour copy: reads the rectangle back, converts each pixel as
@@ -2430,7 +2709,10 @@ impl Drawer {
         if rect.is_empty() {
             return Ok(());
         }
-        if dest_bytes == 4 {
+        // shortcut: 16_16_FLOAT colour copies take the CPU path (WGSL's
+        // pack2x16float does not promise rounding); port f32_to_half to
+        // resolve.wgsl if they show up in profiles.
+        if dest_bytes == 4 && (r.is_depth || r.dest_format != formats::DEST_16_16_FLOAT) {
             self.resolve_gpu(r, rect, format, &tex, mem)?;
             self.resolved_endian
                 .insert(r.dest_base & PHYSICAL_MASK, r.dest_endian);
@@ -2493,7 +2775,11 @@ impl Drawer {
             ))
             .into());
         }
+        // Waiting here only splits the rendering from the resolve in the
+        // timings: the readback waits for it anyway.
         let mut t = Instant::now();
+        self.wait_idle()?;
+        self.timings.gpu_wait += lap(&mut t);
         let base = r.dest_base & PHYSICAL_MASK;
         let pitch = xenon_texture::tile::align_to_tile(r.dest_pitch);
         let extent = xenon_texture::tile::tiled_extent_2d(rect.x1, rect.y1, pitch, 4)
@@ -2512,6 +2798,10 @@ impl Drawer {
             TargetFormat::Float32 => 4,
             TargetFormat::D24S8 => 5,
             TargetFormat::D24FS8 => 6,
+            TargetFormat::Rg16Fixed => 7,
+            TargetFormat::Rgba16Fixed => 8,
+            TargetFormat::Rg16Float => 9,
+            TargetFormat::Rg32Float => 10,
         };
         let entry = match format {
             _ if !format.is_depth() => 0,
@@ -2528,6 +2818,7 @@ impl Drawer {
             match r.dest_format {
                 formats::DEST_8_8_8_8 => 0,
                 formats::DEST_2_10_10_10 => 1,
+                formats::DEST_16_16 => 3,
                 _ => 2,
             },
             u32::from(r.dest_swap),
@@ -2613,6 +2904,7 @@ impl Drawer {
         }
         enc.copy_buffer_to_buffer(&dest, 0, &readback, 0, dest.size());
         let index = self.queue.submit([enc.finish()]);
+        self.timings.submits += 1;
         if let Some(e) = block_on(scope.pop()) {
             return Err(Skip::Fatal(Error::Gpu(e.to_string())));
         }
@@ -2824,10 +3116,18 @@ mod tests {
         assert!(w.contains("o.o0 = (b.o0 - a.o0) + c.o0;\n    o.o2 = (b.o2 - a.o2) + c.o2;"));
         assert!(!w.contains("o.o1 ="));
         assert!(rect_list_wgsl("var<private> x: i32 = 1;\n", 0).is_err());
-        let ps = clamp_pixel_wgsl("    out.c0 = o_col[0];\n", 0, 31.875, 1.0).unwrap();
-        assert!(ps.contains("vec3<f32>(31.875)), clamp(o_col[0].w, 0.0, 1.0)"));
-        assert!(clamp_pixel_wgsl("", 0, 1.0, 1.0).is_err());
-        let ps = clamp_pixel_wgsl("    out.c2 = o_col[2];\n", 2, f32::INFINITY, 1.0).unwrap();
+        let ps = output_pixel_wgsl("    out.c0 = o_col[0];\n", 0, 0, 31.875, 1.0, 1.0).unwrap();
+        assert!(ps.contains("vec3<f32>(31.875)), clamp(o_col[0].w, 0.0, 1.0));"));
+        assert!(output_pixel_wgsl("", 0, 0, 1.0, 1.0, 1.0).is_err());
+        let ps =
+            output_pixel_wgsl("    out.c2 = o_col[2];\n", 2, 0, f32::INFINITY, 1.0, 1.0).unwrap();
         assert!(ps.contains("out.c2 = vec4<f32>(o_col[2].xyz, clamp(o_col[2].w, 0.0, 1.0));"));
+        let inf = f32::INFINITY;
+        let ps = output_pixel_wgsl("    out.c1 = o_col[1];\n", 1, -2, inf, inf, 1.0).unwrap();
+        assert!(ps.contains("out.c1 = vec4<f32>((o_col[1] * 0.25).xyz, (o_col[1] * 0.25).w);"));
+        let ps = output_pixel_wgsl("    out.c3 = o_col[3];\n", 3, 1, inf, inf, 0.03125).unwrap();
+        assert!(
+            ps.contains("out.c3 = vec4<f32>((o_col[3] * 2.0).xyz, (o_col[3] * 2.0).w) * 0.03125;")
+        );
     }
 }

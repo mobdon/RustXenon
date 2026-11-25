@@ -4,28 +4,14 @@
 //! at fixed times since start. The default presses Start, then A a second
 //! and a half later, every four seconds from the fifth second. `--press`
 //! replaces it with a list of `<ms>:<button>[+<button>...]` presses (each
-//! held 150 ms), and `--no-controller` unplugs the pad.
+//! held 150 ms), and `--no-controller` unplugs the pad. `--window` plugs in
+//! the window's live pad instead: an XInput controller and the keyboard.
 
 use super::*;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
+use xenon_input::Pad;
 
-/// Button bits of the gamepad state.
-pub const BUTTONS: [(&str, u16); 14] = [
-    ("up", 0x0001),
-    ("down", 0x0002),
-    ("left", 0x0004),
-    ("right", 0x0008),
-    ("start", 0x0010),
-    ("back", 0x0020),
-    ("lthumb", 0x0040),
-    ("rthumb", 0x0080),
-    ("lb", 0x0100),
-    ("rb", 0x0200),
-    ("a", 0x1000),
-    ("b", 0x2000),
-    ("x", 0x4000),
-    ("y", 0x8000),
-];
+pub use xenon_input::BUTTONS;
 
 /// Virtual key codes for keystroke events, in the order of [`BUTTONS`].
 const KEYS: [u16; 14] = [
@@ -42,11 +28,29 @@ pub enum Script {
     Presses(Vec<(u64, u16)>),
     /// Start, then A, every four seconds from five seconds.
     Default,
+    /// The window's controller and keyboard.
+    Live,
 }
 
+/// The game window, when `--window` opened one.
+pub static WINDOW: OnceLock<Arc<xenon_window::Link>> = OnceLock::new();
+
 static SCRIPT: OnceLock<Script> = OnceLock::new();
-/// Buttons last reported as keystrokes, and the state packet counter.
+/// Buttons last reported as keystrokes.
 static LAST_KEYS: AtomicU32 = AtomicU32::new(0);
+/// The last state reported and its packet number.
+static LAST_STATE: Mutex<(Pad, u32)> = Mutex::new((
+    Pad {
+        buttons: 0,
+        lt: 0,
+        rt: 0,
+        lx: 0,
+        ly: 0,
+        rx: 0,
+        ry: 0,
+    },
+    0,
+));
 
 /// Parses `--press` text: `5000:start,6500:a+b`.
 pub fn parse(text: &str) -> Result<Script, String> {
@@ -86,6 +90,7 @@ fn script() -> &'static Script {
 pub fn buttons_at(s: &Script, ms: u64) -> Option<u16> {
     match s {
         Script::Unplugged => None,
+        Script::Live => Some(WINDOW.get().map_or(0, |w| w.pad().buttons)),
         Script::Presses(v) => Some(
             v.iter()
                 .filter(|(t, _)| ms >= *t && ms < t + HOLD_MS)
@@ -107,8 +112,15 @@ pub fn buttons_at(s: &Script, ms: u64) -> Option<u16> {
     }
 }
 
-fn now() -> Option<u16> {
-    buttons_at(script(), crate::ms() as u64)
+fn now() -> Option<Pad> {
+    let s = script();
+    if let (Script::Live, Some(w)) = (s, WINDOW.get()) {
+        return Some(w.pad());
+    }
+    buttons_at(s, crate::ms() as u64).map(|buttons| Pad {
+        buttons,
+        ..Pad::default()
+    })
 }
 
 fn connected(user: u32) -> bool {
@@ -136,20 +148,29 @@ pub fn xam_input_get_capabilities(rt: &Runtime, c: &mut Context) {
     ret(c, ERROR_SUCCESS);
 }
 
-/// State: packet number, buttons, two triggers, four stick axes (centred).
+/// State: packet number, buttons, two triggers, four stick axes.
 pub fn xam_input_get_state(rt: &Runtime, c: &mut Context) {
     let (user, state) = (arg(rt, c, 0), arg(rt, c, 2));
-    let Some(b) = now().filter(|_| connected(user)) else {
+    let Some(p) = now().filter(|_| connected(user)) else {
         return ret(c, ERROR_DEVICE_NOT_CONNECTED);
     };
-    fill(rt, state, 16, 0);
-    // The packet number changes exactly when the state does.
-    rt.mem.write_u32(
-        state,
-        (crate::ms() as u64 / HOLD_MS) as u32 * 2 + (b != 0) as u32,
-    );
-    rt.mem.write_u16(state + 4, b);
+    rt.mem.write_u32(state, packet(p));
+    rt.mem.write_u16(state + 4, p.buttons);
+    rt.mem.write_u8(state + 6, p.lt);
+    rt.mem.write_u8(state + 7, p.rt);
+    for (i, v) in [p.lx, p.ly, p.rx, p.ry].into_iter().enumerate() {
+        rt.mem.write_u16(state + 8 + 2 * i as u32, v as u16);
+    }
     ret(c, ERROR_SUCCESS);
+}
+
+/// The packet number changes exactly when the state does.
+fn packet(p: Pad) -> u32 {
+    let mut last = LAST_STATE.lock().unwrap();
+    if last.0 != p {
+        *last = (p, last.1.wrapping_add(1));
+    }
+    last.1
 }
 
 pub fn xam_input_set_state(rt: &Runtime, c: &mut Context) {
@@ -171,7 +192,7 @@ pub fn xam_input_get_keystroke_ex(rt: &Runtime, c: &mut Context) {
     } else {
         0xFF
     };
-    let Some(b) = now().filter(|_| connected(user)) else {
+    let Some(b) = now().filter(|_| connected(user)).map(|p| p.buttons) else {
         return ret(c, ERROR_DEVICE_NOT_CONNECTED);
     };
     let last = LAST_KEYS.load(Ordering::Relaxed) as u16;
@@ -209,5 +230,20 @@ mod tests {
         assert_eq!(buttons_at(&Script::Default, 5000), Some(0x10));
         assert_eq!(buttons_at(&Script::Default, 6600), Some(0x1000));
         assert_eq!(buttons_at(&Script::Default, 9000), Some(0x10));
+        // No window yet: a live pad is plugged in and centred.
+        assert_eq!(buttons_at(&Script::Live, 0), Some(0));
+    }
+
+    #[test]
+    fn packet_follows_state() {
+        let a = packet(Pad::default());
+        assert_eq!(packet(Pad::default()), a);
+        let moved = Pad {
+            lx: 100,
+            ..Pad::default()
+        };
+        let b = packet(moved);
+        assert_ne!(a, b);
+        assert_eq!(packet(moved), b);
     }
 }

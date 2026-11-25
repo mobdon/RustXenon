@@ -232,6 +232,57 @@ fn vword(addr: i32, e: u32) -> u32 {
 }
 ";
 
+// Texture fetch result: the fetch constant's per-component sign (dword 0
+// bits 2..9, after the dword 3 swizzle as Xenia's texture_util.cc
+// SwizzleSigns picks it; constant 0/1 components keep their value) and the
+// 2^exp_adjust scale (dword 3 bits 13..18, signed), as Xenia's
+// spirv_shader_translator_fetch.cc applies them (its exp_adjust reads word 4;
+// dword 3 is per xenos.h and dxbc_shader_translator_fetch.cc). Gamma is
+// Xenia's PWLGammaToLinear (spirv_shader_translator.cc / xenos.cc).
+const TFETCH_PRELUDE: &str = "
+fn xe_pwl_gamma_to_linear(g_in: f32) -> f32 {
+    let g = clamp(g_in, 0.0, 1.0);
+    var scale = 1.0 / 1024.0;
+    var offset = 0.0;
+    if (g >= 192.0 / 255.0) {
+        scale = 8.0 / 1024.0;
+        offset = -1024.0;
+    } else if (g >= 96.0 / 255.0) {
+        scale = 4.0 / 1024.0;
+        offset = -256.0;
+    } else if (g >= 64.0 / 255.0) {
+        scale = 2.0 / 1024.0;
+        offset = -64.0;
+    }
+    var l = g * (255.0 * 1024.0) * scale + offset;
+    l += trunc(l * scale);
+    return l * (1.0 / 1023.0);
+}
+
+fn xe_tfetch_sign_bias(v: vec4<f32>, w0: u32, w3: u32) -> vec4<f32> {
+    var r = v;
+    for (var i = 0u; i < 4u; i++) {
+        let s = extractBits(w3, 1u + 3u * i, 3u);
+        if (s > 3u) {
+            continue;
+        }
+        let sign = extractBits(w0, 2u + 2u * s, 2u);
+        if (sign == 1u) {
+            // shortcut: signed is the 8-bit unorm texel reinterpreted as
+            // two's complement after sampling, exact for point-sampled 8-bit
+            // components only; upgrade with signed decoding in xenon-texture.
+            let b = round(v[i] * 255.0);
+            r[i] = max(select(b, b - 256.0, b >= 128.0) / 127.0, -1.0);
+        } else if (sign == 2u) {
+            r[i] = v[i] * 2.0 - 1.0;
+        } else if (sign == 3u) {
+            r[i] = xe_pwl_gamma_to_linear(v[i]);
+        }
+    }
+    return r * ldexp(1.0, extractBits(bitcast<i32>(w3), 13u, 6u));
+}
+";
+
 /// Translates one vertex or pixel program to a WGSL module with entry point
 /// `vs_main` or `ps_main`.
 pub fn translate(words: &[u32], stage: ShaderStage) -> Result<Translated, Error> {
@@ -1089,7 +1140,11 @@ impl Gen {
             // bias is the LOD.
             format!("textureSampleLevel(tex{n}, samp{n}, uv, lod)")
         };
-        self.line(&format!("let v = {sample};"));
+        self.line(&format!(
+            "let v = xe_tfetch_sign_bias({sample}, {}, {});",
+            fetch_dword(n * 6),
+            fetch_dword(n * 6 + 3)
+        ));
         self.fetch_store(t.dest, t.dest_relative, t.dest_swizzle);
         self.line("}");
         Ok(())
@@ -1124,6 +1179,9 @@ fn cnst(i: i32) -> vec4<f32> {{
         }
         if self.info.uses_vertex_fetch {
             s.push_str(GUEST_PRELUDE);
+        }
+        if self.info.textures_used != 0 {
+            s.push_str(TFETCH_PRELUDE);
         }
         for n in 0..32 {
             if self.info.textures_used & (1 << n) != 0 {
