@@ -762,3 +762,44 @@ fn free_of_unknown_block_is_counted_and_heap_stays_whole() {
     assert_ne!(b, 0);
     call(rt, &mut c, memory::ex_free_pool, &[b as u64]);
 }
+
+#[test]
+fn submitted_frames_reach_the_wav_as_stereo() {
+    let e = env();
+    let rt = &e.rt;
+    let mut c = ctx(0x1_B000);
+    let path = std::env::temp_dir().join(format!("xenon-wav-{}.wav", std::process::id()));
+    kernel::audio::start_wav(&path).unwrap();
+    // Front left 0.5, front right -0.25, the other four channels silent.
+    let frame = 0x3_0000u32;
+    for i in 0..256u32 {
+        rt.mem.write_u32(frame + 4 * i, 0.5f32.to_bits());
+        rt.mem.write_u32(frame + 1024 + 4 * i, (-0.25f32).to_bits());
+        for ch in 2..6 {
+            rt.mem.write_u32(frame + ch * 1024 + 4 * i, 0);
+        }
+    }
+    for _ in 0..2 {
+        call(
+            rt,
+            &mut c,
+            kernel::audio::x_audio_submit_render_driver_frame,
+            &[0x4155_0000, frame as u64],
+        );
+    }
+    // Another client's frames are not mixed in.
+    call(
+        rt,
+        &mut c,
+        kernel::audio::x_audio_submit_render_driver_frame,
+        &[0x4155_0001, frame as u64],
+    );
+    kernel::audio::finish_wav();
+    let w = xenon_audio::wav::read(&std::fs::read(&path).unwrap()).unwrap();
+    let _ = std::fs::remove_file(&path);
+    assert_eq!((w.rate, w.channels, w.samples.len()), (48_000, 2, 1024));
+    assert!(w
+        .samples
+        .chunks(2)
+        .all(|s| (s[0] - 0.5).abs() < 1e-3 && (s[1] + 0.25).abs() < 1e-3));
+}

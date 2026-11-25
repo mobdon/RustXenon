@@ -40,8 +40,39 @@ static CLIENTS: AtomicU32 = AtomicU32::new(0);
 pub fn x_audio_unregister_render_driver_client(_: &Runtime, c: &mut Context) {
     ret(c, STATUS_SUCCESS);
 }
-pub fn x_audio_submit_render_driver_frame(_: &Runtime, c: &mut Context) {
+/// (driver, frame): the frame is 6 channels of 256 big-endian floats.
+/// With `--audio-wav` the first client's frames go to the file as stereo.
+pub fn x_audio_submit_render_driver_frame(rt: &Runtime, c: &mut Context) {
+    let (driver, frame) = (arg(rt, c, 0), arg(rt, c, 1));
+    // shortcut: only client 0 is written, no mixing; mix all clients when a title registers several.
+    if driver == 0x4155_0000 && frame != 0 {
+        if let Some(w) = WAV.lock().unwrap().as_mut() {
+            let mut b = vec![0; xenon_audio::GUEST_FRAME_BYTES];
+            rt.mem.read_bytes(frame, &mut b);
+            if let Err(e) = w.write_samples(&xenon_audio::guest_frame_to_stereo(&b)) {
+                crate::log(&format!("audio wav: {e}"));
+            }
+        }
+    }
     ret(c, STATUS_SUCCESS);
+}
+
+type Wav = xenon_audio::wav::WavWriter<std::io::BufWriter<std::fs::File>>;
+static WAV: Mutex<Option<Wav>> = Mutex::new(None);
+
+/// Starts writing submitted sound to `path` (48 kHz stereo, 16-bit).
+pub fn start_wav(path: &std::path::Path) -> std::io::Result<()> {
+    *WAV.lock().unwrap() = Some(Wav::create(path, 48_000, 2)?);
+    Ok(())
+}
+
+/// Patches the .wav header; later frames are not written.
+pub fn finish_wav() {
+    if let Some(w) = WAV.lock().unwrap().take() {
+        if let Err(e) = w.finish() {
+            crate::log(&format!("audio wav: {e}"));
+        }
+    }
 }
 pub fn x_audio_get_voice_category_volume_change_mask(rt: &Runtime, c: &mut Context) {
     rt.mem.write_u32(arg(rt, c, 1), 0);

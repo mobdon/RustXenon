@@ -296,7 +296,7 @@ USAGE: game --exe <patched executable> --game <unpacked game folder>
             [--update <unpacked title update>] [--data <writable folder>]
             [--seconds <n>] [--press <ms>:<button>[+<button>],...]
             [--no-controller] [--window] [--capture <dir> [--capture-at <s>,<s>...]] [--render]
-            [--capture-frames <n>,<n>... --capture-dir <dir>]
+            [--capture-frames <n>,<n>... --capture-dir <dir>] [--audio-wav <file>]
 
 Runs the title headless for --seconds (default 30) and reports how far it
 got: frames presented, threads, imports called, memory in use. A
@@ -308,7 +308,8 @@ the textures bound at its draws and a list of the draws: local files,
 derived from the game. --render draws every frame headless on the host GPU
 and adds the frame image to each capture. --capture-frames writes the listed
 frames (counted from 1, one per swap) as <dir>/frame-<n>.png; it implies
---render. --window opens a window that shows each drawn frame (it implies
+--render. --audio-wav writes the sound the title submits to a 48 kHz
+stereo .wav (nothing is played). --window opens a window that shows each drawn frame (it implies
 --render), plugs in the controller and keyboard as the pad on port 0 (unless
 --press or --no-controller is given) and runs until the window is closed
 (or for --seconds when given).";
@@ -345,6 +346,12 @@ pub fn run(sha256: &str, regs: &[fn(&mut Runtime)]) -> ExitCode {
             .collect();
         let _ = kernel::gpu::capture::FRAMES.set((PathBuf::from(dir), n));
         kernel::gpu::capture::RENDER.store(true, Ordering::Relaxed);
+    }
+    if let Some(w) = opt(&args, "--audio-wav") {
+        if let Err(e) = kernel::audio::start_wav(w.as_ref()) {
+            eprintln!("{w}: {e}");
+            return ExitCode::FAILURE;
+        }
     }
     if args.iter().any(|a| a == "--render") {
         kernel::gpu::capture::RENDER.store(true, Ordering::Relaxed);
@@ -544,6 +551,7 @@ fn host_rss() -> Option<u64> {
 }
 
 fn report() {
+    kernel::audio::finish_wav();
     let kx = kernel::k();
     log(&format!(
         "frames presented: {}",
