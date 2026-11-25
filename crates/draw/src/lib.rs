@@ -655,6 +655,9 @@ impl Drop for Submitter {
     }
 }
 
+/// Flushed batches the submit thread may hold before a flush waits.
+const SUBMITS_IN_FLIGHT: usize = 4;
+
 /// Batch passes timed per flush; later ones in the same batch go untimed.
 const GPU_CLOCK_PASSES: u64 = 1024;
 
@@ -2753,9 +2756,10 @@ impl Drawer {
     fn flush(&mut self) -> Result<(), Skip> {
         // The arena upload counts as submit time too.
         let t = Instant::now();
-        // Two batches in flight at most, so their staged copies stay few;
-        // the drawer records the next batch while the last one submits.
-        self.submitter.drain_to(1);
+        // A few batches in flight, so their staged copies stay few; the
+        // drawer records on while the submit thread catches up. With one,
+        // flushes close together waited on each other's submit.
+        self.submitter.drain_to(SUBMITS_IN_FLIGHT);
         let mut upload = None;
         if let (Some(arena), false) = (&self.arena, self.staged.is_empty()) {
             // A copy goes to the submit thread, which writes it to the arena
