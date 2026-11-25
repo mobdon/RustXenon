@@ -838,3 +838,35 @@ fn swapped_samples_past_the_row_keep_the_destination() {
         assert_eq!(w, want, "depth column {x}: {row:08X?}");
     }
 }
+
+/// A colour draw over the depth target's tiles, then a draw that only
+/// tests depth: each replay transfers the colour words to depth, neither
+/// target is dropped, and the transfer's setup is made once and kept.
+#[test]
+fn repeated_transfers_reuse_their_setup() {
+    let Some(mut d) = drawer() else { return };
+    let mut mem = memory();
+    let c = [0; 4];
+    mem.write_words(
+        VERTS + 48,
+        &color_verts(&[(0.0, 0.0, 0.3, c), (64.0, 0.0, 0.3, c), (0.0, 64.0, 0.3, c)]),
+    );
+    let mut s = Stream::default();
+    s.setup().regs(RB_DEPTH_INFO, &[D24S8_AT_0]);
+    draw_word(&mut s, &mut mem, 64.0, 0x4000_0078);
+    // Colour at tile 100, z LESS without z write against tile 0.
+    s.regs(RB_COLOR_INFO, &[100])
+        .shader(true, &ps_interp())
+        .regs(RB_DEPTHCONTROL, &[2 | (1 << 4)])
+        .vertex_fetch(0, VERTS + 48, 24)
+        .draw_auto(PRIM_RECT_LIST, 3)
+        .regs(RB_DEPTHCONTROL, &[0])
+        .regs(RB_COLOR_INFO, &[0]);
+    let mut counts = Vec::new();
+    for _ in 0..3 {
+        let r = run(&mut d, &s, &mut mem);
+        assert!(r.warnings.is_empty(), "{r:?}");
+        counts.push((r.timings.transfers, r.timings.transfer_setups));
+    }
+    assert_eq!(counts, [(1, 1), (1, 0), (1, 0)]);
+}
