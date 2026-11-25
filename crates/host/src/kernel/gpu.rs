@@ -244,7 +244,17 @@ impl DrawStats {
             by(2),
             by(3),
             by(4),
-        )
+        ) + &if t.passes_timed > 0 {
+            format!(
+                "; GPU ms per {per} (timestamps, {} passes): draw {:.1}, clear {:.1}, resolve {:.1}",
+                t.passes_timed / n,
+                ms(t.gpu_passes[0]),
+                ms(t.gpu_passes[1]),
+                ms(t.gpu_passes[2]),
+            )
+        } else {
+            String::new()
+        }
     }
 }
 
@@ -780,6 +790,16 @@ mod tests {
         ] {
             assert!(line.contains(part), "{part}: {line}");
         }
+        assert!(!line.contains("GPU ms"), "{line}");
+        s.t.passes_timed = 400;
+        s.t.gpu_passes = [ms(100), ms(3), ms(9)];
+        let line = s.line(ms(5000));
+        assert!(
+            line.ends_with(
+                "; GPU ms per frame (timestamps, 200 passes): draw 50.0, clear 1.5, resolve 4.5"
+            ),
+            "{line}"
+        );
         s.frames = 0;
         assert!(s.line(ms(5000)).contains("ms per window: drawer 2000 ="));
     }
