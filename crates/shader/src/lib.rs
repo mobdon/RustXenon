@@ -43,12 +43,15 @@
 //!   (count in bits 0..8, aL start in 8..16, signed aL step in 16..24).
 //! - Texture fetch slot `n` binds `@group(1) @binding(2n)` as
 //!   `texture_2d<f32>` and `@group(1) @binding(2n+1)` as `sampler`, only for
-//!   the slots in [`ShaderInfo::textures_used`]. The shader reads the sign
+//!   the slots in [`ShaderInfo::textures_used`]. The drawer applies the
+//!   fetch constant's swizzle and converts signed components (sign 1) when
+//!   it uploads the texture, so the host filters signed values; the texture
+//!   the shader samples holds those swizzled, signed-converted texels.
+//!   Format and filtering are also the drawer's. The shader reads the sign
 //!   (dword 0), swizzle and exponent bias (dword 3) and LOD bias (dword 4) of
-//!   a texture fetch constant, and applies sign (signed, biased, gamma) and
-//!   exponent bias to the sampled value; the texture it samples holds the
-//!   unsigned decode with the swizzle applied. Format and filtering are the
-//!   drawer's.
+//!   the fetch constant, and applies only the biased sign (2), gamma (3) and
+//!   exponent bias to the sampled value; it reads the swizzle just to find
+//!   which source component's sign each output component takes.
 //! - Vertex stage: entry `vs_main`, input `@builtin(vertex_index)`. r0.x
 //!   starts as the vertex index `(vertex_index + consts.vertex_base) &
 //!   0xFFFFFF` (24 bits, as Xenia masks it; the min/max index clamp is not
@@ -59,7 +62,10 @@
 //! - Pixel stage: entry `ps_main`. Inputs are `@location(i)` vec4 for each
 //!   bit of [`ShaderInfo::interpolators_read`], copied to r<i> on entry;
 //!   outputs are `@location(0..4)` vec4 for the colour exports in
-//!   [`ShaderInfo::colour_targets_written`].
+//!   [`ShaderInfo::colour_targets_written`]. With [`translate_with`] and a
+//!   [`ParamGen`], the pixel parameters (position, facing, primitive flags)
+//!   are written to their register on entry from `@builtin(position)` and
+//!   `@builtin(front_facing)`, after the interpolators are copied.
 //!
 //! Depth export and memory export fail with [`Error::Unsupported`]; the
 //! point size / kill-vertex export is dropped and reported in
@@ -86,6 +92,6 @@ pub mod ucode;
 mod wgsl;
 
 pub use wgsl::{
-    translate, Error, ShaderInfo, ShaderStage, Translated, PIXEL_FLOAT_CONST_BASE, TEMP_REGISTERS,
-    WATCHDOG_STEPS,
+    translate, translate_with, Error, ParamGen, ParamGenPrimitive, ShaderInfo, ShaderStage,
+    Translated, PIXEL_FLOAT_CONST_BASE, TEMP_REGISTERS, WATCHDOG_STEPS,
 };
