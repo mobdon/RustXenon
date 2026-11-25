@@ -293,8 +293,8 @@ fn untransferred_aliasing_is_reported() {
         s.regs(RB_DEPTH_INFO, &[200]);
         clear_depth(&mut s, &mut mem, 0);
         let report = run(&mut d, &s, &mut mem);
-        if !report.unsupported.is_empty() {
-            assert!(name.ends_with("Fixed"), "{report:?}");
+        if name.ends_with("Fixed") && !d.snorm16() {
+            assert!(!report.unsupported.is_empty(), "{report:?}");
             continue;
         }
         let want = format!("D24S8 render target aliases a newer {name}");
