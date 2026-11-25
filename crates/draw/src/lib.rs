@@ -1009,6 +1009,34 @@ impl Drawer {
         self.float32_filterable
     }
 
+    /// What the drawer holds, for the run log: cached textures, render
+    /// targets (bytes estimated from their size and format), the draw upload
+    /// arena and its host staging copy, and pipeline and shader counts.
+    pub fn memory_line(&self) -> String {
+        let bytes = |t: &wgpu::Texture| {
+            let f = t.format();
+            let texel = f.block_copy_size(None).map_or_else(
+                // Depth + stencil formats: 4 or 8 bytes a texel.
+                || if f.has_stencil_aspect() { 8 } else { 4 },
+                u64::from,
+            );
+            let e = t.size();
+            texel * u64::from(e.width * e.height * e.depth_or_array_layers * t.sample_count())
+        };
+        let rt: u64 = self.targets.values().map(bytes).sum();
+        format!(
+            "draw: textures {} MB in {}, targets {} MB in {}, arena {} MB, staged {} MB, pipelines {}, shaders {}",
+            self.texture_cache_bytes >> 20,
+            self.texture_cache.len(),
+            rt >> 20,
+            self.targets.len(),
+            self.arena.as_ref().map_or(0, |b| b.size()) >> 20,
+            self.staged.capacity() >> 20,
+            self.pipelines.len() + self.clear_pipelines.len(),
+            self.modules.len(),
+        )
+    }
+
     /// Keys of every render target created so far.
     pub fn render_targets(&self) -> Vec<RenderTargetKey> {
         self.targets.keys().copied().collect()
