@@ -11,7 +11,7 @@ license.workspace = true
 [dependencies]
 # No window or surface support is used: only the Vulkan and GL backends and
 # the WGSL front end are enabled.
-wgpu = { version = "30", default-features = false, features = ["std", "parking_lot", "vulkan", "gles", "wgsl"] }
+wgpu = { version = "30", default-features = false, features = ["std", "parking_lot", "vulkan", "gles", "wgsl", "counters"] }
 pollster = "0.4"
 png = "0.18"
 xenon-gpu = { path = "../gpu" }
