@@ -57,9 +57,25 @@ impl std::ops::DerefMut for TestDrawer {
 
 /// A drawer, or None (after a skip line) when there is no adapter and
 /// XENON_REQUIRE_GPU is not 1.
+static GPU: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 pub fn drawer() -> Option<TestDrawer> {
-    static GPU: std::sync::Mutex<()> = std::sync::Mutex::new(());
     let gpu = GPU.lock().unwrap_or_else(|e| e.into_inner());
+    test_drawer(gpu)
+}
+
+/// A drawer made with `XENON_GPU_TIMESTAMPS=1`, set only while the GPU
+/// lock keeps other tests from making theirs.
+#[allow(dead_code)]
+pub fn drawer_with_gpu_timestamps() -> Option<TestDrawer> {
+    let gpu = GPU.lock().unwrap_or_else(|e| e.into_inner());
+    std::env::set_var("XENON_GPU_TIMESTAMPS", "1");
+    let d = test_drawer(gpu);
+    std::env::remove_var("XENON_GPU_TIMESTAMPS");
+    d
+}
+
+fn test_drawer(gpu: std::sync::MutexGuard<'static, ()>) -> Option<TestDrawer> {
     match Drawer::new() {
         Ok(drawer) => Some(TestDrawer { drawer, _gpu: gpu }),
         Err(Error::NoAdapter) if std::env::var("XENON_REQUIRE_GPU").as_deref() != Ok("1") => {

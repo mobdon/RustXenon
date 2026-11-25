@@ -1474,10 +1474,15 @@ impl Drawer {
     pub fn new() -> Result<Drawer, Error> {
         let mut desc = wgpu::InstanceDescriptor::new_without_display_handle();
         desc.backends = wgpu::Backends::VULKAN | wgpu::Backends::GL;
-        // Not from the build: wgpu turns Vulkan validation on in builds
-        // with debug assertions, which costs microseconds a draw where the
-        // layer is installed. WGPU_VALIDATION=1 and WGPU_DEBUG=1 still do.
-        desc.flags = wgpu::InstanceFlags::empty().with_env();
+        // wgpu's release default, whatever the build: it turns Vulkan
+        // validation on in builds with debug assertions, which costs
+        // microseconds a draw where the layer is installed.
+        // WGPU_VALIDATION=1 and WGPU_DEBUG=1 still do.
+        desc.flags = wgpu::InstanceFlags::VALIDATION_INDIRECT_CALL.with_env();
+        // Requested only when used, so the device is made as it was before
+        // timestamps: runs with them (and the flags above) unused on it
+        // held about 0.6 GB more host memory outside the Rust heap.
+        let timestamps = std::env::var_os("XENON_GPU_TIMESTAMPS").is_some_and(|v| v != "0");
         let flags = desc.flags;
         let instance = wgpu::Instance::new(desc);
         let options = |force_fallback_adapter| wgpu::RequestAdapterOptions {
@@ -1525,8 +1530,10 @@ impl Drawer {
             & (wgpu::Features::FLOAT32_FILTERABLE | wgpu::Features::TEXTURE_COMPRESSION_BC);
         required_features.set(wgpu::Features::DEPTH32FLOAT_STENCIL8, float_stencil);
         required_features.set(snorm16_features, snorm16);
-        required_features |=
-            adapter.features() & (wgpu::Features::PIPELINE_CACHE | wgpu::Features::TIMESTAMP_QUERY);
+        required_features |= adapter.features() & wgpu::Features::PIPELINE_CACHE;
+        if timestamps {
+            required_features |= adapter.features() & wgpu::Features::TIMESTAMP_QUERY;
+        }
         let (device, queue) = block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("xenon-draw"),
             required_limits: limits.clone(),
@@ -1707,7 +1714,7 @@ impl Drawer {
             max_dim: limits.max_texture_dimension_2d,
             max_storage: limits.max_storage_buffer_binding_size,
         };
-        if std::env::var_os("XENON_GPU_TIMESTAMPS").is_some_and(|v| v != "0") {
+        if timestamps {
             d.enable_gpu_timestamps();
         }
         Ok(d)
@@ -1717,8 +1724,8 @@ impl Drawer {
     /// timestamp queries, into [`Timings::gpu_passes`]. Each flush then
     /// waits for its batch, so frames run slower and `submit` no longer
     /// includes time queued behind the GPU. Returns false where the device
-    /// has no timestamp queries. `XENON_GPU_TIMESTAMPS=1` turns it on at
-    /// [`Drawer::new`].
+    /// has no timestamp queries, which [`Drawer::new`] requests only with
+    /// `XENON_GPU_TIMESTAMPS=1` (and then turns this on).
     pub fn enable_gpu_timestamps(&mut self) -> bool {
         if !self
             .device
