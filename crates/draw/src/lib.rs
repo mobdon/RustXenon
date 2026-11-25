@@ -793,7 +793,8 @@ const TARGET_CAP: u64 = 256 << 20;
 pub struct Drawer {
     device: wgpu::Device,
     queue: wgpu::Queue,
-    /// Adapter name and backend, for logs.
+    /// Adapter name, backend and device type (a software one is `Cpu`),
+    /// for logs.
     pub adapter: String,
     /// Bound on every GPU wait and buffer map.
     pub timeout: Duration,
@@ -1154,14 +1155,15 @@ fn filter(f: u8) -> wgpu::FilterMode {
 }
 
 impl Drawer {
-    /// Opens a headless device: Vulkan or GL, default power preference,
-    /// first without and then with `force_fallback_adapter`.
+    /// Opens a headless device: Vulkan or GL, preferring the discrete GPU
+    /// (a desktop's integrated one would otherwise be picked first), first
+    /// without and then with `force_fallback_adapter`.
     pub fn new() -> Result<Drawer, Error> {
         let mut desc = wgpu::InstanceDescriptor::new_without_display_handle();
         desc.backends = wgpu::Backends::VULKAN | wgpu::Backends::GL;
         let instance = wgpu::Instance::new(desc);
         let options = |force_fallback_adapter| wgpu::RequestAdapterOptions {
-            power_preference: wgpu::PowerPreference::default(),
+            power_preference: wgpu::PowerPreference::HighPerformance,
             force_fallback_adapter,
             compatible_surface: None,
             apply_limit_buckets: false,
@@ -1274,7 +1276,7 @@ impl Drawer {
         Ok(Drawer {
             device,
             queue,
-            adapter: format!("{} ({:?})", info.name, info.backend),
+            adapter: format!("{} ({:?}, {:?})", info.name, info.backend, info.device_type),
             timeout: DEFAULT_TIMEOUT,
             regs: RegisterFile::default(),
             vs: None,
@@ -1384,6 +1386,35 @@ impl Drawer {
             self.modules.len(),
             wgsl.len(),
             wgsl.iter().sum::<usize>().div_ceil(1024),
+        ) + &self.wgpu_line()
+    }
+
+    /// What wgpu itself holds: live objects (a count that keeps rising is a
+    /// leak) and the GPU allocator's reserved against allocated bytes (a gap
+    /// that keeps widening is memory kept after frees).
+    fn wgpu_line(&self) -> String {
+        let h = self.device.get_internal_counters().hal;
+        let alloc = self.device.generate_allocator_report().map_or_else(
+            || "no allocator report".to_string(),
+            |r| {
+                format!(
+                    "GPU memory {} MB used of {} MB reserved in {} blocks",
+                    r.total_allocated_bytes >> 20,
+                    r.total_reserved_bytes >> 20,
+                    r.blocks.len()
+                )
+            },
+        );
+        format!(
+            "; wgpu live: textures {} MB, buffers {} ({} MB), views {}, bind groups {}, pipelines {}, shaders {}; {alloc}",
+            // hal's texture count misses some textures on Vulkan; its bytes do not.
+            h.texture_memory.read() >> 20,
+            h.buffers.read(),
+            h.buffer_memory.read() >> 20,
+            h.texture_views.read(),
+            h.bind_groups.read(),
+            h.render_pipelines.read() + h.compute_pipelines.read(),
+            h.shader_modules.read(),
         )
     }
 
