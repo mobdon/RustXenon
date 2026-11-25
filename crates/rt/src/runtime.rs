@@ -24,12 +24,22 @@ pub type GuestFn = fn(&Runtime, &mut Context);
 /// in guest memory.
 const THREAD_STACK: usize = 16 << 20;
 
+/// Largest flat call table, in slots (8 bytes each): 128 MB of host memory,
+/// 64 MB of guest code. A larger span keeps the hash maps only.
+const MAX_SLOTS: usize = 16 << 20;
+
 pub struct Runtime {
     pub mem: GuestMemory,
     /// Game functions by guest address.
     functions: HashMap<u32, GuestFn>,
     /// Overrides installed by hooks; checked before `functions`.
     overrides: HashMap<u32, GuestFn>,
+    /// Flat copy of both maps over the span of `functions`, one slot per
+    /// instruction from `table_base`, built by [`Runtime::share`]. Overrides
+    /// are already merged in, so a call is one index. Calls outside the span
+    /// (or before `share`) use the maps.
+    table: Vec<Option<GuestFn>>,
+    table_base: u32,
     /// A guest thread stops with a panic once it has made more calls than
     /// this (counted in [`Context::calls`]); catches runaway loops in tests.
     pub call_budget: u64,
@@ -48,6 +58,8 @@ impl Runtime {
             mem,
             functions: HashMap::new(),
             overrides: HashMap::new(),
+            table: Vec::new(),
+            table_base: 0,
             call_budget: u64::MAX,
             trace: None,
             threads: Mutex::new(HashMap::new()),
@@ -69,10 +81,54 @@ impl Runtime {
 
     /// Ends setup: the runtime moves behind an `Arc` so guest threads can
     /// share it. [`Runtime::spawn`] works only after this.
-    pub fn share(self) -> Arc<Self> {
+    pub fn share(mut self) -> Arc<Self> {
+        self.build_table();
         let rt = Arc::new(self);
         rt.me.set(Arc::downgrade(&rt)).unwrap();
         rt
+    }
+
+    fn build_table(&mut self) {
+        let (Some(&lo), Some(&hi)) = (self.functions.keys().min(), self.functions.keys().max())
+        else {
+            return;
+        };
+        let lo = lo & !3;
+        let slots = ((hi - lo) / 4) as usize + 1;
+        if slots > MAX_SLOTS {
+            return;
+        }
+        let mut t = vec![None; slots];
+        for (&a, &f) in &self.functions {
+            if a & 3 == 0 && (lo..=hi).contains(&a) {
+                t[((a - lo) / 4) as usize] = Some(f);
+            }
+        }
+        // Overrides last, so they win.
+        for (&a, &f) in &self.overrides {
+            if a & 3 == 0 && (lo..=hi).contains(&a) {
+                t[((a - lo) / 4) as usize] = Some(f);
+            }
+        }
+        self.table = t;
+        self.table_base = lo;
+    }
+
+    /// Host memory used by the flat call table, in bytes (0 before
+    /// [`Runtime::share`]). Fixed for the run.
+    pub fn table_bytes(&self) -> usize {
+        self.table.len() * std::mem::size_of::<Option<GuestFn>>()
+    }
+
+    fn lookup(&self, addr: u32) -> Option<GuestFn> {
+        let i = addr.wrapping_sub(self.table_base) as usize / 4;
+        if addr & 3 == 0 && i < self.table.len() {
+            return self.table[i];
+        }
+        self.overrides
+            .get(&addr)
+            .or_else(|| self.functions.get(&addr))
+            .copied()
     }
 
     /// Calls the guest function at `addr`. Panics with the address if nothing
@@ -90,10 +146,7 @@ impl Runtime {
         }
         thread::checkpoint();
         let f = self
-            .overrides
-            .get(&addr)
-            .or_else(|| self.functions.get(&addr))
-            .copied()
+            .lookup(addr)
             .unwrap_or_else(|| panic!("no guest function at {addr:#010x}"));
         f(self, ctx);
     }
@@ -232,6 +285,25 @@ mod tests {
     }
 
     #[test]
+    fn shared_table_keeps_overrides_and_outside_calls() {
+        let mut rt = Runtime::new(GuestMemory::new(16));
+        rt.register(0x8200_0000, add_one);
+        rt.register(0x8200_0010, add_one);
+        rt.set_override(0x8200_0010, add_ten);
+        // An override outside the recompiled span (an import thunk, say).
+        rt.set_override(0x9000_0000, add_ten);
+        let rt = rt.share();
+        assert_eq!(rt.table_bytes(), 5 * 8);
+        let mut c = Context::new();
+        for a in [0x8200_0000, 0x8200_0010, 0x9000_0000] {
+            rt.call(&mut c, a);
+        }
+        assert_eq!(c.r[3], 21);
+        assert!(rt.lookup(0x8200_0004).is_none());
+        assert!(rt.lookup(0x8200_0011).is_none());
+    }
+
+    #[test]
     #[should_panic(expected = "0x82001000")]
     fn missing_function_reports_address() {
         let rt = Runtime::new(GuestMemory::new(16));
@@ -248,6 +320,33 @@ mod tests {
         for _ in 0..3 {
             rt.call(&mut c, 0x8200_0000);
         }
+    }
+
+    /// Speed of one guest call through `Runtime::call`, for comparing
+    /// dispatch layouts: `cargo test -p xenon-rt --release -- --ignored dispatch_speed --nocapture`.
+    #[test]
+    #[ignore]
+    fn dispatch_speed() {
+        let mut rt = Runtime::new(GuestMemory::new(16));
+        // A large title: 100k functions over 8 MB of code, 500 import thunks.
+        for i in 0..100_000u32 {
+            rt.register(0x8200_0000 + i * 80, add_one);
+        }
+        for i in 0..500u32 {
+            rt.set_override(0x8280_0000 + i * 16, add_one);
+        }
+        let rt = rt.share();
+        let mut c = Context::new();
+        let n = 20_000_000u32;
+        let t = std::time::Instant::now();
+        let mut x = 1u32;
+        for _ in 0..n {
+            x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            rt.call(&mut c, 0x8200_0000 + (x >> 8) % 100_000 * 80);
+        }
+        let ns = t.elapsed().as_nanos() as f64 / n as f64;
+        assert_eq!(c.r[3], n as u64);
+        eprintln!("dispatch: {ns:.2} ns per call");
     }
 
     #[test]
