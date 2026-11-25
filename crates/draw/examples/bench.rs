@@ -99,35 +99,44 @@ fn main() {
         .shader(false, &vs_uv())
         .shader(true, &ps_texture(1))
         .regs(SHADER_CONSTANT_FETCH + 6, &fetch);
-    let segment = draws.div_ceil(resolves);
-    for i in 0..draws {
-        s.regs(SHADER_CONSTANT_FLOAT, &[f(i as f32), 0, 0, 0])
-            .regs(
-                RB_BLENDCONTROL0,
-                &[if i % 8 == 7 { BLEND } else { 0x0001_0001 }],
-            )
-            .vertex_fetch(0, quad_base + i * 80, 20)
-            .draw_auto(13, 4);
-        let last = i + 1 == draws;
-        if (i + 1) % segment == 0 || last {
-            // This segment's share of the point draws.
-            let n = points / resolves + u32::from((i / segment) < points % resolves);
-            s.shader(false, &vs_color()).shader(true, &ps_const());
-            for _ in 0..n {
-                s.vertex_fetch(0, VERTS, 4).draw_auto(1, 1);
-            }
-            s.shader(false, &vs_uv()).shader(true, &ps_texture(1));
-            if !last {
-                s.resolve_with(
-                    &mut mem,
-                    (FW, FH),
-                    COPY_CONVERT,
-                    (SCRATCH, FW | (FH << 16), dest_info(6, 0, false)),
-                    [0; 3],
-                );
-            }
+    // `resolves` segments, each with its share of the quads and points; every
+    // segment but the last ends with a scratch resolve.
+    let share = |total: u32, k: u32| total / resolves + u32::from(k < total % resolves);
+    let (mut quads_done, mut points_done, mut scratch_resolves) = (0, 0, 0);
+    for k in 0..resolves {
+        for _ in 0..share(draws, k) {
+            let i = quads_done;
+            s.regs(SHADER_CONSTANT_FLOAT, &[f(i as f32), 0, 0, 0])
+                .regs(
+                    RB_BLENDCONTROL0,
+                    &[if i % 8 == 7 { BLEND } else { 0x0001_0001 }],
+                )
+                .vertex_fetch(0, quad_base + i * 80, 20)
+                .draw_auto(13, 4);
+            quads_done += 1;
+        }
+        s.shader(false, &vs_color()).shader(true, &ps_const());
+        for _ in 0..share(points, k) {
+            s.vertex_fetch(0, VERTS, 4).draw_auto(1, 1);
+            points_done += 1;
+        }
+        s.shader(false, &vs_uv()).shader(true, &ps_texture(1));
+        if k + 1 < resolves {
+            s.resolve_with(
+                &mut mem,
+                (FW, FH),
+                COPY_CONVERT,
+                (SCRATCH, FW | (FH << 16), dest_info(6, 0, false)),
+                [0; 3],
+            );
+            scratch_resolves += 1;
         }
     }
+    // Every requested draw and resolve is in the stream, whatever the ratio.
+    assert_eq!(
+        (quads_done, points_done, scratch_resolves + 1),
+        (draws, points, resolves)
+    );
     s.resolve_with(
         &mut mem,
         (FW, FH),
