@@ -343,3 +343,32 @@ fn resolve_into_a_staged_window_reads_it_again() {
     assert_eq!(px(&img, W, 8, 8), clear);
     assert_eq!(px(&img, W, 40, 40), clear);
 }
+
+/// A draw with the same constants as the one before it in the batch binds
+/// that block again; one whose pixel constant changed stages its own, and
+/// each draw shows its own colour.
+#[test]
+fn equal_constants_are_staged_once_per_batch() {
+    let Some(mut d) = drawer() else { return };
+    let mut mem = memory();
+    rect(&mut mem, VERTS, W as f32, H as f32, RED);
+    rect(&mut mem, VERTS + 48, 32.0, 32.0, RED);
+    let c = |v: [u8; 4]| v.map(|x| f(f32::from(x) / 255.0));
+    let mut s = Stream::default();
+    s.setup()
+        .shader(false, &vs_color())
+        .shader(true, &ps_const())
+        .vertex_fetch(0, VERTS, 24)
+        .regs(SHADER_CONSTANT_FLOAT + 256 * 4, &c(GREEN))
+        .draw_auto(PRIM_RECT_LIST, 3)
+        .draw_auto(PRIM_RECT_LIST, 3)
+        .regs(SHADER_CONSTANT_FLOAT + 256 * 4, &c(BLUE))
+        .vertex_fetch(0, VERTS + 48, 12)
+        .draw_auto(PRIM_RECT_LIST, 3);
+    let report = run(&mut d, &s, &mut mem);
+    assert_eq!(report.draws, 3, "{report:?}");
+    assert_eq!(report.timings.consts_reused, 1, "{report:?}");
+    let img = d.read_render_target(COLOR_KEY, 0, 0, W, H).unwrap();
+    assert_eq!(px(&img, W, 8, 8), BLUE);
+    assert_eq!(px(&img, W, 40, 40), GREEN);
+}

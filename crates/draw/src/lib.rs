@@ -412,6 +412,9 @@ pub struct Timings {
     /// guest bytes of their windows.
     pub windows_reused: u32,
     pub reused_bytes: u64,
+    /// Draws whose constants block equals the last one staged in the same
+    /// batch, bound from there instead of staged again.
+    pub consts_reused: u32,
 }
 
 impl std::ops::AddAssign<&Timings> for Timings {
@@ -450,6 +453,7 @@ impl std::ops::AddAssign<&Timings> for Timings {
         }
         self.windows_reused += t.windows_reused;
         self.reused_bytes += t.reused_bytes;
+        self.consts_reused += t.consts_reused;
     }
 }
 
@@ -885,6 +889,10 @@ pub struct Drawer {
     /// their (offset, size) in `arena`. Cleared at each flush, as the next
     /// batch overwrites the arena, and dropped where guest memory changes.
     window_memo: Vec<(u64, u64, (u64, u64))>,
+    /// The last `Consts` block staged in the batch and its (offset, size)
+    /// in `arena`, bound again by a draw with the same bytes. Cleared with
+    /// `window_memo` at each flush.
+    staged_consts: Option<(Vec<u8>, (u64, u64))>,
     max_buffer: u64,
     /// 1x1 texture of zeros bound for a slot without a usable texture.
     zero_texture: wgpu::TextureView,
@@ -1023,6 +1031,29 @@ const TEXTURE_CACHE_LIMIT: u64 = 256 << 20;
 
 fn to_bytes(words: &[u32]) -> Vec<u8> {
     words.iter().flat_map(|w| w.to_le_bytes()).collect()
+}
+
+/// The `Consts` uniform of the shader binding contract: float, fetch, bool
+/// and loop constants, then the window base and the index offset.
+fn consts(r: &regs::RegisterFile, window_base: u32) -> Vec<u8> {
+    // Float and fetch constants are adjacent, and so are bool and loop.
+    const _: () = assert!(regs::SHADER_CONSTANT_FLOAT + 2048 == regs::SHADER_CONSTANT_FETCH);
+    const _: () = assert!(regs::SHADER_CONSTANT_BOOL + 8 == regs::SHADER_CONSTANT_LOOP);
+    let tail = [window_base, r.get(regs::VGT_INDX_OFFSET), 0, 0];
+    let blocks = [
+        r.slice(regs::SHADER_CONSTANT_FLOAT, 2048 + 192),
+        r.slice(regs::SHADER_CONSTANT_BOOL, 8 + 32),
+        &tail,
+    ];
+    let mut b = vec![0; 4 * (2048 + 192 + 8 + 32 + 4)];
+    let mut at = 0;
+    for block in blocks {
+        for (o, w) in b[at..][..4 * block.len()].chunks_exact_mut(4).zip(block) {
+            o.copy_from_slice(&w.to_le_bytes());
+        }
+        at += 4 * block.len();
+    }
+    b
 }
 
 /// Adds the epilogue and the extra outputs to a translated vertex shader.
@@ -1361,6 +1392,7 @@ impl Drawer {
             staged: Vec::new(),
             arena: None,
             window_memo: Vec::new(),
+            staged_consts: None,
             arena_align: u64::from(
                 limits
                     .min_uniform_buffer_offset_alignment
@@ -1585,6 +1617,7 @@ impl Drawer {
         self.batch = None;
         self.staged.clear();
         self.window_memo.clear();
+        self.staged_consts = None;
         // Resolves done before an error still reach guest memory.
         let kept = self.finish_mirrors(&mut mem);
         done?;
@@ -1910,6 +1943,7 @@ impl Drawer {
     /// Submits the batched draws, with their staged buffers.
     fn flush(&mut self) -> Result<(), Skip> {
         self.window_memo.clear();
+        self.staged_consts = None;
         if let (Some(arena), false) = (&self.arena, self.staged.is_empty()) {
             self.queue.write_buffer(arena, 0, &self.staged);
             self.staged.clear();
@@ -2823,15 +2857,7 @@ impl Drawer {
 
     /// The `Consts` uniform of the shader binding contract.
     fn consts(&self, window_base: u32) -> Vec<u8> {
-        let r = &self.regs;
-        let block = |base: u32, n: u32| (0..n).map(move |i| r.get(base + i));
-        let mut v: Vec<u32> = block(regs::SHADER_CONSTANT_FLOAT, 2048)
-            .chain(block(regs::SHADER_CONSTANT_FETCH, 192))
-            .chain(block(regs::SHADER_CONSTANT_BOOL, 8))
-            .chain(block(regs::SHADER_CONSTANT_LOOP, 32))
-            .collect();
-        v.extend([window_base, r.get(regs::VGT_INDX_OFFSET), 0, 0]);
-        to_bytes(&v)
+        consts(&self.regs, window_base)
     }
 
     /// Texture and sampler for fetch constant slot `n`. A slot without a
@@ -3586,36 +3612,76 @@ impl Drawer {
         // draw 6 host vertices per rectangle without an index buffer.
         let idx_bytes = to_bytes(&idx);
         let rect_indices: &[u8] = if rect_list { &idx_bytes } else { &[] };
-        let rest = [&consts[..], &epi, rect_indices, &idx_bytes];
-        let slices = match staged {
-            // Unless the batch was submitted since (the arena is then
-            // overwritten) or would be to stage the rest.
-            Some((w, len)) if self.window_memo.contains(&w) && self.fits(&rest) => {
+        let rest = [&epi[..], rect_indices, &idx_bytes];
+        // The window and constants staged earlier in this batch are bound
+        // again, unless the batch was submitted since (the arena is then
+        // overwritten) or would be to stage the rest.
+        let mut kept_window = staged.filter(|(w, _)| self.window_memo.contains(w));
+        let mut kept_consts = (self.staged_consts.as_ref())
+            .filter(|(b, _)| *b == consts)
+            .map(|&(_, s)| s);
+        fn parts<'a>(
+            w: Option<&'a [u8]>,
+            c: Option<&'a [u8]>,
+            rest: [&'a [u8]; 3],
+        ) -> Vec<&'a [u8]> {
+            w.into_iter().chain(c).chain(rest).collect()
+        }
+        if (kept_window.is_some() || kept_consts.is_some())
+            && !self.fits(&parts(
+                kept_window.is_none().then_some(&window),
+                kept_consts.is_none().then_some(&consts),
+                rest,
+            ))
+        {
+            // Staging all of it submits the batch in `stage`; a kept window
+            // is read again below.
+            (kept_window, kept_consts) = (None, None);
+        }
+        if let (Some(((lo, hi, _), _)), None) = (staged, kept_window) {
+            self.sync(mem, lo, hi)?;
+            report.timings.guest_bytes += hi - lo;
+            let Some(b) = mem.read_bytes(lo as u32, (hi - lo) as usize) else {
+                return unsupported(format!("vertex data at 0x{lo:08X} not readable"));
+            };
+            window = b;
+        }
+        let mut fresh = (self.stage(&parts(
+            kept_window.is_none().then_some(&window),
+            kept_consts.is_none().then_some(&consts),
+            rest,
+        ))?)
+        .into_iter();
+        let window_slice = match kept_window {
+            Some((w, len)) => {
                 self.timings.windows_reused += 1;
                 self.timings.reused_bytes += len;
-                let mut s = vec![w.2];
-                s.extend(self.stage(&rest)?);
-                s
+                w.2
             }
-            _ => {
-                if let Some(((lo, hi, _), _)) = staged {
-                    self.sync(mem, lo, hi)?;
-                    report.timings.guest_bytes += hi - lo;
-                    let Some(b) = mem.read_bytes(lo as u32, (hi - lo) as usize) else {
-                        return unsupported(format!("vertex data at 0x{lo:08X} not readable"));
-                    };
-                    window = b;
-                }
-                let mut parts = vec![&window[..]];
-                parts.extend(rest);
-                let s = self.stage(&parts)?;
+            None => {
+                let s = fresh.next().expect("staged window");
                 if !window.is_empty() {
                     let lo = u64::from(window_base);
-                    self.window_memo.push((lo, lo + window.len() as u64, s[0]));
+                    self.window_memo.push((lo, lo + window.len() as u64, s));
                 }
                 s
             }
         };
+        let consts_slice = match kept_consts {
+            Some(s) => {
+                self.timings.consts_reused += 1;
+                s
+            }
+            None => {
+                let s = fresh.next().expect("staged constants");
+                self.staged_consts = Some((consts, s));
+                s
+            }
+        };
+        let slices: Vec<(u64, u64)> = [window_slice, consts_slice]
+            .into_iter()
+            .chain(fresh)
+            .collect();
         let arena = self.arena.clone().expect("staged");
         let binding = |i: usize| {
             let (offset, size) = slices[i];
@@ -4432,6 +4498,26 @@ fn host_texture_format(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The constants block holds each register of its four blocks in
+    /// order, then the window base and the index offset.
+    #[test]
+    fn consts_block_is_the_registers_in_order() {
+        let mut r = regs::RegisterFile::default();
+        for i in 0x3F00..0x4A00 {
+            r.set(i, i.wrapping_mul(0x9E37_79B9));
+        }
+        r.set(regs::VGT_INDX_OFFSET, 77);
+        let r = &r;
+        let block = |base: u32, n: u32| (0..n).map(move |i| r.get(base + i));
+        let mut want: Vec<u32> = block(regs::SHADER_CONSTANT_FLOAT, 2048)
+            .chain(block(regs::SHADER_CONSTANT_FETCH, 192))
+            .chain(block(regs::SHADER_CONSTANT_BOOL, 8))
+            .chain(block(regs::SHADER_CONSTANT_LOOP, 32))
+            .collect();
+        want.extend([0x1234_5678, 77, 0, 0]);
+        assert_eq!(consts(r, 0x1234_5678), to_bytes(&want));
+    }
 
     /// A drawer on the test adapter, held under one lock so the unit tests
     /// never have two devices at once (lavapipe crashes when they do, as
