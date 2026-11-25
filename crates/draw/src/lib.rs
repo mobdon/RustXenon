@@ -363,6 +363,9 @@ pub struct Timings {
     /// Shader translation, WGSL modules and pipeline creation (cache misses
     /// only cost here), plus fixed-function state decode.
     pub shaders: Duration,
+    /// `shaders` split by step: shader lookup and state decode, guest
+    /// indices, render target lookup, then modules and pipeline lookup.
+    pub setup_parts: [Duration; 4],
     /// Guest vertex window, constants and index buffers: reading guest
     /// memory and uploading it, per draw.
     pub guest_data: Duration,
@@ -460,6 +463,9 @@ impl std::ops::AddAssign<&Timings> for Timings {
     /// Sums the phases and counts of several replays.
     fn add_assign(&mut self, t: &Timings) {
         self.shaders += t.shaders;
+        for (a, b) in self.setup_parts.iter_mut().zip(t.setup_parts) {
+            *a += b;
+        }
         self.guest_data += t.guest_data;
         self.textures += t.textures;
         self.submit += t.submit;
@@ -4412,6 +4418,7 @@ impl Drawer {
             report.warn("blend uses the constant colour and its alpha in the colour channel; drawn with the colour");
         }
 
+        let t_state = Instant::now();
         let mut idx = {
             if let xenon_gpu::IndexSource::Dma {
                 address, format, ..
@@ -4441,6 +4448,7 @@ impl Drawer {
         }
 
         // Every target of a draw has the surface pitch and the same height.
+        let t_indices = Instant::now();
         let (w, h) = (surface & 0x3FFF, RENDER_TARGET_HEIGHT.min(self.max_dim));
         let (sx, sy, sw, sh) = state::scissor(&self.regs, w, h);
         let rows = sy + sh;
@@ -4458,6 +4466,7 @@ impl Drawer {
             return Ok(false);
         }
 
+        let t_targets = Instant::now();
         let info = |a: &ShaderInfo, b: &ShaderInfo| {
             (
                 a.vertex_fetch_consts | b.vertex_fetch_consts,
@@ -4559,6 +4568,11 @@ impl Drawer {
                 p
             }
         };
+        let setup = &mut self.timings.setup_parts;
+        setup[0] += t_state - t;
+        setup[1] += t_indices - t_state;
+        setup[2] += t_targets - t_indices;
+        setup[3] += t_targets.elapsed();
         self.timings.shaders += lap(&mut t);
 
         let reach: Vec<VertexFetchReach> = (vs_t.info.vertex_fetch_reach.iter())
