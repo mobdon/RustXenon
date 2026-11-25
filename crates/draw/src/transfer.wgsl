@@ -59,20 +59,7 @@ fn depth_stencil_word(pos: vec4<f32>, swap: bool) -> u32 {
     return depth_word(at.x, at.y) | (textureLoad(stencil_src, at, 0).r & 0xFFu);
 }
 
-// xenon_texture float20e4_to_f32 (Xenia Float20e4To32): exact in f32.
-fn from_20e4(f24: u32) -> f32 {
-    if f24 == 0u {
-        return 0.0;
-    }
-    var m = f24 & 0xFFFFFu;
-    var e = f24 >> 20u;
-    if e == 0u {
-        let lz = countLeadingZeros(m) - 11u;
-        e = 1u - lz;
-        m = (m << lz) & 0xFFFFFu;
-    }
-    return bitcast<f32>(((e + 112u) << 23u) | (m << 3u));
-}
+// from_20e4 is in resolve.wgsl, which comes before this file.
 
 // n / 0xFFFFFF rounded to nearest, as the drawer's depth clear computes it
 // in f64. The quotient's binary digits are n's 24 bits repeated, so the
