@@ -12,7 +12,7 @@ pub static UNKNOWN_FREES: AtomicU32 = AtomicU32::new(0);
 /// `XENON_TRACE_ALLOC`: one line per allocate or free import with heap, size,
 /// address and caller. Failed allocations and frees of unknown blocks are
 /// always logged (the first 20), since both look like something else later.
-fn note(c: &Context, what: &str, heap: &str, addr: u32, size: u32, ok: bool) {
+pub(super) fn note(c: &Context, what: &str, heap: &str, addr: u32, size: u32, ok: bool) {
     static ON: OnceLock<bool> = OnceLock::new();
     static ODD: AtomicU32 = AtomicU32::new(0);
     let on = *ON.get_or_init(|| std::env::var_os("XENON_TRACE_ALLOC").is_some());
@@ -25,12 +25,25 @@ fn note(c: &Context, what: &str, heap: &str, addr: u32, size: u32, ok: bool) {
             std::thread::current().name().unwrap_or("?"),
             c.lr as u32,
             match (ok, what) {
-                (true, _) => "",
-                (false, "free") => ": not a live block (double free or stale pointer)",
-                _ => ": FAILED",
+                (true, _) => String::new(),
+                (false, "free") => match live_block(addr) {
+                    Some((h, s, n)) => format!(
+                        ": not a live block here, but inside live {h} block {s:#010x} (size {n:#x}): freed through the wrong call"
+                    ),
+                    None => ": not a live block in any heap (double free or stale pointer)".into(),
+                },
+                _ => ": FAILED".into(),
             }
         ));
     }
+}
+
+/// The heap and live block holding `a`, if any.
+fn live_block(a: u32) -> Option<(&'static str, u32, u32)> {
+    [&k().virt, &k().phys, &k().pool].iter().find_map(|h| {
+        let h = h.lock().unwrap();
+        h.find(a).map(|(s, n)| (h.name, s, n))
+    })
 }
 
 fn take(rt: &Runtime, h: &Mutex<crate::heap::Heap>, size: u32, align: u32) -> Option<u32> {

@@ -64,7 +64,22 @@ fn env() -> &'static Env {
             imports: vec![],
             exception_table: vec![],
         };
-        let mut rt = Runtime::new(GuestMemory::new(xenon_host::GUEST_MEMORY));
+        // Guarded, as --guard-memory runs: any address the kernel does not
+        // hand out faults. The tests' own scratch: below the pool and at the start of physical memory.
+        let mut rt = Runtime::new(GuestMemory::new_guarded(xenon_host::GUEST_MEMORY));
+        xenon_rt::guard::commit(0, 0x10_0000);
+        xenon_rt::guard::commit(0xA000_0000, 0x10_0000);
+        xenon_rt::guard::on_wild_access(|a| {
+            // Not eprintln: the test harness captures that and loses it at exit.
+            use std::io::Write;
+            let t = std::thread::current();
+            let _ = writeln!(
+                std::io::stderr(),
+                "wild guest access at {a:#010x} in {}",
+                t.name().unwrap_or("?")
+            );
+            std::process::exit(101)
+        });
         rt.set_override(THREAD_ENTRY, thread_entry);
         rt.set_override(QUICK_ENTRY, quick_entry);
         kernel::install(
@@ -787,7 +802,7 @@ fn submitted_frames_reach_the_wav_as_stereo() {
             &[0x4155_0000, frame as u64],
         );
     }
-    // Another client's frames are not mixed in.
+    // A second client is mixed in: its one frame lands on the first.
     call(
         rt,
         &mut c,
@@ -798,8 +813,193 @@ fn submitted_frames_reach_the_wav_as_stereo() {
     let w = xenon_audio::wav::read(&std::fs::read(&path).unwrap()).unwrap();
     let _ = std::fs::remove_file(&path);
     assert_eq!((w.rate, w.channels, w.samples.len()), (48_000, 2, 1024));
-    assert!(w
-        .samples
+    let (both, one) = w.samples.split_at(512);
+    assert!(both
+        .chunks(2)
+        .all(|s| (s[0] - 1.0).abs() < 1e-3 && (s[1] + 0.5).abs() < 1e-3));
+    assert!(one
         .chunks(2)
         .all(|s| (s[0] - 0.5).abs() < 1e-3 && (s[1] + 0.25).abs() < 1e-3));
+}
+
+#[test]
+fn decoder_context_plays_its_input_into_the_output_ring() {
+    if let Err(e) = xenon_audio::ffmpeg::Ffmpeg::load() {
+        assert!(
+            std::env::var_os("XENON_REQUIRE_FFMPEG").is_none(),
+            "no FFmpeg: {e}"
+        );
+        return eprintln!("skipping: {e}");
+    }
+    let rt = &env().rt;
+    let (ctx, input, ring) = (
+        memory::physical(rt, 64, 256),
+        memory::physical(rt, 8 * 2048, 2048),
+        memory::physical(rt, 8 * 256, 256),
+    );
+    let view = kernel::gpu::gpu_to_cpu;
+    for i in 0..8 {
+        rt.mem
+            .write_bytes(view(input) + 2048 * i, &xenon_audio::xma::silent_packet());
+    }
+    rt.mem.write_bytes(view(ring), &[0xAA; 8 * 256]);
+    // 8 packets in buffer 0 (valid), 8 output blocks; 48 kHz mono, output
+    // valid; read offset just past the first header.
+    let words = [
+        8 | 1 << 20 | 8 << 22,
+        3 << 27 | 1 << 31,
+        32,
+        0,
+        0,
+        input,
+        0,
+        ring,
+        0,
+        0,
+    ];
+    for (i, w) in words.iter().enumerate() {
+        rt.mem.write_u32(ctx + 4 * i as u32, *w);
+    }
+    let mut blocks = 0;
+    for _ in 0..20 {
+        let before = rt.mem.read_u32(ctx) >> 27 & 31;
+        assert!(kernel::sound::decode(rt, ctx));
+        let after = rt.mem.read_u32(ctx) >> 27 & 31;
+        blocks += (after + 8 - before) % 8;
+        // The title reads everything written.
+        rt.mem.write_u32(ctx + 36, after);
+    }
+    let w0 = rt.mem.read_u32(ctx);
+    assert_eq!(w0 >> 20 & 1, 0, "buffer 0 still valid: {w0:#x}");
+    assert_eq!(
+        rt.mem.read_u32(ctx + 16) >> 31,
+        1,
+        "current buffer not moved on"
+    );
+    // 8 frames of 512 less FFmpeg's 64-sample delay, 2 bytes each, the
+    // last part block padded (FFmpeg gives the last 8 frames only once the
+    // input runs dry and the decoder is flushed).
+    assert_eq!(blocks, 32);
+    let mut out = [0u8; 8 * 256];
+    rt.mem.read_bytes(view(ring), &mut out);
+    assert!(
+        out.iter().all(|&b| b == 0),
+        "ring holds something but silence"
+    );
+    kernel::sound::forget(ctx);
+}
+
+#[test]
+fn stall_report_names_the_lock_holder() {
+    let e = env();
+    let rt = &e.rt;
+    let cs = 0x3_2000u64;
+    let mut c = ctx(0x1_C000);
+    call(rt, &mut c, objects::rtl_initialize_critical_section, &[cs]);
+    assert_eq!(objects::describe(rt, cs as u32), "critical section, free");
+    let rt2 = rt.clone();
+    std::thread::Builder::new()
+        .name("holder".into())
+        .spawn(move || {
+            let mut c = ctx(0x1_D000);
+            // Register this thread's name with the activity list first.
+            xenon_host::last_call();
+            call(&rt2, &mut c, objects::rtl_enter_critical_section, &[cs]);
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+    assert_eq!(
+        objects::describe(rt, cs as u32),
+        "critical section, held by holder"
+    );
+    assert_eq!(objects::describe(rt, 0x3_2100), "no host object");
+}
+
+#[test]
+fn guarded_memory_commits_what_the_kernel_hands_out() {
+    use xenon_rt::guard::readable;
+    let e = env();
+    let rt = &e.rt;
+    let mut c = ctx(0x1_E000);
+    let (base, size) = (0x1_1000u32, 0x1_1004u32);
+    rt.mem.write_u32(base, 0);
+    rt.mem.write_u32(size, 0x3_0000);
+    let r = call(
+        rt,
+        &mut c,
+        memory::nt_allocate_virtual_memory,
+        &[base as u64, size as u64, 0x3000, 4],
+    );
+    assert_eq!(r, 0);
+    let a = rt.mem.read_u32(base);
+    assert!(readable(a, 0x3_0000), "allocated range is committed");
+    // The virtual range far above anything handed out stays reserved, as do
+    // the gaps between the kernel's regions.
+    assert!(!readable(0x7E00_0000, 4));
+    assert!(!readable(0x3F80_0000, 4));
+    assert!(!readable(0x9421_FFF8, 4));
+    let p = call(
+        rt,
+        &mut c,
+        memory::mm_allocate_physical_memory_ex,
+        &[0, 0x2000, 4, 0, 0, 0x1000],
+    ) as u32;
+    assert!(readable(p, 0x2000));
+    // The physical page is the same memory in every view.
+    rt.mem.write_u32(p, 0x5A5A_5A5A);
+    assert_eq!(
+        rt.mem.read_u32((p & 0x1FFF_FFFF) | 0xC000_0000),
+        0x5A5A_5A5A
+    );
+    call(rt, &mut c, memory::mm_free_physical_memory, &[0, p as u64]);
+}
+
+#[test]
+fn pool_block_freed_as_physical_stays_live() {
+    use std::sync::atomic::Ordering::Relaxed;
+    let e = env();
+    let rt = &e.rt;
+    let mut c = ctx(0x1_F000);
+    let a = call(
+        rt,
+        &mut c,
+        memory::ex_allocate_pool_type_with_tag,
+        &[0x30, 0, 0],
+    );
+    let before = memory::UNKNOWN_FREES.load(Relaxed);
+    // The wrong call: counted (and logged with the pool block it hit), ignored.
+    call(rt, &mut c, memory::mm_free_physical_memory, &[0, a]);
+    assert!(memory::UNKNOWN_FREES.load(Relaxed) > before);
+    assert_eq!(
+        call(rt, &mut c, memory::mm_query_allocation_size, &[a]),
+        0x30,
+        "still live"
+    );
+    call(rt, &mut c, memory::ex_free_pool, &[a]);
+    assert!(
+        call(rt, &mut c, memory::mm_query_allocation_size, &[a]) == 0,
+        "pool block freed by the right call"
+    );
+}
+
+#[test]
+fn persist_display_block_is_freed_as_physical() {
+    let e = env();
+    let rt = &e.rt;
+    let mut c = ctx(0x1_F800);
+    let out = 0x1_2000u64;
+    call(rt, &mut c, kernel::video::vd_persist_display, &[0, out]);
+    let a = rt.mem.read_u32(out as u32);
+    assert!((0xA000_0000..0xC000_0000).contains(&a), "{a:#x}");
+    assert_ne!(
+        call(rt, &mut c, memory::mm_query_allocation_size, &[a as u64]),
+        0
+    );
+    // What the title does with it: the block must really go.
+    call(rt, &mut c, memory::mm_free_physical_memory, &[1, a as u64]);
+    assert_eq!(
+        call(rt, &mut c, memory::mm_query_allocation_size, &[a as u64]),
+        0
+    );
 }

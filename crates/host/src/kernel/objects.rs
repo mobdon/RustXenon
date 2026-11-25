@@ -287,9 +287,34 @@ pub fn nt_cancel_timer(rt: &Runtime, c: &mut Context) {
     ret(c, STATUS_SUCCESS);
 }
 
+/// What a stall report says about the guest object at `a`: its kind and
+/// state, and for a lock the thread holding it.
+pub fn describe(rt: &Runtime, a: u32) -> String {
+    let held = |m: &CriticalSection| match m.owner() {
+        Some(id) => format!("held by {}", crate::thread_name(id)),
+        None => "free".into(),
+    };
+    let set = |e: &Event| if e.is_set() { "set" } else { "not set" };
+    match rt.find_object::<KObj>(a).as_deref() {
+        None => "no host object".into(),
+        Some(KObj::Event(e)) => format!("event, {}", set(e)),
+        Some(KObj::Thread(e)) => {
+            format!("thread, {}", if e.is_set() { "ended" } else { "running" })
+        }
+        Some(KObj::Timer(e, _)) => format!("timer, {}", set(e)),
+        Some(KObj::Semaphore(s)) => format!("semaphore, count {}", s.count()),
+        Some(KObj::Mutant(m)) => format!("mutant, {}", held(m)),
+        Some(KObj::Section(m)) => format!("critical section, {}", held(m)),
+    }
+}
+
 /// Waits for one object: STATUS_SUCCESS or STATUS_TIMEOUT.
 fn wait_one(rt: &Runtime, a: u32, t: Option<Duration>) -> u32 {
-    let ok = get(rt, a).wait(t);
+    let o = get(rt, a);
+    let ok = {
+        let _w = crate::waiting(a, 1);
+        o.wait(t)
+    };
     if std::env::var("XENON_TRACE_OBJ")
         .ok()
         .and_then(|v| u32::from_str_radix(&v, 16).ok())
@@ -319,6 +344,7 @@ fn wait_many(rt: &Runtime, objs: &[u32], all: bool, t: Option<Duration>) -> u32 
         return STATUS_SUCCESS;
     }
     let os: Vec<_> = objs.iter().map(|&a| get(rt, a)).collect();
+    let _w = crate::waiting(objs.first().copied().unwrap_or(0), objs.len() as u32);
     let mut nap = Duration::from_micros(50);
     loop {
         for (i, o) in os.iter().enumerate() {
@@ -450,7 +476,13 @@ fn enter(rt: &Runtime, c: &Context, a: u32, t: Option<Duration>) -> bool {
     let KObj::Section(cs) = &*section(rt, a) else {
         unreachable!()
     };
-    if !cs.enter(t) {
+    let ok = if t == Some(Duration::ZERO) {
+        cs.enter(t)
+    } else {
+        let _w = crate::waiting(a, 1);
+        cs.enter(t)
+    };
+    if !ok {
         return false;
     }
     rt.mem

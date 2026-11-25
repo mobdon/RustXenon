@@ -15,6 +15,7 @@
 
 pub mod cpu;
 pub mod fpu;
+pub mod guard;
 pub mod mem;
 pub mod ops;
 pub mod runtime;

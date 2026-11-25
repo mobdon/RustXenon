@@ -136,6 +136,27 @@ api! {
     u av_mallocz: fn(usize) -> P;
 }
 
+/// Opens one library. On Windows a library given by full path has its own
+/// dependencies (swresample, ...) looked up in its folder too; the default
+/// search skips that folder unless it is on PATH.
+fn open(path: &std::ffi::OsStr) -> Result<Library, libloading::Error> {
+    // SAFETY: loading FFmpeg runs only its own library constructors.
+    #[cfg(windows)]
+    unsafe {
+        use libloading::os::windows::{Library as W, LOAD_WITH_ALTERED_SEARCH_PATH};
+        let flags = if std::path::Path::new(path).is_absolute() {
+            LOAD_WITH_ALTERED_SEARCH_PATH
+        } else {
+            0
+        };
+        W::load_with_flags(path, flags).map(Library::from)
+    }
+    #[cfg(not(windows))]
+    unsafe {
+        Library::new(path)
+    }
+}
+
 fn lib_names(base: &str, major: u32) -> String {
     if cfg!(windows) {
         format!("{base}-{major}.dll")
@@ -153,7 +174,10 @@ impl Ffmpeg {
         if usize::BITS != 64 {
             return Err(Error::Missing("a 64-bit target".into()));
         }
-        let dir = std::env::var_os("XENON_FFMPEG_DIR").map(PathBuf::from);
+        // Absolute, so Windows also finds FFmpeg's own dependencies there.
+        let dir = std::env::var_os("XENON_FFMPEG_DIR")
+            .map(PathBuf::from)
+            .map(|d| std::path::absolute(&d).unwrap_or(d));
         let path = |name: String| match &dir {
             Some(d) => d.join(name).into_os_string(),
             None => name.into(),
@@ -167,11 +191,10 @@ impl Ffmpeg {
                 path(lib_names("avcodec", major)),
             );
             tried.push(pc.to_string_lossy().into_owned());
-            // SAFETY: loading FFmpeg runs only its own library constructors.
-            let Ok(avutil) = (unsafe { Library::new(&pu) }) else {
+            let Ok(avutil) = open(&pu) else {
                 continue;
             };
-            let Ok(avcodec) = (unsafe { Library::new(&pc) }) else {
+            let Ok(avcodec) = open(&pc) else {
                 continue;
             };
             let ff = Self::bind(avutil, avcodec)?;

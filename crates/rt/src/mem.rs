@@ -20,6 +20,8 @@ use std::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, AtomicU8};
 pub struct GuestMemory {
     base: NonNull<u8>,
     len: usize,
+    /// Reserved with no access ([`crate::guard`]) instead of allocated.
+    guarded: bool,
 }
 
 // SAFETY: every access through `&self` is atomic (see the module notes);
@@ -83,7 +85,7 @@ macro_rules! access {
 /// pages, offset by 4 KB). The upper two views are folded onto the first, so
 /// a buffer written through one view reads back through another.
 #[inline]
-fn alias(addr: u32) -> u32 {
+pub(crate) fn alias(addr: u32) -> u32 {
     if addr < 0xC000_0000 {
         return addr;
     }
@@ -114,7 +116,24 @@ impl GuestMemory {
         // SAFETY: the layout has a non-zero size.
         let base = NonNull::new(unsafe { alloc_zeroed(layout) })
             .unwrap_or_else(|| panic!("cannot reserve {size} bytes of guest memory"));
-        Self { base, len: size }
+        Self {
+            base,
+            len: size,
+            guarded: false,
+        }
+    }
+
+    /// Reserves `size` bytes with no access: only ranges passed to
+    /// [`crate::guard::commit`] can be used, and touching any other address
+    /// faults into the [`crate::guard::on_wild_access`] handler. One per
+    /// process.
+    pub fn new_guarded(size: usize) -> Self {
+        let base = NonNull::new(crate::guard::reserve(size.max(1))).expect("reserved base");
+        Self {
+            base,
+            len: size,
+            guarded: true,
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -235,6 +254,8 @@ impl GuestMemory {
     /// All of guest memory as plain bytes, for loaders before any guest
     /// thread runs (needs exclusive access).
     pub fn bytes_mut(&mut self) -> &mut [u8] {
+        // A slice must be readable throughout; reserved pages are not.
+        assert!(!self.guarded, "bytes_mut on guarded guest memory");
         // SAFETY: `&mut self` rules out concurrent access.
         unsafe { std::slice::from_raw_parts_mut(self.base.as_ptr(), self.len) }
     }
@@ -242,6 +263,10 @@ impl GuestMemory {
 
 impl Drop for GuestMemory {
     fn drop(&mut self) {
+        if self.guarded {
+            crate::guard::release(self.base.as_ptr(), self.len.max(1));
+            return;
+        }
         let layout = Layout::from_size_align(self.len.max(1), ALIGN).unwrap();
         // SAFETY: allocated in `new` with this layout.
         unsafe { dealloc(self.base.as_ptr(), layout) }
