@@ -1221,6 +1221,53 @@ fn texture_fetch_sign_gamma_and_exp_adjust() {
     );
 }
 
+/// The texture log reports each sampled fetch constant once with its
+/// decoded fields, only for the pixel shader it is filtered to.
+#[test]
+fn texture_log_reports_sampled_fetch_fields() {
+    let Some(mut d) = drawer() else { return };
+    let swizzle_zyxw = 2 | (1 << 3) | (3 << 9);
+    let signs = (2 << 2) | (3 << 4) | (1 << 8);
+    let fetch = [
+        2 | signs | (2 << 10) | (2 << 13) | (1 << 22),
+        6 | (2 << 6) | TEXTURE,
+        0,
+        (swizzle_zyxw << 1) | (0x3F << 13), // exp_adjust -1
+        0,
+        1 << 9,
+    ];
+    let line = |d: &mut xenon_draw::Drawer| {
+        let mut mem = memory();
+        let mut s = Stream::default();
+        s.setup()
+            .regs(RB_COLOR_INFO, &[RT_16_16_16_16_FLOAT << 16])
+            .shader(false, &vs_uv())
+            .shader(true, &ps_texture(1))
+            .vertex_fetch(0, VERTS, 15)
+            .regs(SHADER_CONSTANT_FETCH + 6, &fetch)
+            .draw_auto(PRIM_TRI_LIST, 3)
+            .draw_auto(PRIM_TRI_LIST, 3);
+        let r = run(d, &s, &mut mem);
+        r.warnings
+            .into_iter()
+            .filter(|w| w.starts_with("texture log"))
+            .collect::<Vec<_>>()
+    };
+    d.texture_log = Some(Some(0));
+    assert!(line(&mut d).is_empty());
+    d.texture_log = Some(None);
+    let lines = line(&mut d);
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    let l = &lines[0];
+    for part in [
+        " t1 type 2 K8_8_8_8 1x1 ",
+        " swizzle zyxw sign 2301 exp_adjust -1 endian K8in32 ",
+        " mips 0-0 at 00000000 lod_bias 0 computed lod |",
+    ] {
+        assert!(l.contains(part), "{l}");
+    }
+}
+
 /// Signed components convert before filtering: a 2x1 signed 8_8_8_8 texture
 /// of 0x7F (1.0) next to 0x80 (-1.0), sampled with linear filtering exactly
 /// between the two texel centres, reads 0 in every component. Converting the

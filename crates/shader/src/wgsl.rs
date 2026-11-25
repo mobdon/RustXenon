@@ -84,6 +84,9 @@ pub struct ShaderInfo {
     /// Bit n: slot n's fetch overrides a filter of the fetch constant. The
     /// override is ignored; the drawer's sampler decides the filtering.
     pub texture_filter_overrides: u32,
+    /// Bit n: some fetch of slot n picks its LOD itself (a fixed or register
+    /// LOD, or register gradients) instead of the hardware-computed one.
+    pub texture_explicit_lod: u32,
     /// Vertex stage: bit i means `@location(i)` is an output.
     pub interpolators_written: u16,
     /// Pixel stage: bit i means `@location(i)` is an input (copied to r<i>).
@@ -1194,6 +1197,12 @@ impl Gen {
             if t.use_register_lod { " + tf_lod" } else { "" },
             flit(t.lod_bias as f32 / 16.0)
         ));
+        if grad_lod
+            || t.use_register_lod
+            || !(t.use_computed_lod && self.stage == ShaderStage::Pixel)
+        {
+            self.info.texture_explicit_lod |= 1 << n;
+        }
         let sample = if grad_lod {
             // Register gradients scaled by 2^lod (Xenia's gradient form of
             // the bias), normalized when the coordinates are in texels.
