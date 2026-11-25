@@ -1113,7 +1113,8 @@ fn hash_bytes(bytes: &[u8]) -> u64 {
 /// VGT_INDX_OFFSET, 24 bits) lie in `indices`; `None` when they are not
 /// known. Clipped to the constant's buffer, which is all of it for a fetch
 /// with an unbounded index or a constant without a reach entry. The flag is
-/// set when some fetch's words were clipped: the draw reads past the buffer.
+/// set when the draw may read past the buffer: some fetch's words were
+/// clipped, or the whole buffer was taken because the reads are not known.
 fn fetch_range(
     a: u64,
     size_dwords: u32,
@@ -1124,14 +1125,14 @@ fn fetch_range(
     let end = a + 4 * u64::from(size_dwords);
     let mut entries = reach.iter().filter(|r| r.fetch_const == k).peekable();
     if entries.peek().is_none() {
-        return (a, end, false);
+        return (a, end, true);
     }
     let (mut lo, mut hi, mut clipped) = (end, a, false);
     for r in entries {
         let (i0, i1) = match (r.stride, indices) {
             (0, _) => (0, 0),
             (_, Some(i)) if r.bounded => i,
-            _ => return (a, end, false),
+            _ => return (a, end, true),
         };
         let stride = i64::from(r.stride);
         let first = a as i64 + 4 * (i64::from(i0) * stride + i64::from(r.first));
@@ -3144,8 +3145,6 @@ impl Drawer {
         let mut part_of = Vec::new();
         // A read past its constant's buffer must find the guest's word or 0,
         // not another part's, so such a draw stages one span with no rebase.
-        // shortcut: an unbounded index past the buffer is not seen and may
-        // still read another part; bound fetches in the shader if that shows.
         let gap = if clipped { u64::MAX } else { WINDOW_GAP };
         for &(lo, hi, k) in &ranges {
             match parts.last_mut() {
@@ -5366,8 +5365,9 @@ mod tests {
             fetch_range(a, 256, 2, &reach, Some((4, 6))),
             (a + 64, a + 112, false)
         );
-        // Another constant's reach, or unknown indices: the whole buffer.
-        let whole = (a, a + 1024, false);
+        // Another constant's reach, or unknown indices: the whole buffer,
+        // which such a fetch may read past.
+        let whole = (a, a + 1024, true);
         assert_eq!(fetch_range(a, 256, 3, &reach, Some((4, 6))), whole);
         assert_eq!(fetch_range(a, 256, 2, &reach, None), whole);
         assert_eq!(
