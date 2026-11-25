@@ -140,7 +140,9 @@ fn store(x: u32, y: u32, w: u32) {
 @group(0) @binding(3) var depth_src: texture_depth_2d;
 @group(0) @binding(4) var stencil_src: texture_2d<u32>;
 
-// Xenia pixel_formats.xesli XeFloat32To20e4, rounding to nearest even.
+// Xenia pixel_formats.xesli XeFloat32To20e4 without rounding (truncating),
+// as Xenia's host render target dump does by default (depth_float24_round
+// off).
 fn to_20e4(f: f32) -> u32 {
     if !(f > 0.0) {
         return 0u;
@@ -154,7 +156,6 @@ fn to_20e4(f: f32) -> u32 {
     } else {
         u = u + 0xC8000000u;
     }
-    u = u + 3u + ((u >> 3u) & 1u);
     return (u >> 3u) & 0xFFFFFFu;
 }
 
@@ -163,7 +164,9 @@ fn depth_word(x: u32, y: u32) -> u32 {
     if p.src_format == 6u {
         return to_20e4(d) << 8u;
     }
-    return u32(clamp(d, 0.0, 1.0) * 16777215.0 + 0.5) << 8u;
+    // Round to nearest even, as Xenia's dump does: `+ 0.5` ties every odd
+    // value from 2^23 up to the next even one.
+    return u32(round(clamp(d, 0.0, 1.0) * 16777215.0)) << 8u;
 }
 
 // D24FS8 is hosted without stencil, so its stencil bits are 0.
