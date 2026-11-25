@@ -64,7 +64,13 @@ pub fn guest_frame_to_stereo(frame: &[u8]) -> Vec<f32> {
 #[derive(Default)]
 pub struct Mixer {
     sources: Vec<VecDeque<f32>>,
+    /// Samples thrown away because a source held [`MAX_QUEUED`].
+    pub dropped: u64,
 }
+
+/// Stereo samples a source holds at most (64 frames, 341 ms, 128 KB); older
+/// ones are dropped when a source is pushed faster than it is mixed.
+pub const MAX_QUEUED: usize = 64 * FRAME_SAMPLES * 2;
 
 impl Mixer {
     pub fn new() -> Self {
@@ -79,7 +85,11 @@ impl Mixer {
 
     /// Queues interleaved stereo samples on a source.
     pub fn push(&mut self, src: usize, stereo: &[f32]) {
-        self.sources[src].extend(stereo);
+        let q = &mut self.sources[src];
+        q.extend(stereo);
+        let over = q.len().saturating_sub(MAX_QUEUED);
+        q.drain(..over);
+        self.dropped += over as u64;
     }
 
     /// Queues one frame as a render client submits it.
@@ -90,6 +100,11 @@ impl Mixer {
     /// Stereo samples still queued on a source.
     pub fn queued(&self, src: usize) -> usize {
         self.sources[src].len()
+    }
+
+    /// Stereo samples queued on all sources.
+    pub fn queued_total(&self) -> usize {
+        self.sources.iter().map(|q| q.len()).sum()
     }
 
     /// One frame of mixed stereo (256 left/right pairs). A source with too
@@ -153,5 +168,13 @@ mod tests {
         let f = m.mix_frame();
         assert_eq!((f[87], f[88]), (0.25, 0.0));
         assert_eq!(m.queued(a), 0);
+    }
+
+    #[test]
+    fn mixer_caps_each_source() {
+        let mut m = Mixer::new();
+        let a = m.add_source();
+        m.push(a, &vec![0.1; MAX_QUEUED + 10]);
+        assert_eq!((m.queued(a), m.dropped), (MAX_QUEUED, 10));
     }
 }

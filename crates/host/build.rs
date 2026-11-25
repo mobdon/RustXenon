@@ -20,13 +20,25 @@ fn main() {
         None => "unknown".into(),
     };
     println!("cargo:rustc-env=XENON_BUILD={id}");
-    // Rebuild the id when HEAD moves or tracked files change.
-    if let Some(dir) = git(&["rev-parse", "--absolute-git-dir"]) {
-        for f in ["HEAD", "index", "packed-refs"] {
-            println!("cargo:rerun-if-changed={dir}/{f}");
+    // Rebuild the id when HEAD moves or tracked sources change (edits
+    // before `git add` touch no git file). --git-path also resolves linked
+    // worktrees; a missing path would make cargo rerun every build.
+    for f in ["HEAD", "index", "packed-refs"] {
+        rerun(git(&["rev-parse", "--git-path", f]));
+    }
+    if let Some(r) = git(&["symbolic-ref", "-q", "HEAD"]) {
+        rerun(git(&["rev-parse", "--git-path", &r]));
+    }
+    if let Some(top) = git(&["rev-parse", "--show-toplevel"]) {
+        for d in ["crates", "tools"] {
+            rerun(Some(format!("{top}/{d}")));
         }
-        if let Some(r) = git(&["symbolic-ref", "-q", "HEAD"]) {
-            println!("cargo:rerun-if-changed={dir}/{r}");
-        }
+    }
+}
+
+fn rerun(path: Option<String>) {
+    if let Some(p) = path.filter(|p| std::path::Path::new(p).exists()) {
+        let p = std::fs::canonicalize(&p).map_or(p, |c| c.display().to_string());
+        println!("cargo:rerun-if-changed={p}");
     }
 }

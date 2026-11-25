@@ -103,10 +103,12 @@ pub fn vd_swap(rt: &Runtime, c: &mut Context) {
     ret(c, 0);
 }
 
+/// (type, out): the title later frees `*out` with MmFreePhysicalMemory
+/// (type 1), so it must be physical memory, not pool.
 pub fn vd_persist_display(rt: &Runtime, c: &mut Context) {
     let p = arg(rt, c, 1);
     if p != 0 {
-        let a = k().pool_alloc(rt, 64);
+        let a = super::memory::physical(rt, 64, 32);
         rt.mem.write_u32(p, a);
     }
     ret(c, 1);

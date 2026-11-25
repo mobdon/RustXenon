@@ -2845,6 +2845,10 @@ dependencies = [
 [[package]]
 name = "xenon-rt"
 version = "0.0.0"
+dependencies = [
+ "libc",
+ "windows-sys 0.59.0",
+]
 
 [[package]]
 name = "xenon-shader"
