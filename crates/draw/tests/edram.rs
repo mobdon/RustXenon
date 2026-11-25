@@ -1,6 +1,7 @@
-//! EDRAM ownership transfers between a k_8_8_8_8 colour target and a depth
-//! target at the same EDRAM base and pitch, on synthetic streams: what one
-//! writes the other reads as the same 32-bit EDRAM word. They need a wgpu
+//! EDRAM ownership transfers between k_8_8_8_8 colour and depth targets
+//! on the same EDRAM tiles (one base and pitch, or another pitch and MSAA
+//! sample count with rows as wide), on synthetic streams: what one writes
+//! the other reads as the same 32-bit EDRAM word. They need a wgpu
 //! adapter (lavapipe works); without one they print a skip line, unless
 //! XENON_REQUIRE_GPU=1 makes them fail.
 
@@ -417,4 +418,206 @@ fn batched_colour_draws_reach_the_transfer() {
     assert_eq!(px(&img, W, 8, 30), GREEN);
     assert_eq!(px(&img, W, 24, 30), RED);
     assert_eq!(px(&img, W, 48, 30), [0; 4]);
+}
+
+/// One tile of a tiled (predicated) frame: the tile's rows of a 2x MSAA
+/// surface at pitch W are drawn through the window offset into EDRAM rows
+/// 0..32, as a G-buffer target at tile 100 over a kD24FS8 depth target at
+/// tile 0. The tile starts with a clear drawn as 4x MSAA at half the pitch
+/// (the same EDRAM tiles, a quarter of the pixels): blue colour, depth 0.
+/// The G-buffer draw then covers x < 48 of the tile's rows, z 0.25 GEQUAL,
+/// and the tile is resolved to `dest` with a colour and depth clear.
+fn tile(s: &mut Stream, mem: &mut SliceMemory, t: u32, colour: [u8; 4], dest: u32) {
+    const HALF: u32 = H / 2;
+    let mut rect = |at: u32, x1: f32, z: f32, c: [u8; 4]| {
+        let h = H as f32;
+        mem.write_words(
+            at,
+            &color_verts(&[(0.0, 0.0, z, c), (x1, 0.0, z, c), (0.0, h, z, c)]),
+        );
+    };
+    // Clear of draw_word's vertices at VERTS.
+    let at = VERTS + 0x1000 + 0x100 * t;
+    rect(at, (W / 2) as f32, 0.0, BLUE);
+    rect(at + 48, 48.0, 0.25, colour);
+    s.regs(RB_SURFACE_INFO, &[(W / 2) | (2 << 16)])
+        .regs(RB_COLOR_INFO, &[100])
+        .regs(RB_DEPTH_INFO, &[D24FS8_AT_0])
+        .regs(PA_SU_SC_MODE_CNTL, &[0])
+        .regs(PA_SC_WINDOW_OFFSET, &[0])
+        .regs(PA_SC_WINDOW_SCISSOR_TL, &[1 << 31, W | (H << 16)])
+        .shader(false, &vs_color())
+        .shader(true, &ps_interp())
+        .regs(RB_DEPTHCONTROL, &[2 | 4 | (7 << 4)])
+        .vertex_fetch(0, at, 24)
+        .draw_auto(PRIM_RECT_LIST, 3);
+    // The tile: window offset -32 rows per tile, scissor in window rows.
+    let off = (HALF * t).wrapping_neg() & 0x7FFF;
+    s.regs(RB_SURFACE_INFO, &[W | (1 << 16)])
+        .regs(PA_SU_SC_MODE_CNTL, &[1 << 16])
+        .regs(PA_SC_WINDOW_OFFSET, &[off << 16])
+        .regs(
+            PA_SC_WINDOW_SCISSOR_TL,
+            &[(HALF * t) << 16, W | ((HALF * (t + 1)) << 16)],
+        )
+        .regs(RB_DEPTHCONTROL, &[2 | 4 | (6 << 4)])
+        .vertex_fetch(0, at + 48, 24)
+        .draw_auto(PRIM_RECT_LIST, 3)
+        .regs(RB_DEPTHCONTROL, &[0])
+        .regs(PA_SU_SC_MODE_CNTL, &[0])
+        .regs(PA_SC_WINDOW_OFFSET, &[0])
+        .regs(PA_SC_WINDOW_SCISSOR_TL, &[1 << 31, W | (H << 16)]);
+    s.resolve_with(
+        mem,
+        (W, HALF),
+        COPY_RAW | CLEAR_COLOR | CLEAR_DEPTH,
+        (dest, W | (HALF << 16), dest_info(6, 0, false)),
+        [0; 3],
+    );
+}
+
+/// The frame after the tiles: single-sampled at pitch W, depth is
+/// restored by drawing its words as k_8_8_8_8 colour at the depth base
+/// (20e4 0.5 everywhere), then a depth-tested draw (colour at tile 300)
+/// uses the restored depth.
+fn after_tiles(s: &mut Stream, mem: &mut SliceMemory) {
+    s.regs(RB_SURFACE_INFO, &[W])
+        .regs(PA_SC_WINDOW_SCISSOR_TL, &[1 << 31, W | (H << 16)])
+        .regs(RB_COLOR_INFO, &[0]);
+    draw_word(s, mem, 64.0, 0xE000_0000);
+    mem.write_words(
+        VERTS + 0x400,
+        &color_verts(&[
+            (0.0, 0.0, 0.25, RED),
+            (64.0, 0.0, 0.25, RED),
+            (0.0, 64.0, 0.25, RED),
+        ]),
+    );
+    s.regs(RB_COLOR_INFO, &[300])
+        .shader(true, &ps_interp())
+        .regs(RB_DEPTHCONTROL, &[DEPTH_LESS])
+        .vertex_fetch(0, VERTS + 0x400, 24)
+        .draw_auto(PRIM_RECT_LIST, 3)
+        .regs(RB_DEPTHCONTROL, &[0]);
+}
+
+const BLUE: [u8; 4] = [0, 0, 255, 255];
+
+/// Two frames of two tiles each. The second frame's first tile starts
+/// with the depth the first frame restored (0.5, which the G-buffer draw
+/// at 0.25 GEQUAL fails); only its 4x half-pitch clear makes it 0. That
+/// clear, at another pitch and sample count but the same EDRAM tiles, is
+/// the newest data there, so the 2x target must take it, colour (blue
+/// where the G-buffer draw does not reach) and depth alike. The second
+/// tile's depth is also cleared by the first tile's resolve, so it worked
+/// either way.
+#[test]
+fn tiled_frame_takes_the_half_pitch_msaa_clear() {
+    let Some(mut d) = drawer() else { return };
+    let mut mem = memory();
+    let mut s = Stream::default();
+    s.setup();
+    for frame in 0..2 {
+        for (t, colour) in [(0, RED), (1, GREEN)] {
+            let dest = DEST + 0x2_0000 * (2 * frame + t);
+            tile(&mut s, &mut mem, t, colour, dest);
+        }
+        after_tiles(&mut s, &mut mem);
+    }
+    let report = run(&mut d, &s, &mut mem);
+    assert!(report.unsupported.is_empty(), "{report:?}");
+    assert_eq!((report.draws, report.resolves), (12, 4), "{report:?}");
+    assert!(
+        !report.warnings.iter().any(|w| w.contains("aliases")),
+        "{report:?}"
+    );
+    for frame in 0..2 {
+        for (t, colour) in [(0, RED), (1, GREEN)] {
+            let dest = DEST + 0x2_0000 * (2 * frame + t);
+            let got = |x, y| word_at(&mem, dest, x, y).to_le_bytes();
+            assert_eq!(got(10, 5), colour, "frame {frame} tile {t}");
+            assert_eq!(got(10, 30), colour, "frame {frame} tile {t}");
+        }
+    }
+    // Where the G-buffer draw does not reach, the tile keeps the clear.
+    for dest in (0..4).map(|i| DEST + 0x2_0000 * i) {
+        assert_eq!(word_at(&mem, dest, 56, 20).to_le_bytes(), BLUE);
+    }
+    // The second frame's restored depth (0.5) passes the draw at 0.25
+    // LESS; the tiles' resolve clear (0) would fail it.
+    let key = RenderTargetKey {
+        base_tiles: 300,
+        pitch: W,
+        format: TargetFormat::Rgba8,
+    };
+    let img = d.read_render_target(key, 0, 0, W, H).unwrap();
+    assert_eq!(px(&img, W, 10, 10), RED);
+}
+
+/// kD24S8 and kD24FS8 at one EDRAM base and pitch share the 32-bit word:
+/// a kD24S8 clear read as kD24FS8 is the same word (24-bit depth bits
+/// taken as 20e4), and back.
+#[test]
+fn d24s8_and_d24fs8_reinterpret_the_word() {
+    let Some(mut d) = drawer() else { return };
+    let mut mem = memory();
+    let mut s = Stream::default();
+    s.setup().regs(RB_DEPTH_INFO, &[D24S8_AT_0]);
+    clear_depth(&mut s, &mut mem, 0x4000_0078);
+    s.regs(RB_DEPTH_INFO, &[D24FS8_AT_0]);
+    resolve_words(&mut s, &mut mem, true, DEST2);
+    clear_depth(&mut s, &mut mem, 0x2345_6700);
+    s.regs(RB_DEPTH_INFO, &[D24S8_AT_0]);
+    resolve_words(&mut s, &mut mem, true, DEST3);
+    let report = run(&mut d, &s, &mut mem);
+    assert_eq!(report.resolves, 4, "{report:?}");
+    assert!(report.warnings.is_empty(), "{report:?}");
+    let stencil = if d.float_stencil() { 0x78 } else { 0 };
+    assert_eq!(word_at(&mem, DEST2, 5, 5), 0x4000_0000 | stencil);
+    assert_eq!(word_at(&mem, DEST3, 5, 5), 0x2345_6700);
+}
+
+/// The depth restore of a tiled frame, as drawn after the tiles: the
+/// k_8_8_8_8 words are drawn at the depth base, a 4x MSAA draw at half the
+/// pitch z tests against them without writing (its target takes a
+/// resampled copy, as new as the words), then the depth target is used
+/// single-sampled. It must take the words, not the copy, which holds one
+/// pixel of every two columns: column 32 is word B, column 33 word A.
+#[test]
+fn depth_restore_takes_the_words_not_a_resampled_copy() {
+    const A: u32 = 0xD333_3300;
+    const B: u32 = 0x4000_0000;
+    let Some(mut d) = drawer() else { return };
+    let mut mem = memory();
+    let mut s = Stream::default();
+    s.setup().regs(RB_DEPTH_INFO, &[D24FS8_AT_0]);
+    clear_depth(&mut s, &mut mem, 0);
+    draw_word(&mut s, &mut mem, 64.0, A);
+    let at = VERTS + 0x400;
+    let c = [0; 4];
+    mem.write_words(
+        at,
+        &color_verts(&[(0.0, 0.0, 0.0, c), (33.0, 0.0, 0.0, c), (0.0, 64.0, 0.0, c)]),
+    );
+    s.regs(SHADER_CONSTANT_FLOAT + 256 * 4, &word_color(B).map(f))
+        .vertex_fetch(0, at, 12)
+        .draw_auto(PRIM_RECT_LIST, 3);
+    // z ALWAYS without z write, colour at tile 200.
+    s.regs(RB_SURFACE_INFO, &[(W / 2) | (2 << 16)])
+        .regs(RB_COLOR_INFO, &[200])
+        .regs(RB_DEPTHCONTROL, &[2 | (7 << 4)])
+        .draw_auto(PRIM_RECT_LIST, 3)
+        .regs(RB_DEPTHCONTROL, &[0])
+        .regs(RB_SURFACE_INFO, &[W]);
+    resolve_words(&mut s, &mut mem, true, DEST2);
+    let report = run(&mut d, &s, &mut mem);
+    assert_eq!((report.draws, report.resolves), (3, 2), "{report:?}");
+    assert!(
+        !report.warnings.iter().any(|w| w.contains("aliases")),
+        "{report:?}"
+    );
+    for y in [4, 33] {
+        assert_eq!(word_at(&mem, DEST2, 32, y), B, "row {y}");
+        assert_eq!(word_at(&mem, DEST2, 33, y), A, "row {y}");
+    }
 }

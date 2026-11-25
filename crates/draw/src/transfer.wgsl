@@ -1,10 +1,16 @@
 
-// EDRAM ownership transfers between a k_8_8_8_8 colour target and a depth
-// target at the same EDRAM base and pitch (Xenia render_target_cache.cc,
-// transfer shaders of d3d12/vulkan_render_target_cache.cc): the other
-// target's pixels are drawn as the 32-bit EDRAM word with a fullscreen
-// triangle. Appended to resolve.wgsl, whose `src`, `depth_src`,
-// `stencil_src`, `p` and `depth_word` it uses.
+// EDRAM ownership transfers between k_8_8_8_8 colour, kD24S8 and kD24FS8
+// targets on the same EDRAM tiles (Xenia render_target_cache.cc, transfer
+// shaders of d3d12/vulkan_render_target_cache.cc): the other target's
+// pixels are drawn as the 32-bit EDRAM word with a fullscreen triangle.
+// Appended to resolve.wgsl, whose `src`, `depth_src`, `stencil_src`, `p`
+// and `depth_word` it uses. Entry points are `<source>_to_<destination>`.
+//
+// The two targets may differ in pitch and sample count while covering the
+// same tiles (a 4x MSAA surface at half the pitch of a 2x one): `p.x0` and
+// `p.y0` are the destination's samples per pixel across and down, `p.w`
+// and `p.h` the source's, so a destination pixel reads the source pixel
+// holding its first sample.
 
 // The depth target is kD24FS8 (20e4), else kD24S8 (24-bit unorm).
 override transfer_20e4: bool = false;
@@ -17,9 +23,25 @@ fn transfer_vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
     return vec4<f32>(uv * 2.0 - 1.0, 0.0, 1.0);
 }
 
+// The source pixel under destination pixel `pos`.
+fn src_at(pos: vec4<f32>) -> vec2<u32> {
+    return vec2<u32>(pos.xy) * vec2<u32>(p.x0, p.y0) / vec2<u32>(p.w, p.h);
+}
+
 // The colour texel as its EDRAM word: red in the low byte.
 fn color_word(pos: vec4<f32>) -> u32 {
-    return pack4x8unorm(textureLoad(src, vec2<u32>(pos.xy), 0));
+    return pack4x8unorm(textureLoad(src, src_at(pos), 0));
+}
+
+// The depth texel as its EDRAM word, stencil 0 (no host stencil).
+fn depth_word_at(pos: vec4<f32>) -> u32 {
+    let at = src_at(pos);
+    return depth_word(at.x, at.y);
+}
+
+fn depth_stencil_word(pos: vec4<f32>) -> u32 {
+    let at = src_at(pos);
+    return depth_word(at.x, at.y) | (textureLoad(stencil_src, at, 0).r & 0xFFu);
 }
 
 // xenon_texture float20e4_to_f32 (Xenia Float20e4To32): exact in f32.
@@ -62,6 +84,16 @@ fn color_to_depth(@builtin(position) pos: vec4<f32>) -> @builtin(frag_depth) f32
     return word_depth(color_word(pos) >> 8u);
 }
 
+@fragment
+fn depth_to_depth(@builtin(position) pos: vec4<f32>) -> @builtin(frag_depth) f32 {
+    return word_depth(depth_word_at(pos) >> 8u);
+}
+
+@fragment
+fn depth_stencil_to_depth(@builtin(position) pos: vec4<f32>) -> @builtin(frag_depth) f32 {
+    return word_depth(depth_stencil_word(pos) >> 8u);
+}
+
 // wgpu has no stencil export: one pass per stencil bit after the stencil
 // is cleared, writing only bit `transfer_bit` where the word has it set
 // (Xenia's fallback without shader stencil export).
@@ -73,13 +105,23 @@ fn color_to_stencil(@builtin(position) pos: vec4<f32>) {
 }
 
 @fragment
+fn depth_stencil_to_stencil(@builtin(position) pos: vec4<f32>) {
+    if (depth_stencil_word(pos) & (1u << transfer_bit)) == 0u {
+        discard;
+    }
+}
+
+@fragment
+fn color_to_color(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
+    return unpack4x8unorm(color_word(pos));
+}
+
+@fragment
 fn depth_to_color(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
-    return unpack4x8unorm(depth_word(u32(pos.x), u32(pos.y)));
+    return unpack4x8unorm(depth_word_at(pos));
 }
 
 @fragment
 fn depth_stencil_to_color(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
-    let x = u32(pos.x);
-    let y = u32(pos.y);
-    return unpack4x8unorm(depth_word(x, y) | (textureLoad(stencil_src, vec2<u32>(x, y), 0).r & 0xFFu));
+    return unpack4x8unorm(depth_stencil_word(pos));
 }
