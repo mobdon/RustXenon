@@ -277,6 +277,9 @@ pub struct Timings {
     pub clears: Duration,
     /// Reading, swapping and detiling the front buffer at each swap.
     pub swap: Duration,
+    /// EDRAM ownership transfers between colour and depth targets (also
+    /// counted in the phase that needed the target).
+    pub transfer: Duration,
     /// Counts: pipelines and shader modules created, textures uploaded.
     pub pipelines_created: u32,
     pub textures_uploaded: u32,
@@ -285,6 +288,38 @@ pub struct Timings {
     pub submits: u32,
     pub texture_bytes: u64,
     pub guest_bytes: u64,
+    /// EDRAM transfers and their render passes.
+    pub transfers: u32,
+    pub transfer_passes: u32,
+    /// Bytes read back from the GPU for resolves.
+    pub readback_bytes: u64,
+    /// Guest texture bytes read and hashed to look up the texture cache.
+    pub hashed_bytes: u64,
+}
+
+impl std::ops::AddAssign<&Timings> for Timings {
+    /// Sums the phases and counts of several replays.
+    fn add_assign(&mut self, t: &Timings) {
+        self.shaders += t.shaders;
+        self.guest_data += t.guest_data;
+        self.textures += t.textures;
+        self.submit += t.submit;
+        self.gpu_wait += t.gpu_wait;
+        self.readback += t.readback;
+        self.resolve_cpu += t.resolve_cpu;
+        self.clears += t.clears;
+        self.swap += t.swap;
+        self.transfer += t.transfer;
+        self.pipelines_created += t.pipelines_created;
+        self.textures_uploaded += t.textures_uploaded;
+        self.submits += t.submits;
+        self.texture_bytes += t.texture_bytes;
+        self.guest_bytes += t.guest_bytes;
+        self.transfers += t.transfers;
+        self.transfer_passes += t.transfer_passes;
+        self.readback_bytes += t.readback_bytes;
+        self.hashed_bytes += t.hashed_bytes;
+    }
 }
 
 impl Report {
@@ -1038,12 +1073,17 @@ impl Drawer {
         done?;
         // Counts made where only the report is mutable.
         let t = &report.timings;
-        let (uploaded, tex_bytes, guest_bytes) =
-            (t.textures_uploaded, t.texture_bytes, t.guest_bytes);
+        let (uploaded, tex_bytes, guest_bytes, hashed_bytes) = (
+            t.textures_uploaded,
+            t.texture_bytes,
+            t.guest_bytes,
+            t.hashed_bytes,
+        );
         report.timings = Timings {
             textures_uploaded: uploaded,
             texture_bytes: tex_bytes,
             guest_bytes,
+            hashed_bytes,
             ..std::mem::take(&mut self.timings)
         };
         Ok(report)
@@ -1485,7 +1525,9 @@ impl Drawer {
         }
         if let Some((src, w)) = newest {
             if transferable(src.format, key.format) {
+                let t = Instant::now();
                 self.transfer(src, key, &tex, w.rows)?;
+                self.timings.transfer += t.elapsed();
                 // Both now hold the same words: the source's stamp, so
                 // using the source again does not transfer them back.
                 let own = self.written.entry(key).or_default();
@@ -1722,6 +1764,8 @@ impl Drawer {
         }
         self.queue.submit([enc.finish()]);
         self.timings.submits += 1;
+        self.timings.transfers += 1;
+        self.timings.transfer_passes += pipelines.len() as u32;
         match block_on(scope.pop()) {
             Some(e) => Err(Skip::Fatal(Error::Gpu(e.to_string()))),
             None => Ok(()),
@@ -1987,6 +2031,7 @@ impl Drawer {
                     })
             })
             .map_err(|e| e.to_string())?;
+        report.timings.hashed_bytes += bytes.len() as u64;
         let key = (self.regs.fetch_constant(n), hash_bytes(&bytes));
         if let Some(view) = self.texture_cache.get(&key) {
             self.texture_memo.insert(key.0, view.clone());
@@ -2770,6 +2815,7 @@ impl Drawer {
         self.timings.gpu_wait += lap(&mut t);
         let px = self.read_texture(&tex, rect.x0, rect.y0, rect.width(), rect.height())?;
         self.timings.readback += lap(&mut t);
+        self.timings.readback_bytes += px.len() as u64;
         let src_bytes = px.len() / (rect.width() * rect.height()) as usize;
         let mut out = vec![0; px.len() / src_bytes * dest_bytes];
         for (src, dst) in px
@@ -2957,6 +3003,7 @@ impl Drawer {
         }
         let mut out = self.map_read(&readback, index)?;
         self.timings.readback += lap(&mut t);
+        self.timings.readback_bytes += out.len() as u64;
         out.truncate(extent as usize);
         if !mem.write_bytes(base, &out) {
             return unsupported(format!("resolve destination 0x{base:08X} is not writable"));
