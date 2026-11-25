@@ -8,6 +8,7 @@
 /// line/triangle/quad patches when tessellation is enabled in
 /// `VGT_OUTPUT_PATH_CNTL`; the drawer has to look at that register.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "bundle", derive(serde::Serialize, serde::Deserialize))]
 pub enum PrimitiveType {
     None,
     PointList,
@@ -64,6 +65,7 @@ impl PrimitiveType {
 
 /// `VGT_DRAW_INITIATOR::index_size`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "bundle", derive(serde::Serialize, serde::Deserialize))]
 pub enum IndexFormat {
     Int16,
     Int32,
@@ -80,6 +82,7 @@ impl IndexFormat {
 
 /// Two-bit GPU byte swap mode (`xenos::Endian`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "bundle", derive(serde::Serialize, serde::Deserialize))]
 pub enum Endian {
     None,
     E8in16,
@@ -125,6 +128,7 @@ impl Endian {
 
 /// `RB_COPY_CONTROL::copy_command`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "bundle", derive(serde::Serialize, serde::Deserialize))]
 pub enum CopyCommand {
     Raw,
     Convert,
@@ -145,6 +149,7 @@ impl CopyCommand {
 
 /// `xenos::FetchConstantType`, the low two bits of a fetch constant.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "bundle", derive(serde::Serialize, serde::Deserialize))]
 pub enum FetchConstantType {
     InvalidTexture,
     InvalidVertex,
@@ -154,6 +159,7 @@ pub enum FetchConstantType {
 
 /// A decoded vertex fetch constant (`xe_gpu_vertex_fetch_t`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "bundle", derive(serde::Serialize, serde::Deserialize))]
 pub struct VertexFetch {
     pub fetch_type: FetchConstantType,
     /// Guest byte address as stored (the field is in dwords), not masked

@@ -385,7 +385,7 @@ const USAGE: &str = "\
 USAGE: game --exe <patched executable> --game <unpacked game folder>
             [--update <unpacked title update>] [--data <writable folder>]
             [--seconds <n>] [--press <ms>:<button>[+<button>],...]
-            [--no-controller] [--window] [--capture <dir> [--capture-at <s>,<s>...]] [--render]
+            [--no-controller] [--window] [--capture <dir> [--capture-at <s>,<s>...] [--capture-bundle]] [--render]
             [--capture-frames <n>,<n>... --capture-dir <dir>] [--audio-wav <file>]
             [--guard-memory]
 
@@ -397,7 +397,9 @@ unplugs it. Buttons: up down left right start back lthumb rthumb lb rb a b
 x y. --capture writes, for one frame at each given second (default 20),
 the textures bound at its draws and a list of the draws: local files,
 derived from the game. --render draws every frame headless on the host GPU
-and adds the frame image to each capture. --capture-frames writes the listed
+and adds the frame image to each capture; --capture-bundle also
+writes a frame bundle (commands and 512 MB of guest memory) for the
+drawer's replay_frame example. --capture-frames writes the listed
 frames (counted from 1, one per swap) as <dir>/frame-<n>.png; it implies
 --render. --window opens a window that shows each drawn frame (it implies
 --render), plugs in the controller and keyboard as the pad on port 0 (unless
@@ -458,6 +460,9 @@ pub fn run(sha256: &str, regs: &[fn(&mut Runtime)]) -> ExitCode {
             .filter_map(|x| x.trim().parse().ok())
             .collect();
         let _ = kernel::gpu::capture::SETTINGS.set((PathBuf::from(d), at));
+        if args.iter().any(|a| a == "--capture-bundle") {
+            kernel::gpu::capture::BUNDLE.store(true, Ordering::Relaxed);
+        }
     }
     if window {
         kernel::gpu::capture::RENDER.store(true, Ordering::Relaxed);

@@ -8,3 +8,9 @@ publish.workspace = true
 license.workspace = true
 
 [dependencies]
+serde = { version = "1", features = ["derive"], optional = true }
+serde_json = { version = "1", optional = true }
+
+[features]
+# Frame bundles: a command list saved to a file and read back for offline replay.
+bundle = ["dep:serde", "dep:serde_json"]

@@ -11,6 +11,7 @@ use crate::xenos::{sign_extend, CopyCommand, Endian, IndexFormat, PrimitiveType,
 
 /// One recorded GPU command, in stream order.
 #[derive(Clone, Debug, PartialEq)]
+#[cfg_attr(feature = "bundle", derive(serde::Serialize, serde::Deserialize))]
 pub enum Command {
     /// Consecutive register writes from `base`. Covers type-0/1 packets,
     /// SET_CONSTANT(2), SET_SHADER_CONSTANTS, LOAD_ALU_CONSTANT, REG_RMW and
@@ -97,6 +98,7 @@ pub enum Command {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "bundle", derive(serde::Serialize, serde::Deserialize))]
 pub enum ShaderStage {
     Vertex,
     Pixel,
@@ -104,6 +106,7 @@ pub enum ShaderStage {
 
 /// A DRAW_INDX or DRAW_INDX_2 packet.
 #[derive(Clone, Debug, PartialEq)]
+#[cfg_attr(feature = "bundle", derive(serde::Serialize, serde::Deserialize))]
 pub struct Draw {
     pub primitive: PrimitiveType,
     pub index_count: u32,
@@ -115,6 +118,7 @@ pub struct Draw {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+#[cfg_attr(feature = "bundle", derive(serde::Serialize, serde::Deserialize))]
 pub enum IndexSource {
     /// Indices 0..index_count are generated.
     Auto,
@@ -137,6 +141,7 @@ pub enum IndexSource {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "bundle", derive(serde::Serialize, serde::Deserialize))]
 pub enum EventKind {
     /// EVENT_WRITE.
     Plain,
@@ -150,6 +155,7 @@ pub enum EventKind {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "bundle", derive(serde::Serialize, serde::Deserialize))]
 pub struct EventWrite {
     pub kind: EventKind,
     pub initiator: u32,
@@ -163,6 +169,7 @@ pub struct EventWrite {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "bundle", derive(serde::Serialize, serde::Deserialize))]
 pub struct WaitRegMem {
     /// Compare function (wait_info bits 0:2): 0 never, 1 <, 2 <=, 3 ==,
     /// 4 !=, 5 >=, 6 >, 7 always; applied to `(value & mask)` vs `reference`.
@@ -198,6 +205,7 @@ impl WaitRegMem {
 
 /// Pixel rectangle, right/bottom exclusive.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "bundle", derive(serde::Serialize, serde::Deserialize))]
 pub struct Rect {
     pub left: i32,
     pub top: i32,
@@ -210,6 +218,7 @@ pub struct Rect {
 /// `vertex_fetch0` (Direct3D 9 convention, see Xenia GetResolveInfo), which
 /// the drawer reads from guest memory; it is not decoded here.
 #[derive(Clone, Debug, PartialEq)]
+#[cfg_attr(feature = "bundle", derive(serde::Serialize, serde::Deserialize))]
 pub struct Resolve {
     // Raw registers.
     pub copy_control: u32,
