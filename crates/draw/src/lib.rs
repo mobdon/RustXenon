@@ -541,7 +541,8 @@ struct Submitter {
     /// Batches sent and not yet received back, and what came back: time
     /// spent, the first validation error and the last submission.
     state: Mutex<SubmitState>,
-    thread: Option<std::thread::JoinHandle<()>>,
+    /// The finish thread, then the submit thread.
+    threads: Vec<std::thread::JoinHandle<()>>,
 }
 
 type SubmitDone = (Duration, Option<String>, wgpu::SubmissionIndex);
@@ -565,13 +566,32 @@ impl Submitter {
     fn new(device: wgpu::Device, queue: wgpu::Queue) -> Submitter {
         let (tx, jobs) = std::sync::mpsc::channel::<SubmitJob>();
         let (done, rx) = std::sync::mpsc::channel();
+        // Finishing encoders (wgpu encodes the recorded passes then) runs on
+        // a thread of its own, a batch ahead of the uploads and submits.
+        let (fin_tx, finished) = std::sync::mpsc::channel();
+        let dev = device.clone();
+        let finisher = std::thread::Builder::new()
+            .name("xenon-draw finish".into())
+            .spawn(move || {
+                for (upload, encs) in jobs {
+                    let t = Instant::now();
+                    let scope = dev.push_error_scope(wgpu::ErrorFilter::Validation);
+                    let bufs: Vec<wgpu::CommandBuffer> =
+                        encs.into_iter().map(|e| e.finish()).collect();
+                    let error = block_on(scope.pop()).map(|e| e.to_string());
+                    if fin_tx.send((upload, bufs, t.elapsed(), error)).is_err() {
+                        break;
+                    }
+                }
+            })
+            .expect("spawn finish thread");
         let thread = std::thread::Builder::new()
             .name("xenon-draw submit".into())
             .spawn(move || {
                 // Mapped upload chunks, kept and reused: recalled after each
                 // submit, so mapped again by the next upload.
                 let mut belt = wgpu::util::StagingBelt::new(device.clone(), BELT_CHUNK);
-                for (upload, encs) in jobs {
+                for (upload, bufs, finish, finish_error) in finished {
                     let t = Instant::now();
                     // Error scopes are per thread.
                     let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
@@ -593,10 +613,10 @@ impl Submitter {
                         belt.finish();
                         enc
                     });
-                    let index = queue.submit(upload.into_iter().chain(encs).map(|e| e.finish()));
+                    let index = queue.submit(upload.map(|e| e.finish()).into_iter().chain(bufs));
                     belt.recall();
-                    let error = block_on(scope.pop()).map(|e| e.to_string());
-                    if done.send((t.elapsed(), error, index)).is_err() {
+                    let error = finish_error.or(block_on(scope.pop()).map(|e| e.to_string()));
+                    if done.send((finish + t.elapsed(), error, index)).is_err() {
                         break;
                     }
                 }
@@ -606,7 +626,7 @@ impl Submitter {
             tx: Some(tx),
             rx: Mutex::new(rx),
             state: Mutex::new(SubmitState::default()),
-            thread: Some(thread),
+            threads: vec![finisher, thread],
         }
     }
 
@@ -649,7 +669,7 @@ impl Submitter {
 impl Drop for Submitter {
     fn drop(&mut self) {
         drop(self.tx.take());
-        if let Some(t) = self.thread.take() {
+        for t in self.threads.drain(..) {
             let _ = t.join();
         }
     }
