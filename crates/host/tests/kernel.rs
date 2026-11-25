@@ -66,6 +66,7 @@ fn env() -> &'static Env {
         };
         let mut rt = Runtime::new(GuestMemory::new(xenon_host::GUEST_MEMORY));
         rt.set_override(THREAD_ENTRY, thread_entry);
+        rt.set_override(QUICK_ENTRY, quick_entry);
         kernel::install(
             &mut rt,
             &Setup {
@@ -638,4 +639,91 @@ fn empty_enumerations_and_request_completion() {
     // A failure's extended error is the system error code form.
     xam::complete(rt, &c, 0xE300, 18, 0);
     assert_eq!(rt.mem.read_u32(0xE318), 0x8007_0012);
+}
+
+/// Guest entry for the leak test: returns at once.
+const QUICK_ENTRY: u32 = 0x8200_0100;
+fn quick_entry(_: &Runtime, c: &mut Context) {
+    c.r[3] = 0;
+}
+
+#[test]
+fn ended_threads_give_back_their_stacks() {
+    let e = env();
+    let rt = &e.rt;
+    let mut c = ctx(0x1_B000);
+    let used = || kernel::k().virt.lock().unwrap().usage().0;
+    let before = used();
+    // Each thread takes the header's 256 KB default stack; 16 of them would
+    // hold 4 MB if their stacks were never freed.
+    for i in 0..16u32 {
+        call(
+            rt,
+            &mut c,
+            threads::ex_create_thread,
+            &[0x7000, 0, 0, 0, QUICK_ENTRY as u64, 0, 0],
+        );
+        let th = rt.mem.read_u32(0x7000) as u64;
+        rt.mem.write_u64(0x7010, (-50_000_000i64) as u64);
+        assert_eq!(
+            call(
+                rt,
+                &mut c,
+                objects::nt_wait_for_single_object_ex,
+                &[th, 1, 0, 0x7010]
+            ),
+            0,
+            "thread {i} ended"
+        );
+        // The watcher frees the stack just after signalling the object.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        call(rt, &mut c, objects::nt_close, &[th]);
+    }
+    let after = used();
+    assert!(
+        after < before + (1 << 20),
+        "virtual memory grew from {before:#x} to {after:#x}"
+    );
+}
+
+#[test]
+fn closing_a_periodic_timer_stops_it() {
+    let e = env();
+    let rt = &e.rt;
+    let mut c = ctx(0x1_C000);
+    // Notification timer, so it stays signalled once it fires.
+    call(rt, &mut c, objects::nt_create_timer, &[0x7100, 0, 0]);
+    let h = rt.mem.read_u32(0x7100) as u64;
+    call(
+        rt,
+        &mut c,
+        objects::ob_reference_object_by_handle,
+        &[h, 0, 0x7104],
+    );
+    let a = rt.mem.read_u32(0x7104);
+    rt.mem.write_u64(0x7110, (-10_000i64) as u64); // 1 ms, then every 2 ms
+    assert_eq!(
+        call(
+            rt,
+            &mut c,
+            objects::nt_set_timer_ex,
+            &[h, 0x7110, 0, 0, 0, 0, 2]
+        ),
+        0
+    );
+    let objects::KObj::Timer(ev, _) = &*objects::get(rt, a) else {
+        panic!("not a timer")
+    };
+    let ev = ev.clone();
+    assert!(
+        ev.wait(Some(std::time::Duration::from_secs(5))),
+        "timer fired"
+    );
+    assert_eq!(call(rt, &mut c, objects::nt_close, &[h]), 0);
+    std::thread::sleep(std::time::Duration::from_millis(10));
+    ev.reset();
+    assert!(
+        !ev.wait(Some(std::time::Duration::from_millis(50))),
+        "a closed timer kept firing"
+    );
 }

@@ -368,10 +368,19 @@ pub fn nt_wait_for_multiple_objects_ex(rt: &Runtime, c: &mut Context) {
 }
 
 pub fn nt_close(rt: &Runtime, c: &mut Context) {
-    let s = if k().close(arg(rt, c, 0)) {
-        STATUS_SUCCESS
-    } else {
-        STATUS_INVALID_HANDLE
+    let s = match k().close(arg(rt, c, 0)) {
+        Some(Handle::Object(a)) => {
+            // A timer's last handle closed: its periodic thread stops, as
+            // the console deletes the timer.
+            if !k().referenced(a) {
+                if let KObj::Timer(_, g) = &*get(rt, a) {
+                    g.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+            STATUS_SUCCESS
+        }
+        Some(_) => STATUS_SUCCESS,
+        None => STATUS_INVALID_HANDLE,
     };
     ret(c, s);
 }
