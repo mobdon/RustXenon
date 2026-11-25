@@ -28,15 +28,14 @@ static THUNKS: (AtomicU32, AtomicU32) = (AtomicU32::new(0), AtomicU32::new(0));
 static START: OnceLock<Instant> = OnceLock::new();
 
 thread_local! {
-    /// The last call targets on this host thread, newest last.
-    static RECENT: Cell<[u32; 8]> = const { Cell::new([0; 8]) };
     /// Guest stack pointer at the newest call.
     static SP: Cell<u32> = const { Cell::new(0) };
     /// This thread's entry in [`ACTIVITY`].
     static MINE: Arc<Activity> = {
         let a = Arc::new(Activity::default());
-        let name = std::thread::current().name().unwrap_or("?").to_string();
-        ACTIVITY.lock().unwrap().push((name, a.clone()));
+        let t = std::thread::current();
+        let name = t.name().unwrap_or("?").to_string();
+        ACTIVITY.lock().unwrap().push((name, t.id(), a.clone()));
         a
     };
 }
@@ -52,9 +51,62 @@ struct Activity {
     sp: AtomicU32,
     /// First argument of the last import call.
     arg0: AtomicU32,
+    /// The last call targets, written only by the owning thread at
+    /// `head % 8`, so any thread can print them on a stop.
+    ring: [AtomicU32; 8],
+    head: AtomicU32,
+    /// Guest object this thread is blocked on (0: none), and how many
+    /// objects the wait covers.
+    wait: AtomicU32,
+    wait_n: AtomicU32,
 }
 
-static ACTIVITY: std::sync::Mutex<Vec<(String, Arc<Activity>)>> = std::sync::Mutex::new(Vec::new());
+impl Activity {
+    /// The last call targets, oldest first.
+    fn recent(&self) -> Vec<u32> {
+        let h = self.head.load(Ordering::Relaxed);
+        (0..8)
+            .map(|i| self.ring[(h.wrapping_add(i) % 8) as usize].load(Ordering::Relaxed))
+            .filter(|&a| a != 0)
+            .collect()
+    }
+}
+
+type ThreadEntry = (String, std::thread::ThreadId, Arc<Activity>);
+static ACTIVITY: std::sync::Mutex<Vec<ThreadEntry>> = std::sync::Mutex::new(Vec::new());
+
+/// Name of the host thread `id`, for saying who holds a lock.
+pub fn thread_name(id: std::thread::ThreadId) -> String {
+    ACTIVITY
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|e| e.1 == id)
+        .map_or_else(|| format!("{id:?}"), |e| e.0.clone())
+}
+
+/// Marks this thread as blocked on the guest object `addr` (one of `n`)
+/// until the returned guard drops, so a stall report can say what it waits on.
+pub fn waiting(addr: u32, n: u32) -> impl Drop {
+    struct Clear;
+    impl Drop for Clear {
+        fn drop(&mut self) {
+            MINE.with(|m| m.wait.store(0, Ordering::Relaxed));
+        }
+    }
+    MINE.with(|m| {
+        m.wait_n.store(n, Ordering::Relaxed);
+        m.wait.store(addr, Ordering::Relaxed);
+    });
+    Clear
+}
+
+fn hex_list(v: &[u32]) -> String {
+    v.iter()
+        .map(|a| format!("{a:#010x}"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
 
 /// Source commit this host was built from (`-dirty` with local edits).
 pub const BUILD: &str = env!("XENON_BUILD");
@@ -68,7 +120,9 @@ pub fn ms() -> u32 {
 /// last call target.
 fn activity_report() {
     let now = ms();
-    for (name, a) in ACTIVITY.lock().unwrap().iter() {
+    // Copied out: describing a lock owner looks the list up again.
+    let all: Vec<_> = ACTIVITY.lock().unwrap().clone();
+    for (name, _, a) in all.iter() {
         let imp = a.import.load(Ordering::Relaxed);
         let what = kernel::import_name(imp).unwrap_or_else(|| "-".into());
         log(&format!(
@@ -77,6 +131,23 @@ fn activity_report() {
             now.saturating_sub(a.at_ms.load(Ordering::Relaxed)),
             a.call.load(Ordering::Relaxed)
         ));
+        log(&format!(
+            "             recent calls {}",
+            hex_list(&a.recent())
+        ));
+        let w = a.wait.load(Ordering::Relaxed);
+        if w != 0 {
+            let n = a.wait_n.load(Ordering::Relaxed);
+            let more = if n > 1 {
+                format!(" (first of {n})")
+            } else {
+                String::new()
+            };
+            let what = RT
+                .get()
+                .map_or_else(String::new, |rt| kernel::objects::describe(rt, w));
+            log(&format!("             waiting on {w:#010x}{more}: {what}"));
+        }
         if let Some(rt) = RT.get() {
             let bt: Vec<String> = backtrace_from(rt, a.sp.load(Ordering::Relaxed))
                 .iter()
@@ -96,13 +167,14 @@ fn backtrace(rt: &Runtime) -> Vec<u32> {
 }
 
 fn backtrace_from(rt: &Runtime, mut sp: u32) -> Vec<u32> {
+    use xenon_rt::guard::readable;
     let mut out = Vec::new();
     for _ in 0..24 {
-        if sp == 0 || sp % 4 != 0 || sp as usize + 4 > GUEST_MEMORY {
+        if sp == 0 || sp % 4 != 0 || sp as usize + 4 > GUEST_MEMORY || !readable(sp, 4) {
             break;
         }
         let prev = rt.mem.read_u32(sp);
-        if prev <= sp || prev < 8 {
+        if prev <= sp || prev < 8 || !readable(prev - 8, 4) {
             break;
         }
         out.push(rt.mem.read_u32(prev - 8));
@@ -134,7 +206,10 @@ pub fn set_thunk_range(lo: u32, hi: u32) {
 
 /// Target of the newest call on this thread.
 pub fn last_call() -> u32 {
-    RECENT.with(|r| r.get()[7])
+    MINE.with(|m| {
+        m.ring[(m.head.load(Ordering::Relaxed).wrapping_sub(1) % 8) as usize]
+            .load(Ordering::Relaxed)
+    })
 }
 
 /// `XENON_CALL_PROFILE=<thread>:<from ms>:<to ms>`: counts the guest
@@ -244,7 +319,7 @@ fn watch(c: &Context, addr: u32) {
             "[watch] {name} = {v:#x} at call to {addr:#010x} from {:#010x} in {} after {:x?}",
             c.lr as u32,
             std::thread::current().name().unwrap_or("?"),
-            RECENT.with(|r| r.get())
+            MINE.with(|m| m.recent())
         ));
     }
 }
@@ -253,13 +328,10 @@ fn trace(c: &Context, addr: u32) {
     profile_call(addr);
     watch(c, addr);
     SP.with(|s| s.set(c.r[1] as u32));
-    RECENT.with(|r| {
-        let mut v = r.get();
-        v.copy_within(1.., 0);
-        v[7] = addr;
-        r.set(v);
-    });
     MINE.with(|m| {
+        let h = m.head.load(Ordering::Relaxed);
+        m.ring[(h % 8) as usize].store(addr, Ordering::Relaxed);
+        m.head.store(h.wrapping_add(1), Ordering::Relaxed);
         m.call.store(addr, Ordering::Relaxed);
         m.sp.store(c.r[1] as u32, Ordering::Relaxed);
     });
@@ -297,6 +369,7 @@ USAGE: game --exe <patched executable> --game <unpacked game folder>
             [--seconds <n>] [--press <ms>:<button>[+<button>],...]
             [--no-controller] [--window] [--capture <dir> [--capture-at <s>,<s>...]] [--render]
             [--capture-frames <n>,<n>... --capture-dir <dir>] [--audio-wav <file>]
+            [--guard-memory]
 
 Runs the title headless for --seconds (default 30) and reports how far it
 got: frames presented, threads, imports called, memory in use. A
@@ -314,7 +387,10 @@ frames (counted from 1, one per swap) as <dir>/frame-<n>.png; it implies
 (or for --seconds when given). --audio-wav writes the game's sound (the
 render clients' frames mixed to 48 kHz stereo) to a .wav file; compressed
 sound is decoded through an LGPL FFmpeg found at run time (XENON_FFMPEG_DIR),
-silence without one. Nothing is ever played.";
+silence without one. Nothing is ever played. --guard-memory (or
+XENON_GUARD_MEMORY=1) reserves guest memory without access and commits only
+what the kernel hands out, so a wild pointer stops the run with its address
+and every thread's last calls instead of reading zeros.";
 
 fn opt(args: &[String], name: &str) -> Option<String> {
     args.iter()
@@ -407,9 +483,17 @@ pub fn run(sha256: &str, regs: &[fn(&mut Runtime)]) -> ExitCode {
         }
     };
 
-    let mut mem = GuestMemory::new(GUEST_MEMORY);
-    let base = image.base as usize;
-    mem.bytes_mut()[base..base + image.data.len()].copy_from_slice(&image.data);
+    let guarded = args.iter().any(|a| a == "--guard-memory")
+        || std::env::var_os("XENON_GUARD_MEMORY").is_some();
+    let mem = if guarded {
+        log("guarded guest memory: a never-allocated address stops the run");
+        GuestMemory::new_guarded(GUEST_MEMORY)
+    } else {
+        GuestMemory::new(GUEST_MEMORY)
+    };
+    xenon_rt::guard::commit(image.base, image.data.len() as u32);
+    // Not bytes_mut: with guarded memory most of the range is inaccessible.
+    mem.write_bytes(image.base, &image.data);
     let mut rt = Runtime::new(mem);
     for r in regs {
         r(&mut rt);
@@ -429,26 +513,13 @@ pub fn run(sha256: &str, regs: &[fn(&mut Runtime)]) -> ExitCode {
     set_runtime(rt.clone());
     log(&format!("call table: {} MB", rt.table_bytes() >> 20));
 
-    std::panic::set_hook(Box::new(|info| {
-        let recent = RECENT.with(|r| r.get());
-        let name = std::thread::current().name().unwrap_or("?").to_string();
-        log(&format!("STOP in {name}: {info}"));
-        log(&format!(
-            "recent calls: {}",
-            recent
-                .iter()
-                .filter(|&&a| a != 0)
-                .map(|a| format!("{a:#010x}"))
-                .collect::<Vec<_>>()
-                .join(" ")
-        ));
-        if let Some(rt) = RT.get() {
-            let bt: Vec<String> = backtrace(rt).iter().map(|a| format!("{a:#010x}")).collect();
-            log(&format!("guest return addresses: {}", bt.join(" ")));
-        }
-        report();
-        std::process::exit(101);
-    }));
+    std::panic::set_hook(Box::new(|info| stop(&info.to_string())));
+    xenon_rt::guard::on_wild_access(|a| {
+        stop(&format!(
+            "wild guest access at {a:#010x}, never allocated{}",
+            xenon_rt::runtime::wild_hint(a)
+        ))
+    });
 
     if let Some(w) = opt(&args, "--audio-wav") {
         if let Err(e) = kernel::audio::start_wav(w.as_ref()) {
@@ -553,6 +624,25 @@ fn host_rss() -> Option<u64> {
     None
 }
 
+/// Stops the run: the reason, this thread's last calls and guest return
+/// addresses, then the full report (every thread). Never returns.
+fn stop(why: &str) -> ! {
+    let name = std::thread::current().name().unwrap_or("?").to_string();
+    log(&format!("STOP in {name}: {why}"));
+    log(&format!(
+        "recent calls: {}",
+        hex_list(&MINE.with(|m| m.recent()))
+    ));
+    if let Some(rt) = RT.get() {
+        log(&format!(
+            "guest return addresses: {}",
+            hex_list(&backtrace(rt))
+        ));
+    }
+    report();
+    std::process::exit(101);
+}
+
 fn report() {
     kernel::audio::finish_wav();
     let kx = kernel::k();
@@ -612,7 +702,7 @@ fn start_memwatch(rt: Arc<Runtime>) {
                         .lock()
                         .unwrap()
                         .iter()
-                        .map(|(t, x)| {
+                        .map(|(t, _, x)| {
                             format!(
                                 "{t}:{:#x}@{:#x}",
                                 x.call.load(Ordering::Relaxed),
@@ -654,6 +744,28 @@ fn start_clock(rt: Arc<Runtime>) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn ring_keeps_the_last_eight_calls_and_wait_marker_clears() {
+        let c = xenon_rt::Context::new();
+        for a in 1..=10u32 {
+            super::trace(&c, 0x8200_0000 + 4 * a);
+        }
+        let want: Vec<u32> = (3..=10).map(|a| 0x8200_0000 + 4 * a).collect();
+        assert_eq!(super::MINE.with(|m| m.recent()), want);
+        assert_eq!(super::last_call(), 0x8200_0028);
+        {
+            let _w = super::waiting(0x4000_0010, 3);
+            assert_eq!(
+                super::MINE.with(|m| m.wait.load(super::Ordering::Relaxed)),
+                0x4000_0010
+            );
+        }
+        assert_eq!(
+            super::MINE.with(|m| m.wait.load(super::Ordering::Relaxed)),
+            0
+        );
+    }
+
     #[test]
     fn build_id_is_a_commit_or_unknown() {
         let c = super::BUILD.trim_end_matches("-dirty");

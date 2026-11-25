@@ -13,6 +13,7 @@
 //! | `0x00100000..0x3F000000` | kernel pool: kernel structures, pool and system-library allocations |
 //! | `0x40000000..0x7F000000` | virtual memory and thread stacks, 64 KB granularity |
 //! | `0x7FC80000` | GPU registers (plain memory, polled by [`video`]) |
+//! | `0x7FEA0000..0x7FEB0000` | audio decoder registers (plain memory, read by the title) |
 //! | `0x82000000..` | the executable image |
 //! | `0xA0000000..0xC0000000` | physical memory, 4 KB granularity |
 //!
@@ -268,6 +269,12 @@ fn missing(_: &Runtime, _: &mut Context) {
 /// import. Call before [`Runtime::share`].
 pub fn install(rt: &mut Runtime, s: &Setup) {
     let h = xenon_recomp::xex::Header::parse(s.file).expect("executable header");
+    // Fixed ranges outside the heaps (no-ops without guarded memory).
+    xenon_rt::guard::commit(s.image.base, s.image.data.len() as u32);
+    xenon_rt::guard::commit(video::GPU_REGS, 0x8_0000);
+    // Audio decoder (XMA) registers, which the title reads directly
+    // (first seen in a --guard-memory run); plain memory, as unguarded.
+    xenon_rt::guard::commit(0x7FEA_0000, 0x1_0000);
     let mut pool = Heap::new("pool", POOL.0, POOL.1, 0x10);
     let mut alloc = |size: u32| pool.alloc(size, 16).unwrap().0;
 

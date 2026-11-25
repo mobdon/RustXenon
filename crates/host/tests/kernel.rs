@@ -64,7 +64,22 @@ fn env() -> &'static Env {
             imports: vec![],
             exception_table: vec![],
         };
-        let mut rt = Runtime::new(GuestMemory::new(xenon_host::GUEST_MEMORY));
+        // Guarded, as --guard-memory runs: any address the kernel does not
+        // hand out faults. The tests' own scratch: below the pool and at the start of physical memory.
+        let mut rt = Runtime::new(GuestMemory::new_guarded(xenon_host::GUEST_MEMORY));
+        xenon_rt::guard::commit(0, 0x10_0000);
+        xenon_rt::guard::commit(0xA000_0000, 0x10_0000);
+        xenon_rt::guard::on_wild_access(|a| {
+            // Not eprintln: the test harness captures that and loses it at exit.
+            use std::io::Write;
+            let t = std::thread::current();
+            let _ = writeln!(
+                std::io::stderr(),
+                "wild guest access at {a:#010x} in {}",
+                t.name().unwrap_or("?")
+            );
+            std::process::exit(101)
+        });
         rt.set_override(THREAD_ENTRY, thread_entry);
         rt.set_override(QUICK_ENTRY, quick_entry);
         kernel::install(
@@ -872,4 +887,70 @@ fn decoder_context_plays_its_input_into_the_output_ring() {
         "ring holds something but silence"
     );
     kernel::sound::forget(ctx);
+}
+
+#[test]
+fn stall_report_names_the_lock_holder() {
+    let e = env();
+    let rt = &e.rt;
+    let cs = 0x3_2000u64;
+    let mut c = ctx(0x1_C000);
+    call(rt, &mut c, objects::rtl_initialize_critical_section, &[cs]);
+    assert_eq!(objects::describe(rt, cs as u32), "critical section, free");
+    let rt2 = rt.clone();
+    std::thread::Builder::new()
+        .name("holder".into())
+        .spawn(move || {
+            let mut c = ctx(0x1_D000);
+            // Register this thread's name with the activity list first.
+            xenon_host::last_call();
+            call(&rt2, &mut c, objects::rtl_enter_critical_section, &[cs]);
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+    assert_eq!(
+        objects::describe(rt, cs as u32),
+        "critical section, held by holder"
+    );
+    assert_eq!(objects::describe(rt, 0x3_2100), "no host object");
+}
+
+#[test]
+fn guarded_memory_commits_what_the_kernel_hands_out() {
+    use xenon_rt::guard::readable;
+    let e = env();
+    let rt = &e.rt;
+    let mut c = ctx(0x1_E000);
+    let (base, size) = (0x1_1000u32, 0x1_1004u32);
+    rt.mem.write_u32(base, 0);
+    rt.mem.write_u32(size, 0x3_0000);
+    let r = call(
+        rt,
+        &mut c,
+        memory::nt_allocate_virtual_memory,
+        &[base as u64, size as u64, 0x3000, 4],
+    );
+    assert_eq!(r, 0);
+    let a = rt.mem.read_u32(base);
+    assert!(readable(a, 0x3_0000), "allocated range is committed");
+    // The virtual range far above anything handed out stays reserved, as do
+    // the gaps between the kernel's regions.
+    assert!(!readable(0x7E00_0000, 4));
+    assert!(!readable(0x3F80_0000, 4));
+    assert!(!readable(0x9421_FFF8, 4));
+    let p = call(
+        rt,
+        &mut c,
+        memory::mm_allocate_physical_memory_ex,
+        &[0, 0x2000, 4, 0, 0, 0x1000],
+    ) as u32;
+    assert!(readable(p, 0x2000));
+    // The physical page is the same memory in every view.
+    rt.mem.write_u32(p, 0x5A5A_5A5A);
+    assert_eq!(
+        rt.mem.read_u32((p & 0x1FFF_FFFF) | 0xC000_0000),
+        0x5A5A_5A5A
+    );
+    call(rt, &mut c, memory::mm_free_physical_memory, &[0, p as u64]);
 }
