@@ -787,7 +787,7 @@ fn submitted_frames_reach_the_wav_as_stereo() {
             &[0x4155_0000, frame as u64],
         );
     }
-    // Another client's frames are not mixed in.
+    // A second client is mixed in: its one frame lands on the first.
     call(
         rt,
         &mut c,
@@ -798,8 +798,78 @@ fn submitted_frames_reach_the_wav_as_stereo() {
     let w = xenon_audio::wav::read(&std::fs::read(&path).unwrap()).unwrap();
     let _ = std::fs::remove_file(&path);
     assert_eq!((w.rate, w.channels, w.samples.len()), (48_000, 2, 1024));
-    assert!(w
-        .samples
+    let (both, one) = w.samples.split_at(512);
+    assert!(both
+        .chunks(2)
+        .all(|s| (s[0] - 1.0).abs() < 1e-3 && (s[1] + 0.5).abs() < 1e-3));
+    assert!(one
         .chunks(2)
         .all(|s| (s[0] - 0.5).abs() < 1e-3 && (s[1] + 0.25).abs() < 1e-3));
+}
+
+#[test]
+fn decoder_context_plays_its_input_into_the_output_ring() {
+    if let Err(e) = xenon_audio::ffmpeg::Ffmpeg::load() {
+        assert!(
+            std::env::var_os("XENON_REQUIRE_FFMPEG").is_none(),
+            "no FFmpeg: {e}"
+        );
+        return eprintln!("skipping: {e}");
+    }
+    let rt = &env().rt;
+    let (ctx, input, ring) = (
+        memory::physical(rt, 64, 256),
+        memory::physical(rt, 8 * 2048, 2048),
+        memory::physical(rt, 8 * 256, 256),
+    );
+    let view = kernel::gpu::gpu_to_cpu;
+    for i in 0..8 {
+        rt.mem
+            .write_bytes(view(input) + 2048 * i, &xenon_audio::xma::silent_packet());
+    }
+    rt.mem.write_bytes(view(ring), &[0xAA; 8 * 256]);
+    // 8 packets in buffer 0 (valid), 8 output blocks; 48 kHz mono, output
+    // valid; read offset just past the first header.
+    let words = [
+        8 | 1 << 20 | 8 << 22,
+        3 << 27 | 1 << 31,
+        32,
+        0,
+        0,
+        input,
+        0,
+        ring,
+        0,
+        0,
+    ];
+    for (i, w) in words.iter().enumerate() {
+        rt.mem.write_u32(ctx + 4 * i as u32, *w);
+    }
+    let mut blocks = 0;
+    for _ in 0..20 {
+        let before = rt.mem.read_u32(ctx) >> 27 & 31;
+        assert!(kernel::sound::decode(rt, ctx));
+        let after = rt.mem.read_u32(ctx) >> 27 & 31;
+        blocks += (after + 8 - before) % 8;
+        // The title reads everything written.
+        rt.mem.write_u32(ctx + 36, after);
+    }
+    let w0 = rt.mem.read_u32(ctx);
+    assert_eq!(w0 >> 20 & 1, 0, "buffer 0 still valid: {w0:#x}");
+    assert_eq!(
+        rt.mem.read_u32(ctx + 16) >> 31,
+        1,
+        "current buffer not moved on"
+    );
+    // 8 frames of 512 less FFmpeg's 64-sample delay, 2 bytes each, the
+    // last part block padded (FFmpeg gives the last 8 frames only once the
+    // input runs dry and the decoder is flushed).
+    assert_eq!(blocks, 32);
+    let mut out = [0u8; 8 * 256];
+    rt.mem.read_bytes(view(ring), &mut out);
+    assert!(
+        out.iter().all(|&b| b == 0),
+        "ring holds something but silence"
+    );
+    kernel::sound::forget(ctx);
 }

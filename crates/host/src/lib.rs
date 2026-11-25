@@ -308,11 +308,13 @@ the textures bound at its draws and a list of the draws: local files,
 derived from the game. --render draws every frame headless on the host GPU
 and adds the frame image to each capture. --capture-frames writes the listed
 frames (counted from 1, one per swap) as <dir>/frame-<n>.png; it implies
---render. --audio-wav writes the sound the title submits to a 48 kHz
-stereo .wav (nothing is played). --window opens a window that shows each drawn frame (it implies
+--render. --window opens a window that shows each drawn frame (it implies
 --render), plugs in the controller and keyboard as the pad on port 0 (unless
 --press or --no-controller is given) and runs until the window is closed
-(or for --seconds when given).";
+(or for --seconds when given). --audio-wav writes the game's sound (the
+render clients' frames mixed to 48 kHz stereo) to a .wav file; compressed
+sound is decoded through an LGPL FFmpeg found at run time (XENON_FFMPEG_DIR),
+silence without one. Nothing is ever played.";
 
 fn opt(args: &[String], name: &str) -> Option<String> {
     args.iter()
@@ -504,12 +506,13 @@ fn growth_line() -> String {
     let rss = host_rss().map_or("?".into(), |b| (b >> 20).to_string());
     let r = |i: usize| kernel::files::READS[i].load(Ordering::Relaxed);
     format!(
-        "handles {}, threads {} live, host {rss} MB, file reads {} ({} MB, {} ms)",
+        "handles {}, threads {} live, host {rss} MB, file reads {} ({} MB, {} ms), {}",
         kx.handle_count(),
         started.saturating_sub(ended),
         r(0),
         r(1) >> 20,
-        r(2) / 1000
+        r(2) / 1000,
+        kernel::sound::line()
     )
 }
 
