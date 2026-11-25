@@ -71,7 +71,8 @@ mod os {
             return None;
         }
         let base = p as usize;
-        let pages = addrs[..count].iter().map(|&a| a as usize - base).collect();
+        let mut pages: Vec<usize> = addrs[..count].iter().map(|&a| a as usize - base).collect();
+        pages.sort_unstable();
         Some((pages, page as usize))
     }
 }
