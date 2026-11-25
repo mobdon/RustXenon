@@ -108,3 +108,25 @@ fn never_panics_on_garbage() {
         disassemble(&words, ShaderStage::Pixel);
     }
 }
+
+#[test]
+fn export_components_in_both_masks_list_as_one() {
+    let mut a = AluInstr::vector(
+        VectorOp::Mul,
+        0,
+        mask("xyz"),
+        &[AluSrc::temp(1, swz("xyzw")), AluSrc::temp(2, swz("xyzw"))],
+    )
+    .exported(62);
+    a.scalar_op = ScalarOp::Rcp;
+    a.scalar_write_mask = mask("zw");
+    a.src[2] = AluSrc::temp(3, swz("x"));
+    let words = assemble(&[CfInstr::Exec(Exec::new(0, 1, true))], &[Instr::Alu(a)]);
+    let d = disassemble(&words, ShaderStage::Vertex);
+    assert!(
+        d.text
+            .contains("mul oPos.xy__, r1, r2 + rcp oPos.___w, r3.xxxx one __z_"),
+        "{}",
+        d.text
+    );
+}

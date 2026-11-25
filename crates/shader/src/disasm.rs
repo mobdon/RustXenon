@@ -403,6 +403,12 @@ impl Dis {
                 | V::KillNe
                 | V::MaxA
         );
+        // Export components in both masks are written as 1.0, by neither op.
+        let one = if a.export {
+            a.vector_write_mask & a.scalar_write_mask
+        } else {
+            0
+        };
         let mut parts = Vec::new();
         if a.vector_write_mask != 0 || side_effect {
             let srcs: Vec<String> = (1..=a.vector_op.operand_count())
@@ -413,7 +419,7 @@ impl Dis {
                 snake(format!("{:?}", a.vector_op)),
                 if a.vector_saturate { "_sat" } else { "" },
                 dest(self, a.vector_dest, a.vector_dest_relative),
-                mask(a.vector_write_mask),
+                mask(a.vector_write_mask & !one),
                 srcs.join(", ")
             ));
         }
@@ -444,7 +450,7 @@ impl Dis {
                 snake(format!("{:?}", a.scalar_op)),
                 if a.scalar_saturate { "_sat" } else { "" },
                 dest(self, r, rel),
-                mask(a.scalar_write_mask),
+                mask(a.scalar_write_mask & !one),
                 if srcs.is_empty() { "" } else { ", " }
             ));
         }
@@ -456,6 +462,11 @@ impl Dis {
         } else {
             ""
         };
-        format!("{}{}{zero}", pred(a.predicate), parts.join(" + "))
+        let one = if one != 0 {
+            format!(" one {}", mask(one))
+        } else {
+            String::new()
+        };
+        format!("{}{}{one}{zero}", pred(a.predicate), parts.join(" + "))
     }
 }
