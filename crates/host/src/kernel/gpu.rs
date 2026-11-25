@@ -182,7 +182,7 @@ impl DrawStats {
             format!("{} ({:.1} MB)", count / n, mb(bytes))
         };
         format!(
-            "[draw] {:.1} s: {} frames, {} replays; ms per {per}: drawer {:.0} = shaders {:.0}, \
+            "[draw] {:.1} s: {} frames, {} replays; ms per {per}: drawer {:.0} = shaders {:.0} (pipelines {:.0}), \
              guest data {:.0}, textures {:.0}, submit {:.0}, gpu wait {:.0}, readback {:.0}, \
              resolve cpu {:.0}, clears {:.0}, swap {:.0} (transfers {:.0}); per {per}: {} draws, \
              {} resolves, {} submits ({} resolve, {} transfer, {} decode, {} flush/other), {} transfers ({} passes), readback {:.1} MB, \
@@ -194,6 +194,7 @@ impl DrawStats {
             self.replays,
             ms(self.busy),
             ms(t.shaders),
+            ms(t.pipeline),
             ms(t.guest_data),
             ms(t.textures),
             ms(t.submit),

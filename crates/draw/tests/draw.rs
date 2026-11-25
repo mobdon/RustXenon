@@ -1305,3 +1305,90 @@ fn pixel_param_gen_point_flag() {
         assert!(near(p, want, 1), "SQ_PROGRAM_CNTL {program_cntl:#x}: {p:?}");
     }
 }
+
+/// Draws the triangle of `triangle_interpolates_vertex_colours` and
+/// returns the report and the render target.
+fn draw_triangle(d: &mut xenon_draw::Drawer) -> (xenon_draw::Report, Vec<u8>) {
+    let mut mem = memory();
+    mem.write_words(
+        VERTS,
+        &color_verts(&[
+            (-1.0, 1.0, 0.0, [255, 0, 0, 255]),
+            (1.0, 1.0, 0.0, [0, 255, 0, 255]),
+            (-1.0, -1.0, 0.0, [0, 0, 255, 255]),
+        ]),
+    );
+    let half = (W / 2) as f32;
+    let mut s = Stream::default();
+    s.setup()
+        .resolve(&mut mem, W, H, false, Some((rgba(CLEAR), 0)))
+        .regs(PA_CL_VTE_CNTL, &[0x3F | (1 << 10)])
+        .regs(PA_SU_VTX_CNTL, &[0])
+        .regs(
+            PA_CL_VPORT_XSCALE,
+            &[f(half), f(half), f(-half), f(half), f(1.0), f(0.0)],
+        )
+        .shader(false, &vs_color())
+        .shader(true, &ps_interp())
+        .vertex_fetch(0, VERTS, 12)
+        .draw_auto(PRIM_TRI_LIST, 3);
+    let report = run(d, &s, &mut mem);
+    assert_eq!(report.draws, 1, "{report:?}");
+    assert!(report.unsupported.is_empty(), "{report:?}");
+    let img = d.read_render_target(COLOR_KEY, 0, 0, W, H).unwrap();
+    assert!(near(px(&img, W, 8, 8), [191, 32, 32, 255], 2));
+    (report, img)
+}
+
+/// The pipeline cache file is written when the drawer drops, read by the
+/// next drawer, and replaced when it is garbage or from another adapter;
+/// the drawer draws the same with and without it.
+#[test]
+fn pipeline_cache_persists_across_drawers() {
+    let dir = std::env::temp_dir().join(format!("xenon-pipeline-cache-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let reference = {
+        let Some(mut d) = drawer() else { return };
+        // No cache set: nothing to save.
+        d.save_pipeline_cache().unwrap();
+        let (report, img) = draw_triangle(&mut d);
+        assert!(report.timings.pipelines_created >= 1, "{report:?}");
+        assert!(report.timings.pipeline > std::time::Duration::ZERO);
+        img
+    };
+    let file = {
+        let mut d = drawer().unwrap();
+        let Some(file) = d.set_pipeline_cache_dir(&dir).unwrap() else {
+            eprintln!("SKIP: no pipeline cache on {}", d.adapter);
+            return;
+        };
+        assert!(!file.exists());
+        assert_eq!(draw_triangle(&mut d).1, reference);
+        file
+    };
+    let saved = std::fs::read(&file).unwrap();
+    assert!(saved.starts_with(b"WGPUPLCH"), "{} bytes", saved.len());
+    assert!(!file.with_extension("tmp").exists());
+    // Reloaded: same drawing, and saved again (the driver's data may
+    // grow but keeps wgpu's header).
+    {
+        let mut d = drawer().unwrap();
+        assert_eq!(d.set_pipeline_cache_dir(&dir).unwrap(), Some(file.clone()));
+        assert_eq!(draw_triangle(&mut d).1, reference);
+    }
+    assert_eq!(std::fs::read(&file).unwrap()[..32], saved[..32]);
+    // Garbage, then a header for another adapter (wgpu refuses that one
+    // even with `fallback`): an empty cache instead, and a valid file after.
+    let mut other = saved.clone();
+    other[20] ^= 0xFF;
+    for bad in [b"not a cache".to_vec(), other] {
+        std::fs::write(&file, bad).unwrap();
+        {
+            let mut d = drawer().unwrap();
+            assert_eq!(d.set_pipeline_cache_dir(&dir).unwrap(), Some(file.clone()));
+            assert_eq!(draw_triangle(&mut d).1, reference);
+        }
+        assert_eq!(std::fs::read(&file).unwrap()[..32], saved[..32]);
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
