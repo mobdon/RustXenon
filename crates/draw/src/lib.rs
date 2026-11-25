@@ -1118,6 +1118,10 @@ pub struct Drawer {
     /// append, and staging starts again at 0 only when it is full.
     staged: Vec<u8>,
     staged_base: u64,
+    /// This replay began with guest memory listing the pages written since
+    /// the last ([`GuestMemory::take_written`]), so the arena and
+    /// `window_memo` are kept across replays and dropped only where written.
+    watching: bool,
     /// Mapped upload chunks for `staged`, kept and reused across flushes:
     /// `queue.write_buffer` took a fresh staging buffer per flush, whose
     /// pages the copy faulted in every time.
@@ -1285,6 +1289,14 @@ const TEXTURE_GROUP_CAP: usize = 4096;
 
 /// Smallest draw upload arena; it grows to fit a larger draw.
 const ARENA_MIN: u64 = 16 << 20;
+
+/// Smallest arena while guest memory lists its writes: vertex windows then
+/// stay staged across replays until written, so the arena holds several
+/// frames of them instead of being refilled every frame.
+const ARENA_WATCHED: u64 = 256 << 20;
+
+/// Largest CPU-side staging capacity reserved up front.
+const STAGED_RESERVE: u64 = 64 << 20;
 
 /// Time since `t`, restarting `t`.
 fn lap(t: &mut Instant) -> Duration {
@@ -1813,6 +1825,7 @@ impl Drawer {
             window_memo: BTreeMap::new(),
             staged_consts: None,
             staged_base: 0,
+            watching: false,
             belt: wgpu::util::StagingBelt::new(device_for_belt, 4 << 20),
             submitter,
             pre: None,
@@ -2170,11 +2183,18 @@ impl Drawer {
         self.timings = Timings::default();
         match mem.take_written() {
             Some(written) if self.texture_memo.len() < TEXTURE_MEMO_CAP => {
+                self.watching = true;
                 for (lo, hi) in written {
                     self.forget_guest(lo, hi);
                 }
             }
-            _ => self.texture_memo.clear(),
+            _ => {
+                self.watching = false;
+                self.texture_memo.clear();
+                // Windows staged by a watched replay: anything may have
+                // changed since.
+                self.wrap();
+            }
         }
         self.replays += 1;
         for m in &mut self.mirrors {
@@ -2198,7 +2218,9 @@ impl Drawer {
         self.batch = None;
         self.pre = None;
         self.texture_groups.clear();
-        self.wrap();
+        if !self.watching || done.is_err() {
+            self.wrap();
+        }
         // Resolves done before an error still reach guest memory.
         let kept = self.finish_mirrors(&mut mem);
         done?;
@@ -2740,15 +2762,21 @@ impl Drawer {
         if self.staged_base + self.staged.len() as u64 + need > have {
             self.flush()?;
             self.wrap();
-            if need > have {
+            // A watched replay grows an arena made before it to keep windows.
+            if need > have || (self.watching && have < ARENA_WATCHED.min(self.max_buffer)) {
                 if need > self.max_buffer {
                     return unsupported(format!("{need} bytes of draw data"));
                 }
-                let size = need.max(ARENA_MIN).next_power_of_two().min(self.max_buffer);
+                let min = if self.watching {
+                    ARENA_WATCHED
+                } else {
+                    ARENA_MIN
+                };
+                let size = need.max(min).next_power_of_two().min(self.max_buffer);
                 // Flushed, so empty: the batch never stages more than the
                 // arena holds, so it never grows past this (a Vec doubling
                 // from an odd size would).
-                self.staged = Vec::with_capacity(size as usize);
+                self.staged = Vec::with_capacity(size.min(STAGED_RESERVE) as usize);
                 self.arena_groups.clear();
                 self.arena = Some(self.device.create_buffer(&wgpu::BufferDescriptor {
                     label: Some("draw arena"),
