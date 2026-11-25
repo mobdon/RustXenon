@@ -778,7 +778,8 @@ const TARGET_CAP: u64 = 256 << 20;
 pub struct Drawer {
     device: wgpu::Device,
     queue: wgpu::Queue,
-    /// Adapter name and backend, for logs.
+    /// Adapter name, backend and device type (a software one is `Cpu`),
+    /// for logs.
     pub adapter: String,
     /// Bound on every GPU wait and buffer map.
     pub timeout: Duration,
@@ -1135,14 +1136,15 @@ fn filter(f: u8) -> wgpu::FilterMode {
 }
 
 impl Drawer {
-    /// Opens a headless device: Vulkan or GL, default power preference,
-    /// first without and then with `force_fallback_adapter`.
+    /// Opens a headless device: Vulkan or GL, preferring the discrete GPU
+    /// (a desktop's integrated one would otherwise be picked first), first
+    /// without and then with `force_fallback_adapter`.
     pub fn new() -> Result<Drawer, Error> {
         let mut desc = wgpu::InstanceDescriptor::new_without_display_handle();
         desc.backends = wgpu::Backends::VULKAN | wgpu::Backends::GL;
         let instance = wgpu::Instance::new(desc);
         let options = |force_fallback_adapter| wgpu::RequestAdapterOptions {
-            power_preference: wgpu::PowerPreference::default(),
+            power_preference: wgpu::PowerPreference::HighPerformance,
             force_fallback_adapter,
             compatible_surface: None,
             apply_limit_buckets: false,
@@ -1254,7 +1256,7 @@ impl Drawer {
         Ok(Drawer {
             device,
             queue,
-            adapter: format!("{} ({:?})", info.name, info.backend),
+            adapter: format!("{} ({:?}, {:?})", info.name, info.backend, info.device_type),
             timeout: DEFAULT_TIMEOUT,
             regs: RegisterFile::default(),
             vs: None,
