@@ -62,6 +62,21 @@ pub fn skip_draws(cmds: &[Command], lo: u32, hi: u32) -> (Vec<Command>, u32) {
     (out, n)
 }
 
+/// The commands up to and including draw `k` of the last frame (counted
+/// from 1), to look at the render targets as that draw left them.
+pub fn cut_after_draw(cmds: &[Command], k: u32) -> Vec<Command> {
+    let start = last_frame_start(&skip_draws(cmds, 1, 0).0);
+    let mut n = 0;
+    let end = cmds[start..]
+        .iter()
+        .position(|c| {
+            n += u32::from(matches!(c, Command::Draw(_)));
+            n == k && matches!(c, Command::Draw(_))
+        })
+        .map_or(cmds.len(), |i| start + i + 1);
+    cmds[..end].to_vec()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -96,6 +111,14 @@ mod tests {
         assert_eq!(n, 4);
         assert_eq!(out, vec![draw(1), swap(), draw(2), draw(5), swap()]);
         assert_eq!(skip_draws(&cmds, 1, 0).0, whole);
+    }
+
+    #[test]
+    fn cuts_after_a_draw_of_the_last_frame() {
+        let cmds = vec![draw(1), swap(), draw(2), swap(), draw(3), draw(4), swap()];
+        assert_eq!(cut_after_draw(&cmds, 1), cmds[..5].to_vec());
+        assert_eq!(cut_after_draw(&cmds, 2), cmds[..6].to_vec());
+        assert_eq!(cut_after_draw(&cmds, 9), cmds);
     }
 
     #[test]

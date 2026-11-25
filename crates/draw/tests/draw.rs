@@ -627,6 +627,14 @@ fn bundle_replays_with_a_draw_skipped() {
     assert_eq!((r.frames.len(), r.draws), (2, 1), "{r:?}");
     let frame = &r.frames[1].rgba8;
     assert!(frame.chunks_exact(4).all(|p| p == CLEAR));
+
+    // Stopped after the last frame's draw, its target holds the pattern.
+    let cut = xenon_gpu::bundle::cut_after_draw(&cmds, 1);
+    d.replay(&cut, &mut back).unwrap();
+    let (w, h) = d.render_target_size(COLOR_KEY).unwrap();
+    assert!(w >= W && h >= H, "{w}x{h}");
+    let rt = d.read_render_target(COLOR_KEY, 0, 0, w, h).unwrap();
+    assert_ne!(px(&rt, w, 2, 2), CLEAR);
 }
 
 /// Unsupported render target formats and primitive types are reported and

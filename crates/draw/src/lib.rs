@@ -2276,6 +2276,11 @@ impl Drawer {
         self.targets.keys().copied().collect()
     }
 
+    /// Width and height of the host texture behind render target `key`.
+    pub fn render_target_size(&self, key: RenderTargetKey) -> Option<(u32, u32)> {
+        self.targets.get(&key).map(|t| (t.width(), t.height()))
+    }
+
     /// Replays `commands` in order. Register writes, shader loads, draws,
     /// resolves, swaps and MEM_WRITE packets are executed; other commands
     /// (waits, events, interrupts, queries) are ignored.
