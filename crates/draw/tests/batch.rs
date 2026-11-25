@@ -112,8 +112,8 @@ fn resolve_sees_batched_draws() {
     assert_eq!((report.draws, report.resolves), (2, 1), "{report:?}");
     let t = &report.timings;
     assert_eq!(t.submits_by_site.iter().sum::<u32>(), t.submits, "{t:?}");
-    // One resolve copy; the clears go with the second draw.
-    assert_eq!(t.submits_by_site[..3], [1, 0, 0], "{t:?}");
+    // The copy and clears go into the batch with the draws.
+    assert_eq!(t.submits_by_site[..3], [0, 0, 0], "{t:?}");
     // The resolve's flush ends the first draw's pass.
     assert_eq!(t.render_passes, 2, "{t:?}");
     assert!(t.queue <= t.submit, "{t:?}");
@@ -596,11 +596,11 @@ fn resolve_clears_join_the_next_batch() {
     let img = d.read_render_target(COLOR_KEY, 0, 0, W, H).unwrap();
     assert_eq!(px(&img, W, 10, 10), BLUE);
     assert_eq!(px(&img, W, 40, 40), GREEN);
-    // Two copies and five flushes and write-backs (the second resolve's
-    // flush submits the clears): 7, where a submit per clear made 8.
+    // The copies and clears are recorded in the batch: 4 flushes and
+    // write-backs, where a submit per copy and a flush before each made 7.
     let t = &report.timings;
-    assert_eq!(t.submits_by_site, [2, 0, 0, 5], "{t:?}");
-    assert_eq!(t.submits, 7, "{t:?}");
+    assert_eq!(t.submits_by_site, [0, 0, 0, 4], "{t:?}");
+    assert_eq!(t.submits, 4, "{t:?}");
 }
 
 /// A resolve copy taken on the CPU (16_16_FLOAT destination) counts its

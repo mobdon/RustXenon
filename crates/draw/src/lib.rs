@@ -952,6 +952,10 @@ pub struct Drawer {
     /// Kept-resolve texture decodes recorded since the last flush,
     /// submitted with (before) the batch's draws.
     pre: Option<wgpu::CommandEncoder>,
+    /// A GPU resolve is recorded in the batch, not yet submitted: what
+    /// reads kept resolve buffers on its own (write-back, decodes, which
+    /// run before the batch) flushes first.
+    resolve_pending: bool,
     max_buffer: u64,
     /// 1x1 texture of zeros bound for a slot without a usable texture.
     zero_texture: wgpu::TextureView,
@@ -1553,6 +1557,7 @@ impl Drawer {
             staged_consts: None,
             staged_base: 0,
             pre: None,
+            resolve_pending: false,
             arena_align: u64::from(
                 limits
                     .min_uniform_buffer_offset_alignment
@@ -2087,6 +2092,12 @@ impl Drawer {
         let Some(enc) = enc else {
             return Ok(());
         };
+        if self.resolve_pending {
+            self.flush().map_err(|e| match e {
+                Skip::Fatal(e) => e,
+                Skip::Unsupported(why) => Error::Gpu(why),
+            })?;
+        }
         let mut t = Instant::now();
         self.wait_idle()?;
         self.timings.gpu_wait += lap(&mut t);
@@ -2218,6 +2229,7 @@ impl Drawer {
             self.staged_base += self.staged.len() as u64;
             self.staged.clear();
         }
+        self.resolve_pending = false;
         let (pre, batch) = (self.pre.take(), self.batch.take());
         if pre.is_none() && batch.is_none() {
             let e = t.elapsed();
@@ -3406,6 +3418,10 @@ impl Drawer {
         if let Some(t0) = t0 {
             self.pipeline_made(t0);
         }
+        // The decode runs before the batch, so after a resolve in it.
+        if self.resolve_pending {
+            self.flush()?;
+        }
         let pipeline = &pipeline;
         let mut enc = self
             .pre
@@ -4444,8 +4460,8 @@ impl Drawer {
         mem: &mut Tracked,
         report: &mut Report,
     ) -> Result<bool, Skip> {
-        // The copy and clears see every draw before them.
-        self.flush()?;
+        // The copy and clears are recorded after every draw before them (a
+        // CPU copy flushes first).
         let v = u64::from(r.vertex_fetch0.address & PHYSICAL_MASK);
         self.sync(mem, v, v + 24)?;
         if r.msaa_samples != 0 {
@@ -4596,6 +4612,7 @@ impl Drawer {
         {
             self.sync(mem, base, base + u64::from(extent))?;
         }
+        self.flush()?;
         let mut t = Instant::now();
         self.wait_idle()?;
         self.timings.gpu_wait += lap(&mut t);
@@ -4793,21 +4810,25 @@ impl Drawer {
             layout: &pipeline.get_bind_group_layout(0),
             entries: &entries,
         });
-        let mut enc = self.device.create_command_encoder(&Default::default());
+        // Recorded in the batch after its draws, which end their render
+        // pass here; submitted with them.
+        let device = &self.device;
+        let batch = self.batch.get_or_insert_with(|| Batch {
+            pass: None,
+            enc: device.create_command_encoder(&Default::default()),
+        });
+        batch.pass = None;
         {
-            let mut pass = enc.begin_compute_pass(&Default::default());
+            let mut pass = batch.enc.begin_compute_pass(&Default::default());
             pass.set_pipeline(pipeline);
             pass.set_bind_group(0, &bg, &[]);
             pass.dispatch_workgroups(rect.width().div_ceil(8), rect.height().div_ceil(8), 1);
         }
+        self.resolve_pending = true;
         self.timings.resolve_cpu += lap(&mut t);
-        self.queue.submit([enc.finish()]);
-        self.submitted(Site::Resolve);
         if let Some(e) = block_on(scope.pop()) {
             return Err(Skip::Fatal(Error::Gpu(e.to_string())));
         }
-        // A software driver finishes the rendering before it here.
-        self.timings.gpu_wait += lap(&mut t);
         let m = &mut self.mirrors[i];
         let (mut a, mut b) = (lo, hi);
         m.dirty.retain(|&(x, y)| {
