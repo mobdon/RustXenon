@@ -1291,6 +1291,11 @@ pub struct Drawer {
     /// The front buffer copy queued at the last swap, see
     /// [`Drawer::late_front_buffer`].
     late_front: Option<LateFront>,
+    /// Records kept-texture decodes after a resolve in the open batch
+    /// instead of flushing it first (`XENON_DECODE_IN_BATCH=1`). Off by
+    /// default: with it, a frame went in a few batches of thousands of
+    /// draws, and a machine's GPU driver hung.
+    decode_in_batch: bool,
     late: Option<(Vec<Vec<Option<u64>>>, WriteBack)>,
     /// Bytes of decoded guest textures the texture cache keeps before
     /// evicting the least recently used ones (default 256 MiB).
@@ -2016,6 +2021,7 @@ impl Drawer {
             late_writeback: std::env::var("XENON_RESOLVE_WRITEBACK").as_deref() == Ok("late"),
             late_front_buffer: std::env::var("XENON_LATE_FRAME").as_deref() == Ok("1"),
             late_front: None,
+            decode_in_batch: std::env::var("XENON_DECODE_IN_BATCH").as_deref() == Ok("1"),
             late: None,
             texture_cache_limit: TEXTURE_CACHE_LIMIT,
             texture_cache_count: TEXTURE_CACHE_COUNT,
@@ -4136,10 +4142,15 @@ impl Drawer {
         if let Some(t0) = t0 {
             self.pipeline_made(t0);
         }
-        // After a resolve recorded in the batch, the decode is recorded
-        // there too, after it, instead of flushing the batch to run it
-        // before the next one: the batch's earlier draws still sample the
-        // old texels first. Otherwise it runs before the batch (`pre`).
+        // After a resolve recorded in the batch, the decode runs after it:
+        // by default the batch is flushed and the decode runs before the
+        // next one (`pre`). With `decode_in_batch` it is recorded in the
+        // batch instead, after the resolve, so the batch's earlier draws
+        // still sample the old texels first; batches then grow to a whole
+        // frame, which hung a whole machine's GPU driver.
+        if self.resolve_pending && !self.decode_in_batch {
+            self.flush()?;
+        }
         let mut batch = match self.resolve_pending {
             true => self.batch.take(),
             false => None,
