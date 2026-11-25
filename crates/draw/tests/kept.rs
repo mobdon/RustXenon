@@ -448,3 +448,122 @@ fn cpu_write_during_a_replay_takes_the_guest_path() {
     assert_eq!(img, guest_path(&mem, f));
     assert!(img.chunks(4).any(|p| p == [0x55; 4]));
 }
+
+/// A kept buffer over three 64x32 tiles, resolved whole by one replay; the
+/// next replays (two per frame) resolve the first tile, then the first and
+/// last: each reads back and hashes only the tiles it resolved, not the
+/// middle one or the whole buffer, and writes back exactly those to guest
+/// memory. The CPU wrote the middle tile, which no replay uses, so a
+/// write-back of the buffer's older copy of it would show.
+#[test]
+fn write_back_reads_back_only_resolved_bytes() {
+    let tile = W * 32 * 4;
+    let tiles = [DEST, DEST + tile, DEST + 2 * tile];
+    let bytes = |mem: &SliceMemory, t: u32| mem.data[t as usize..][..tile as usize].to_vec();
+    let Some(mut d) = drawer() else { return };
+    let mut mem = memory();
+    vertices(&mut mem);
+    let mut s = Stream::default();
+    paint(s.setup());
+    for t in tiles {
+        resolve_to(&mut s, &mut mem, W, 32, t);
+    }
+    run(&mut d, &s, &mut mem);
+    mem.data[tiles[1] as usize..][..tile as usize].fill(0x55);
+    for (resolved, read) in [(&tiles[..1], tile), (&[tiles[0], tiles[2]][..], 2 * tile)] {
+        let mut s = Stream::default();
+        paint_small(s.setup());
+        for &t in resolved {
+            resolve_to(&mut s, &mut mem, W, 32, t);
+        }
+        let before = mem.clone();
+        let r = run(&mut d, &s, &mut mem);
+        assert!(r.unsupported.is_empty(), "{r:?}");
+        assert_eq!(r.timings.readback_bytes, u64::from(read), "{r:?}");
+        // Checked before the resolves, hashed again at write-back.
+        assert_eq!(r.timings.kept_hashed_bytes, u64::from(2 * read), "{r:?}");
+        let top = d.read_render_target(COLOR_KEY, 0, 0, W, 32).unwrap();
+        assert_eq!(px(&top, W, 5, 5), [10, 20, 230, 255]);
+        for t in tiles {
+            if resolved.contains(&t) {
+                assert_eq!(detiled(&mem, t, W, 32, W, 4), top, "tile 0x{t:X}");
+            } else {
+                assert_eq!(bytes(&mem, t), bytes(&before, t), "tile 0x{t:X}");
+            }
+        }
+    }
+}
+
+/// A resolve into a kept buffer at a word aligned destination that is not
+/// block aligned: the guest bytes under it are the target's, and the bytes
+/// beside it in the same blocks keep what guest memory held.
+#[test]
+fn write_back_mid_block_keeps_the_bytes_beside_it() {
+    let tile = W * 32 * 4;
+    let at = DEST + 0x100;
+    let Some(mut d) = drawer() else { return };
+    let mut mem = memory();
+    vertices(&mut mem);
+    let mut s = Stream::default();
+    paint(s.setup());
+    resolve_to(&mut s, &mut mem, W, 32, DEST);
+    resolve_to(&mut s, &mut mem, W, 32, DEST + tile);
+    run(&mut d, &s, &mut mem);
+    let mut s = Stream::default();
+    paint_small(s.setup());
+    resolve_to(&mut s, &mut mem, W, 32, at);
+    let before = mem.clone();
+    let r = run(&mut d, &s, &mut mem);
+    assert!(r.unsupported.is_empty(), "{r:?}");
+    // Still the kept buffer: two blocks of the first tile and one of the
+    // second come back, not the whole buffer.
+    assert_eq!(r.timings.readback_bytes, u64::from(tile + 4096), "{r:?}");
+    let top = d.read_render_target(COLOR_KEY, 0, 0, W, 32).unwrap();
+    assert_eq!(detiled(&mem, at, W, 32, W, 4), top);
+    let around = |m: &SliceMemory| {
+        let (lo, hi) = (DEST as usize, (at + tile) as usize);
+        (
+            m.data[lo..lo + 0x100].to_vec(),
+            m.data[hi..hi + 4096 - 0x100].to_vec(),
+        )
+    };
+    assert_eq!(around(&mem), around(&before));
+}
+
+/// A resolve into a destination twice as wide as the rectangle, sampled
+/// with that pitch: the kept texture is the target's pixels column for
+/// column, as the guest path draws them.
+#[test]
+fn wider_destination_pitch_keeps_the_columns() {
+    let mut wide = fetch(6, 2, IDENTITY);
+    wide[0] = (wide[0] & !(0x1FF << 22)) | (((2 * W) >> 5) << 22);
+    let Some(mut d) = drawer() else { return };
+    let mut mem = memory();
+    vertices(&mut mem);
+    let mut s = Stream::default();
+    paint(s.setup());
+    let (wf, hf) = (W as f32, H as f32);
+    mem.write_words(RECT, &[f(0.0), f(0.0), f(wf), f(0.0), f(wf), f(hf)]);
+    s.vertex_fetch(0, RECT, 6)
+        .regs(RB_MODECONTROL, &[6])
+        .regs(
+            RB_COPY_CONTROL,
+            &[
+                COPY_CONVERT,
+                DEST,
+                (2 * W) | (H << 16),
+                dest_info(6, 0, false),
+            ],
+        )
+        .draw_auto(PRIM_RECT_LIST, 3)
+        .regs(RB_MODECONTROL, &[4]);
+    sample(&mut s, wide);
+    let r = run(&mut d, &s, &mut mem);
+    assert!(r.unsupported.is_empty(), "{r:?}");
+    assert_eq!(r.timings.textures_kept, 1, "{r:?}");
+    let painted = d.read_render_target(COLOR_KEY, 0, 0, W, H).unwrap();
+    let kept = d.read_render_target(OUT, 0, 0, W, H).unwrap();
+    drop(d);
+    assert_eq!(kept, painted);
+    assert_eq!(kept, guest_path(&mem, wide));
+}

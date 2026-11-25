@@ -138,7 +138,7 @@ impl DrawStats {
              guest data {:.0}, textures {:.0}, submit {:.0}, gpu wait {:.0}, readback {:.0}, \
              resolve cpu {:.0}, clears {:.0}, swap {:.0} (transfers {:.0}); per {per}: {} draws, \
              {} resolves, {} submits, {} transfers ({} passes), readback {:.1} MB, \
-             hashed {:.1} MB, {} textures uploaded ({:.1} MB, {} evicted before), \
+             hashed {:.1} MB (kept resolves {:.1} MB), {} textures uploaded ({:.1} MB, {} evicted before), \
              {} evicted, {} from kept resolves, {} pipelines created; guest data {:.1} MB; \
              uploads by format: rgba8 {}, bc {}, f16 {}, f32 {}, other {}",
             window.as_secs_f64(),
@@ -162,6 +162,7 @@ impl DrawStats {
             t.transfer_passes / n,
             mb(t.readback_bytes),
             mb(t.hashed_bytes),
+            mb(t.kept_hashed_bytes),
             t.textures_uploaded / n,
             mb(t.texture_bytes),
             t.textures_reuploaded / n,
