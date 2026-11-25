@@ -7,7 +7,8 @@
 //!
 //! cargo run --release -p xenon-draw --example bench -- [frames] [draws] [points] [resolves]
 //!
-//! A world frame is about `4 3000 384 40`.
+//! A world frame is about `4 3000 384 40`. `XENON_PIPELINE_CACHE=<dir>`
+//! keeps the pipeline cache there (frame 0 shows the pipeline time).
 
 #[path = "../tests/common/mod.rs"]
 mod common;
@@ -44,6 +45,13 @@ fn main() {
         }
     };
     println!("adapter: {}", d.adapter);
+    // A second run with the same directory starts with the pipelines warm.
+    if let Some(dir) = std::env::var_os("XENON_PIPELINE_CACHE") {
+        println!(
+            "pipeline cache: {:?}",
+            d.set_pipeline_cache_dir(dir.as_ref())
+        );
+    }
     let mut mem = xenon_gpu::SliceMemory {
         base: 0,
         data: vec![0; 0xA0_0000],

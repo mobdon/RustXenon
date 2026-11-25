@@ -167,7 +167,7 @@ pub mod state;
 
 use std::collections::hash_map::DefaultHasher;
 use std::collections::hash_map::Entry;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex};
@@ -375,6 +375,10 @@ pub struct Timings {
     /// EDRAM ownership transfers between colour and depth targets (also
     /// counted in the phase that needed the target).
     pub transfer: Duration,
+    /// Of all the phases, the time spent in `create_render_pipeline` and
+    /// `create_compute_pipeline` (where a driver compiles to machine
+    /// code), including the pipelines' share of `shaders`.
+    pub pipeline: Duration,
     /// Counts: pipelines and shader modules created, textures uploaded.
     pub pipelines_created: u32,
     pub textures_uploaded: u32,
@@ -382,8 +386,9 @@ pub struct Timings {
     pub submits: u32,
     /// `submits` by where they come from: resolve copies (GPU copies and
     /// CPU resolve readbacks), EDRAM transfers, kept resolve texture
-    /// decodes, and batch flushes and resolve write-backs. Resolve clears
-    /// are recorded into the next batch.
+    /// decodes with no draw to batch them with, and batch flushes and
+    /// resolve write-backs. Resolve clears and texture decodes are
+    /// recorded into the next batch.
     pub submits_by_site: [u32; 4],
     pub texture_bytes: u64,
     /// Guest vertex window bytes read (not those of reused windows).
@@ -436,6 +441,7 @@ impl std::ops::AddAssign<&Timings> for Timings {
         self.clears += t.clears;
         self.swap += t.swap;
         self.transfer += t.transfer;
+        self.pipeline += t.pipeline;
         self.pipelines_created += t.pipelines_created;
         self.textures_uploaded += t.textures_uploaded;
         self.submits += t.submits;
@@ -728,6 +734,17 @@ fn transferable(a: TargetFormat, b: TargetFormat) -> bool {
 /// about 1.6 MB of driver memory.
 const PIPELINE_CAP: usize = 1024;
 
+/// New pipelines between writes of the pipeline cache file.
+const PIPELINE_SAVE_EVERY: u32 = 16;
+
+/// A pipeline cache loaded from and saved to a file.
+struct DiskCache {
+    cache: wgpu::PipelineCache,
+    path: std::path::PathBuf,
+    /// Pipelines created since the file was last written.
+    unsaved: u32,
+}
+
 /// A draw's texture slot mask and its slots' views and samplers, in slot
 /// order.
 type TextureGroupKey = (u32, Vec<(wgpu::TextureView, wgpu::Sampler)>);
@@ -903,19 +920,28 @@ pub struct Drawer {
     /// Group 0 bind groups over `arena`, by the sizes of the four slices
     /// they bind (at dynamic offsets). Cleared when the arena is replaced.
     arena_groups: HashMap<[u64; 4], wgpu::BindGroup>,
-    /// Draw buffers (guest window, constants, epilogue, indices) of the
-    /// batch, as slices of `arena`, written to it once at submit.
+    /// Draw buffers (guest window, constants, epilogue, indices) staged
+    /// since the last flush, as slices of `arena` from `staged_base`,
+    /// written to it at the next flush. The arena is a ring: flushes
+    /// append, and staging starts again at 0 only when it is full.
     staged: Vec<u8>,
+    staged_base: u64,
     arena: Option<wgpu::Buffer>,
     arena_align: u64,
-    /// Vertex windows staged in the batch: guest physical `[lo, hi)` and
-    /// their (offset, size) in `arena`. Cleared at each flush, as the next
-    /// batch overwrites the arena, and dropped where guest memory changes.
-    window_memo: Vec<(u64, u64, (u64, u64))>,
-    /// The last `Consts` block staged in the batch and its (offset, size)
-    /// in `arena`, bound again by a draw with the same bytes. Cleared with
-    /// `window_memo` at each flush.
+    /// Vertex windows staged in the arena since it last wrapped: guest
+    /// physical `lo` to `hi` and their (offset, size) in `arena`. Cleared
+    /// when the arena wraps or grows and at the end of a replay, and
+    /// dropped where guest memory changes (see `forget_guest`). No window
+    /// holds another, so `hi` grows with `lo` and the one window that can
+    /// hold a range is the last starting at or before it.
+    window_memo: BTreeMap<u64, (u64, (u64, u64))>,
+    /// The last `Consts` block staged in the arena and its (offset, size),
+    /// bound again by a draw with the same bytes. Cleared with
+    /// `window_memo` when the arena wraps or grows.
     staged_consts: Option<(Vec<u8>, (u64, u64))>,
+    /// Kept-resolve texture decodes recorded since the last flush,
+    /// submitted with (before) the batch's draws.
+    pre: Option<wgpu::CommandEncoder>,
     max_buffer: u64,
     /// 1x1 texture of zeros bound for a slot without a usable texture.
     zero_texture: wgpu::TextureView,
@@ -966,11 +992,23 @@ pub struct Drawer {
     /// (such as a cube or 3D fetch) do not log.
     pub texture_log: Option<Option<u64>>,
     timings: Timings,
+    /// File name for the pipeline cache of this adapter, when the device
+    /// has `PIPELINE_CACHE` (Vulkan only).
+    cache_key: Option<String>,
+    disk_cache: Option<DiskCache>,
     uncaptured: Arc<Mutex<Vec<String>>>,
     max_dim: u32,
     max_storage: u64,
     /// Last, so it drops after the device and every resource made from it.
     instance: wgpu::Instance,
+}
+
+impl Drop for Drawer {
+    fn drop(&mut self) {
+        if let Err(e) = self.save_pipeline_cache() {
+            eprintln!("[draw] pipeline cache not saved: {e}");
+        }
+    }
 }
 
 /// Draws recorded into one command encoder, in one render pass while the
@@ -1381,6 +1419,7 @@ impl Drawer {
             & (wgpu::Features::FLOAT32_FILTERABLE | wgpu::Features::TEXTURE_COMPRESSION_BC);
         required_features.set(wgpu::Features::DEPTH32FLOAT_STENCIL8, float_stencil);
         required_features.set(snorm16_features, snorm16);
+        required_features |= adapter.features() & wgpu::Features::PIPELINE_CACHE;
         let (device, queue) = block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("xenon-draw"),
             required_limits: limits.clone(),
@@ -1496,8 +1535,10 @@ impl Drawer {
             arena_groups: HashMap::new(),
             staged: Vec::new(),
             arena: None,
-            window_memo: Vec::new(),
+            window_memo: BTreeMap::new(),
             staged_consts: None,
+            staged_base: 0,
+            pre: None,
             arena_align: u64::from(
                 limits
                     .min_uniform_buffer_offset_alignment
@@ -1531,10 +1572,113 @@ impl Drawer {
                     }
                 }),
             timings: Timings::default(),
+            cache_key: required_features
+                .contains(wgpu::Features::PIPELINE_CACHE)
+                .then(|| wgpu::util::pipeline_cache_key(&info))
+                .flatten(),
+            disk_cache: None,
             uncaptured,
             max_dim: limits.max_texture_dimension_2d,
             max_storage: limits.max_storage_buffer_binding_size,
         })
+    }
+
+    /// Keeps compiled pipelines in a file under `dir` (made if missing),
+    /// loaded now and written every few new pipelines, when the drawer
+    /// drops and on [`Drawer::save_pipeline_cache`] (an owner that never
+    /// drops the drawer calls it now and then), so pipelines compiled in
+    /// earlier runs are not compiled again. Returns the file, or `None`
+    /// where the device has no pipeline cache (GL). A file from another
+    /// driver version, or unreadable, is replaced once a pipeline is made. Pipelines made before this call are not in the cache.
+    pub fn set_pipeline_cache_dir(
+        &mut self,
+        dir: &std::path::Path,
+    ) -> std::io::Result<Option<std::path::PathBuf>> {
+        let Some(key) = &self.cache_key else {
+            return Ok(None);
+        };
+        std::fs::create_dir_all(dir)?;
+        let path = dir.join(key);
+        let data = match std::fs::read(&path) {
+            Ok(d) => Some(d),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(e),
+        };
+        let create = |data: Option<&[u8]>| {
+            let scope = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
+            // SAFETY: the data was written by `get_data` (from the file named
+            // by this adapter's cache key); wgpu checks its header, version
+            // and adapter and falls back to an empty cache for a stale one.
+            let cache = unsafe {
+                self.device
+                    .create_pipeline_cache(&wgpu::PipelineCacheDescriptor {
+                        label: Some("pipelines"),
+                        data,
+                        fallback: true,
+                    })
+            };
+            block_on(scope.pop()).is_none().then_some(cache)
+        };
+        // wgpu refuses data for another adapter even with `fallback` (a
+        // copied file): start empty then.
+        let cache = create(data.as_deref())
+            .or_else(|| create(None))
+            .ok_or_else(|| std::io::Error::other("could not create a pipeline cache"))?;
+        self.disk_cache = Some(DiskCache {
+            cache,
+            path: path.clone(),
+            unsaved: 0,
+        });
+        Ok(Some(path))
+    }
+
+    /// Writes the pipeline cache file, if there is one (see
+    /// [`Drawer::set_pipeline_cache_dir`]) and pipelines were created since
+    /// it was last written, so it is cheap to call often; through a
+    /// temporary file of its
+    /// own so a crash, or another process saving to the same directory,
+    /// leaves a whole file (the last one renamed wins).
+    pub fn save_pipeline_cache(&mut self) -> std::io::Result<()> {
+        static SAVES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let Some(c) = &mut self.disk_cache else {
+            return Ok(());
+        };
+        if c.unsaved == 0 {
+            return Ok(());
+        }
+        c.unsaved = 0;
+        let Some(data) = c.cache.get_data() else {
+            return Ok(());
+        };
+        let n = SAVES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tmp = c
+            .path
+            .with_extension(format!("{}-{n}.tmp", std::process::id()));
+        let r = std::fs::write(&tmp, data).and_then(|()| std::fs::rename(&tmp, &c.path));
+        if r.is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+        r
+    }
+
+    /// The pipeline cache, for pipeline descriptors.
+    fn pipeline_cache(&self) -> Option<&wgpu::PipelineCache> {
+        self.disk_cache.as_ref().map(|c| &c.cache)
+    }
+
+    /// Counts a pipeline created since `t0` and writes the cache file every
+    /// [`PIPELINE_SAVE_EVERY`] new ones.
+    fn pipeline_made(&mut self, t0: Instant) {
+        self.timings.pipeline += t0.elapsed();
+        let Some(c) = &mut self.disk_cache else {
+            return;
+        };
+        c.unsaved += 1;
+        if c.unsaved >= PIPELINE_SAVE_EVERY {
+            if let Err(e) = self.save_pipeline_cache() {
+                eprintln!("[draw] pipeline cache not saved: {e}");
+            }
+        }
     }
 
     /// The drawer's register file (the state after the commands replayed).
@@ -1720,10 +1864,9 @@ impl Drawer {
         });
         let done = done.and(flushed);
         self.batch = None;
-        self.staged.clear();
-        self.window_memo.clear();
-        self.staged_consts = None;
+        self.pre = None;
         self.texture_groups.clear();
+        self.wrap();
         // Resolves done before an error still reach guest memory.
         let kept = self.finish_mirrors(&mut mem);
         done?;
@@ -1839,7 +1982,8 @@ impl Drawer {
     fn forget_guest(&mut self, lo: u64, hi: u64) {
         self.texture_memo
             .retain(|_, &mut (_, a, b)| b <= lo || hi <= a);
-        self.window_memo.retain(|&(a, b, _)| b <= lo || hi <= a);
+        self.window_memo
+            .retain(|&a, &mut (b, _)| b <= lo || hi <= a);
     }
 
     /// Hash of one [`KEPT_BLOCK`] of a kept resolve.
@@ -2046,25 +2190,43 @@ impl Drawer {
         self.timings.submits_by_site[site as usize] += 1;
     }
 
-    /// Submits the batched draws, with their staged buffers.
+    /// Submits the recorded texture decodes and the batched draws, after
+    /// writing the newly staged bytes to the arena. The windows and
+    /// constants staged so far stay in the arena for later batches.
     fn flush(&mut self) -> Result<(), Skip> {
         // The arena upload counts as submit time too.
         let t = Instant::now();
-        self.window_memo.clear();
-        self.staged_consts = None;
         self.texture_groups.clear();
         if let (Some(arena), false) = (&self.arena, self.staged.is_empty()) {
-            self.queue.write_buffer(arena, 0, &self.staged);
+            // Ordered on the queue after the work already submitted, which
+            // reads only bytes before `staged_base` (or before a wrap).
+            self.queue
+                .write_buffer(arena, self.staged_base, &self.staged);
+            self.staged_base += self.staged.len() as u64;
             self.staged.clear();
         }
-        let Some(mut batch) = self.batch.take() else {
+        let (pre, batch) = (self.pre.take(), self.batch.take());
+        if pre.is_none() && batch.is_none() {
             self.timings.submit += t.elapsed();
             return Ok(());
-        };
+        }
         let scope = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
-        drop(batch.pass.take());
-        self.queue.submit([batch.enc.finish()]);
-        self.submitted(Site::Other);
+        let site = if batch.is_some() {
+            Site::Other
+        } else {
+            Site::Decode
+        };
+        // Decodes first: the draws sample what they write, and they read
+        // kept resolves written by work submitted before.
+        let bufs = pre
+            .map(|e| e.finish())
+            .into_iter()
+            .chain(batch.map(|mut b| {
+                drop(b.pass.take());
+                b.enc.finish()
+            }));
+        self.queue.submit(bufs);
+        self.submitted(site);
         self.timings.submit += t.elapsed();
         match block_on(scope.pop()) {
             Some(e) => Err(Skip::Fatal(Error::Gpu(e.to_string()))),
@@ -2072,17 +2234,29 @@ impl Drawer {
         }
     }
 
+    /// Forgets what the arena holds, to stage from its start again: the
+    /// staged windows and constants are no longer bound by later draws.
+    /// Only after a flush, or once nothing will be submitted.
+    fn wrap(&mut self) {
+        self.staged.clear();
+        self.staged_base = 0;
+        self.window_memo.clear();
+        self.staged_consts = None;
+    }
+
     /// Copies `parts` into the batch's staging area, each at an offset
     /// aligned for uniform and storage bindings, and returns their
-    /// (offset, size) in the arena. Submits the batch first when the arena
-    /// is full, and grows the arena when one draw does not fit.
+    /// (offset, size) in the arena. Submits the batch and wraps the arena
+    /// first when it is full, and grows the arena when one draw does not
+    /// fit. A grown arena is a new buffer: submitted draws keep the old one.
     fn stage(&mut self, mem: &dyn GuestRead, parts: &[Part]) -> Result<Vec<(u64, u64)>, Skip> {
         let size = |p: &Part| (p.len() as u64).max(4).next_multiple_of(4);
         let align = self.arena_align;
         let need: u64 = parts.iter().map(|p| size(p).next_multiple_of(align)).sum();
         let have = self.arena.as_ref().map_or(0, |b| b.size());
-        if self.staged.len() as u64 + need > have {
+        if self.staged_base + self.staged.len() as u64 + need > have {
             self.flush()?;
+            self.wrap();
             if need > have {
                 if need > self.max_buffer {
                     return unsupported(format!("{need} bytes of draw data"));
@@ -2121,7 +2295,7 @@ impl Drawer {
                 }
             }
             self.staged.resize((off + size(p)) as usize, 0);
-            out.push((off, size(p)));
+            out.push((self.staged_base + off, size(p)));
             let end = self.staged.len() as u64;
             self.staged.resize(end.next_multiple_of(align) as usize, 0);
         }
@@ -2135,7 +2309,8 @@ impl Drawer {
             .iter()
             .map(|p| size(p).next_multiple_of(self.arena_align))
             .sum();
-        self.staged.len() as u64 + need <= self.arena.as_ref().map_or(0, |b| b.size())
+        self.staged_base + self.staged.len() as u64 + need
+            <= self.arena.as_ref().map_or(0, |b| b.size())
     }
 
     /// The batch's render pass, begun on `key`'s targets unless the current
@@ -2593,6 +2768,8 @@ impl Drawer {
             blend: None,
             write_mask: wgpu::ColorWrites::ALL,
         })];
+        let cache = self.pipeline_cache();
+        let t0 = Instant::now();
         let p = self.validated("transfer pipeline", |dev| {
             dev.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some("transfer"),
@@ -2626,9 +2803,10 @@ impl Drawer {
                     targets: if to_depth { &[] } else { &color_target },
                 }),
                 multiview_mask: None,
-                cache: None,
+                cache,
             })
         })?;
+        self.pipeline_made(t0);
         self.transfer_pipelines.insert((src, dst, bit), p.clone());
         Ok(p)
     }
@@ -2926,7 +3104,7 @@ impl Drawer {
     /// one after the other as one window. Returns the
     /// parts' physical `[lo, hi)` (none for no window), the window base and
     /// each constant's rebase words (see the shader binding contract); or,
-    /// when the window is one part and a window staged in this batch holds
+    /// when the window is one part and a window staged in the arena holds
     /// it, no parts, that window's base and its memo entry, with this
     /// window's size.
     #[allow(clippy::type_complexity)]
@@ -2981,9 +3159,9 @@ impl Drawer {
             return Ok((parts, 0, rebase, None));
         };
         if parts.len() == 1 {
-            let mut memo = self.window_memo.iter().rev();
-            if let Some(&w) = memo.find(|&&(a, b, _)| a <= lo && hi <= b) {
-                return Ok((Vec::new(), w.0 as u32, rebase, Some((w, hi - lo))));
+            let memo = self.window_memo.range(..=lo).next_back();
+            if let Some((&a, &(b, s))) = memo.filter(|(_, (b, _))| hi <= *b) {
+                return Ok((Vec::new(), a as u32, rebase, Some(((a, b, s), hi - lo))));
             }
         }
         // Where each part lands in the window, as `stage` lays them out.
@@ -3153,7 +3331,10 @@ impl Drawer {
         // Only the rows resolves wrote since the last decode are decoded
         // again (all levels with mips). Nothing in the open batch samples
         // the old texels: the resolve flushed it, and dropped this texture
-        // from the memo.
+        // from the memo. So the decode is recorded to run before the whole
+        // batch (`pre`), after the resolves submitted before it. A chain
+        // with a new mip count gets a new texture, decoded whole, which no
+        // recorded draw can sample yet.
         let old = self.mirrors[i]
             .views
             .get(&constant)
@@ -3184,25 +3365,35 @@ impl Drawer {
         };
         let scope = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
         let device = &self.device;
+        let cache = self.disk_cache.as_ref().map(|c| &c.cache);
         let entry = ["decode_8888", "decode_float"][usize::from(mode.is_some())];
+        // Set once the shader module is made, so it times the pipeline alone.
+        let mut t0 = None;
         let pipeline = self.decode_pipelines[usize::from(mode.is_some())]
             .get_or_insert_with(|| {
                 let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
                     label: Some("resolve"),
                     source: wgpu::ShaderSource::Wgsl(include_str!("resolve.wgsl").into()),
                 });
+                t0 = Some(Instant::now());
                 device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                     label: Some(entry),
                     layout: None,
                     module: &module,
                     entry_point: Some(entry),
                     compilation_options: Default::default(),
-                    cache: None,
+                    cache,
                 })
             })
             .clone();
+        if let Some(t0) = t0 {
+            self.pipeline_made(t0);
+        }
         let pipeline = &pipeline;
-        let mut enc = self.device.create_command_encoder(&Default::default());
+        let mut enc = self
+            .pre
+            .take()
+            .unwrap_or_else(|| self.device.create_command_encoder(&Default::default()));
         for (level, &(lw, lh, lpitch, la)) in levels.iter().enumerate() {
             let (ly0, rows) = if level == 0 { (y0, y1 - y0) } else { (0, lh) };
             let row_words =
@@ -3278,8 +3469,7 @@ impl Drawer {
                 },
             );
         }
-        self.queue.submit([enc.finish()]);
-        self.submitted(Site::Decode);
+        self.pre = Some(enc);
         if let Some(e) = block_on(scope.pop()) {
             return Err(Skip::Fatal(Error::Gpu(e.to_string())));
         }
@@ -3773,6 +3963,8 @@ impl Drawer {
             }
             None => {
                 let k = key.clone();
+                let cache = self.pipeline_cache();
+                let t0 = Instant::now();
                 let p = self.validated("render pipeline", |dev| {
                     dev.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                         label: Some("draw"),
@@ -3813,9 +4005,10 @@ impl Drawer {
                             }),
                         }),
                         multiview_mask: None,
-                        cache: None,
+                        cache,
                     })
                 })?;
+                self.pipeline_made(t0);
                 self.pipelines.insert(key, (p.clone(), self.pipeline_uses));
                 self.timings.pipelines_created += 1;
                 self.drop_pipelines();
@@ -3838,10 +4031,11 @@ impl Drawer {
         let idx_bytes = to_bytes(&idx);
         let rect_indices: &[u8] = if rect_list { &idx_bytes } else { &[] };
         let rest = [&epi[..], rect_indices, &idx_bytes].map(Part::Bytes);
-        // The window and constants staged earlier in this batch are bound
-        // again, unless the batch was submitted since (the arena is then
-        // overwritten) or would be to stage the rest.
-        let mut kept_window = staged.filter(|(w, _)| self.window_memo.contains(w));
+        // The window and constants staged earlier (in this batch or one
+        // submitted since) are bound again, unless the arena wrapped since
+        // (it is then overwritten) or would wrap to stage the rest.
+        let mut kept_window =
+            staged.filter(|((a, b, s), _)| self.window_memo.get(a) == Some(&(*b, *s)));
         let mut kept_consts = (self.staged_consts.as_ref())
             .filter(|(b, _)| *b == consts)
             .map(|&(_, s)| s);
@@ -3907,7 +4101,16 @@ impl Drawer {
                     .last()
                     .unwrap_or(first);
                 if let [(lo, hi)] = read[..] {
-                    self.window_memo.push((lo, hi, first));
+                    // None holds this window (it was read), so those it
+                    // holds are the ones from `lo` that end by `hi`.
+                    let inside: Vec<u64> = (self.window_memo.range(lo..))
+                        .take_while(|(_, (b, _))| *b <= hi)
+                        .map(|(&a, _)| a)
+                        .collect();
+                    for a in inside {
+                        self.window_memo.remove(&a);
+                    }
+                    self.window_memo.insert(lo, (hi, first));
                 }
                 (first.0, last.0 + last.1 - first.0)
             }
@@ -4067,6 +4270,8 @@ impl Drawer {
             blend: None,
             write_mask: wgpu::ColorWrites::ALL,
         })];
+        let cache = self.pipeline_cache();
+        let t0 = Instant::now();
         let p = self.validated("clear pipeline", |dev| {
             dev.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some("clear"),
@@ -4103,9 +4308,10 @@ impl Drawer {
                     targets: if is_depth { &[] } else { &color_target },
                 }),
                 multiview_mask: None,
-                cache: None,
+                cache,
             })
         })?;
+        self.pipeline_made(t0);
         self.clear_pipelines.insert(format, p.clone());
         Ok(p)
     }
@@ -4507,20 +4713,28 @@ impl Drawer {
         );
         let scope = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
         let device = &self.device;
+        let cache = self.disk_cache.as_ref().map(|c| &c.cache);
+        // Set once the shader module is made, so it times the pipeline alone.
+        let mut t0 = None;
         let pipeline = self.resolve_pipelines[entry].get_or_insert_with(|| {
             let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("resolve"),
                 source: wgpu::ShaderSource::Wgsl(include_str!("resolve.wgsl").into()),
             });
+            t0 = Some(Instant::now());
             device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                 label: Some("resolve"),
                 layout: None,
                 module: &module,
                 entry_point: Some(["main", "depth_main", "depth_stencil_main"][entry]),
                 compilation_options: Default::default(),
-                cache: None,
+                cache,
             })
         });
+        let pipeline = &pipeline.clone();
+        if let Some(t0) = t0 {
+            self.pipeline_made(t0);
+        }
         let aspect = |aspect| {
             tex.create_view(&wgpu::TextureViewDescriptor {
                 aspect,

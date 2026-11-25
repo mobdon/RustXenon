@@ -115,9 +115,20 @@ impl DrawSide {
             crate::log(&self.drawer.memory_line());
         }
         let start = std::time::Instant::now();
-        match self.drawer.replay(cmds, &mut Physical(rt)) {
+        let replayed = self.drawer.replay(cmds, &mut Physical(rt));
+        let busy = start.elapsed();
+        // The drawer is never dropped at exit (its thread is left running),
+        // so new pipelines reach the cache file here at most 5 s late.
+        static SAVE: AtomicU32 = AtomicU32::new(0);
+        if crate::ms() >= SAVE.load(Ordering::Relaxed) {
+            SAVE.store(crate::ms() + 5_000, Ordering::Relaxed);
+            if let Err(e) = self.drawer.save_pipeline_cache() {
+                crate::log(&format!("[draw] pipeline cache not saved: {e}"));
+            }
+        }
+        match replayed {
             Ok(r) => {
-                self.stats.add(&r, start.elapsed());
+                self.stats.add(&r, busy);
                 for u in r.unsupported.iter().chain(&r.warnings) {
                     capture::note(u);
                 }
@@ -184,7 +195,8 @@ impl DrawStats {
         format!(
             "[draw] {:.1} s: {} frames, {} replays; ms per {per}: drawer {:.0} = shaders {:.0}, \
              guest data {:.0}, textures {:.0}, submit {:.0}, gpu wait {:.0}, readback {:.0}, \
-             resolve cpu {:.0}, clears {:.0}, swap {:.0} (transfers {:.0}); per {per}: {} draws, \
+             resolve cpu {:.0}, clears {:.0}, swap {:.0} (transfers {:.0}); of those, creating \
+             pipelines {:.0}; per {per}: {} draws, \
              {} resolves, {} submits ({} resolve, {} transfer, {} decode, {} flush/other), {} transfers ({} passes), readback {:.1} MB, \
              hashed {:.1} MB (kept resolves {:.1} MB), {} textures uploaded ({:.1} MB, {} evicted before), \
              {} evicted, {} from kept resolves, {} pipelines created; guest data {:.1} MB ({} windows reused, {:.1} MB); \
@@ -203,6 +215,7 @@ impl DrawStats {
             ms(t.clears),
             ms(t.swap),
             ms(t.transfer),
+            ms(t.pipeline),
             self.draws / n,
             self.resolves / n,
             t.submits / n,

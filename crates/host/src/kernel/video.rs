@@ -189,8 +189,23 @@ pub fn start(rt: std::sync::Arc<Runtime>) {
             let mut gpu = Gpu::default();
             if super::gpu::capture::RENDER.load(Ordering::Relaxed) {
                 match xenon_draw::Drawer::new() {
-                    Ok(d) => {
+                    Ok(mut d) => {
                         crate::log(&format!("[draw] adapter: {}", d.adapter));
+                        // Compiled pipelines persist across runs, next to the
+                        // title's saves unless XENON_PIPELINE_CACHE names a
+                        // directory.
+                        let dir = std::env::var_os("XENON_PIPELINE_CACHE")
+                            .map_or_else(|| k().data_dir.join("pipeline-cache"), Into::into);
+                        match d.set_pipeline_cache_dir(&dir) {
+                            Ok(Some(f)) => {
+                                crate::log(&format!("[draw] pipeline cache: {}", f.display()))
+                            }
+                            Ok(None) => crate::log("[draw] no pipeline cache on this device"),
+                            Err(e) => crate::log(&format!(
+                                "[draw] no pipeline cache in {}: {e}",
+                                dir.display()
+                            )),
+                        }
                         gpu.set_drawer(&rt, d);
                     }
                     Err(e) => crate::log(&format!("[draw] no drawer: {e}")),

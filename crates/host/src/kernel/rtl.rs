@@ -260,6 +260,80 @@ pub fn dbg_print(rt: &Runtime, c: &mut Context) {
     ret(c, 0);
 }
 
+/// Data sections of the image: where a title's message strings live.
+static DATA_SECTIONS: std::sync::OnceLock<Vec<(u32, u32)>> = std::sync::OnceLock::new();
+
+/// `XENON_GAME_LOG=<addr>[,<addr>...]`: hex guest addresses of functions the
+/// title calls with a printf-style message (often an empty function in a
+/// release build). Each becomes a hook that logs `[game] <message>` and
+/// returns. Release builds fold every empty function into one, so a call is
+/// logged only when its first argument is a printable string in a data
+/// section of the image; other calls return silently, as before.
+pub fn install_game_log(rt: &mut Runtime, image: &xenon_recomp::xex::Image) {
+    let Ok(v) = std::env::var("XENON_GAME_LOG") else {
+        return;
+    };
+    let _ = DATA_SECTIONS.set(
+        image
+            .sections
+            .iter()
+            .filter(|s| !s.code)
+            .map(|s| (s.start, s.end()))
+            .collect(),
+    );
+    for a in v.split(',').map(str::trim).filter(|a| !a.is_empty()) {
+        let addr = u32::from_str_radix(a.trim_start_matches("0x"), 16)
+            .unwrap_or_else(|_| panic!("XENON_GAME_LOG: bad address {a:?}"));
+        rt.set_override(addr, game_log);
+    }
+}
+
+fn game_log(rt: &Runtime, c: &mut Context) {
+    let p = c.r[3] as u32;
+    let in_data = DATA_SECTIONS
+        .get()
+        .is_some_and(|v| v.iter().any(|&(s, e)| p >= s && p < e));
+    if !in_data {
+        return;
+    }
+    let raw: Vec<u8> = (0..MESSAGE_MAX)
+        .map(|i| rt.mem.read_u8(p.wrapping_add(i)))
+        .collect();
+    let Some(fmt) = message(&raw) else {
+        return;
+    };
+    let s = format(
+        rt,
+        c,
+        fmt,
+        Args::Regs {
+            next: 4,
+            stack: c.r[1] as u32 + 0x50,
+        },
+    );
+    // Some callers repeat one message every frame: log it once per run of repeats.
+    static LAST: Mutex<String> = Mutex::new(String::new());
+    let s = s.trim_end();
+    let mut last = LAST.lock().unwrap();
+    if *last != s {
+        crate::log(&format!("[game] {s}"));
+        *last = s.to_string();
+    }
+}
+
+const MESSAGE_MAX: u32 = 512;
+
+/// The text before the first NUL when it reads as a message: at least two
+/// characters, all printable ASCII or tab/newline. `None` for anything else.
+fn message(raw: &[u8]) -> Option<&str> {
+    let n = raw.iter().position(|&b| b == 0)?;
+    let t = &raw[..n];
+    let ok = t.len() >= 2
+        && t.iter()
+            .all(|&b| (0x20..0x7f).contains(&b) || b == b'\n' || b == b'\t' || b == b'\r');
+    ok.then(|| std::str::from_utf8(t).unwrap())
+}
+
 // ---- strings ---------------------------------------------------------------
 
 pub fn rtl_init_ansi_string(rt: &Runtime, c: &mut Context) {
@@ -737,5 +811,22 @@ mod tests {
             assert_eq!(days_from_civil(y, m, dd), d);
         }
         assert_eq!(civil(days_from_civil(2000, 2, 29)), (2000, 2, 29));
+    }
+
+    #[test]
+    fn message_accepts_only_printable_text() {
+        assert_eq!(message(b"loaded %s\n\0junk"), Some("loaded %s\n"));
+        assert_eq!(message(b"ok\0"), Some("ok"));
+        // An object pointer: starts with a vtable address byte.
+        assert_eq!(message(b"\x82\x00\x10\x00\0"), None);
+        assert_eq!(message(b"x\0"), None);
+        assert_eq!(message(b"no terminator"), None);
+    }
+
+    #[test]
+    fn command_line_adds_switches_after_name() {
+        assert_eq!(command_line(None), "\"default.xex\"");
+        assert_eq!(command_line(Some("  ")), "\"default.xex\"");
+        assert_eq!(command_line(Some(" -a -b=1 ")), "\"default.xex\" -a -b=1");
     }
 }
