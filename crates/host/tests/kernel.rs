@@ -982,3 +982,24 @@ fn pool_block_freed_as_physical_stays_live() {
         "pool block freed by the right call"
     );
 }
+
+#[test]
+fn persist_display_block_is_freed_as_physical() {
+    let e = env();
+    let rt = &e.rt;
+    let mut c = ctx(0x1_F800);
+    let out = 0x1_2000u64;
+    call(rt, &mut c, kernel::video::vd_persist_display, &[0, out]);
+    let a = rt.mem.read_u32(out as u32);
+    assert!((0xA000_0000..0xC000_0000).contains(&a), "{a:#x}");
+    assert_ne!(
+        call(rt, &mut c, memory::mm_query_allocation_size, &[a as u64]),
+        0
+    );
+    // What the title does with it: the block must really go.
+    call(rt, &mut c, memory::mm_free_physical_memory, &[1, a as u64]);
+    assert_eq!(
+        call(rt, &mut c, memory::mm_query_allocation_size, &[a as u64]),
+        0
+    );
+}
