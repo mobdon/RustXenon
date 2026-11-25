@@ -364,6 +364,48 @@ fn texture_cache_evicts_least_recently_used() {
     assert_eq!(draw(&mut d, &mut mem, 1), (1, 1, 0));
 }
 
+/// The texture cache also evicts past its texture count, however few bytes
+/// the textures hold: at 4 a fifth texture evicts the least recently drawn.
+#[test]
+fn texture_cache_evicts_past_its_count() {
+    let Some(mut d) = drawer() else { return };
+    let mut mem = memory();
+    let n = 32u32;
+    d.texture_cache_count = 4;
+    let verts: Vec<u32> = [(0.0, 0.0), (8.0, 0.0), (8.0, 8.0), (0.0, 8.0)]
+        .iter()
+        .flat_map(|&(x, y)| [f(x), f(y), f(0.0), f(0.5), f(0.5)])
+        .collect();
+    mem.write_words(VERTS, &verts);
+    let draw = |d: &mut xenon_draw::Drawer, mem: &mut xenon_gpu::SliceMemory, k: u32| {
+        let fetch = [
+            2 | ((n >> 5) << 22) | (1 << 31),
+            6 | (2 << 6) | (TEXTURE + k * 0x1000),
+            (n - 1) | ((n - 1) << 13),
+            ((1 << 3) | (2 << 6) | (3 << 9)) << 1,
+            0,
+            1 << 9,
+        ];
+        let mut s = Stream::default();
+        s.setup()
+            .shader(false, &vs_uv())
+            .shader(true, &ps_texture(1))
+            .vertex_fetch(0, VERTS, 20)
+            .regs(SHADER_CONSTANT_FETCH + 6, &fetch)
+            .draw_auto(PRIM_QUAD_LIST, 4);
+        let t = run(d, &s, mem).timings;
+        (t.textures_uploaded, t.textures_evicted)
+    };
+    for k in 0..4 {
+        assert_eq!(draw(&mut d, &mut mem, k), (1, 0), "texture {k}");
+    }
+    assert_eq!(draw(&mut d, &mut mem, 0), (0, 0));
+    // Full: evicts 1, the least recently drawn, down to 3 of 4.
+    assert_eq!(draw(&mut d, &mut mem, 4), (1, 1));
+    assert_eq!(draw(&mut d, &mut mem, 0), (0, 0));
+    assert_eq!(draw(&mut d, &mut mem, 2), (0, 0));
+}
+
 /// A texture slot without a texture fetch constant, or with a format that
 /// cannot be decoded, samples zeros (Xenia's null image) and the draw still
 /// happens, with one warning per kind.
