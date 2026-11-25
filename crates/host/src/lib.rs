@@ -56,6 +56,9 @@ struct Activity {
 
 static ACTIVITY: std::sync::Mutex<Vec<(String, Arc<Activity>)>> = std::sync::Mutex::new(Vec::new());
 
+/// Source commit this host was built from (`-dirty` with local edits).
+pub const BUILD: &str = env!("XENON_BUILD");
+
 /// Milliseconds since the host started.
 pub fn ms() -> u32 {
     START.get_or_init(Instant::now).elapsed().as_millis() as u32
@@ -323,6 +326,7 @@ fn opt(args: &[String], name: &str) -> Option<String> {
 /// Entry point of a generated game crate.
 pub fn run(sha256: &str, regs: &[fn(&mut Runtime)]) -> ExitCode {
     START.get_or_init(Instant::now);
+    log(&format!("build {BUILD}"));
     let args: Vec<String> = std::env::args().skip(1).collect();
     let (Some(exe), Some(game)) = (opt(&args, "--exe"), opt(&args, "--game")) else {
         eprintln!("{USAGE}");
@@ -345,6 +349,12 @@ pub fn run(sha256: &str, regs: &[fn(&mut Runtime)]) -> ExitCode {
         let _ = kernel::gpu::capture::FRAMES.set((PathBuf::from(dir), n));
         kernel::gpu::capture::RENDER.store(true, Ordering::Relaxed);
     }
+    if let Some(w) = opt(&args, "--audio-wav") {
+        if let Err(e) = kernel::audio::start_wav(w.as_ref()) {
+            eprintln!("{w}: {e}");
+            return ExitCode::FAILURE;
+        }
+    }
     if args.iter().any(|a| a == "--render") {
         kernel::gpu::capture::RENDER.store(true, Ordering::Relaxed);
     }
@@ -356,18 +366,12 @@ pub fn run(sha256: &str, regs: &[fn(&mut Runtime)]) -> ExitCode {
             .collect();
         let _ = kernel::gpu::capture::SETTINGS.set((PathBuf::from(d), at));
     }
-    if let Some(p) = opt(&args, "--audio-wav") {
-        if let Err(e) = kernel::sound::start_wav(&p) {
-            eprintln!("--audio-wav {p}: {e}");
-            return ExitCode::FAILURE;
-        }
-    }
     if window {
         kernel::gpu::capture::RENDER.store(true, Ordering::Relaxed);
         if opt(&args, "--press").is_none() && !args.iter().any(|a| a == "--no-controller") {
             kernel::input::set_script(kernel::input::Script::Live);
         }
-        let link = xenon_window::spawn("RustXenon".into(), || {
+        let link = xenon_window::spawn(format!("RustXenon {BUILD}"), || {
             report();
             std::process::exit(0);
         });
@@ -550,7 +554,7 @@ fn host_rss() -> Option<u64> {
 }
 
 fn report() {
-    kernel::sound::finish();
+    kernel::audio::finish_wav();
     let kx = kernel::k();
     log(&format!(
         "frames presented: {}",
@@ -560,7 +564,12 @@ fn report() {
         "threads started: {}",
         kx.threads.lock().map(|t| t.len()).unwrap_or(0)
     ));
-    log(&format!("memory: {}, {}", kx.usage_line(), growth_line()));
+    log(&format!(
+        "memory: {}, {}, unknown frees {}",
+        kx.usage_line(),
+        growth_line(),
+        kernel::memory::UNKNOWN_FREES.load(Ordering::Relaxed)
+    ));
     if let Some(p) = PROFILE.lock().unwrap().as_ref() {
         let mut v: Vec<_> = p.iter().collect();
         v.sort_by(|a, b| b.1.cmp(a.1));
@@ -641,4 +650,17 @@ fn start_clock(rt: Arc<Runtime>) {
             std::thread::sleep(Duration::from_millis(1));
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn build_id_is_a_commit_or_unknown() {
+        let c = super::BUILD.trim_end_matches("-dirty");
+        assert!(
+            c == "unknown" || (c.len() == 12 && c.bytes().all(|b| b.is_ascii_hexdigit())),
+            "{}",
+            super::BUILD
+        );
+    }
 }

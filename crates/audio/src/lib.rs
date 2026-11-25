@@ -68,8 +68,8 @@ pub struct Mixer {
     pub dropped: u64,
 }
 
-/// Stereo samples a source holds at most (64 frames, 341 ms, 128 KB); older ones are
-/// dropped when a source is pushed faster than it is mixed.
+/// Stereo samples a source holds at most (64 frames, 341 ms, 128 KB); older
+/// ones are dropped when a source is pushed faster than it is mixed.
 pub const MAX_QUEUED: usize = 64 * FRAME_SAMPLES * 2;
 
 impl Mixer {

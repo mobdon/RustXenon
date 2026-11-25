@@ -147,7 +147,7 @@ impl Runtime {
         thread::checkpoint();
         let f = self
             .lookup(addr)
-            .unwrap_or_else(|| panic!("no guest function at {addr:#010x}"));
+            .unwrap_or_else(|| panic!("no guest function at {addr:#010x}{}", wild_hint(addr)));
         f(self, ctx);
     }
 
@@ -261,6 +261,22 @@ impl Runtime {
     }
 }
 
+/// A call target that is really a common instruction word means code bytes
+/// were read as a pointer: an overwritten function pointer or a stale object.
+fn wild_hint(addr: u32) -> String {
+    let what = match addr {
+        a if a >> 16 == 0x9421 => "stwu r1,-n(r1), a function's first instruction",
+        0x7D88_02A6 => "mflr r12, a function's first instruction",
+        0x7C08_02A6 => "mflr r0",
+        0x4E80_0020 => "blr",
+        0x6000_0000 => "nop",
+        _ => return String::new(),
+    };
+    format!(
+        " (that is the instruction {what}, not an address: look for an overwritten function pointer or a stale object)"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -308,6 +324,19 @@ mod tests {
     fn missing_function_reports_address() {
         let rt = Runtime::new(GuestMemory::new(16));
         rt.call(&mut Context::new(), 0x8200_1000);
+    }
+
+    #[test]
+    #[should_panic(expected = "no guest function at 0x9421fff8 (that is the instruction stwu")]
+    fn instruction_as_address_is_named() {
+        let rt = Runtime::new(GuestMemory::new(16));
+        rt.call(&mut Context::new(), 0x9421_FFF8);
+    }
+
+    #[test]
+    fn ordinary_address_gets_no_hint() {
+        assert_eq!(wild_hint(0x8200_1000), "");
+        assert!(wild_hint(0x7D88_02A6).contains("mflr r12"));
     }
 
     #[test]

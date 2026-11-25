@@ -48,6 +48,16 @@ pub fn x_audio_submit_render_driver_frame(rt: &Runtime, c: &mut Context) {
     super::sound::submit(rt, arg(rt, c, 0), arg(rt, c, 1));
     ret(c, STATUS_SUCCESS);
 }
+
+/// Starts writing the mixed sound to `path` (`--audio-wav`).
+pub fn start_wav(path: &std::path::Path) -> std::io::Result<()> {
+    super::sound::start_wav(path)
+}
+
+/// Mixes what is still queued and patches the .wav header.
+pub fn finish_wav() {
+    super::sound::finish();
+}
 pub fn x_audio_get_voice_category_volume_change_mask(rt: &Runtime, c: &mut Context) {
     rt.mem.write_u32(arg(rt, c, 1), 0);
     ret(c, STATUS_SUCCESS);

@@ -54,6 +54,13 @@ pub fn forget(ctx: u32) {
     }
 }
 
+/// Logs the first few decoder errors.
+fn error(ctx: u32, e: &dyn std::fmt::Display) {
+    if ERRORS.fetch_add(1, Ordering::Relaxed) < 5 {
+        crate::log(&format!("audio: context {ctx:#x}: {e}"));
+    }
+}
+
 /// One decoder round for the context at `a`: feeds its input packets and
 /// fills its output ring as far as the title has read it. Returns false
 /// when no FFmpeg is loaded (the caller writes silence instead).
@@ -66,11 +73,8 @@ pub fn decode(rt: &Runtime, a: u32) -> bool {
     let s = all.get_or_insert_with(HashMap::new).entry(a).or_default();
     let off = c.read_offset();
     let format = (c.rate(), c.channels());
-    if s.expect != Some(off) || s.format != format || s.dec.is_none() {
+    if s.expect != Some(off) || s.format != format {
         *s = Ctx {
-            dec: Decoder::xma2(ff, format.0, format.1)
-                .map_err(|e| crate::log(&format!("audio: context {a:#x}: {e}")))
-                .ok(),
             format,
             ..Ctx::default()
         };
@@ -88,6 +92,21 @@ pub fn decode(rt: &Runtime, a: u32) -> bool {
             continue;
         }
         if !c.input_valid(cur) || consumed >> cur & 1 != 0 {
+            // Input ran dry. FFmpeg holds about 8 frames back, so flush
+            // them now or the end of a sound never plays.
+            // shortcut: a stream refilled late restarts its decoder and
+            // loses a frame that spans the gap; keep the decoder across
+            // short gaps if that is heard.
+            if let Some(mut d) = s.dec.take() {
+                let mut o = Vec::new();
+                if let Err(e) = d.finish(&mut o) {
+                    error(a, &e);
+                }
+                DECODED.fetch_add(o.len() as u64, Ordering::Relaxed);
+                s.stream.push(&o);
+                s.stream.pad();
+                continue;
+            }
             break;
         }
         moved = true;
@@ -99,13 +118,16 @@ pub fn decode(rt: &Runtime, a: u32) -> bool {
         }
         let src = super::gpu::gpu_to_cpu(c.input_ptr(cur)) + (xma::PACKET_BYTES as u32) * packet;
         rt.mem.read_bytes(src, &mut buf);
+        if s.dec.is_none() {
+            s.dec = Decoder::xma2(ff, format.0, format.1)
+                .map_err(|e| error(a, &e))
+                .ok();
+        }
         let dec = s.dec.as_mut();
         s.stream.feed(&buf, |p, o| {
             if let Some(d) = dec {
                 if let Err(e) = d.decode(p, o) {
-                    if ERRORS.fetch_add(1, Ordering::Relaxed) < 5 {
-                        crate::log(&format!("audio: context {a:#x}: {e}"));
-                    }
+                    error(a, &e);
                 }
             }
             DECODED.fetch_add(o.len() as u64, Ordering::Relaxed);
@@ -143,7 +165,7 @@ struct Out {
 static OUT: Mutex<Option<Out>> = Mutex::new(None);
 
 /// Starts writing the mix to `path` (`--audio-wav`).
-pub fn start_wav(path: &str) -> std::io::Result<()> {
+pub fn start_wav(path: &std::path::Path) -> std::io::Result<()> {
     let wav = WavWriter::create(path, SAMPLE_RATE, 2)?;
     *OUT.lock().unwrap() = Some(Out {
         mixer: Mixer::new(),
@@ -192,8 +214,17 @@ pub fn tick() {
     o.frames += 1;
 }
 
-/// Finishes the .wav so its header holds the right length.
+/// Mixes what is still queued, then finishes the .wav so its header holds
+/// the right length.
 pub fn finish() {
+    while OUT
+        .lock()
+        .unwrap()
+        .as_ref()
+        .is_some_and(|o| o.wav.is_some() && o.mixer.queued_total() > 0)
+    {
+        tick();
+    }
     if let Some(o) = OUT.lock().unwrap().as_mut() {
         if let Some(w) = o.wav.take() {
             let secs = o.frames as f64 * 256.0 / SAMPLE_RATE as f64;

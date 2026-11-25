@@ -160,7 +160,13 @@ impl Stream {
         };
         let mut f = Vec::new();
         decode(packet, &mut f);
-        for s in f {
+        self.push(&f);
+        true
+    }
+
+    /// Queues decoded samples (interleaved, -1..=1).
+    pub fn push(&mut self, samples: &[f32]) {
+        for s in samples {
             if self.pcm.len() >= STREAM_CAP {
                 self.dropped += 1;
                 continue;
@@ -168,7 +174,12 @@ impl Stream {
             self.pcm
                 .extend(((s.clamp(-1.0, 1.0) * 32767.0).round() as i16).to_be_bytes());
         }
-        true
+    }
+
+    /// Pads the last part block with silence so it can be written.
+    pub fn pad(&mut self) {
+        let n = self.pcm.len().next_multiple_of(BLOCK_BYTES);
+        self.pcm.resize(n, 0);
     }
 
     /// The next full output block, if one is decoded.
@@ -187,6 +198,52 @@ impl Stream {
     pub fn queued(&self) -> usize {
         self.pcm.len()
     }
+}
+
+/// MSB-first bit writer for hand-building XMA packets.
+struct Bits(Vec<u8>, usize);
+impl Bits {
+    fn put(&mut self, v: u32, n: usize) {
+        for i in (0..n).rev() {
+            if self.1 / 8 == self.0.len() {
+                self.0.push(0);
+            }
+            if v >> i & 1 != 0 {
+                self.0[self.1 / 8] |= 0x80 >> (self.1 % 8);
+            }
+            self.1 += 1;
+        }
+    }
+}
+
+/// One mono XMA2 packet holding one frame whose single subframe sends no
+/// coefficients (silence). Bits per FFmpeg's wmaprodec.c with the XMA
+/// flags 0x10d6: length prefix, 4 subframes max, range compression on.
+/// For tests: no XMA encoder exists here.
+pub fn silent_packet() -> Vec<u8> {
+    let mut b = Bits(
+        PacketHeader {
+            frame_count: 1,
+            frame_offset_bits: 0,
+            metadata: 0,
+            skip_count: 0,
+        }
+        .to_bytes()
+        .to_vec(),
+        32,
+    );
+    b.put(31, 15); // frame length in bits, trailer included
+    b.put(1, 1); // every channel uses the same tiling
+    b.put(0, 1); // one subframe of full length
+    b.put(0, 8); // range compression gain
+    b.put(0, 1); // no trim
+    b.put(0, 1); // no extended subframe header
+    b.put(0, 1); // reserved
+    b.put(0, 1); // channel 0 sends no coefficients
+    b.put(0, 1); // pad up to the length
+    b.put(0, 1); // no more frames in this packet
+    b.0.resize(PACKET_BYTES, 0);
+    b.0
 }
 
 #[cfg(test)]
@@ -227,6 +284,9 @@ mod tests {
         s.block();
         s.block();
         assert!(s.block().is_none());
+        s.push(&[0.5]);
+        s.pad();
+        assert_eq!(s.block().unwrap()[..3], [0x40, 0, 0]);
     }
 
     #[test]
