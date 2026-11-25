@@ -10,9 +10,10 @@ struct Params {
     // Destination pitch in texels, a multiple of 32.
     pitch: u32,
     // 0 8_8_8_8, 1 2_10_10_10, 2 7e3 (hosted as half), 3 16_16_16_16 float,
-    // 4 32 float, 5 D24S8, 6 D24FS8.
+    // 4 32 float, 5 D24S8, 6 D24FS8, 7 16_16 and 8 16_16_16_16 (hosted as
+    // snorm / 32), 9 16_16 float, 10 32_32 float.
     src_format: u32,
-    // 0 8_8_8_8, 1 2_10_10_10, 2 32_FLOAT.
+    // 0 8_8_8_8, 1 2_10_10_10, 2 32_FLOAT, 3 16_16.
     dest_format: u32,
     swap: u32,
     endian: u32,
@@ -112,6 +113,14 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
         c = vec4<f32>(q7e3(c.r), q7e3(c.g), q7e3(c.b), f32(a2) * (1.0 / 3.0));
     } else if p.src_format == 4u {
         c = vec4<f32>(c.r, 0.0, 0.0, 0.0);
+    } else if p.src_format == 7u || p.src_format == 8u {
+        // The snorm texel back to its 16 bits, then XeUnpackR16G16Edram.
+        c = max(vec4<f32>(-1.0), round(c * 32767.0) * (32.0 / 32767.0));
+        if p.src_format == 7u {
+            c = vec4<f32>(c.rg, 0.0, 0.0);
+        }
+    } else if p.src_format >= 9u {
+        c = vec4<f32>(c.rg, 0.0, 0.0);
     }
     c = c * p.scale;
     if p.swap != 0u {
@@ -123,6 +132,8 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
             | (to_unorm(c.a, 255.0) << 24u);
     } else if p.dest_format == 2u {
         w = bitcast<u32>(c.r);
+    } else if p.dest_format == 3u {
+        w = to_unorm(c.r, 65535.0) | (to_unorm(c.g, 65535.0) << 16u);
     } else {
         w = to_unorm(c.r, 1023.0) | (to_unorm(c.g, 1023.0) << 10u) | (to_unorm(c.b, 1023.0) << 20u)
             | (to_unorm(c.a, 3.0) << 30u);

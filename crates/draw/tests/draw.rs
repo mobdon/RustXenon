@@ -350,8 +350,8 @@ fn unsupported_format_and_primitive_are_reported() {
         .shader(true, &ps_interp())
         .vertex_fetch(0, VERTS, 12)
         .draw_auto(PRIM_LINE_LOOP, 3)
-        // k_16_16 colour target.
-        .regs(RB_COLOR_INFO, &[4 << 16])
+        // Colour target format 8, which Xenos does not define.
+        .regs(RB_COLOR_INFO, &[8 << 16])
         .draw_auto(PRIM_TRI_LIST, 3)
         .regs(RB_COLOR_INFO, &[0])
         .draw_auto(PRIM_TRI_LIST, 3);
@@ -361,7 +361,7 @@ fn unsupported_format_and_primitive_are_reported() {
         report.unsupported,
         vec![
             "primitive type LineLoop".to_string(),
-            "colour render target format 4".to_string()
+            "colour render target format 8".to_string()
         ]
     );
     let missing = RenderTargetKey {

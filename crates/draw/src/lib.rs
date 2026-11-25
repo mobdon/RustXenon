@@ -43,8 +43,17 @@
 //!   EDRAM emulation does. The blend result itself is not clamped and keeps
 //!   half precision until a resolve quantises it (see below).
 //! - `k_16_16_16_16_FLOAT` as `Rgba16Float`.
-//! - `k_32_FLOAT` as `R32Float`, drawn without blending (a warning) and
-//!   resolvable to `k_32_FLOAT` with its float bits kept, unsaturated.
+//! - `k_32_FLOAT` as `R32Float` and `k_32_32_FLOAT` as `Rg32Float`, drawn
+//!   without blending (a warning) and resolvable to `k_32_FLOAT` /
+//!   `k_32_32_FLOAT` with their float bits kept, unsaturated.
+//! - `k_16_16_FLOAT` as `Rg16Float`.
+//! - `k_16_16` and `k_16_16_16_16` (16-bit fixed point in [-32, 32]) as
+//!   `Rg16Snorm` / `Rgba16Snorm` holding the value / 32, Xenia's full-range
+//!   host path: the pixel shader's colour is divided by 32 (so blending
+//!   works on the value / 32, as in Xenia) and a resolve unpacks the 16
+//!   bits as `x * 32 / 32767`, floored at -1, like Xenia's resolve shader.
+//!   They need a host that renders into 16-bit snorm
+//!   ([`Drawer::snorm16`]) and are unsupported without one.
 //!
 //! All four render targets (`RB_COLOR_INFO_RT[0..4]`) are drawn, each with
 //! its own `RB_COLOR_MASK` bits, `RB_BLENDCONTROL_RT` blend and output
@@ -55,9 +64,7 @@
 //! RB_COLOR_CLEAR_LO << 32` per format ([`formats::clear_color`]).
 //! Depth targets: `kD24S8` as `Depth24PlusStencil8` and `kD24FS8` as
 //! `Depth32FloatStencil8` where the host has it, else `Depth32Float` without
-//! stencil (the 20e4 float is stored at f32 precision). Anything
-//! else (`k_16_16`, `k_16_16_16_16`, `k_16_16_FLOAT`, `k_32_32_FLOAT`) is
-//! reported in [`Report::unsupported`].
+//! stencil (the 20e4 float is stored at f32 precision).
 //!
 //! # Resolves
 //!
@@ -66,10 +73,12 @@
 //! Xenia's dump of a host render target into EDRAM), applies the exponent
 //! bias `2^copy_dest_exp_bias` and the red/blue swap, packs it like Xenia's
 //! resolve shader (unorm: saturate, `x * max + 0.5` truncated) into
-//! `k_8_8_8_8`, `k_2_10_10_10` or `k_16_16_16_16_FLOAT`, and tiles it into
-//! guest memory with the destination endian. Copy commands are described at
-//! `Drawer::resolve` (`Raw` and `Convert` alike, `Null` clears only,
-//! `ConstantOne` unsupported).
+//! `k_8_8_8_8`, `k_2_10_10_10`, `k_16_16`, `k_16_16_16_16` (unorm),
+//! `k_16_16_FLOAT`, `k_16_16_16_16_FLOAT`, `k_32_FLOAT` or `k_32_32_FLOAT`,
+//! and tiles it into guest memory with the destination endian. A copy that
+//! cannot be done is reported and the resolve's clears still run. Copy
+//! commands are described at `Drawer::resolve` (`Raw` and `Convert` alike,
+//! `Null` clears only, `ConstantOne` unsupported).
 //!
 //! A depth copy (to any 32bpp destination format) writes the raw EDRAM word,
 //! as Xenia's fast resolve does: depth in bits 8..31 (`kD24S8` as 24-bit
@@ -270,6 +279,15 @@ pub enum TargetFormat {
     Rgba16Float,
     /// `k_32_FLOAT`, hosted as `R32Float`.
     Float32,
+    /// `k_16_16`: 16-bit fixed point in [-32, 32], hosted as `Rg16Snorm`
+    /// holding the value / 32 (Xenia's full-range snorm16 path).
+    Rg16Fixed,
+    /// `k_16_16_16_16`, as `Rg16Fixed` with four channels (`Rgba16Snorm`).
+    Rgba16Fixed,
+    /// `k_16_16_FLOAT`, hosted as `Rg16Float`.
+    Rg16Float,
+    /// `k_32_32_FLOAT`, hosted as `Rg32Float`.
+    Rg32Float,
 }
 
 impl TargetFormat {
@@ -281,6 +299,10 @@ impl TargetFormat {
             TargetFormat::Rgb10a2 => wgpu::TextureFormat::Rgb10a2Unorm,
             TargetFormat::Float7e3 | TargetFormat::Rgba16Float => wgpu::TextureFormat::Rgba16Float,
             TargetFormat::Float32 => wgpu::TextureFormat::R32Float,
+            TargetFormat::Rg16Fixed => wgpu::TextureFormat::Rg16Snorm,
+            TargetFormat::Rgba16Fixed => wgpu::TextureFormat::Rgba16Snorm,
+            TargetFormat::Rg16Float => wgpu::TextureFormat::Rg16Float,
+            TargetFormat::Rg32Float => wgpu::TextureFormat::Rg32Float,
         }
     }
 
@@ -291,13 +313,22 @@ impl TargetFormat {
             2 | 10 => TargetFormat::Rgb10a2,
             3 | 12 => TargetFormat::Float7e3,
             14 => TargetFormat::Float32,
+            4 => TargetFormat::Rg16Fixed,
+            5 => TargetFormat::Rgba16Fixed,
+            6 => TargetFormat::Rg16Float,
             7 => TargetFormat::Rgba16Float,
+            15 => TargetFormat::Rg32Float,
             _ => return None,
         })
     }
 
     fn is_depth(self) -> bool {
         matches!(self, TargetFormat::D24S8 | TargetFormat::D24FS8)
+    }
+
+    /// Hosted as 16-bit snorm, which needs an optional wgpu feature.
+    fn is_snorm16(self) -> bool {
+        matches!(self, TargetFormat::Rg16Fixed | TargetFormat::Rgba16Fixed)
     }
 }
 
@@ -367,9 +398,10 @@ enum Variant {
     Plain,
     /// Vertex shader wrapped to make rectangle list corners.
     RectList,
-    /// Pixel shader colour i clamped to [0, rgb] and [0, alpha] (f32 bits)
-    /// where entry i is set.
-    Clamp([Option<(u32, u32)>; 4]),
+    /// Pixel shader colour i clamped to [0, rgb] and [0, alpha], then
+    /// scaled (f32 bits; an infinite bound does not clamp) where entry i is
+    /// set.
+    Clamp([Option<(u32, u32, u32)>; 4]),
 }
 
 #[derive(Clone, PartialEq, Eq, Hash)]
@@ -453,6 +485,9 @@ pub struct Drawer {
     resolve_pipelines: [Option<wgpu::ComputePipeline>; 3],
     /// kD24FS8 is hosted as `Depth32FloatStencil8` (else `Depth32Float`).
     float_stencil: bool,
+    /// `Rg16Snorm` and `Rgba16Snorm` can be render targets (k_16_16 and
+    /// k_16_16_16_16 are refused without them).
+    snorm16: bool,
     timings: Timings,
     uncaptured: Arc<Mutex<Vec<String>>>,
     max_dim: u32,
@@ -610,7 +645,13 @@ fn vs_main(@builtin(vertex_index) host_index: u32) -> VsOut {{
 }
 
 /// Clamps colour 0 of a translated pixel shader to [0, rgb] / [0, alpha].
-fn clamp_pixel_wgsl(ps: &str, rt: usize, rgb: f32, alpha: f32) -> Result<String, String> {
+fn clamp_pixel_wgsl(
+    ps: &str,
+    rt: usize,
+    rgb: f32,
+    alpha: f32,
+    scale: f32,
+) -> Result<String, String> {
     let store = format!("    out.c{rt} = o_col[{rt}];\n");
     if !ps.contains(&store) {
         return Err(format!("pixel shader colour output {rt} not recognised"));
@@ -622,9 +663,14 @@ fn clamp_pixel_wgsl(ps: &str, rt: usize, rgb: f32, alpha: f32) -> Result<String,
     } else {
         format!("o_col[{rt}].xyz")
     };
+    let alpha = if alpha.is_finite() {
+        format!("clamp(o_col[{rt}].w, 0.0, {alpha:?})")
+    } else {
+        format!("o_col[{rt}].w")
+    };
     Ok(ps.replacen(
         &store,
-        &format!("    out.c{rt} = vec4<f32>({rgb}, clamp(o_col[{rt}].w, 0.0, {alpha:?}));\n"),
+        &format!("    out.c{rt} = vec4<f32>({rgb}, {alpha}) * {scale:?};\n"),
         1,
     ))
 }
@@ -678,13 +724,28 @@ impl Drawer {
         let float_stencil = adapter
             .features()
             .contains(wgpu::Features::DEPTH32FLOAT_STENCIL8);
+        // k_16_16 and k_16_16_16_16 render into snorm16, which WebGPU
+        // only renders into with these features and the adapter's say-so.
+        let snorm16_features = wgpu::Features::TEXTURE_FORMAT_16BIT_NORM
+            | wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES;
+        let snorm16 = adapter.features().contains(snorm16_features)
+            && [
+                wgpu::TextureFormat::Rg16Snorm,
+                wgpu::TextureFormat::Rgba16Snorm,
+            ]
+            .iter()
+            .all(|&f| {
+                adapter
+                    .get_texture_format_features(f)
+                    .allowed_usages
+                    .contains(wgpu::TextureUsages::RENDER_ATTACHMENT)
+            });
+        let mut required_features = wgpu::Features::empty();
+        required_features.set(wgpu::Features::DEPTH32FLOAT_STENCIL8, float_stencil);
+        required_features.set(snorm16_features, snorm16);
         let (device, queue) = block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("xenon-draw"),
-            required_features: if float_stencil {
-                wgpu::Features::DEPTH32FLOAT_STENCIL8
-            } else {
-                wgpu::Features::empty()
-            },
+            required_features,
             required_limits: limits.clone(),
             ..Default::default()
         }))
@@ -752,6 +813,7 @@ impl Drawer {
             texture_cache_bytes: 0,
             resolve_pipelines: [None, None, None],
             float_stencil,
+            snorm16,
             timings: Timings::default(),
             uncaptured,
             max_dim: limits.max_texture_dimension_2d,
@@ -902,7 +964,9 @@ impl Drawer {
     /// Reads `w` x `h` pixels at (`x`, `y`) of a colour render target as
     /// host texels, rows top to bottom, little-endian: 4 bytes per pixel for
     /// `Rgba8` (R first) and `Rgb10a2` (one word, R in bits 0..10), 8 for
-    /// `Float7e3` and `Rgba16Float` (four halves, R first).
+    /// `Float7e3` and `Rgba16Float` (four halves, R first); the other
+    /// formats as their wgpu texels (`Float32` 4, `Rg16Fixed` and
+    /// `Rg16Float` 4, `Rgba16Fixed` and `Rg32Float` 8, R first).
     pub fn read_render_target_raw(
         &self,
         key: RenderTargetKey,
@@ -1031,6 +1095,12 @@ impl Drawer {
         if key.pitch == 0 || key.pitch > self.max_dim {
             return unsupported(format!("surface pitch {}", key.pitch));
         }
+        if key.format.is_snorm16() && !self.snorm16 {
+            return unsupported(format!(
+                "{:?} render target: the host cannot render into 16-bit snorm",
+                key.format
+            ));
+        }
         let host_format = self.host_format(key.format);
         let (device, height) = (&self.device, RENDER_TARGET_HEIGHT.min(self.max_dim));
         Ok(self
@@ -1063,6 +1133,12 @@ impl Drawer {
     /// target is skipped with a warning and resolves write stencil 0.
     pub fn float_stencil(&self) -> bool {
         self.float_stencil
+    }
+
+    /// Whether the host renders into 16-bit snorm, which `k_16_16` and
+    /// `k_16_16_16_16` targets need (they are unsupported without it).
+    pub fn snorm16(&self) -> bool {
+        self.snorm16
     }
 
     /// The host texture format of a render target.
@@ -1123,9 +1199,13 @@ impl Drawer {
                 c.iter()
                     .enumerate()
                     .try_fold(t.wgsl.clone(), |ps, (rt, c)| match c {
-                        Some((rgb, a)) => {
-                            clamp_pixel_wgsl(&ps, rt, f32::from_bits(*rgb), f32::from_bits(*a))
-                        }
+                        Some((rgb, a, k)) => clamp_pixel_wgsl(
+                            &ps,
+                            rt,
+                            f32::from_bits(*rgb),
+                            f32::from_bits(*a),
+                            f32::from_bits(*k),
+                        ),
                         None => Ok(ps),
                     })
             }
@@ -1435,15 +1515,20 @@ impl Drawer {
                 .map_err(Skip::Unsupported)?;
             // shortcut: wgpu blends R32Float only with FLOAT32_BLENDABLE;
             // request it if a game blends into a 32-bit float target.
-            if blends[rt].is_some() && color[rt].map(|k| k.format) == Some(TargetFormat::Float32) {
+            if blends[rt].is_some()
+                && matches!(
+                    color[rt].map(|k| k.format),
+                    Some(TargetFormat::Float32 | TargetFormat::Rg32Float)
+                )
+            {
                 report.warn("blending into a 32-bit float render target drawn without blending");
                 blends[rt] = None;
             }
         }
-        let clamps: [Option<(u32, u32)>; 4] = std::array::from_fn(|rt| {
+        let clamps: [Option<(u32, u32, u32)>; 4] = std::array::from_fn(|rt| {
             color[rt]
                 .and_then(|k| formats::output_clamp(k.format, blends[rt].is_some()))
-                .map(|(rgb, a)| (rgb.to_bits(), a.to_bits()))
+                .map(|(rgb, a, k)| (rgb.to_bits(), a.to_bits(), k.to_bits()))
         });
         let ps_variant = if clamps.iter().any(Option::is_some) {
             Variant::Clamp(clamps)
@@ -1880,8 +1965,8 @@ impl Drawer {
         }
     }
 
-    /// Performs a resolve: copy, then the colour and depth clears. Ok(false)
-    /// when the rectangle is empty.
+    /// Performs a resolve: copy, then the colour and depth clears (also when
+    /// the copy is unsupported). Ok(false) when the rectangle is empty.
     ///
     /// Copy commands: `Raw` and `Convert` both convert from the source to
     /// the destination format, as in Xenia, whose resolve shaders do not
@@ -1907,10 +1992,15 @@ impl Drawer {
         if rect.is_empty() {
             return Ok(false);
         }
-        match r.copy_command {
-            CopyCommand::Raw | CopyCommand::Convert => self.resolve_copy(r, rect, mem)?,
-            CopyCommand::Null => {}
+        let copied = match r.copy_command {
+            CopyCommand::Raw | CopyCommand::Convert => self.resolve_copy(r, rect, mem),
+            CopyCommand::Null => Ok(()),
             CopyCommand::ConstantOne => return unsupported("resolve copy command ConstantOne"),
+        };
+        // A copy this drawer cannot do still clears, as Xenia always would;
+        // the copy is reported after the clears.
+        if let Err(Skip::Fatal(_)) = copied {
+            return copied.map(|()| true);
         }
         // A depth resolve never clears colour (Xenia draw_util.h
         // IsClearingColor).
@@ -1933,7 +2023,7 @@ impl Drawer {
             self.clear(key, rect, [0.0; 4], depth, r.depth_clear & 0xFF)?;
             self.timings.clears += t.elapsed();
         }
-        Ok(true)
+        copied.map(|()| true)
     }
 
     /// Colour copy: reads the rectangle back, converts each pixel as
@@ -1996,7 +2086,10 @@ impl Drawer {
                 r.dest_format
             ));
         }
-        if dest_bytes == 4 {
+        // shortcut: 16_16_FLOAT colour copies take the CPU path (WGSL's
+        // pack2x16float does not promise rounding); port f32_to_half to
+        // resolve.wgsl if they show up in profiles.
+        if dest_bytes == 4 && (r.is_depth || r.dest_format != formats::DEST_16_16_FLOAT) {
             self.resolve_gpu(r, rect, format, &tex, mem)?;
             self.resolved_endian
                 .insert(r.dest_base & PHYSICAL_MASK, r.dest_endian);
@@ -2078,6 +2171,10 @@ impl Drawer {
             TargetFormat::Float32 => 4,
             TargetFormat::D24S8 => 5,
             TargetFormat::D24FS8 => 6,
+            TargetFormat::Rg16Fixed => 7,
+            TargetFormat::Rgba16Fixed => 8,
+            TargetFormat::Rg16Float => 9,
+            TargetFormat::Rg32Float => 10,
         };
         let entry = match format {
             _ if !format.is_depth() => 0,
@@ -2094,6 +2191,7 @@ impl Drawer {
             match r.dest_format {
                 formats::DEST_8_8_8_8 => 0,
                 formats::DEST_2_10_10_10 => 1,
+                formats::DEST_16_16 => 3,
                 _ => 2,
             },
             u32::from(r.dest_swap),
@@ -2304,10 +2402,13 @@ mod tests {
         assert!(w.contains("o.o0 = (b.o0 - a.o0) + c.o0;\n    o.o2 = (b.o2 - a.o2) + c.o2;"));
         assert!(!w.contains("o.o1 ="));
         assert!(rect_list_wgsl("var<private> x: i32 = 1;\n", 0).is_err());
-        let ps = clamp_pixel_wgsl("    out.c0 = o_col[0];\n", 0, 31.875, 1.0).unwrap();
-        assert!(ps.contains("vec3<f32>(31.875)), clamp(o_col[0].w, 0.0, 1.0)"));
-        assert!(clamp_pixel_wgsl("", 0, 1.0, 1.0).is_err());
-        let ps = clamp_pixel_wgsl("    out.c2 = o_col[2];\n", 2, f32::INFINITY, 1.0).unwrap();
-        assert!(ps.contains("out.c2 = vec4<f32>(o_col[2].xyz, clamp(o_col[2].w, 0.0, 1.0));"));
+        let ps = clamp_pixel_wgsl("    out.c0 = o_col[0];\n", 0, 31.875, 1.0, 1.0).unwrap();
+        assert!(ps.contains("vec3<f32>(31.875)), clamp(o_col[0].w, 0.0, 1.0)) * 1.0;"));
+        assert!(clamp_pixel_wgsl("", 0, 1.0, 1.0, 1.0).is_err());
+        let ps = clamp_pixel_wgsl("    out.c2 = o_col[2];\n", 2, f32::INFINITY, 1.0, 1.0).unwrap();
+        assert!(ps.contains("out.c2 = vec4<f32>(o_col[2].xyz, clamp(o_col[2].w, 0.0, 1.0)) * 1.0;"));
+        let inf = f32::INFINITY;
+        let ps = clamp_pixel_wgsl("    out.c1 = o_col[1];\n", 1, inf, inf, 0.03125).unwrap();
+        assert!(ps.contains("out.c1 = vec4<f32>(o_col[1].xyz, o_col[1].w) * 0.03125;"));
     }
 }
