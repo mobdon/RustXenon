@@ -1,8 +1,13 @@
 //! Times a synthetic frame shaped like a real game's: a 1280x720 7e3 render
-//! target cleared with a rectangle list, `DRAWS` textured quads, a Convert
-//! resolve to the front buffer and a swap. Prints where the time goes.
+//! target cleared with a rectangle list, `draws` textured quads (each with
+//! its own float constant, every eighth one blended), `points` single-vertex
+//! point list draws, `resolves - 1` full-screen Convert resolves to a scratch
+//! surface spread over the frame, a last resolve to the front buffer and a
+//! swap. Prints where the time goes.
 //!
-//! cargo run --release -p xenon-draw --example bench -- [frames] [draws]
+//! cargo run --release -p xenon-draw --example bench -- [frames] [draws] [points] [resolves]
+//!
+//! A world frame is about `4 3000 384 40`.
 
 #[path = "../tests/common/mod.rs"]
 mod common;
@@ -15,7 +20,10 @@ use xenon_texture::{endian, tile};
 const FW: u32 = 1280;
 const FH: u32 = 720;
 const FRONT: u32 = 0x20_0000;
+const SCRATCH: u32 = 0x60_0000;
 const TEX: u32 = 256;
+/// Source alpha blending.
+const BLEND: u32 = 6 | (7 << 8) | (6 << 16) | (7 << 24);
 
 fn main() {
     let mut args = std::env::args().skip(1);
@@ -26,6 +34,8 @@ fn main() {
         .unwrap_or(10)
         .max(2);
     let draws: u32 = args.next().and_then(|a| a.parse().ok()).unwrap_or(100);
+    let points: u32 = args.next().and_then(|a| a.parse().ok()).unwrap_or(0);
+    let resolves: u32 = args.next().and_then(|a| a.parse().ok()).unwrap_or(1).max(1);
     let mut d = match xenon_draw::Drawer::new() {
         Ok(d) => d,
         Err(e) => {
@@ -36,7 +46,7 @@ fn main() {
     println!("adapter: {}", d.adapter);
     let mut mem = xenon_gpu::SliceMemory {
         base: 0,
-        data: vec![0; 0x60_0000],
+        data: vec![0; 0xA0_0000],
     };
     let linear: Vec<u8> = (0..TEX * TEX)
         .flat_map(|i| [(i % TEX) as u8, (i / TEX) as u8, 128, 255])
@@ -89,8 +99,34 @@ fn main() {
         .shader(false, &vs_uv())
         .shader(true, &ps_texture(1))
         .regs(SHADER_CONSTANT_FETCH + 6, &fetch);
+    let segment = draws.div_ceil(resolves);
     for i in 0..draws {
-        s.vertex_fetch(0, quad_base + i * 80, 20).draw_auto(13, 4);
+        s.regs(SHADER_CONSTANT_FLOAT, &[f(i as f32), 0, 0, 0])
+            .regs(
+                RB_BLENDCONTROL0,
+                &[if i % 8 == 7 { BLEND } else { 0x0001_0001 }],
+            )
+            .vertex_fetch(0, quad_base + i * 80, 20)
+            .draw_auto(13, 4);
+        let last = i + 1 == draws;
+        if (i + 1) % segment == 0 || last {
+            // This segment's share of the point draws.
+            let n = points / resolves + u32::from((i / segment) < points % resolves);
+            s.shader(false, &vs_color()).shader(true, &ps_const());
+            for _ in 0..n {
+                s.vertex_fetch(0, VERTS, 4).draw_auto(1, 1);
+            }
+            s.shader(false, &vs_uv()).shader(true, &ps_texture(1));
+            if !last {
+                s.resolve_with(
+                    &mut mem,
+                    (FW, FH),
+                    COPY_CONVERT,
+                    (SCRATCH, FW | (FH << 16), dest_info(6, 0, false)),
+                    [0; 3],
+                );
+            }
+        }
     }
     s.resolve_with(
         &mut mem,
@@ -131,6 +167,7 @@ fn main() {
             *a += b;
         }
         total.textures_uploaded += t.textures_uploaded;
+        total.submits += t.submits;
         total.pipelines_created += t.pipelines_created;
     }
     let n = frames - 1;
@@ -154,8 +191,9 @@ fn main() {
         println!("  {name:26} {:>10.2?} per frame", v / n);
     }
     println!(
-        "  textures uploaded {} / pipelines created {} per frame",
+        "  textures uploaded {} / pipelines created {} / submits {} per frame",
         t.textures_uploaded / n,
-        t.pipelines_created / n
+        t.pipelines_created / n,
+        t.submits / n
     );
 }

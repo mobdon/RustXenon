@@ -43,9 +43,12 @@
 //!   (count in bits 0..8, aL start in 8..16, signed aL step in 16..24).
 //! - Texture fetch slot `n` binds `@group(1) @binding(2n)` as
 //!   `texture_2d<f32>` and `@group(1) @binding(2n+1)` as `sampler`, only for
-//!   the slots in [`ShaderInfo::textures_used`]. The shader reads only the
-//!   LOD bias (dword 4) of a texture fetch constant; format, swizzle, sign,
-//!   exponent bias and filtering are the drawer's.
+//!   the slots in [`ShaderInfo::textures_used`]. The shader reads the sign
+//!   (dword 0), swizzle and exponent bias (dword 3) and LOD bias (dword 4) of
+//!   a texture fetch constant, and applies sign (signed, biased, gamma) and
+//!   exponent bias to the sampled value; the texture it samples holds the
+//!   unsigned decode with the swizzle applied. Format and filtering are the
+//!   drawer's.
 //! - Vertex stage: entry `vs_main`, input `@builtin(vertex_index)`. r0.x
 //!   starts as the vertex index `(vertex_index + consts.vertex_base) &
 //!   0xFFFFFF` (24 bits, as Xenia masks it; the min/max index clamp is not
