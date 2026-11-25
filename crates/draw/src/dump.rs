@@ -12,7 +12,7 @@ use std::path::PathBuf;
 
 use xenon_gpu::regs::{self, RegisterFile};
 use xenon_shader::disasm::{disassemble, Disassembly};
-use xenon_shader::ucode::FetchInstr;
+use xenon_shader::ucode::{FetchInstr, TextureOp};
 use xenon_shader::{ShaderStage, PIXEL_FLOAT_CONST_BASE};
 
 use crate::{state, texture_log_line, TargetFormat};
@@ -144,6 +144,24 @@ fn draw_state(
     }
 
     let _ = writeln!(s, "\n# texture fetches");
+    // Explicit LOD and bias per slot over both stages, by the translator's
+    // rule (ShaderInfo::texture_explicit_lod), so the lines match the
+    // texture log.
+    let (mut lod, mut bias) = (0u32, 0u32);
+    for (pixel, d) in [(false, vs_d), (true, ps_d)] {
+        for f in &d.fetches {
+            let FetchInstr::Texture(t) = f else { continue };
+            if t.op != TextureOp::Fetch {
+                continue;
+            }
+            if !(t.use_computed_lod && pixel) || t.use_register_lod || t.use_register_gradients {
+                lod |= 1 << t.slot;
+            }
+            if t.lod_bias != 0 {
+                bias |= 1 << t.slot;
+            }
+        }
+    }
     for (stage, d) in [("vs", vs_d), ("ps", ps_d)] {
         let mut seen = 0u32;
         for f in &d.fetches {
@@ -151,10 +169,9 @@ fn draw_state(
             let _ = writeln!(s, "{stage} {}", xenon_shader::disasm::fetch_text(f));
             if seen & (1 << t.slot) == 0 {
                 seen |= 1 << t.slot;
-                let explicit =
-                    !t.use_computed_lod || t.use_register_lod || t.use_register_gradients;
                 let c = r.fetch_constant(t.slot);
-                let line = texture_log_line(ps, t.slot, c, explicit, t.lod_bias != 0);
+                let bit = |m: u32| m & (1 << t.slot) != 0;
+                let line = texture_log_line(ps, t.slot, c, bit(lod), bit(bias));
                 let _ = writeln!(s, "    {line}");
             }
         }
@@ -226,4 +243,45 @@ fn draw_state(
         words(regs::SHADER_CONSTANT_LOOP, 32)
     );
     s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use xenon_shader::asm::assemble;
+    use xenon_shader::ucode::{CfInstr, Exec, Instr, TextureFetch};
+
+    fn tfetch_program(stage: ShaderStage, slot: u32) -> Disassembly {
+        let t = TextureFetch::fetch_2d(0, 0, slot);
+        assert!(t.use_computed_lod);
+        let words = assemble(
+            &[CfInstr::Exec(Exec::new(0, 1, true))],
+            &[Instr::Fetch(FetchInstr::Texture(t))],
+        );
+        disassemble(&words, stage)
+    }
+
+    /// Computed LOD is explicit in a vertex shader, as the translator
+    /// samples it there.
+    #[test]
+    fn texture_lod_label_follows_the_translator() {
+        let vs = tfetch_program(ShaderStage::Vertex, 3);
+        let ps = tfetch_program(ShaderStage::Pixel, 5);
+        let draw = xenon_gpu::Draw {
+            primitive: xenon_gpu::PrimitiveType::TriangleList,
+            index_count: 3,
+            source: xenon_gpu::IndexSource::Auto,
+            initiator: 0,
+            viz_query: None,
+        };
+        let s = draw_state(&RegisterFile::default(), 1, &vs, 2, &ps, &draw);
+        let line = |n: u32| {
+            s.lines()
+                .find(|l| l.contains(&format!(" t{n} ")))
+                .unwrap_or_else(|| panic!("no t{n} line in\n{s}"))
+                .to_owned()
+        };
+        assert!(line(3).contains("explicit lod"), "{s}");
+        assert!(line(5).contains("computed lod"), "{s}");
+    }
 }
