@@ -3,6 +3,7 @@
 //!
 //! - [`ucode`] decodes control-flow, ALU and fetch instructions.
 //! - [`asm`] encodes them again, so tests can build programs by hand.
+//! - [`disasm`] lists a program as text, for diagnostics.
 //! - [`translate`] turns a program into a WGSL module.
 //!
 //! # Binding contract with the drawer
@@ -88,6 +89,7 @@
 //! infinities into signed zeros.
 
 pub mod asm;
+pub mod disasm;
 pub mod ucode;
 mod wgsl;
 
