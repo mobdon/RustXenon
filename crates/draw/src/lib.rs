@@ -805,7 +805,6 @@ const TARGET_CAP: u64 = 256 << 20;
 
 /// Replays recorded command lists on a headless wgpu device.
 pub struct Drawer {
-    instance: wgpu::Instance,
     device: wgpu::Device,
     queue: wgpu::Queue,
     /// Adapter name, backend and device type (a software one is `Cpu`),
@@ -924,6 +923,8 @@ pub struct Drawer {
     uncaptured: Arc<Mutex<Vec<String>>>,
     max_dim: u32,
     max_storage: u64,
+    /// Last, so it drops after the device and every resource made from it.
+    instance: wgpu::Instance,
 }
 
 /// Draws recorded into one command encoder, in one render pass while the
@@ -2247,8 +2248,9 @@ impl Drawer {
 
     /// Drops the host textures of render targets that a newer target on
     /// the same EDRAM tiles, one their words transfer to, has written all
-    /// the rows of: their next use takes that target's words (or newer
-    /// ones) as it would without the drop. Then, past the cap, drops the
+    /// the rows of, with no newer alias whose words do not transfer:
+    /// their next use takes that target's words (or newer ones) as it
+    /// would without the drop. Then, past the cap, drops the
     /// least recently written targets; one still holding the newest
     /// pixels of its tiles comes back cleared, as EDRAM garbage would, and
     /// is reported. Runs with no batch recorded.
@@ -2268,6 +2270,14 @@ impl Drawer {
                         && row_width(n, nw.msaa) == row_width(k, w.msaa)
                         && transferable(n.format, k.format)
                         && rows_down(nw) >= rows_down(w)
+                        // `target` would pick a newer alias first and not
+                        // transfer from it, so keep k's own words.
+                        && !self.written.iter().any(|(&m, &mw)| {
+                            mw.stamp > nw.stamp
+                                && m.base_tiles == k.base_tiles
+                                && !(transferable(m.format, k.format)
+                                    && row_width(m, mw.msaa) == row_width(k, w.msaa))
+                        })
                 })
             })
             .map(|(&k, _)| k)
@@ -4424,6 +4434,52 @@ mod tests {
         assert!(!d.written.contains_key(&key(0)));
         assert!(d.memory_line().contains("targets 1 MB in 2, 1 dropped,"));
         assert_eq!(report.warnings.len(), 1, "{report:?}");
+    }
+
+    #[test]
+    fn drop_keeps_a_target_whose_newest_alias_does_not_transfer() {
+        let Some(mut d) = gpu() else { return };
+        let key = |format| RenderTargetKey {
+            base_tiles: 0,
+            pitch: 64,
+            format,
+        };
+        let mut report = Report::default();
+        // (format, msaa) in write order; the last one transferable but at
+        // another row width does not transfer either.
+        for (formats, kept) in [
+            (
+                &[
+                    (TargetFormat::D24S8, 0),
+                    (TargetFormat::Rgba8, 0),
+                    (TargetFormat::Rgba16Float, 0),
+                ][..],
+                true,
+            ),
+            (
+                &[
+                    (TargetFormat::D24S8, 0),
+                    (TargetFormat::Rgba8, 0),
+                    (TargetFormat::D24FS8, 2),
+                ][..],
+                true,
+            ),
+            (
+                &[(TargetFormat::D24S8, 0), (TargetFormat::Rgba8, 0)][..],
+                false,
+            ),
+        ] {
+            d.targets.clear();
+            d.written.clear();
+            for &(f, msaa) in formats {
+                d.target(key(f), 64, msaa, &mut report).unwrap();
+                d.mark_written(key(f), 64, msaa);
+            }
+            d.drop_targets(&mut report);
+            let depth = key(TargetFormat::D24S8);
+            assert_eq!(d.render_targets().contains(&depth), kept, "{formats:?}");
+            assert_eq!(d.written.contains_key(&depth), kept, "{formats:?}");
+        }
     }
 
     #[test]

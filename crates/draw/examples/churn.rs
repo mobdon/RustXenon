@@ -77,13 +77,14 @@ fn main() {
     d.texture_cache_limit = u64::from(cache_mb) << 20;
     let resolved = xenon_texture::tile::tiled_extent_2d(FW, FH, FW, 4).unwrap();
     assert!(FRONT + resolved <= SCRATCH && SCRATCH + resolved <= FULL);
+    // In u64 so a huge count fails here instead of wrapping.
     assert!(
-        QUADS + 80 * textures.max(draws) <= TEXTURES,
+        u64::from(QUADS) + 80 * u64::from(textures.max(draws)) <= u64::from(TEXTURES),
         "too many draws"
     );
     // Guest addresses are 512 MB physical.
     assert!(
-        TEXTURES + textures * SLOT <= 0x2000_0000,
+        u64::from(TEXTURES) + u64::from(textures) * u64::from(SLOT) <= 0x2000_0000,
         "too many textures"
     );
     let mut mem = xenon_gpu::SliceMemory {
@@ -134,7 +135,14 @@ fn main() {
     // The front buffer resolve and the scratch ones.
     let mut built = 1;
     for i in 0..textures + draws {
-        if draws > 0 && i > textures && (i - textures) % draws.div_ceil(resolves).max(1) == 0 {
+        // Exactly `resolves - 1` scratch resolves, spread evenly before the draws.
+        let scratch = if i < textures || draws == 0 {
+            0
+        } else {
+            let (j, n) = (u64::from(i - textures), u64::from(resolves - 1));
+            ((j + 1) * n / u64::from(draws) - j * n / u64::from(draws)) as u32
+        };
+        for _ in 0..scratch {
             built += 1;
             s.resolve_with(
                 &mut mem,
