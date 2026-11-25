@@ -4034,9 +4034,11 @@ fn bc_blocks(
     let blocks = if fetch.tiled {
         tile::detile_2d(&raw, wb, hb, pitch, bpb)?
     } else {
-        let row = (wb * bpb) as usize;
-        raw.chunks(pitch as usize * bpb as usize)
-            .flat_map(|r| &r[..row])
+        // Index rows rather than chunk by pitch: a single linear row may have
+        // a pitch below its width, even 0.
+        let (row, pitch) = ((wb * bpb) as usize, (pitch * bpb) as usize);
+        (0..hb as usize)
+            .flat_map(|y| &raw[y * pitch..][..row])
             .copied()
             .collect()
     };

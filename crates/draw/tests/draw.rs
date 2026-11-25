@@ -193,11 +193,17 @@ fn textured_quad_samples_tiled_texture() {
     }
 }
 
-/// Draws a 32x32 DXT `format` (k8in16, nearest sampling, tiled or with a
-/// pitch of 32 blocks) of pseudo-random blocks of `bpb` bytes over the
-/// target's corner with BC passthrough on or off; returns the quad's pixels
-/// and the bytes uploaded.
-fn draw_dxt(bc: bool, format: u32, bpb: u32, tiled: bool) -> Option<(Vec<[u8; 4]>, u64)> {
+/// Draws a `w`x`h` DXT `format` (k8in16, nearest sampling, tiled or linear
+/// with a pitch field of `pitch`) of pseudo-random blocks of `bpb` bytes over
+/// the target's corner, at most `W` wide, with BC passthrough on or off;
+/// returns the quad's pixels and the bytes uploaded.
+fn draw_dxt(
+    bc: bool,
+    format: u32,
+    bpb: u32,
+    tiled: bool,
+    (w, h, pitch): (u32, u32, u32),
+) -> Option<(Vec<[u8; 4]>, u64)> {
     let mut d = drawer()?;
     if bc && !d.bc_textures {
         println!("skip: the adapter has no BC textures");
@@ -205,40 +211,41 @@ fn draw_dxt(bc: bool, format: u32, bpb: u32, tiled: bool) -> Option<(Vec<[u8; 4]
     }
     d.bc_textures = bc;
     let mut mem = memory();
-    let n = 32u32;
     let mut seed = 0x1234_5678u32;
-    let linear: Vec<u8> = (0..n * n / 16 * bpb)
+    let linear: Vec<u8> = (0..w * h / 16 * bpb)
         .map(|_| {
             seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
             (seed >> 24) as u8
         })
         .collect();
     let mut guest = if tiled {
-        tile::tile_2d(&linear, n / 4, n / 4, n / 4, bpb).unwrap()
+        tile::tile_2d(&linear, w / 4, h / 4, w / 4, bpb).unwrap()
     } else {
-        let row = (n / 4 * bpb) as usize;
+        let row = (w / 4 * bpb) as usize;
+        let stride = (tile::align_to_tile(pitch * 8) * bpb) as usize;
         linear
             .chunks(row)
-            .flat_map(|r| [r, &vec![0; row * 3]].concat())
+            .flat_map(|r| [r, &vec![0; stride.saturating_sub(row)]].concat())
             .collect()
     };
     endian::swap_in_place(&mut guest, xenon_texture::Endian::K8in16);
     mem.data[TEXTURE as usize..][..guest.len()].copy_from_slice(&guest);
-    let q = n as f32;
+    let (qw, qh) = (w.min(W), h);
+    let (x, y) = (qw as f32, qh as f32);
     let verts: Vec<u32> = [
         (0.0, 0.0, 0.0, 0.0),
-        (q, 0.0, 1.0, 0.0),
-        (q, q, 1.0, 1.0),
-        (0.0, q, 0.0, 1.0),
+        (x, 0.0, 1.0, 0.0),
+        (x, y, 1.0, 1.0),
+        (0.0, y, 0.0, 1.0),
     ]
     .iter()
     .flat_map(|&(x, y, u, v)| [f(x), f(y), f(0.0), f(u), f(v)])
     .collect();
     mem.write_words(VERTS, &verts);
     let fetch = [
-        2 | (2 << 10) | (2 << 13) | ((n >> 5) << 22) | (u32::from(tiled) << 31), // clamp
-        format | (1 << 6) | TEXTURE,                                             // k8in16
-        (n - 1) | ((n - 1) << 13),
+        2 | (2 << 10) | (2 << 13) | (pitch << 22) | (u32::from(tiled) << 31), // clamp
+        format | (1 << 6) | TEXTURE,                                          // k8in16
+        (w - 1) | ((h - 1) << 13),
         ((1 << 3) | (2 << 6) | (3 << 9)) << 1, // swizzle RGBA, point filters
         0,
         1 << 9, // 2D
@@ -256,7 +263,7 @@ fn draw_dxt(bc: bool, format: u32, bpb: u32, tiled: bool) -> Option<(Vec<[u8; 4]
     assert!(report.warnings.is_empty(), "{report:?}");
     assert_eq!(report.timings.textures_uploaded, 1, "{report:?}");
     let img = d.read_render_target(COLOR_KEY, 0, 0, W, H).unwrap();
-    let pixels = (0..n * n).map(|i| px(&img, W, i % n, i / n)).collect();
+    let pixels = (0..qw * qh).map(|i| px(&img, W, i % qw, i / qw)).collect();
     Some((pixels, report.timings.texture_bytes))
 }
 
@@ -266,20 +273,30 @@ fn draw_dxt(bc: bool, format: u32, bpb: u32, tiled: bool) -> Option<(Vec<[u8; 4]
 /// (lavapipe rounds where the CPU decoder truncates), as the BC spec allows.
 #[test]
 fn dxt_passthrough_matches_cpu_decode() {
-    for (format, bpb, tiled) in [(18, 8, true), (20, 16, true), (18, 8, false)] {
-        let Some((bc, bc_bytes)) = draw_dxt(true, format, bpb, tiled) else {
+    let square = (32, 32, 1);
+    // One linear block row may have a pitch below its width.
+    let strip = (256, 4, 0);
+    for (format, bpb, tiled, size) in [
+        (18, 8, true, square),
+        (19, 16, true, square),
+        (20, 16, true, square),
+        (18, 8, false, square),
+        (20, 16, false, strip),
+    ] {
+        let Some((bc, bc_bytes)) = draw_dxt(true, format, bpb, tiled, size) else {
             return;
         };
-        let (cpu, cpu_bytes) = draw_dxt(false, format, bpb, tiled).unwrap();
-        assert_eq!(cpu_bytes, 32 * 32 * 4);
-        assert_eq!(bc_bytes, 64 * u64::from(bpb), "format {format}");
+        let (cpu, cpu_bytes) = draw_dxt(false, format, bpb, tiled, size).unwrap();
+        let texels = u64::from(size.0 * size.1);
+        assert_eq!(cpu_bytes, texels * 4);
+        assert_eq!(bc_bytes, texels / 16 * u64::from(bpb), "format {format}");
         for (i, (b, c)) in bc.iter().zip(&cpu).enumerate() {
             let near = b.iter().zip(c).all(|(&b, &c)| b.abs_diff(c) <= 1);
             assert!(
                 near,
                 "format {format} ({}, {}): {b:?} {c:?}",
-                i % 32,
-                i / 32
+                i as u32 % size.0.min(W),
+                i as u32 / size.0.min(W)
             );
         }
     }
