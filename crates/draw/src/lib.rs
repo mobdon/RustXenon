@@ -159,6 +159,7 @@
 //! (`IsRasterizationPotentiallyDone`): Direct3D draws before its first
 //! render target setup. They are skipped with a warning.
 
+mod dump;
 pub mod formats;
 pub mod frame;
 pub mod indices;
@@ -179,6 +180,8 @@ use xenon_gpu::{
 };
 use xenon_shader::{ParamGen, ParamGenPrimitive, ShaderInfo, Translated};
 use xenon_texture::convert::float20e4_to_f32 as float20e4;
+
+pub use dump::ShaderDump;
 
 pub use frame::Frame;
 
@@ -945,6 +948,10 @@ pub struct Drawer {
     /// hash in hex); off without it. Draws whose shaders fail translation
     /// (such as a cube or 3D fetch) do not log.
     pub texture_log: Option<Option<u64>>,
+    /// Diagnostic: write each drawn shader's words, listing, WGSL and first
+    /// draw state to a directory (see [`ShaderDump`]). Default from
+    /// `XENON_SHADER_DUMP=<dir>[,<hash>...]`; off without it.
+    pub shader_dump: Option<ShaderDump>,
     timings: Timings,
     uncaptured: Arc<Mutex<Vec<String>>>,
     max_dim: u32,
@@ -1445,6 +1452,11 @@ impl Drawer {
                         r
                     }
                 }),
+            shader_dump: std::env::var("XENON_SHADER_DUMP").ok().and_then(|v| {
+                ShaderDump::parse(&v)
+                    .map_err(|e| eprintln!("XENON_SHADER_DUMP={v:?}: {e}; shader dump off"))
+                    .ok()
+            }),
             timings: Timings::default(),
             uncaptured,
             max_dim: limits.max_texture_dimension_2d,
@@ -3424,8 +3436,27 @@ impl Drawer {
             );
         let param_gen = self.param_gen(topology, polygonal);
         let mut t = Instant::now();
-        let vs_t = self.translate(&vs, ShaderStage::Vertex, None)?;
-        let ps_t = self.translate(&ps, ShaderStage::Pixel, param_gen)?;
+        let vs_t = self.translate(&vs, ShaderStage::Vertex, None);
+        let ps_t = self.translate(&ps, ShaderStage::Pixel, param_gen);
+        if let Some(dump) = &mut self.shader_dump {
+            fn wgsl(t: &Result<Translated, Skip>) -> Result<&str, String> {
+                match t {
+                    Ok(t) => Ok(&t.wgsl),
+                    Err(e) => Err(format!("{e:?}")),
+                }
+            }
+            if let Err(e) = dump.draw(
+                &self.regs,
+                (vs.hash, &vs.words),
+                wgsl(&vs_t),
+                (ps.hash, &ps.words),
+                wgsl(&ps_t),
+                d,
+            ) {
+                report.warn(format!("shader dump to {}: {e}", dump.dir.display()));
+            }
+        }
+        let (vs_t, ps_t) = (vs_t?, ps_t?);
         let surface = self.regs.get(regs::RB_SURFACE_INFO);
         // shortcut: MSAA targets are drawn with one sample per pixel (the
         // resolve then copies that sample); add samples if edges matter.
