@@ -252,7 +252,9 @@ fn xe_pwl_gamma_to_linear(g: f32) -> f32 {
     var seg_linear = array<f32, 4>(0.0, 64.0, 128.0, 512.0);
     let slope = f32(1u << seg);
     let l = seg_linear[seg] + slope * (x - seg_start[seg]);
-    return (l + floor(l * slope / 1024.0)) / 1023.0;
+    // Multiply by the reciprocal: WGSL division is allowed 2.5 ulp of error,
+    // and the console curve scales by 1/1023 this way.
+    return (l + floor(l * slope / 1024.0)) * (1.0 / 1023.0);
 }
 
 fn xe_tfetch_sign_bias(v: vec4<f32>, w0: u32, w3: u32) -> vec4<f32> {
