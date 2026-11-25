@@ -673,10 +673,10 @@ impl Report {
         }
     }
 
-    fn warn(&mut self, why: impl Into<String>) {
-        let why = why.into();
-        if !self.warnings.contains(&why) {
-            self.warnings.push(why);
+    /// Allocates only for a warning not reported yet: some repeat per draw.
+    fn warn(&mut self, why: impl AsRef<str> + Into<String>) {
+        if !self.warnings.iter().any(|w| w == why.as_ref()) {
+            self.warnings.push(why.into());
         }
     }
 }
@@ -1286,6 +1286,9 @@ impl Part<'_> {
 #[derive(Clone, Copy)]
 enum Site {
     Resolve,
+    // Transfers ride in the batch now; the slot stays so the others keep
+    // their indices on the `[draw]` line.
+    #[allow(dead_code)]
     Transfer,
     Decode,
     Other,
@@ -3360,9 +3363,9 @@ impl Drawer {
         if rows == 0 {
             return Ok(());
         }
-        // The source's batched draws (and any reads of `dst` in the batch)
-        // come before the transfer, which is submitted on its own.
-        self.flush()?;
+        // Recorded in the batch after its draws, like a clear: its render
+        // pass ends theirs, so the source's draws (and reads of `dst`) land
+        // before it and later draws after it, with no submit of its own.
         let (sf, df) = (self.host_format(src.format), self.host_format(dst.format));
         let to_depth = df.is_depth_stencil_format();
         // Without a source stencil the depth pass's stencil 0 is the word's.
@@ -3445,9 +3448,14 @@ impl Drawer {
             load: wgpu::LoadOp::Load,
             store: wgpu::StoreOp::Store,
         };
-        let mut enc = self.device.create_command_encoder(&Default::default());
+        let device = &self.device;
+        let batch = self.batch.get_or_insert_with(|| Batch {
+            pass: None,
+            enc: device.create_command_encoder(&Default::default()),
+        });
+        batch.pass = None;
         {
-            let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+            let mut pass = batch.enc.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("transfer"),
                 color_attachments: if to_depth { &[] } else { &color_attachment },
                 depth_stencil_attachment: to_depth.then(|| {
@@ -3470,8 +3478,6 @@ impl Drawer {
                 pass.draw(0..3, 0..1);
             }
         }
-        self.submit_now([enc.finish()]);
-        self.submitted(Site::Transfer);
         self.timings.transfers += 1;
         self.timings.transfer_passes += pipelines.len() as u32;
         match block_on(scope.pop()) {

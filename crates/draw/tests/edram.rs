@@ -358,9 +358,9 @@ fn transfer_does_not_bounce_back() {
 /// rectangles of narrowing width (depth words 0x2.., 0x6.. and 0xA..,
 /// just over 0.125, 0.375 and 0.625) are recorded into one render pass on
 /// the colour target at tile 0, then a depth-tested draw makes the depth
-/// target at tile 0 current. The transfer must see all three, so the batch
-/// is submitted first: one submit for the colour draws, one for the
-/// transfer and one for the depth-tested draws. Depth column x takes
+/// target at tile 0 current. The transfer must see all three: it is
+/// recorded in the batch after them, before the depth-tested draws, all
+/// in one submit. Depth column x takes
 /// colour column x + 40 (or x - 40), the other half of the tile.
 #[test]
 fn batched_colour_draws_reach_the_transfer() {
@@ -410,7 +410,7 @@ fn batched_colour_draws_reach_the_transfer() {
     let report = run(&mut d, &s, &mut mem);
     assert_eq!(report.draws, 5, "{report:?}");
     assert!(report.warnings.is_empty(), "{report:?}");
-    assert_eq!(report.timings.submits, 3, "{report:?}");
+    assert_eq!(report.timings.submits, 1, "{report:?}");
     let key = RenderTargetKey {
         base_tiles: 100,
         pitch: W,
@@ -665,9 +665,13 @@ fn dropped_and_recreated_targets_do_not_leak() {
     let Some(mut d) = drawer() else { return };
     let mut mem = memory();
     let s = restore_then_draw_depth(&mut mem);
-    run(&mut d, &s, &mut mem);
+    // Two warm-up replays: the upload belt keeps a second chunk while the
+    // first is still in flight, then reuses the pair.
+    for _ in 0..2 {
+        run(&mut d, &s, &mut mem);
+    }
     let live = d.gpu_live();
-    for frame in 1..30 {
+    for frame in 2..30 {
         run(&mut d, &s, &mut mem);
         assert_eq!(d.gpu_live(), live, "replay {frame}");
     }
