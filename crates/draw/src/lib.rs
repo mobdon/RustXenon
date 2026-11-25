@@ -605,7 +605,8 @@ fn unsupported<T>(why: impl Into<String>) -> Result<T, Skip> {
 
 #[derive(Clone)]
 struct Program {
-    words: Vec<u32>,
+    /// Shared, so a draw takes the loaded programs without copying them.
+    words: Arc<[u32]>,
     hash: u64,
 }
 
@@ -723,6 +724,9 @@ fn transferable(a: TargetFormat, b: TargetFormat) -> bool {
 /// about 1.6 MB of driver memory.
 const PIPELINE_CAP: usize = 1024;
 
+/// A program's translation, or why it failed.
+type Translation = Result<Arc<Translated>, String>;
+
 /// Key of a shader module: program hash, vertex stage, extra vertex
 /// outputs, variant and pixel parameter generation.
 type ModuleKey = (u64, bool, u16, Variant, Option<ParamGen>);
@@ -830,7 +834,8 @@ pub struct Drawer {
     regs: RegisterFile,
     vs: Option<Program>,
     ps: Option<Program>,
-    translated: HashMap<(u64, bool, Option<ParamGen>), Result<Translated, String>>,
+    /// Shared, so a draw takes a translation without copying its WGSL.
+    translated: HashMap<(u64, bool, Option<ParamGen>), Translation>,
     /// Keyed by program hash, stage, extra vertex outputs, variant (the
     /// rectangle list wrapper or the pixel output bias and clamp) and pixel parameter
     /// generation.
@@ -1679,7 +1684,7 @@ impl Drawer {
                     }
                     let p = Some(Program {
                         hash: hash_words(words),
-                        words: words.clone(),
+                        words: words.as_slice().into(),
                     });
                     match stage {
                         ShaderStage::Vertex => self.vs = p,
@@ -2711,7 +2716,7 @@ impl Drawer {
         p: &Program,
         stage: ShaderStage,
         param_gen: Option<ParamGen>,
-    ) -> Result<Translated, Skip> {
+    ) -> Result<Arc<Translated>, Skip> {
         let vertex = stage == ShaderStage::Vertex;
         let t = self
             .translated
@@ -2722,7 +2727,9 @@ impl Drawer {
                 } else {
                     xenon_shader::ShaderStage::Pixel
                 };
-                xenon_shader::translate_with(&p.words, s, param_gen).map_err(|e| e.to_string())
+                xenon_shader::translate_with(&p.words, s, param_gen)
+                    .map(Arc::new)
+                    .map_err(|e| e.to_string())
             });
         match t {
             Ok(t) => Ok(t.clone()),
