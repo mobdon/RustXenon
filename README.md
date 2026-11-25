@@ -45,6 +45,8 @@ See [DATA-RULES.md](DATA-RULES.md).
 | `crates/shader` | `xenon-shader`: GPU shader microcode decoder, assembler for tests, translation to WGSL |
 | `crates/draw` | `xenon-draw`: headless wgpu drawer: replays recorded commands into offscreen render targets, resolves, PNG frames |
 | `crates/host` | `xenon-host`: loads the player's files, runs recompiled code, replaces system calls; later graphics, input and audio |
+| `crates/input` | `xenon-input`: the pad state the game reads: keyboard layout, stick dead zones, merging controller and keyboard. No window or GPU |
+| `crates/window` | `xenon-window`: the game window (`--window`): shows drawn frames, reads an XInput controller and the keyboard |
 | `crates/compare` | `xenon-compare`: diff two frames with a tolerance (side-by-side sheet) and make a blink image. No window or GPU |
 | `crates/regress` | `xenon-regress`: runs game-level regression tests headless and reports pass or fail per frame with pictures. See `games/README.md` |
 | `games/<sha256>/hooks.toml` | Per-game hook addresses with role names. The only per-game file in git |
@@ -57,6 +59,33 @@ cargo build
 cargo test
 cargo run -p xenon-host -- --probe
 ```
+
+## Playing in a window
+
+Run the built game with `--window` (plus `--exe` and `--game` as usual). The
+window shows every frame the drawer makes, letterboxed, and the game runs until
+you close it. An Xbox controller (XInput, on Windows) and the keyboard both
+work at once and act as the pad on port 0; `--press` still replaces them with
+a script for tests, and `--no-controller` unplugs the pad.
+
+Default keys:
+
+| Pad | Key |
+|---|---|
+| Left stick | W A S D |
+| Left stick click | Left Shift |
+| Right stick | I J K L |
+| Right stick click | Right Shift |
+| D-pad | Arrow keys |
+| A, B, X, Y | Space, C, F, R |
+| LB, RB | Q, E |
+| LT, RT | Z, X |
+| Start | Enter or Escape |
+| Back | Backspace or Tab |
+
+Keys are physical positions, so they sit in the same place on any keyboard
+layout. Stick keys push the stick fully; controller sticks use XInput's
+standard dead zones.
 
 ## Plan
 
