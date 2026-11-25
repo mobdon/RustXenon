@@ -727,3 +727,38 @@ fn closing_a_periodic_timer_stops_it() {
         "a closed timer kept firing"
     );
 }
+
+#[test]
+fn free_of_unknown_block_is_counted_and_heap_stays_whole() {
+    let e = env();
+    let rt = &e.rt;
+    let mut c = ctx(0x1_A000);
+    let before = memory::UNKNOWN_FREES.load(std::sync::atomic::Ordering::Relaxed);
+    let a = call(
+        rt,
+        &mut c,
+        memory::ex_allocate_pool_type_with_tag,
+        &[0x40, 0, 0],
+    ) as u32;
+    assert_ne!(a, 0);
+    call(rt, &mut c, memory::ex_free_pool, &[a as u64]);
+    // The second free of the same block and a free of a never-allocated one.
+    call(rt, &mut c, memory::ex_free_pool, &[a as u64]);
+    call(
+        rt,
+        &mut c,
+        memory::mm_free_physical_memory,
+        &[0, 0x1234_5000],
+    );
+    let after = memory::UNKNOWN_FREES.load(std::sync::atomic::Ordering::Relaxed);
+    assert!(after - before >= 2, "{before} -> {after}");
+    // The pool still hands out the freed block's space.
+    let b = call(
+        rt,
+        &mut c,
+        memory::ex_allocate_pool_type_with_tag,
+        &[0x40, 0, 0],
+    ) as u32;
+    assert_ne!(b, 0);
+    call(rt, &mut c, memory::ex_free_pool, &[b as u64]);
+}

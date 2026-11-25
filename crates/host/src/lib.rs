@@ -553,7 +553,12 @@ fn report() {
         "threads started: {}",
         kx.threads.lock().map(|t| t.len()).unwrap_or(0)
     ));
-    log(&format!("memory: {}, {}", kx.usage_line(), growth_line()));
+    log(&format!(
+        "memory: {}, {}, unknown frees {}",
+        kx.usage_line(),
+        growth_line(),
+        kernel::memory::UNKNOWN_FREES.load(Ordering::Relaxed)
+    ));
     if let Some(p) = PROFILE.lock().unwrap().as_ref() {
         let mut v: Vec<_> = p.iter().collect();
         v.sort_by(|a, b| b.1.cmp(a.1));
