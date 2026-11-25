@@ -1032,8 +1032,23 @@ impl Drop for Drawer {
 /// transfers) and at the end of a replay.
 struct Batch {
     /// Dropped (ended) before `enc` is finished.
-    pass: Option<(PassKey, wgpu::RenderPass<'static>)>,
+    pass: Option<(PassKey, wgpu::RenderPass<'static>, Bound)>,
     enc: wgpu::CommandEncoder,
+}
+
+/// The state a render pass has set, so a draw sets only what changed:
+/// wgpu validates and tracks every set call again at submit.
+#[derive(Default)]
+struct Bound {
+    pipeline: Option<wgpu::RenderPipeline>,
+    g0: Option<(wgpu::BindGroup, Vec<u32>)>,
+    g1: Option<wgpu::BindGroup>,
+    /// The whole arena, so draws pick their indices by first index.
+    index: Option<wgpu::Buffer>,
+    viewport: Option<(u32, u32)>,
+    scissor: Option<(u32, u32, u32, u32)>,
+    stencil: Option<u32>,
+    blend: Option<[u32; 4]>,
 }
 
 /// One buffer of a draw's staged data: bytes, or `len` guest bytes at
@@ -2350,7 +2365,7 @@ impl Drawer {
         key: PassKey,
         color: &[Option<wgpu::Texture>; 4],
         depth: Option<&wgpu::Texture>,
-    ) -> &mut wgpu::RenderPass<'static> {
+    ) -> (&mut wgpu::RenderPass<'static>, &mut Bound) {
         let device = &self.device;
         let batch = self.batch.get_or_insert_with(|| Batch {
             pass: None,
@@ -2391,9 +2406,10 @@ impl Drawer {
                     ..Default::default()
                 })
                 .forget_lifetime();
-            batch.pass = Some((key, pass));
+            batch.pass = Some((key, pass, Bound::default()));
         }
-        &mut batch.pass.as_mut().expect("pass begun").1
+        let (_, pass, bound) = batch.pass.as_mut().expect("pass begun");
+        (pass, bound)
     }
 
     fn check_uncaptured(&self) -> Result<(), Error> {
@@ -4244,30 +4260,55 @@ impl Drawer {
                 v.insert(g).clone()
             }
         };
-        let pass = self.pass((color, depth_key), &color_tex, depth_tex.as_ref());
-        pass.set_pipeline(&pipeline);
-        pass.set_bind_group(0, &g0, &offsets);
-        pass.set_bind_group(1, &g1, &[]);
-        let (offset, size) = slices[4];
-        pass.set_index_buffer(
-            arena.slice(offset..offset + size),
-            wgpu::IndexFormat::Uint32,
-        );
-        pass.set_viewport(0.0, 0.0, w as f32, h as f32, 0.0, 1.0);
-        pass.set_scissor_rect(sx, sy, sw, sh);
-        if let Some((_, reference)) = &stencil {
-            pass.set_stencil_reference(*reference);
+        let (pass, bound) = self.pass((color, depth_key), &color_tex, depth_tex.as_ref());
+        if bound.pipeline.as_ref() != Some(&pipeline) {
+            pass.set_pipeline(&pipeline);
+            bound.pipeline = Some(pipeline);
         }
-        pass.set_blend_constant(wgpu::Color {
-            r: f64::from(blend_rgba[0]),
-            g: f64::from(blend_rgba[1]),
-            b: f64::from(blend_rgba[2]),
-            a: f64::from(blend_rgba[3]),
-        });
+        if bound
+            .g0
+            .as_ref()
+            .is_none_or(|(g, o)| *g != g0 || *o != offsets)
+        {
+            pass.set_bind_group(0, &g0, &offsets);
+            bound.g0 = Some((g0, offsets));
+        }
+        if bound.g1.as_ref() != Some(&g1) {
+            pass.set_bind_group(1, &g1, &[]);
+            bound.g1 = Some(g1);
+        }
+        if bound.index.as_ref() != Some(&arena) {
+            pass.set_index_buffer(arena.slice(..), wgpu::IndexFormat::Uint32);
+            bound.index = Some(arena.clone());
+        }
+        if bound.viewport != Some((w, h)) {
+            pass.set_viewport(0.0, 0.0, w as f32, h as f32, 0.0, 1.0);
+            bound.viewport = Some((w, h));
+        }
+        if bound.scissor != Some((sx, sy, sw, sh)) {
+            pass.set_scissor_rect(sx, sy, sw, sh);
+            bound.scissor = Some((sx, sy, sw, sh));
+        }
+        if let Some(&(_, reference)) = stencil.as_ref().filter(|s| bound.stencil != Some(s.1)) {
+            pass.set_stencil_reference(reference);
+            bound.stencil = Some(reference);
+        }
+        let blend = blend_rgba.map(f32::to_bits);
+        if bound.blend != Some(blend) {
+            pass.set_blend_constant(wgpu::Color {
+                r: f64::from(blend_rgba[0]),
+                g: f64::from(blend_rgba[1]),
+                b: f64::from(blend_rgba[2]),
+                a: f64::from(blend_rgba[3]),
+            });
+            bound.blend = Some(blend);
+        }
         if rect_list {
             pass.draw(0..idx.len() as u32 * 2, 0..1);
         } else {
-            pass.draw_indexed(0..idx.len() as u32, 0, 0..1);
+            // Staged at the arena's alignment, so a whole u32 index.
+            let first = (slices[4].0 / 4) as u32;
+            pass.draw_indexed(first..first + idx.len() as u32, 0, 0..1);
         }
         self.timings.submit += lap(&mut t);
         // Recorded, not yet submitted: everything else that touches the
