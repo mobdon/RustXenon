@@ -815,3 +815,118 @@ fn float_resolve_is_kept_for_the_next_replay() {
         assert!(kept == case.guest_path(&mem, f), "{}", case.fetch_format);
     }
 }
+
+const FETCH_16_16_16_16_EXPAND: u32 = 29;
+/// Mip level 1 of a 64x64 8-byte texture at DEST: right after the base.
+const MIP: u32 = DEST + W * H * 8;
+
+/// Fetch constant of the 64x64 k_16_16_16_16_EXPAND chain at DEST (signed,
+/// integer number format, as games fetch 16_16_16_16_FLOAT resolves) with
+/// one mip at MIP, sampling levels `min`..=1, all filters linear.
+fn mip_fetch(min: u32) -> [u32; 6] {
+    let mut f = fetch(FETCH_16_16_16_16_EXPAND, 2, IDENTITY);
+    f[0] |= 0x55 << 2;
+    f[3] |= 1 | (1 << 19) | (1 << 21) | (1 << 23);
+    f[4] = (min << 2) | (1 << 6);
+    f[5] |= MIP;
+    f
+}
+
+/// A 7e3 gradient resolved to k_16_16_16_16_FLOAT as the base level and a
+/// blue rectangle resolved as its 32x32 mip right after it, the way games
+/// build blurred chains. The mip lives in the same kept resolve and is
+/// decoded with the base: a fetch that starts at level 1 samples only
+/// blue, and one that starts at level 0 (texel for texel, so LOD 0) still
+/// samples the base exactly as the guest path does.
+/// Draws `paint` and resolves its top-left 32x32 to MIP as
+/// k_16_16_16_16_FLOAT.
+fn paint_mip(s: &mut Stream, mem: &mut SliceMemory, paint: fn(&mut Stream) -> &mut Stream) {
+    let at = RECT + 32;
+    mem.write_words(at, &[f(0.0), f(0.0), f(32.0), f(0.0), f(32.0), f(32.0)]);
+    paint(s)
+        .vertex_fetch(0, at, 6)
+        .regs(RB_MODECONTROL, &[6])
+        .regs(
+            RB_COPY_CONTROL,
+            &[
+                COPY_CONVERT,
+                MIP,
+                32 | (32 << 16),
+                (dest_info(FETCH_16_16_16_16_FLOAT, 0, false) & !7) | 2,
+            ],
+        )
+        .draw_auto(PRIM_RECT_LIST, 3)
+        .regs(RB_MODECONTROL, &[4]);
+}
+
+#[test]
+fn kept_mip_level_is_sampled() {
+    let case = &HALF4;
+    let mut outputs = Vec::new();
+    for min in [0, 1] {
+        let Some(mut d) = case.drawer() else { return };
+        let mut mem = memory();
+        vertices(&mut mem);
+        let mut s = Stream::default();
+        case.paint_and_resolve(s.setup(), &mut mem, 2);
+        paint_mip(&mut s, &mut mem, paint_small);
+        case.sample(&mut s, mip_fetch(min));
+        let r = run(&mut d, &s, &mut mem);
+        assert!(r.unsupported.is_empty(), "{r:?}");
+        let t = &r.timings;
+        assert_eq!(
+            (t.textures_kept, t.kept_bytes, t.textures_uploaded),
+            (1, u64::from(W * H * 8 + 32 * 32 * 8), 0),
+            "{r:?}"
+        );
+        outputs.push(
+            d.read_render_target_raw(case.out_key(), 0, 0, W, H)
+                .unwrap(),
+        );
+    }
+    let half = |t: &[u8], c: usize| u16::from_le_bytes([t[2 * c], t[2 * c + 1]]);
+    let mip: std::collections::HashSet<_> = outputs[1].chunks(8).collect();
+    assert_eq!(mip.len(), 1, "level 1 is one blue");
+    let blue = mip.into_iter().next().unwrap();
+    assert!(
+        half(blue, 2) > half(blue, 0) && half(blue, 0) > 0,
+        "{blue:?}"
+    );
+    let mut mem = memory();
+    vertices(&mut mem);
+    let mut s = Stream::default();
+    case.paint_and_resolve(s.setup(), &mut mem, 2);
+    let Some(mut d) = case.drawer() else { return };
+    run(&mut d, &s, &mut mem);
+    drop(d);
+    assert!(outputs[0] == case.guest_path(&mem, mip_fetch(0)));
+}
+
+/// A resolve into the mip of a kept chain after it was sampled decodes the
+/// chain again: the second fetch of level 1 sees the new gradient.
+#[test]
+fn resolve_into_a_kept_mip_decodes_it_again() {
+    let case = &HALF4;
+    let Some(mut d) = case.drawer() else { return };
+    let mut mem = memory();
+    vertices(&mut mem);
+    let mut s = Stream::default();
+    case.paint_and_resolve(s.setup(), &mut mem, 2);
+    paint_mip(&mut s, &mut mem, paint_small);
+    case.sample(&mut s, mip_fetch(1));
+    s.regs(RB_COLOR_INFO, &[COLOR_BASE | (case.rt << 16)]);
+    paint_mip(&mut s, &mut mem, paint);
+    case.sample(&mut s, mip_fetch(1));
+    let r = run(&mut d, &s, &mut mem);
+    assert!(r.unsupported.is_empty(), "{r:?}");
+    assert_eq!(
+        (r.timings.textures_kept, r.timings.textures_uploaded),
+        (2, 0),
+        "{r:?}"
+    );
+    let out = d
+        .read_render_target_raw(case.out_key(), 0, 0, W, H)
+        .unwrap();
+    let distinct: std::collections::HashSet<_> = out.chunks(8).collect();
+    assert!(distinct.len() > 16, "{}", distinct.len());
+}
