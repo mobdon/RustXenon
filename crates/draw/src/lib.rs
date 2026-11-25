@@ -377,13 +377,13 @@ pub struct Timings {
     /// Counts: pipelines and shader modules created, textures uploaded.
     pub pipelines_created: u32,
     pub textures_uploaded: u32,
-    /// Command buffer submissions for draws, clears, EDRAM transfers and
+    /// Command buffer submissions for draws and clears, EDRAM transfers and
     /// GPU resolves.
     pub submits: u32,
-    /// `submits` by where they come from: 32bpp resolve copies, resolve
-    /// clears, EDRAM transfers, kept resolve texture decodes, and batch
-    /// flushes and resolve write-backs.
-    pub submits_by_site: [u32; 5],
+    /// `submits` by where they come from: GPU resolve copies, EDRAM
+    /// transfers, kept resolve texture decodes, and batch flushes and
+    /// resolve write-backs. Resolve clears are recorded into the next batch.
+    pub submits_by_site: [u32; 4],
     pub texture_bytes: u64,
     /// Guest vertex window bytes read (not those of reused windows).
     pub guest_bytes: u64,
@@ -954,9 +954,10 @@ pub struct Drawer {
 }
 
 /// Draws recorded into one command encoder, in one render pass while the
-/// render targets stay the same. Submitted by [`Drawer::flush`] before
-/// anything that reads or writes the targets outside the batch (resolves,
-/// clears and EDRAM transfers) and at the end of a replay.
+/// render targets stay the same, and the resolve clears between them, each
+/// in a pass of its own. Submitted by [`Drawer::flush`] before anything
+/// that reads or writes the targets outside the batch (resolves and EDRAM
+/// transfers) and at the end of a replay.
 struct Batch {
     /// Dropped (ended) before `enc` is finished.
     pass: Option<(PassKey, wgpu::RenderPass<'static>)>,
@@ -985,7 +986,6 @@ impl Part<'_> {
 #[derive(Clone, Copy)]
 enum Site {
     Resolve,
-    Clear,
     Transfer,
     Decode,
     Other,
@@ -3920,9 +3920,18 @@ impl Drawer {
             resolve_target: None,
             ops: keep_color,
         })];
-        let mut enc = self.device.create_command_encoder(&Default::default());
+        // Recorded into the batch, which the resolve copy before it was
+        // submitted ahead of: the clear ends the batch's render pass, so it
+        // lands after the draws before it and under those after it, and
+        // anything else that reads the target flushes the batch first.
+        let device = &self.device;
+        let batch = self.batch.get_or_insert_with(|| Batch {
+            pass: None,
+            enc: device.create_command_encoder(&Default::default()),
+        });
+        batch.pass = None;
         {
-            let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+            let mut pass = batch.enc.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("clear"),
                 color_attachments: if is_depth { &[] } else { &color_attachment },
                 depth_stencil_attachment: is_depth.then(|| {
@@ -3943,8 +3952,6 @@ impl Drawer {
             pass.set_stencil_reference(stencil);
             pass.draw(0..3, 0..1);
         }
-        self.queue.submit([enc.finish()]);
-        self.submitted(Site::Clear);
         if let Some(e) = block_on(scope.pop()) {
             return Err(Skip::Fatal(Error::Gpu(e.to_string())));
         }

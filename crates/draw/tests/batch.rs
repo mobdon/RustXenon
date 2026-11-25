@@ -112,8 +112,8 @@ fn resolve_sees_batched_draws() {
     assert_eq!((report.draws, report.resolves), (2, 1), "{report:?}");
     let t = &report.timings;
     assert_eq!(t.submits_by_site.iter().sum::<u32>(), t.submits, "{t:?}");
-    // One resolve copy, a colour and a depth clear.
-    assert_eq!(t.submits_by_site[..4], [1, 2, 0, 0], "{t:?}");
+    // One resolve copy; the clears go with the second draw.
+    assert_eq!(t.submits_by_site[..3], [1, 0, 0], "{t:?}");
     let copy = detiled(&mem, DEST, W, H, W, 4);
     assert_eq!(px(&copy, W, 40, 40), RED);
     let img = d.read_render_target(COLOR_KEY, 0, 0, W, H).unwrap();
@@ -405,4 +405,50 @@ fn unreadable_vertex_window_skips_only_its_draw() {
     let img = d.read_render_target(COLOR_KEY, 0, 0, W, H).unwrap();
     assert_eq!(px(&img, W, 8, 8), GREEN);
     assert_eq!(px(&img, W, 40, 40), RED);
+}
+
+/// Resolve clears are recorded into the next batch instead of submitted on
+/// their own: after the copy that reads the target, before the draws after
+/// them, and seen by the next resolve's copy.
+#[test]
+fn resolve_clears_join_the_next_batch() {
+    let Some(mut d) = drawer() else { return };
+    let mut mem = memory();
+    let wf = W as f32;
+    rect(&mut mem, VERTS, wf, wf, RED);
+    rect(&mut mem, VERTS + 48, 32.0, 32.0, BLUE);
+    let dest2 = DEST + 0x4000;
+    let mut s = Stream::default();
+    s.setup()
+        .shader(false, &vs_color())
+        .shader(true, &ps_interp())
+        .vertex_fetch(0, VERTS, 12)
+        .draw_auto(PRIM_RECT_LIST, 3)
+        // Copies red, then clears colour to green and depth.
+        .resolve(&mut mem, W, H, true, Some((rgba(GREEN), 0)))
+        // Copies the cleared target, clears nothing.
+        .resolve_with(
+            &mut mem,
+            (W, H),
+            COPY_RAW,
+            (dest2, W | (H << 16), dest_info(6, 0, false)),
+            [0; 3],
+        )
+        .vertex_fetch(0, VERTS + 48, 12)
+        .draw_auto(PRIM_RECT_LIST, 3);
+    let report = run(&mut d, &s, &mut mem);
+    assert_eq!((report.draws, report.resolves), (2, 2), "{report:?}");
+    let copy = detiled(&mem, DEST, W, H, W, 4);
+    assert_eq!(px(&copy, W, 40, 40), RED);
+    let copy = detiled(&mem, dest2, W, H, W, 4);
+    assert_eq!(px(&copy, W, 8, 8), GREEN);
+    assert_eq!(px(&copy, W, 40, 40), GREEN);
+    let img = d.read_render_target(COLOR_KEY, 0, 0, W, H).unwrap();
+    assert_eq!(px(&img, W, 10, 10), BLUE);
+    assert_eq!(px(&img, W, 40, 40), GREEN);
+    // Two copies and five flushes and write-backs (the second resolve's
+    // flush submits the clears): 7, where a submit per clear made 8.
+    let t = &report.timings;
+    assert_eq!(t.submits_by_site, [2, 0, 0, 5], "{t:?}");
+    assert_eq!(t.submits, 7, "{t:?}");
 }
