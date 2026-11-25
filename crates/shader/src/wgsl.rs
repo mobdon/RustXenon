@@ -232,8 +232,9 @@ fn vword(addr: i32, e: u32) -> u32 {
 // bits 2..9, after the dword 3 swizzle as Xenia's texture_util.cc
 // SwizzleSigns picks it; constant 0/1 components keep their value) and the
 // 2^exp_adjust scale (dword 3 bits 13..18, signed), as Xenia's
-// spirv_shader_translator_fetch.cc applies them. Gamma is Xenia's
-// PWLGammaToLinear (spirv_shader_translator.cc / xenos.cc).
+// spirv_shader_translator_fetch.cc applies them (its exp_adjust reads word 4;
+// dword 3 is per xenos.h and dxbc_shader_translator_fetch.cc). Gamma is
+// Xenia's PWLGammaToLinear (spirv_shader_translator.cc / xenos.cc).
 const TFETCH_PRELUDE: &str = "
 fn xe_pwl_gamma_to_linear(g_in: f32) -> f32 {
     let g = clamp(g_in, 0.0, 1.0);

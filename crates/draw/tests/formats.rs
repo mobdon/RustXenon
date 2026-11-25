@@ -750,8 +750,10 @@ fn color_exp_bias_scales_pixel_output() {
 
 /// A texture fetch applies the fetch constant's sign per component and its
 /// exponent adjust: an 8_8_8_8 texel (0x80, 12, 200, 255) with signs
-/// signed, unsigned biased, gamma, unsigned and exp_adjust 1 reads as
-/// 2 * (-1 (clamped from -128/127), 12/255 * 2 - 1, PWL gamma 580/1023, 1).
+/// signed, unsigned biased, gamma, signed, swizzle YXZ1 and exp_adjust 1
+/// reads as 2 * (12/255 * 2 - 1, -1 (clamped from -128/127), PWL gamma
+/// 580/1023, 1): each sign follows its source component through the
+/// swizzle, and the constant 1 takes no sign.
 #[test]
 fn texture_fetch_sign_gamma_and_exp_adjust() {
     use xenon_texture::{endian, tile};
@@ -768,13 +770,13 @@ fn texture_fetch_sign_gamma_and_exp_adjust() {
         .flat_map(|&(x, y, u, v)| [f(x), f(y), f(0.0), f(u), f(v)])
         .collect();
     mem.write_words(VERTS, &verts);
-    let swizzle_rgba = (1 << 3) | (2 << 6) | (3 << 9);
-    let signs = (1 << 2) | (2 << 4) | (3 << 6);
+    let swizzle_yxz1 = 1 | (2 << 6) | (5 << 9);
+    let signs = (1 << 2) | (2 << 4) | (3 << 6) | (1 << 8);
     let fetch = [
         2 | signs | (2 << 10) | (2 << 13) | ((n >> 5) << 22) | (1 << 31),
         6 | (2 << 6) | TEXTURE, // 8_8_8_8, k8in32
         (n - 1) | ((n - 1) << 13),
-        (swizzle_rgba << 1) | (1 << 13), // exp_adjust 1, point filters
+        (swizzle_yxz1 << 1) | (1 << 13), // exp_adjust 1, point filters
         0,
         1 << 9, // 2D
     ];
@@ -792,9 +794,9 @@ fn texture_fetch_sign_gamma_and_exp_adjust() {
     let raw = d
         .read_render_target_raw(key(TargetFormat::Rgba16Float), 0, 0, W, H)
         .unwrap();
-    // -2.0, -1.8115 (rounded down), 1.1338, 2.0.
+    // -1.8115 (rounded down), -2.0, 1.1338, 2.0.
     assert_eq!(
         halves(&texel(&raw, W, 8, 4, 4)),
-        [0xC000, 0xBF3F, 0x3C89, 0x4000]
+        [0xBF3F, 0xC000, 0x3C89, 0x4000]
     );
 }
