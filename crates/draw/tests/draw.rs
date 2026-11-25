@@ -469,6 +469,42 @@ fn cull_mode_and_front_face() {
     }
 }
 
+/// States that differ only where the pipeline does not look share one:
+/// the winding without culling, an alpha blend with alpha masked off, and
+/// a stencil test that always passes and keeps next to a depth test that
+/// always passes. Five draws, two pipelines, the same pixels.
+#[test]
+fn pipeline_keys_drop_what_the_pipeline_ignores() {
+    let Some(mut d) = drawer() else { return };
+    let mut mem = memory();
+    mem.write_words(VERTS, &full_triangle(WHITE, 0.0));
+    let mut s = Stream::default();
+    s.setup()
+        .resolve(&mut mem, W, H, false, Some((rgba(CLEAR), 0)))
+        .shader(false, &vs_color())
+        .shader(true, &ps_interp())
+        .vertex_fetch(0, VERTS, 12)
+        .regs(RB_COLOR_MASK, &[0b0111])
+        .draw_auto(PRIM_TRI_LIST, 3)
+        .regs(PA_SU_SC_MODE_CNTL, &[4])
+        .draw_auto(PRIM_TRI_LIST, 3)
+        // Alpha: src alpha, one minus src alpha.
+        .regs(RB_BLENDCONTROL0, &[1 | (6 << 16) | (7 << 24)])
+        .draw_auto(PRIM_TRI_LIST, 3)
+        // Stencil on, ALWAYS, all ops KEEP.
+        .regs(RB_DEPTHCONTROL, &[1 | (7 << 8)])
+        .draw_auto(PRIM_TRI_LIST, 3)
+        // Depth test ALWAYS without write.
+        .regs(RB_DEPTHCONTROL, &[2 | (7 << 4)])
+        .draw_auto(PRIM_TRI_LIST, 3);
+    let report = run(&mut d, &s, &mut mem);
+    assert_eq!(report.draws, 5, "{report:?}");
+    assert!(report.unsupported.is_empty(), "{report:?}");
+    assert_eq!(report.timings.pipelines_created, 2, "{report:?}");
+    let img = d.read_render_target(COLOR_KEY, 0, 0, W, H).unwrap();
+    assert_eq!(px(&img, W, 10, 10), [255, 255, 255, 255]);
+}
+
 /// RB_COLOR_MASK keeps the masked channels of the render target.
 #[test]
 fn colour_write_mask() {

@@ -531,9 +531,11 @@ struct PipelineKey {
         Option<wgpu::BlendState>,
         wgpu::ColorWrites,
     )>; 4],
+    /// Format, depth write, depth compare and stencil.
     depth: Option<(
         wgpu::TextureFormat,
-        state::Depth,
+        bool,
+        wgpu::CompareFunction,
         Option<wgpu::StencilState>,
     )>,
     cull: (wgpu::FrontFace, Option<wgpu::Face>),
@@ -610,6 +612,64 @@ fn edram_range(k: RenderTargetKey, rows: u32, msaa: u32) -> (u32, u32) {
 fn transferable(a: TargetFormat, b: TargetFormat) -> bool {
     let word = |f: TargetFormat| f == TargetFormat::Rgba8 || f.is_depth();
     word(a) && word(b)
+}
+
+/// `blend` as the pipeline needs it with colour write mask `mask`: a
+/// component whose channels are not written is left as replace, and a
+/// state that is all replace is no blending.
+fn pipeline_blend(
+    blend: Option<wgpu::BlendState>,
+    mask: wgpu::ColorWrites,
+) -> Option<wgpu::BlendState> {
+    let mut b = blend?;
+    if !mask.contains(wgpu::ColorWrites::ALPHA) {
+        b.alpha = wgpu::BlendComponent::REPLACE;
+    }
+    if !mask.intersects(wgpu::ColorWrites::COLOR) {
+        b.color = wgpu::BlendComponent::REPLACE;
+    }
+    (b != wgpu::BlendState::REPLACE).then_some(b)
+}
+
+/// `st` as the pipeline needs it under `cull`: a culled face takes the
+/// other's state, operations are keep when nothing is written, the read
+/// mask is 0 when nothing compares, and a state that neither tests nor
+/// writes is no stencil.
+fn pipeline_stencil(
+    mut st: wgpu::StencilState,
+    cull: Option<wgpu::Face>,
+) -> Option<wgpu::StencilState> {
+    use wgpu::{CompareFunction as C, StencilOperation as Op};
+    match cull {
+        Some(wgpu::Face::Back) => st.back = st.front,
+        Some(wgpu::Face::Front) => st.front = st.back,
+        None => {}
+    }
+    for f in [&mut st.front, &mut st.back] {
+        if st.write_mask == 0 {
+            (f.fail_op, f.depth_fail_op, f.pass_op) = (Op::Keep, Op::Keep, Op::Keep);
+        }
+        if f.compare == C::Always {
+            f.fail_op = Op::Keep;
+        }
+    }
+    let always = st.front.compare == C::Always && st.back.compare == C::Always;
+    if always {
+        st.read_mask = 0;
+    }
+    let keeps = |f: &wgpu::StencilFaceState| f.depth_fail_op == Op::Keep && f.pass_op == Op::Keep;
+    if always && keeps(&st.front) && keeps(&st.back) {
+        return None;
+    }
+    if st.write_mask != 0
+        && keeps(&st.front)
+        && keeps(&st.back)
+        && st.front.fail_op == Op::Keep
+        && st.back.fail_op == Op::Keep
+    {
+        st.write_mask = 0;
+    }
+    Some(st)
 }
 
 /// Bytes of a texture, estimated from its size and format.
@@ -2556,6 +2616,14 @@ impl Drawer {
         let ps_mod = self.module(ps.hash, false, 0, ps_variant, param_gen, &ps_t)?;
         let (g1_layout, layout) = self.texture_layout(tex_mask);
 
+        let key_stencil = stencil
+            .as_ref()
+            .and_then(|s| pipeline_stencil(s.0.clone(), cull.1));
+        // The winding only matters to culling, two-sided stencil and the
+        // facing flag of polygon parameter generation.
+        let facing = cull.1.is_some()
+            || key_stencil.as_ref().is_some_and(|s| s.front != s.back)
+            || param_gen.is_some_and(|p| p.primitive == ParamGenPrimitive::Polygon);
         let key = PipelineKey {
             vs: vs.hash,
             vs_extra: extra,
@@ -2566,15 +2634,12 @@ impl Drawer {
             topology,
             color: std::array::from_fn(|rt| {
                 color[rt].map(|k| {
-                    (
-                        k.format.wgpu(),
-                        blends[rt],
-                        state::write_mask(color_mask, rt as u32),
-                    )
+                    let mask = state::write_mask(color_mask, rt as u32);
+                    (k.format.wgpu(), pipeline_blend(blends[rt], mask), mask)
                 })
             }),
-            depth: depth_format.map(|f| (f, depth, stencil.as_ref().map(|s| s.0.clone()))),
-            cull,
+            depth: depth_format.map(|f| (f, depth.write, depth.compare, key_stencil)),
+            cull: (if facing { cull.0 } else { wgpu::FrontFace::Ccw }, cull.1),
             textures: tex_mask,
         };
         let pipeline = match self.pipelines.get(&key) {
@@ -2598,12 +2663,14 @@ impl Drawer {
                             cull_mode: k.cull.1,
                             ..Default::default()
                         },
-                        depth_stencil: k.depth.map(|(format, d, st)| wgpu::DepthStencilState {
-                            format,
-                            depth_write_enabled: Some(d.write),
-                            depth_compare: Some(d.compare),
-                            stencil: st.unwrap_or_default(),
-                            bias: Default::default(),
+                        depth_stencil: k.depth.map(|(format, write, compare, st)| {
+                            wgpu::DepthStencilState {
+                                format,
+                                depth_write_enabled: Some(write),
+                                depth_compare: Some(compare),
+                                stencil: st.unwrap_or_default(),
+                                bias: Default::default(),
+                            }
                         }),
                         multisample: Default::default(),
                         fragment: Some(wgpu::FragmentState {
