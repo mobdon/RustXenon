@@ -1101,25 +1101,33 @@ fn saves_are_created_listed_and_reopened() {
     assert_eq!((r, rt.mem.read_u32(0xF908)), (18, 0));
     // With a request block, as titles scan: the record and its count, then
     // success with zero at the end.
-    call(
+    let r = call(
         rt,
         &mut c,
         xam::xam_content_create_enumerator,
         &[0, 0, 1, 0, 4, 0xF900, 0xF904],
     );
+    assert_eq!(r, 0);
     let en = rt.mem.read_u32(0xF904) as u64;
     for want in [1, 0] {
+        rt.mem.write_u32(0xFF00, 997);
+        rt.mem.write_u32(0xFF04, 0xFFFF);
+        fill_bytes(rt, 0xFA00, 0x134);
         let r = call(
             rt,
             &mut c,
             xam::xam_enumerate,
-            &[en, 0, 0xFA00, 4 * 0x134, 0, 0xFB00],
+            &[en, 0, 0xFA00, 0x134, 0, 0xFF00],
         );
         assert_eq!(r, 997);
         assert_eq!(
-            (rt.mem.read_u32(0xFB00), rt.mem.read_u32(0xFB04)),
+            (rt.mem.read_u32(0xFF00), rt.mem.read_u32(0xFF04)),
             (0, want)
         );
+        if want == 1 {
+            rt.mem.read_bytes(0xFA00, &mut got);
+            assert_eq!(got, xam::content_record(1, "Slot 1", "SLOT1"));
+        }
     }
     // Another type lists nothing.
     call(
@@ -1175,4 +1183,9 @@ fn media_player_says_the_title_controls_playback() {
         &[0xFA, 0x7_0001, 0xFC00, 12],
     );
     assert_eq!(r as u32, 0x8007_0490);
+}
+
+/// Fills `n` bytes at `p` with 0xCC, so a test sees what a call wrote.
+fn fill_bytes(rt: &Runtime, p: u32, n: u32) {
+    rt.mem.write_bytes(p, &vec![0xCC; n as usize]);
 }
