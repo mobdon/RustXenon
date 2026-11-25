@@ -155,6 +155,10 @@ var<private> loop_al: array<i32, 4>;
 var<private> call_depth: u32;
 var<private> call_ret: array<u32, 4>;
 var<private> vf_addr: i32;
+// Register LOD and gradients set by setTexLOD / setGradientH / setGradientV.
+var<private> tf_lod: f32;
+var<private> tf_grad_h: vec3<f32>;
+var<private> tf_grad_v: vec3<f32>;
 
 // aL of the innermost loop, clamped to the sequencer's range.
 fn al() -> i32 {
@@ -1048,16 +1052,57 @@ impl Gen {
         Ok(())
     }
 
+    /// The texture instructions that only move values: setTexLOD,
+    /// setGradientH/V and getGradients, as Xenia's
+    /// ProcessTextureFetchInstruction handles them.
+    fn texture_register_op(&mut self, t: &TextureFetch) -> Result<(), Error> {
+        if t.op == TextureOp::GetGradients && self.stage != ShaderStage::Pixel {
+            return Self::unsupported("getGradients outside a pixel shader");
+        }
+        if let Some(v) = t.predicate {
+            self.line(&format!("if (p0 == {v}) {{"));
+        } else {
+            self.line("{");
+        }
+        let src = temp_ref(t.src, t.src_relative);
+        let sw = |n: u32| -> String {
+            (0..n)
+                .map(|c| comp((t.src_swizzle >> (2 * c)) & 3))
+                .collect()
+        };
+        match t.op {
+            TextureOp::SetLod => self.line(&format!("tf_lod = {src}.{};", sw(1))),
+            TextureOp::SetGradientsHorz => self.line(&format!("tf_grad_h = {src}.{};", sw(3))),
+            TextureOp::SetGradientsVert => self.line(&format!("tf_grad_v = {src}.{};", sw(3))),
+            _ => {
+                // Coarse derivatives in Xenia's order: x = ddx(s0),
+                // y = ddy(s0), z = ddx(s1), w = ddy(s1).
+                self.line(&format!("let g = {src}.{};", sw(2)));
+                self.line(
+                    "let v = vec4<f32>(dpdxCoarse(g.x), dpdyCoarse(g.x), dpdxCoarse(g.y), dpdyCoarse(g.y));",
+                );
+                self.fetch_store(t.dest, t.dest_relative, t.dest_swizzle);
+            }
+        }
+        self.line("}");
+        Ok(())
+    }
+
     fn tfetch(&mut self, t: &TextureFetch) -> Result<(), Error> {
-        if t.op != TextureOp::Fetch {
-            return Self::unsupported(format!("texture instruction {:?}", t.op));
+        match t.op {
+            TextureOp::Fetch => {}
+            TextureOp::SetLod
+            | TextureOp::SetGradientsHorz
+            | TextureOp::SetGradientsVert
+            | TextureOp::GetGradients => return self.texture_register_op(t),
+            _ => return Self::unsupported(format!("texture instruction {:?}", t.op)),
         }
         if t.dim != TextureDim::D2 {
             return Self::unsupported(format!("{:?} texture fetch (only 2D is handled)", t.dim));
         }
-        if t.use_register_lod || t.use_register_gradients {
-            return Self::unsupported("texture fetch with register LOD or gradients");
-        }
+        // As Xenia: register gradients only count with computed LOD; they
+        // also give the vertex stage a computed LOD.
+        let grad_lod = t.use_computed_lod && t.use_register_gradients;
         let n = t.slot;
         self.info.textures_used |= 1 << n;
         let overrides = t.mag_filter != 3
@@ -1097,20 +1142,28 @@ impl Gen {
         }
         self.line(&format!("let uv = {coord};"));
         // LOD bias: the fetch constant's (dword 4 bits 12..21, signed, 1/32
-        // steps; Xenia xenos.h xe_gpu_texture_fetch_t) plus the instruction's
-        // (1/16 steps), as spirv_shader_translator_fetch.cc adds them.
+        // steps; Xenia xenos.h xe_gpu_texture_fetch_t), the register LOD if
+        // used, then the instruction's (1/16 steps), as
+        // spirv_shader_translator_fetch.cc adds them.
         self.line(&format!(
-            "let lod = f32(extractBits(bitcast<i32>({}), 12u, 10u)) / 32.0 + {};",
+            "let lod = f32(extractBits(bitcast<i32>({}), 12u, 10u)) / 32.0{} + {};",
             fetch_dword(n * 6 + 4),
+            if t.use_register_lod { " + tf_lod" } else { "" },
             flit(t.lod_bias as f32 / 16.0)
         ));
-        let sample = match (self.stage, t.use_computed_lod) {
-            (ShaderStage::Pixel, true) => {
-                format!("textureSampleBias(tex{n}, samp{n}, uv, lod)")
-            }
+        let sample = if grad_lod {
+            // Register gradients scaled by 2^lod (Xenia's gradient form of
+            // the bias), normalized when the coordinates are in texels.
+            let norm = if t.unnormalized { " / size" } else { "" };
+            format!(
+                "textureSampleGrad(tex{n}, samp{n}, uv, tf_grad_h.xy * exp2(lod){norm}, tf_grad_v.xy * exp2(lod){norm})"
+            )
+        } else if t.use_computed_lod && self.stage == ShaderStage::Pixel {
+            format!("textureSampleBias(tex{n}, samp{n}, uv, lod)")
+        } else {
             // No derivatives in the vertex stage; without computed LOD the
             // bias is the LOD.
-            _ => format!("textureSampleLevel(tex{n}, samp{n}, uv, lod)"),
+            format!("textureSampleLevel(tex{n}, samp{n}, uv, lod)")
         };
         self.line(&format!("let v = {sample};"));
         self.fetch_store(t.dest, t.dest_relative, t.dest_swizzle);

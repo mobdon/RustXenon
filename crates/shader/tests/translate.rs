@@ -243,6 +243,139 @@ fn texture_fetch_variants() {
     );
 }
 
+/// A texture instruction of `op` reading `src` with `swizzle`, writing
+/// `dest` (for the ones with a result).
+fn tex_op(op: TextureOp, dest: u32, src: u32, swizzle: u32) -> TextureFetch {
+    let mut tf = TextureFetch::fetch_2d(dest, src, 0);
+    tf.op = op;
+    tf.src_swizzle = swizzle;
+    tf
+}
+
+#[test]
+fn set_lod_feeds_register_lod_fetch() {
+    // setTexLOD r2.z; tfetch2D with register LOD and no computed LOD samples
+    // that level (plus the fetch constant's and the instruction's bias).
+    let mut tf = TextureFetch::fetch_2d(1, 0, 3);
+    tf.use_computed_lod = false;
+    tf.use_register_lod = true;
+    tf.lod_bias = -8;
+    let words = assemble(
+        &[exec(0, 3, true)],
+        &[
+            tfetch(tex_op(TextureOp::SetLod, 0, 2, 2)),
+            tfetch(tf),
+            alu(export(0, r(1))),
+        ],
+    );
+    let t = ok(&words, Pixel);
+    has(&t, "tf_lod = r[2].z;");
+    has(
+        &t,
+        "let lod = f32(extractBits(bitcast<i32>(consts.fetch[5u][2u]), 12u, 10u)) / 32.0 + tf_lod + -0.5f;",
+    );
+    has(&t, "textureSampleLevel(tex3, samp3, uv, lod)");
+    // setTexLOD has no result and samples nothing.
+    assert_eq!(t.info.textures_used, 1 << 3);
+    // With computed LOD the register LOD is a bias.
+    let mut tf = TextureFetch::fetch_2d(1, 0, 0);
+    tf.use_register_lod = true;
+    let words = assemble(
+        &[exec(0, 3, true)],
+        &[
+            tfetch(tex_op(TextureOp::SetLod, 0, 4, 0)),
+            tfetch(tf),
+            alu(export(0, r(1))),
+        ],
+    );
+    let t = ok(&words, Pixel);
+    has(&t, "tf_lod = r[4].x;");
+    has(&t, "/ 32.0 + tf_lod + 0.0f;");
+    has(&t, "textureSampleBias(tex0, samp0, uv, lod)");
+    // Register LOD works in the vertex stage too.
+    let mut tf = TextureFetch::fetch_2d(1, 0, 0);
+    tf.use_register_lod = true;
+    let words = assemble(
+        &[exec(0, 3, true)],
+        &[
+            tfetch(tex_op(TextureOp::SetLod, 0, 4, 1)),
+            tfetch(tf),
+            alu(export(62, r(1))),
+        ],
+    );
+    let t = ok(&words, Vertex);
+    has(&t, "tf_lod = r[4].y;");
+    has(&t, "textureSampleLevel(tex0, samp0, uv, lod)");
+}
+
+#[test]
+fn get_gradients_writes_coarse_derivatives() {
+    // getGradients r1, r0.zx: x = ddx(r0.z), y = ddy(r0.z), z = ddx(r0.x),
+    // w = ddy(r0.x), through the destination swizzle.
+    let mut tf = tex_op(TextureOp::GetGradients, 1, 0, 0b00_10);
+    tf.dest_swizzle = fetch_dest_swz("wz_1");
+    let words = assemble(&[exec(0, 2, true)], &[tfetch(tf), alu(export(0, r(1)))]);
+    let t = ok(&words, Pixel);
+    has(&t, "let g = r[0].zx;");
+    has(
+        &t,
+        "let v = vec4<f32>(dpdxCoarse(g.x), dpdyCoarse(g.x), dpdxCoarse(g.y), dpdyCoarse(g.y));",
+    );
+    has(&t, "r[1].x = v.w;");
+    has(&t, "r[1].y = v.z;");
+    has(&t, "r[1].w = 1.0;");
+    assert!(!t.wgsl.contains("r[1].z ="));
+    assert_eq!(t.info.textures_used, 0);
+    // Predicated, relative source.
+    let mut tf = tex_op(TextureOp::GetGradients, 1, 2, 0b01_00);
+    tf.src_relative = true;
+    tf.predicate = Some(false);
+    let words = assemble(&[exec(0, 2, true)], &[tfetch(tf), alu(export(0, r(1)))]);
+    let t = ok(&words, Pixel);
+    has(&t, "if (p0 == false) {");
+    has(&t, "let g = r[u32(2 + al()) & 63u].xy;");
+}
+
+#[test]
+fn register_gradients_fetch() {
+    // setGradientH r3.xyz, setGradientV r4.yzw, then a computed-LOD fetch
+    // with register gradients samples with them, scaled by 2^lod.
+    let mut tf = TextureFetch::fetch_2d(1, 0, 2);
+    tf.use_register_gradients = true;
+    let words = assemble(
+        &[exec(0, 4, true)],
+        &[
+            tfetch(tex_op(TextureOp::SetGradientsHorz, 0, 3, 0b10_01_00)),
+            tfetch(tex_op(TextureOp::SetGradientsVert, 0, 4, 0b11_10_01)),
+            tfetch(tf),
+            alu(export(0, r(1))),
+        ],
+    );
+    let t = ok(&words, Pixel);
+    has(&t, "tf_grad_h = r[3].xyz;");
+    has(&t, "tf_grad_v = r[4].yzw;");
+    has(
+        &t,
+        "textureSampleGrad(tex2, samp2, uv, tf_grad_h.xy * exp2(lod), tf_grad_v.xy * exp2(lod))",
+    );
+    // The vertex stage gets a computed LOD from register gradients, and
+    // unnormalized coordinates normalize them.
+    tf.unnormalized = true;
+    let words = assemble(&[exec(0, 2, true)], &[tfetch(tf), alu(export(62, r(1)))]);
+    let t = ok(&words, Vertex);
+    has(
+        &t,
+        "textureSampleGrad(tex2, samp2, uv, tf_grad_h.xy * exp2(lod) / size, tf_grad_v.xy * exp2(lod) / size)",
+    );
+    // Without computed LOD register gradients are ignored.
+    tf.use_computed_lod = false;
+    let words = assemble(&[exec(0, 2, true)], &[tfetch(tf), alu(export(0, r(1)))]);
+    has(
+        &ok(&words, Pixel),
+        "textureSampleLevel(tex2, samp2, uv, lod)",
+    );
+}
+
 #[test]
 fn float_constants() {
     // VS: r1 = c3 + c[5 + a0]; oPos = r1 * c[2 + aL].
@@ -778,18 +911,26 @@ fn unsupported_features_are_errors() {
         Vertex,
     );
     assert!(m.contains("memory export"), "{m}");
-    // Cube and 3D fetches, other texture ops, register LOD.
+    // Cube and 3D fetches and the texture ops still unsupported.
     for dim in [TextureDim::D1, TextureDim::D3OrStacked, TextureDim::Cube] {
         let mut tf = TextureFetch::fetch_2d(0, 0, 0);
         tf.dim = dim;
         unsupported(assemble(&[exec(0, 1, true)], &[tfetch(tf)]), Pixel);
     }
+    for op in [
+        TextureOp::GetBorderColorFrac,
+        TextureOp::GetComputedLod,
+        TextureOp::GetWeights,
+    ] {
+        let mut tf = TextureFetch::fetch_2d(0, 0, 0);
+        tf.op = op;
+        let m = unsupported(assemble(&[exec(0, 1, true)], &[tfetch(tf)]), Pixel);
+        assert!(m.contains(&format!("{op:?}")), "{m}");
+    }
+    // No derivatives outside the pixel stage.
     let mut tf = TextureFetch::fetch_2d(0, 0, 0);
     tf.op = TextureOp::GetGradients;
-    unsupported(assemble(&[exec(0, 1, true)], &[tfetch(tf)]), Pixel);
-    let mut tf = TextureFetch::fetch_2d(0, 0, 0);
-    tf.use_register_lod = true;
-    unsupported(assemble(&[exec(0, 1, true)], &[tfetch(tf)]), Pixel);
+    unsupported(assemble(&[exec(0, 1, true)], &[tfetch(tf)]), Vertex);
     // Kill in a vertex shader.
     let a = AluInstr::scalar(ScalarOp::KillsEq, 0, 0, r(0));
     unsupported(assemble(&[exec(0, 1, true)], &[alu(a)]), Vertex);

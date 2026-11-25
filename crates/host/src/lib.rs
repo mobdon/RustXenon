@@ -292,7 +292,7 @@ const USAGE: &str = "\
 USAGE: game --exe <patched executable> --game <unpacked game folder>
             [--update <unpacked title update>] [--data <writable folder>]
             [--seconds <n>] [--press <ms>:<button>[+<button>],...]
-            [--no-controller] [--capture <dir> [--capture-at <s>,<s>...]] [--render]
+            [--no-controller] [--window] [--capture <dir> [--capture-at <s>,<s>...]] [--render]
             [--capture-frames <n>,<n>... --capture-dir <dir>]
 
 Runs the title headless for --seconds (default 30) and reports how far it
@@ -305,7 +305,10 @@ the textures bound at its draws and a list of the draws: local files,
 derived from the game. --render draws every frame headless on the host GPU
 and adds the frame image to each capture. --capture-frames writes the listed
 frames (counted from 1, one per swap) as <dir>/frame-<n>.png; it implies
---render.";
+--render. --window opens a window that shows each drawn frame (it implies
+--render), plugs in the controller and keyboard as the pad on port 0 (unless
+--press or --no-controller is given) and runs until the window is closed
+(or for --seconds when given).";
 
 fn opt(args: &[String], name: &str) -> Option<String> {
     args.iter()
@@ -326,9 +329,10 @@ pub fn run(sha256: &str, regs: &[fn(&mut Runtime)]) -> ExitCode {
         || PathBuf::from(&game).with_extension("data"),
         PathBuf::from,
     );
+    let window = args.iter().any(|a| a == "--window");
     let seconds: u64 = opt(&args, "--seconds")
         .and_then(|s| s.parse().ok())
-        .unwrap_or(30);
+        .unwrap_or(if window { u64::MAX / 4 } else { 30 });
     if let Some(list) = opt(&args, "--capture-frames") {
         let dir = opt(&args, "--capture-dir").unwrap_or_else(|| "captures".into());
         let n: Vec<u32> = list
@@ -348,6 +352,17 @@ pub fn run(sha256: &str, regs: &[fn(&mut Runtime)]) -> ExitCode {
             .filter_map(|x| x.trim().parse().ok())
             .collect();
         let _ = kernel::gpu::capture::SETTINGS.set((PathBuf::from(d), at));
+    }
+    if window {
+        kernel::gpu::capture::RENDER.store(true, Ordering::Relaxed);
+        if opt(&args, "--press").is_none() && !args.iter().any(|a| a == "--no-controller") {
+            kernel::input::set_script(kernel::input::Script::Live);
+        }
+        let link = xenon_window::spawn("RustXenon".into(), || {
+            report();
+            std::process::exit(0);
+        });
+        let _ = kernel::input::WINDOW.set(link);
     }
     if args.iter().any(|a| a == "--no-controller") {
         kernel::input::set_script(kernel::input::Script::Unplugged);
