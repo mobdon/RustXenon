@@ -657,7 +657,14 @@ fn texture_bind_group_is_reused_across_a_resolve() {
 
 #[test]
 fn gpu_timestamps_time_each_batch_pass() {
-    let Some(mut d) = drawer() else { return };
+    // Not requested unless asked for.
+    {
+        let Some(mut plain) = drawer() else { return };
+        assert!(!plain.enable_gpu_timestamps());
+    }
+    let Some(mut d) = drawer_with_gpu_timestamps() else {
+        return;
+    };
     if !d.enable_gpu_timestamps() {
         eprintln!("skipped: no timestamp queries on this device");
         return;
