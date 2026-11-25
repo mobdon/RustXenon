@@ -2208,7 +2208,8 @@ impl Drawer {
                         && !self.written.iter().any(|(&m, &mw)| {
                             mw.stamp > nw.stamp
                                 && m.base_tiles == k.base_tiles
-                                && !transferable(m.format, k.format)
+                                && !(transferable(m.format, k.format)
+                                    && row_width(m, mw.msaa) == row_width(k, w.msaa))
                         })
                 })
             })
@@ -4365,22 +4366,35 @@ mod tests {
             format,
         };
         let mut report = Report::default();
+        // (format, msaa) in write order; the last one transferable but at
+        // another row width does not transfer either.
         for (formats, kept) in [
             (
                 &[
-                    TargetFormat::D24S8,
-                    TargetFormat::Rgba8,
-                    TargetFormat::Rgba16Float,
+                    (TargetFormat::D24S8, 0),
+                    (TargetFormat::Rgba8, 0),
+                    (TargetFormat::Rgba16Float, 0),
                 ][..],
                 true,
             ),
-            (&[TargetFormat::D24S8, TargetFormat::Rgba8][..], false),
+            (
+                &[
+                    (TargetFormat::D24S8, 0),
+                    (TargetFormat::Rgba8, 0),
+                    (TargetFormat::D24FS8, 2),
+                ][..],
+                true,
+            ),
+            (
+                &[(TargetFormat::D24S8, 0), (TargetFormat::Rgba8, 0)][..],
+                false,
+            ),
         ] {
             d.targets.clear();
             d.written.clear();
-            for &f in formats {
-                d.target(key(f), 64, 0, &mut report).unwrap();
-                d.mark_written(key(f), 64, 0);
+            for &(f, msaa) in formats {
+                d.target(key(f), 64, msaa, &mut report).unwrap();
+                d.mark_written(key(f), 64, msaa);
             }
             d.drop_targets(&mut report);
             let depth = key(TargetFormat::D24S8);
