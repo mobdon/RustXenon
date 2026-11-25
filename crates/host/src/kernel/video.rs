@@ -191,8 +191,12 @@ pub fn start(rt: std::sync::Arc<Runtime>) {
                 match xenon_draw::Drawer::new() {
                     Ok(mut d) => {
                         crate::log(&format!("[draw] adapter: {}", d.adapter));
+                        // Skipped unless asked for: in play it showed no
+                        // visual change and saved about 23 ms a frame.
+                        let mode = std::env::var("XENON_RESOLVE_WRITEBACK");
+                        d.skip_resolve_writeback = !matches!(mode.as_deref(), Ok("on" | "late"));
                         if d.skip_resolve_writeback {
-                            crate::log("[draw] resolve write-back: skipped (the CPU never sees resolve output)");
+                            crate::log("[draw] resolve write-back: skipped (the CPU never sees resolve output; XENON_RESOLVE_WRITEBACK=on writes it back)");
                         }
                         if d.late_writeback {
                             crate::log("[draw] resolve write-back: late (the CPU sees resolves a frame later)");
