@@ -167,7 +167,7 @@ pub mod state;
 
 use std::collections::hash_map::DefaultHasher;
 use std::collections::hash_map::Entry;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex};
@@ -386,8 +386,9 @@ pub struct Timings {
     pub submits: u32,
     /// `submits` by where they come from: resolve copies (GPU copies and
     /// CPU resolve readbacks), EDRAM transfers, kept resolve texture
-    /// decodes, and batch flushes and resolve write-backs. Resolve clears
-    /// are recorded into the next batch.
+    /// decodes with no draw to batch them with, and batch flushes and
+    /// resolve write-backs. Resolve clears and texture decodes are
+    /// recorded into the next batch.
     pub submits_by_site: [u32; 4],
     pub texture_bytes: u64,
     /// Guest vertex window bytes read (not those of reused windows).
@@ -919,19 +920,28 @@ pub struct Drawer {
     /// Group 0 bind groups over `arena`, by the sizes of the four slices
     /// they bind (at dynamic offsets). Cleared when the arena is replaced.
     arena_groups: HashMap<[u64; 4], wgpu::BindGroup>,
-    /// Draw buffers (guest window, constants, epilogue, indices) of the
-    /// batch, as slices of `arena`, written to it once at submit.
+    /// Draw buffers (guest window, constants, epilogue, indices) staged
+    /// since the last flush, as slices of `arena` from `staged_base`,
+    /// written to it at the next flush. The arena is a ring: flushes
+    /// append, and staging starts again at 0 only when it is full.
     staged: Vec<u8>,
+    staged_base: u64,
     arena: Option<wgpu::Buffer>,
     arena_align: u64,
-    /// Vertex windows staged in the batch: guest physical `[lo, hi)` and
-    /// their (offset, size) in `arena`. Cleared at each flush, as the next
-    /// batch overwrites the arena, and dropped where guest memory changes.
-    window_memo: Vec<(u64, u64, (u64, u64))>,
-    /// The last `Consts` block staged in the batch and its (offset, size)
-    /// in `arena`, bound again by a draw with the same bytes. Cleared with
-    /// `window_memo` at each flush.
+    /// Vertex windows staged in the arena since it last wrapped: guest
+    /// physical `lo` to `hi` and their (offset, size) in `arena`. Cleared
+    /// when the arena wraps or grows and at the end of a replay, and
+    /// dropped where guest memory changes (see `forget_guest`). No window
+    /// holds another, so `hi` grows with `lo` and the one window that can
+    /// hold a range is the last starting at or before it.
+    window_memo: BTreeMap<u64, (u64, (u64, u64))>,
+    /// The last `Consts` block staged in the arena and its (offset, size),
+    /// bound again by a draw with the same bytes. Cleared with
+    /// `window_memo` when the arena wraps or grows.
     staged_consts: Option<(Vec<u8>, (u64, u64))>,
+    /// Kept-resolve texture decodes recorded since the last flush,
+    /// submitted with (before) the batch's draws.
+    pre: Option<wgpu::CommandEncoder>,
     max_buffer: u64,
     /// 1x1 texture of zeros bound for a slot without a usable texture.
     zero_texture: wgpu::TextureView,
@@ -1471,8 +1481,10 @@ impl Drawer {
             arena_groups: HashMap::new(),
             staged: Vec::new(),
             arena: None,
-            window_memo: Vec::new(),
+            window_memo: BTreeMap::new(),
             staged_consts: None,
+            staged_base: 0,
+            pre: None,
             arena_align: u64::from(
                 limits
                     .min_uniform_buffer_offset_alignment
@@ -1798,10 +1810,9 @@ impl Drawer {
         });
         let done = done.and(flushed);
         self.batch = None;
-        self.staged.clear();
-        self.window_memo.clear();
-        self.staged_consts = None;
+        self.pre = None;
         self.texture_groups.clear();
+        self.wrap();
         // Resolves done before an error still reach guest memory.
         let kept = self.finish_mirrors(&mut mem);
         done?;
@@ -1917,7 +1928,8 @@ impl Drawer {
     fn forget_guest(&mut self, lo: u64, hi: u64) {
         self.texture_memo
             .retain(|_, &mut (_, a, b)| b <= lo || hi <= a);
-        self.window_memo.retain(|&(a, b, _)| b <= lo || hi <= a);
+        self.window_memo
+            .retain(|&a, &mut (b, _)| b <= lo || hi <= a);
     }
 
     /// Hash of one [`KEPT_BLOCK`] of a kept resolve.
@@ -2124,25 +2136,43 @@ impl Drawer {
         self.timings.submits_by_site[site as usize] += 1;
     }
 
-    /// Submits the batched draws, with their staged buffers.
+    /// Submits the recorded texture decodes and the batched draws, after
+    /// writing the newly staged bytes to the arena. The windows and
+    /// constants staged so far stay in the arena for later batches.
     fn flush(&mut self) -> Result<(), Skip> {
         // The arena upload counts as submit time too.
         let t = Instant::now();
-        self.window_memo.clear();
-        self.staged_consts = None;
         self.texture_groups.clear();
         if let (Some(arena), false) = (&self.arena, self.staged.is_empty()) {
-            self.queue.write_buffer(arena, 0, &self.staged);
+            // Ordered on the queue after the work already submitted, which
+            // reads only bytes before `staged_base` (or before a wrap).
+            self.queue
+                .write_buffer(arena, self.staged_base, &self.staged);
+            self.staged_base += self.staged.len() as u64;
             self.staged.clear();
         }
-        let Some(mut batch) = self.batch.take() else {
+        let (pre, batch) = (self.pre.take(), self.batch.take());
+        if pre.is_none() && batch.is_none() {
             self.timings.submit += t.elapsed();
             return Ok(());
-        };
+        }
         let scope = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
-        drop(batch.pass.take());
-        self.queue.submit([batch.enc.finish()]);
-        self.submitted(Site::Other);
+        let site = if batch.is_some() {
+            Site::Other
+        } else {
+            Site::Decode
+        };
+        // Decodes first: the draws sample what they write, and they read
+        // kept resolves written by work submitted before.
+        let bufs = pre
+            .map(|e| e.finish())
+            .into_iter()
+            .chain(batch.map(|mut b| {
+                drop(b.pass.take());
+                b.enc.finish()
+            }));
+        self.queue.submit(bufs);
+        self.submitted(site);
         self.timings.submit += t.elapsed();
         match block_on(scope.pop()) {
             Some(e) => Err(Skip::Fatal(Error::Gpu(e.to_string()))),
@@ -2150,17 +2180,29 @@ impl Drawer {
         }
     }
 
+    /// Forgets what the arena holds, to stage from its start again: the
+    /// staged windows and constants are no longer bound by later draws.
+    /// Only after a flush, or once nothing will be submitted.
+    fn wrap(&mut self) {
+        self.staged.clear();
+        self.staged_base = 0;
+        self.window_memo.clear();
+        self.staged_consts = None;
+    }
+
     /// Copies `parts` into the batch's staging area, each at an offset
     /// aligned for uniform and storage bindings, and returns their
-    /// (offset, size) in the arena. Submits the batch first when the arena
-    /// is full, and grows the arena when one draw does not fit.
+    /// (offset, size) in the arena. Submits the batch and wraps the arena
+    /// first when it is full, and grows the arena when one draw does not
+    /// fit. A grown arena is a new buffer: submitted draws keep the old one.
     fn stage(&mut self, mem: &dyn GuestRead, parts: &[Part]) -> Result<Vec<(u64, u64)>, Skip> {
         let size = |p: &Part| (p.len() as u64).max(4).next_multiple_of(4);
         let align = self.arena_align;
         let need: u64 = parts.iter().map(|p| size(p).next_multiple_of(align)).sum();
         let have = self.arena.as_ref().map_or(0, |b| b.size());
-        if self.staged.len() as u64 + need > have {
+        if self.staged_base + self.staged.len() as u64 + need > have {
             self.flush()?;
+            self.wrap();
             if need > have {
                 if need > self.max_buffer {
                     return unsupported(format!("{need} bytes of draw data"));
@@ -2199,7 +2241,7 @@ impl Drawer {
                 }
             }
             self.staged.resize((off + size(p)) as usize, 0);
-            out.push((off, size(p)));
+            out.push((self.staged_base + off, size(p)));
             let end = self.staged.len() as u64;
             self.staged.resize(end.next_multiple_of(align) as usize, 0);
         }
@@ -2213,7 +2255,8 @@ impl Drawer {
             .iter()
             .map(|p| size(p).next_multiple_of(self.arena_align))
             .sum();
-        self.staged.len() as u64 + need <= self.arena.as_ref().map_or(0, |b| b.size())
+        self.staged_base + self.staged.len() as u64 + need
+            <= self.arena.as_ref().map_or(0, |b| b.size())
     }
 
     /// The batch's render pass, begun on `key`'s targets unless the current
@@ -3002,7 +3045,7 @@ impl Drawer {
     /// The guest memory the vertex fetch constants in `mask` point at, as
     /// one window, made ready to read (kept resolves under it written
     /// back). Returns its physical `[lo, hi)` (none for no window) and base
-    /// address; or, when a window staged in this batch holds it, none, that
+    /// address; or, when a window staged in the arena holds it, none, that
     /// window's base and its memo entry, with this window's size.
     #[allow(clippy::type_complexity)]
     fn guest_window(
@@ -3032,9 +3075,9 @@ impl Drawer {
         if lo >= hi {
             return Ok((None, 0, None));
         }
-        let mut memo = self.window_memo.iter().rev();
-        if let Some(&w) = memo.find(|&&(a, b, _)| a <= lo && hi <= b) {
-            return Ok((None, w.0 as u32, Some((w, hi - lo))));
+        let memo = self.window_memo.range(..=lo).next_back();
+        if let Some((&a, &(b, s))) = memo.filter(|(_, (b, _))| hi <= *b) {
+            return Ok((None, a as u32, Some(((a, b, s), hi - lo))));
         }
         if hi - lo > self.max_storage {
             return unsupported(format!(
@@ -3187,7 +3230,10 @@ impl Drawer {
         // Only the rows resolves wrote since the last decode are decoded
         // again (all levels with mips). Nothing in the open batch samples
         // the old texels: the resolve flushed it, and dropped this texture
-        // from the memo.
+        // from the memo. So the decode is recorded to run before the whole
+        // batch (`pre`), after the resolves submitted before it. A chain
+        // with a new mip count gets a new texture, decoded whole, which no
+        // recorded draw can sample yet.
         let old = self.mirrors[i]
             .views
             .get(&constant)
@@ -3243,7 +3289,10 @@ impl Drawer {
             self.pipeline_made(t0);
         }
         let pipeline = &pipeline;
-        let mut enc = self.device.create_command_encoder(&Default::default());
+        let mut enc = self
+            .pre
+            .take()
+            .unwrap_or_else(|| self.device.create_command_encoder(&Default::default()));
         for (level, &(lw, lh, lpitch, la)) in levels.iter().enumerate() {
             let (ly0, rows) = if level == 0 { (y0, y1 - y0) } else { (0, lh) };
             let row_words =
@@ -3319,8 +3368,7 @@ impl Drawer {
                 },
             );
         }
-        self.queue.submit([enc.finish()]);
-        self.submitted(Site::Decode);
+        self.pre = Some(enc);
         if let Some(e) = block_on(scope.pop()) {
             return Err(Skip::Fatal(Error::Gpu(e.to_string())));
         }
@@ -3876,10 +3924,11 @@ impl Drawer {
         let idx_bytes = to_bytes(&idx);
         let rect_indices: &[u8] = if rect_list { &idx_bytes } else { &[] };
         let rest = [&epi[..], rect_indices, &idx_bytes].map(Part::Bytes);
-        // The window and constants staged earlier in this batch are bound
-        // again, unless the batch was submitted since (the arena is then
-        // overwritten) or would be to stage the rest.
-        let mut kept_window = staged.filter(|(w, _)| self.window_memo.contains(w));
+        // The window and constants staged earlier (in this batch or one
+        // submitted since) are bound again, unless the arena wrapped since
+        // (it is then overwritten) or would wrap to stage the rest.
+        let mut kept_window =
+            staged.filter(|((a, b, s), _)| self.window_memo.get(a) == Some(&(*b, *s)));
         let mut kept_consts = (self.staged_consts.as_ref())
             .filter(|(b, _)| *b == consts)
             .map(|&(_, s)| s);
@@ -3937,7 +3986,16 @@ impl Drawer {
             None => {
                 let s = fresh.next().expect("staged window");
                 if let Some((lo, hi)) = read {
-                    self.window_memo.push((lo, hi, s));
+                    // None holds this window (it was read), so those it
+                    // holds are the ones from `lo` that end by `hi`.
+                    let inside: Vec<u64> = (self.window_memo.range(lo..))
+                        .take_while(|(_, (b, _))| *b <= hi)
+                        .map(|(&a, _)| a)
+                        .collect();
+                    for a in inside {
+                        self.window_memo.remove(&a);
+                    }
+                    self.window_memo.insert(lo, (hi, s));
                 }
                 s
             }

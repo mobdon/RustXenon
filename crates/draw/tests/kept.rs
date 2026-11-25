@@ -325,6 +325,35 @@ fn partial_resolve_updates_the_kept_texture() {
     assert_ne!(px(&img, W, 40, 5), [10, 20, 230, 255]);
 }
 
+/// Kept-texture decodes are submitted with the draws that sample them, not
+/// on their own: the same pixels as the guest path, with a submit fewer per
+/// decode.
+#[test]
+fn decodes_join_the_batch() {
+    let f = fetch(6, 2, IDENTITY);
+    let Some(mut d) = drawer() else { return };
+    let mut mem = memory();
+    vertices(&mut mem);
+    let mut s = Stream::default();
+    paint(s.setup());
+    resolve(&mut s, &mut mem, W, H);
+    sample(&mut s, f);
+    paint_small(&mut s);
+    resolve(&mut s, &mut mem, 32, 32);
+    sample(&mut s, f);
+    let r = run(&mut d, &s, &mut mem);
+    let t = &r.timings;
+    assert_eq!((t.textures_kept, t.textures_uploaded), (2, 0), "{r:?}");
+    // Two resolve copies; three batches (the last two with a decode each)
+    // and the end-of-replay write-back.
+    assert_eq!(t.submits_by_site, [2, 0, 0, 4], "{t:?}");
+    assert_eq!(t.submits, 6, "{t:?}");
+    let img = d.read_render_target(OUT, 0, 0, W, H).unwrap();
+    drop(d);
+    assert_eq!(img, guest_path(&mem, f));
+    assert_eq!(px(&img, W, 5, 5), [10, 20, 230, 255]);
+}
+
 /// Two resolves one under the other, as tiles of one surface (the second
 /// at the address of row 32): one texture over both is decoded on the GPU.
 #[test]
