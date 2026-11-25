@@ -361,6 +361,9 @@ pub struct Timings {
     pub textures: Duration,
     /// Encoding and submitting draws (the GPU runs them asynchronously).
     pub submit: Duration,
+    /// Of `submit`: writing the staged bytes to the arena and
+    /// `queue.submit` when a batch is flushed; the rest is recording draws.
+    pub queue: Duration,
     /// Waiting for queued GPU work before a resolve readback: where the
     /// rendering itself shows up.
     pub gpu_wait: Duration,
@@ -426,6 +429,8 @@ pub struct Timings {
     pub consts_reused: u32,
     /// Draws that bound a texture bind group made earlier in their batch.
     pub texture_groups_reused: u32,
+    /// Render passes begun for draws: each target change or flush ends one.
+    pub render_passes: u32,
 }
 
 impl std::ops::AddAssign<&Timings> for Timings {
@@ -467,6 +472,8 @@ impl std::ops::AddAssign<&Timings> for Timings {
         self.reused_bytes += t.reused_bytes;
         self.consts_reused += t.consts_reused;
         self.texture_groups_reused += t.texture_groups_reused;
+        self.queue += t.queue;
+        self.render_passes += t.render_passes;
     }
 }
 
@@ -2209,6 +2216,7 @@ impl Drawer {
         let (pre, batch) = (self.pre.take(), self.batch.take());
         if pre.is_none() && batch.is_none() {
             self.timings.submit += t.elapsed();
+            self.timings.queue += t.elapsed();
             return Ok(());
         }
         let scope = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
@@ -2229,6 +2237,7 @@ impl Drawer {
         self.queue.submit(bufs);
         self.submitted(site);
         self.timings.submit += t.elapsed();
+        self.timings.queue += t.elapsed();
         match block_on(scope.pop()) {
             Some(e) => Err(Skip::Fatal(Error::Gpu(e.to_string()))),
             None => Ok(()),
@@ -2339,6 +2348,7 @@ impl Drawer {
                 .each_ref()
                 .map(|t| t.as_ref().map(|t| t.create_view(&Default::default())));
             let depth_view = depth.map(|t| (t.format(), t.create_view(&Default::default())));
+            self.timings.render_passes += 1;
             let pass = batch
                 .enc
                 .begin_render_pass(&wgpu::RenderPassDescriptor {

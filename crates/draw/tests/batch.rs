@@ -114,6 +114,9 @@ fn resolve_sees_batched_draws() {
     assert_eq!(t.submits_by_site.iter().sum::<u32>(), t.submits, "{t:?}");
     // One resolve copy; the clears go with the second draw.
     assert_eq!(t.submits_by_site[..3], [1, 0, 0], "{t:?}");
+    // The resolve's flush ends the first draw's pass.
+    assert_eq!(t.render_passes, 2, "{t:?}");
+    assert!(t.queue <= t.submit, "{t:?}");
     let copy = detiled(&mem, DEST, W, H, W, 4);
     assert_eq!(px(&copy, W, 40, 40), RED);
     let img = d.read_render_target(COLOR_KEY, 0, 0, W, H).unwrap();
