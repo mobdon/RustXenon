@@ -191,6 +191,9 @@ pub fn start(rt: std::sync::Arc<Runtime>) {
                 match xenon_draw::Drawer::new() {
                     Ok(mut d) => {
                         crate::log(&format!("[draw] adapter: {}", d.adapter));
+                        if d.late_writeback {
+                            crate::log("[draw] resolve write-back: late (the CPU sees resolves a frame later)");
+                        }
                         // Opt-in: loading the cache cost about 900 MB of host
                         // memory in a warm run and gained no speed over the
                         // driver's own shader cache.
