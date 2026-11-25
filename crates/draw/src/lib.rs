@@ -381,8 +381,9 @@ pub struct Timings {
     pub submits: u32,
     /// `submits` by where they come from: resolve copies (GPU copies and
     /// CPU resolve readbacks), EDRAM transfers, kept resolve texture
-    /// decodes, and batch flushes and resolve write-backs. Resolve clears
-    /// are recorded into the next batch.
+    /// decodes with no draw to batch them with, and batch flushes and
+    /// resolve write-backs. Resolve clears and texture decodes are
+    /// recorded into the next batch.
     pub submits_by_site: [u32; 4],
     pub texture_bytes: u64,
     /// Guest vertex window bytes read (not those of reused windows).
@@ -902,6 +903,9 @@ pub struct Drawer {
     /// bound again by a draw with the same bytes. Cleared with
     /// `window_memo` when the arena wraps or grows.
     staged_consts: Option<(Vec<u8>, (u64, u64))>,
+    /// Kept-resolve texture decodes recorded since the last flush,
+    /// submitted with (before) the batch's draws.
+    pre: Option<wgpu::CommandEncoder>,
     max_buffer: u64,
     /// 1x1 texture of zeros bound for a slot without a usable texture.
     zero_texture: wgpu::TextureView,
@@ -1420,6 +1424,7 @@ impl Drawer {
             window_memo: BTreeMap::new(),
             staged_consts: None,
             staged_base: 0,
+            pre: None,
             arena_align: u64::from(
                 limits
                     .min_uniform_buffer_offset_alignment
@@ -1642,6 +1647,7 @@ impl Drawer {
         });
         let done = done.and(flushed);
         self.batch = None;
+        self.pre = None;
         self.wrap();
         // Resolves done before an error still reach guest memory.
         let kept = self.finish_mirrors(&mut mem);
@@ -1966,9 +1972,9 @@ impl Drawer {
         self.timings.submits_by_site[site as usize] += 1;
     }
 
-    /// Submits the batched draws, after writing the newly staged bytes to
-    /// the arena. The windows and constants staged so far stay in the arena
-    /// for later batches.
+    /// Submits the recorded texture decodes and the batched draws, after
+    /// writing the newly staged bytes to the arena. The windows and
+    /// constants staged so far stay in the arena for later batches.
     fn flush(&mut self) -> Result<(), Skip> {
         // The arena upload counts as submit time too.
         let t = Instant::now();
@@ -1980,14 +1986,28 @@ impl Drawer {
             self.staged_base += self.staged.len() as u64;
             self.staged.clear();
         }
-        let Some(mut batch) = self.batch.take() else {
+        let (pre, batch) = (self.pre.take(), self.batch.take());
+        if pre.is_none() && batch.is_none() {
             self.timings.submit += t.elapsed();
             return Ok(());
-        };
+        }
         let scope = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
-        drop(batch.pass.take());
-        self.queue.submit([batch.enc.finish()]);
-        self.submitted(Site::Other);
+        let site = if batch.is_some() {
+            Site::Other
+        } else {
+            Site::Decode
+        };
+        // Decodes first: the draws sample what they write, and they read
+        // kept resolves written by work submitted before.
+        let bufs = pre
+            .map(|e| e.finish())
+            .into_iter()
+            .chain(batch.map(|mut b| {
+                drop(b.pass.take());
+                b.enc.finish()
+            }));
+        self.queue.submit(bufs);
+        self.submitted(site);
         self.timings.submit += t.elapsed();
         match block_on(scope.pop()) {
             Some(e) => Err(Skip::Fatal(Error::Gpu(e.to_string()))),
@@ -3006,7 +3026,9 @@ impl Drawer {
         }
         // Only the rows resolves wrote since the last decode are decoded
         // again. Nothing in the open batch samples the old texels: the
-        // resolve flushed it, and dropped this texture from the memo.
+        // resolve flushed it, and dropped this texture from the memo. So
+        // the decode is recorded to run before the whole batch (`pre`),
+        // after the resolves submitted before it.
         let (y0, y1) = match self.mirrors[i].views.get(&constant) {
             Some(k) => match k.stale {
                 None => return Ok(Some(k.view.clone())),
@@ -3094,7 +3116,8 @@ impl Drawer {
                 },
             ],
         });
-        let mut enc = self.device.create_command_encoder(&Default::default());
+        let enc =
+            (self.pre).get_or_insert_with(|| device.create_command_encoder(&Default::default()));
         {
             let mut pass = enc.begin_compute_pass(&Default::default());
             pass.set_pipeline(pipeline);
@@ -3122,8 +3145,6 @@ impl Drawer {
                 depth_or_array_layers: 1,
             },
         );
-        self.queue.submit([enc.finish()]);
-        self.submitted(Site::Decode);
         if let Some(e) = block_on(scope.pop()) {
             return Err(Skip::Fatal(Error::Gpu(e.to_string())));
         }
