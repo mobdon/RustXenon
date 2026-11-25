@@ -537,7 +537,10 @@ fn dropped_pipeline_is_made_again_and_draws_the_same() {
     assert_eq!(report.timings.pipelines_created, 2, "{report:?}");
     let kept = d.read_render_target(COLOR_KEY, 0, 0, W, H).unwrap();
     let m = d.memory_line();
-    assert!(m.contains("(2 vs/ps pairs, 0 dropped), shaders 3"), "{m}");
+    assert!(
+        m.contains("(2 vs/ps pairs, 0 dropped), shaders 3, translated 3 ("),
+        "{m}"
+    );
 
     drop(d);
     let Some(mut d) = drawer() else { return };
@@ -546,7 +549,11 @@ fn dropped_pipeline_is_made_again_and_draws_the_same() {
     assert_eq!(report.draws, 3, "{report:?}");
     assert_eq!(report.timings.pipelines_created, 3, "{report:?}");
     let m = d.memory_line();
-    assert!(m.contains("(1 vs/ps pairs, 2 dropped), shaders 2"), "{m}");
+    assert!(
+        m.contains("(1 vs/ps pairs, 2 dropped), shaders 2, translated 2 ("),
+        "{m}"
+    );
+    assert!(!m.contains("(0 KB WGSL)"), "{m}");
     assert!(kept == d.read_render_target(COLOR_KEY, 0, 0, W, H).unwrap());
 }
 

@@ -1211,13 +1211,20 @@ impl Drawer {
     /// targets (bytes estimated from their size and format), the draw upload
     /// arena and its host staging copy, pipeline counts (with the distinct
     /// vertex and pixel shader pairs of the draw pipelines and how many were
-    /// dropped) and shader module counts.
+    /// dropped), shader module counts and the translated shaders with the
+    /// bytes of their WGSL.
     pub fn memory_line(&self) -> String {
         let rt: u64 = self.targets.values().map(texture_bytes).sum();
         let pairs: std::collections::HashSet<(u64, u64)> =
             self.pipelines.keys().map(|k| (k.vs, k.ps)).collect();
+        let wgsl: Vec<usize> = self
+            .translated
+            .values()
+            .flatten()
+            .map(|t| t.wgsl.len())
+            .collect();
         format!(
-            "draw: textures {} MB in {}, targets {} MB in {}, {} dropped, arena {} MB, staged {} MB, pipelines {} ({} vs/ps pairs, {} dropped), shaders {}",
+            "draw: textures {} MB in {}, targets {} MB in {}, {} dropped, arena {} MB, staged {} MB, pipelines {} ({} vs/ps pairs, {} dropped), shaders {}, translated {} ({} KB WGSL)",
             self.texture_cache_bytes >> 20,
             self.texture_cache.len(),
             rt >> 20,
@@ -1229,6 +1236,8 @@ impl Drawer {
             pairs.len(),
             self.pipeline_drops,
             self.modules.len(),
+            wgsl.len(),
+            wgsl.iter().sum::<usize>().div_ceil(1024),
         )
     }
 
