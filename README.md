@@ -269,9 +269,9 @@ pixels.
 
 Not covered yet: textures beyond the base level of 1D and 2D (mips, the
 packed mip tail, 3D, cube faces other than the first, stacked slices past 0),
-the fetch constant's border colour, signed texel components wider than 8
-bits or filtered (signed texels are reinterpreted from the unsigned decode
-after sampling), and the
+the fetch constant's border colour, signed block-compressed texels
+(converted from the unsigned palette decode, not interpolated as signed),
+and the
 border and mirror-once clamp modes; texture fetch filter overrides, 1D/3D/cube
 fetches, the getCompTexLOD, getWeights and getBCF texture instructions;
 depth export and memory

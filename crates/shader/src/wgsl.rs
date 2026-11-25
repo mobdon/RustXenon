@@ -263,31 +263,29 @@ fn vword(addr: i32, e: u32) -> u32 {
 }
 ";
 
-// Texture fetch result: the fetch constant's per-component sign (dword 0
-// bits 2..9, after the dword 3 swizzle as Xenia's texture_util.cc
-// SwizzleSigns picks it; constant 0/1 components keep their value) and the
-// 2^exp_adjust scale (dword 3 bits 13..18, signed), as Xenia's
-// spirv_shader_translator_fetch.cc applies them (its exp_adjust reads word 4;
-// dword 3 is per xenos.h and dxbc_shader_translator_fetch.cc). Gamma is
-// Xenia's PWLGammaToLinear (spirv_shader_translator.cc / xenos.cc).
+// Texture fetch result. The host texture already holds the swizzled texels
+// with signed components (sign 1) converted at upload, so only the biased
+// sign (2: x * 2 - 1) and gamma (3) remain. The sign of an output component
+// is the sign of the source component its swizzle select picks (fetch dword
+// 0 bits 2..9, swizzle in dword 3 bits 1..12); constant 0 / 1 selects take
+// none. The result is then scaled by 2^exp_adjust (dword 3 bits 13..18,
+// signed).
+//
+// Gamma is the console's piecewise-linear 8-bit curve: on the 0..255 input
+// scale it has breakpoints at 64, 96 and 192 with slopes 1, 2, 4 and 8 to a
+// 10-bit linear value, plus a slope-scaled correction that stretches the
+// top of the curve to reach 1023.
 const TFETCH_PRELUDE: &str = "
-fn xe_pwl_gamma_to_linear(g_in: f32) -> f32 {
-    let g = clamp(g_in, 0.0, 1.0);
-    var scale = 1.0 / 1024.0;
-    var offset = 0.0;
-    if (g >= 192.0 / 255.0) {
-        scale = 8.0 / 1024.0;
-        offset = -1024.0;
-    } else if (g >= 96.0 / 255.0) {
-        scale = 4.0 / 1024.0;
-        offset = -256.0;
-    } else if (g >= 64.0 / 255.0) {
-        scale = 2.0 / 1024.0;
-        offset = -64.0;
-    }
-    var l = g * (255.0 * 1024.0) * scale + offset;
-    l += trunc(l * scale);
-    return l * (1.0 / 1023.0);
+fn xe_pwl_gamma_to_linear(g: f32) -> f32 {
+    let x = clamp(g, 0.0, 1.0) * 255.0;
+    let seg = u32(x >= 64.0) + u32(x >= 96.0) + u32(x >= 192.0);
+    var seg_start = array<f32, 4>(0.0, 64.0, 96.0, 192.0);
+    var seg_linear = array<f32, 4>(0.0, 64.0, 128.0, 512.0);
+    let slope = f32(1u << seg);
+    let l = seg_linear[seg] + slope * (x - seg_start[seg]);
+    // Multiply by the reciprocal: WGSL division is allowed 2.5 ulp of error,
+    // and the console curve scales by 1/1023 this way.
+    return (l + floor(l * slope / 1024.0)) * (1.0 / 1023.0);
 }
 
 fn xe_tfetch_sign_bias(v: vec4<f32>, w0: u32, w3: u32) -> vec4<f32> {
@@ -298,13 +296,7 @@ fn xe_tfetch_sign_bias(v: vec4<f32>, w0: u32, w3: u32) -> vec4<f32> {
             continue;
         }
         let sign = extractBits(w0, 2u + 2u * s, 2u);
-        if (sign == 1u) {
-            // shortcut: signed is the 8-bit unorm texel reinterpreted as
-            // two's complement after sampling, exact for point-sampled 8-bit
-            // components only; upgrade with signed decoding in xenon-texture.
-            let b = round(v[i] * 255.0);
-            r[i] = max(select(b, b - 256.0, b >= 128.0) / 127.0, -1.0);
-        } else if (sign == 2u) {
+        if (sign == 2u) {
             r[i] = v[i] * 2.0 - 1.0;
         } else if (sign == 3u) {
             r[i] = xe_pwl_gamma_to_linear(v[i]);
