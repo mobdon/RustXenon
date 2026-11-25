@@ -482,6 +482,7 @@ impl RenderTargetKey {
 }
 
 /// Why one draw or resolve was not done.
+#[derive(Debug)]
 enum Skip {
     Unsupported(String),
     Fatal(Error),
@@ -1302,9 +1303,14 @@ impl Drawer {
                 if need > self.max_buffer {
                     return unsupported(format!("{need} bytes of draw data"));
                 }
+                let size = need.max(ARENA_MIN).next_power_of_two().min(self.max_buffer);
+                // Flushed, so empty: the batch never stages more than the
+                // arena holds, so it never grows past this (a Vec doubling
+                // from an odd size would).
+                self.staged = Vec::with_capacity(size as usize);
                 self.arena = Some(self.device.create_buffer(&wgpu::BufferDescriptor {
                     label: Some("draw arena"),
-                    size: need.max(ARENA_MIN).next_power_of_two().min(self.max_buffer),
+                    size,
                     usage: wgpu::BufferUsages::STORAGE
                         | wgpu::BufferUsages::UNIFORM
                         | wgpu::BufferUsages::INDEX
@@ -3317,6 +3323,37 @@ mod tests {
                 assert_eq!(got, want.to_bits(), "{float} {:06X}", n(i));
             }
         }
+    }
+
+    /// A drawer on the test adapter, or None without one (unless
+    /// XENON_REQUIRE_GPU=1).
+    fn gpu() -> Option<Drawer> {
+        match Drawer::new() {
+            Ok(d) => Some(d),
+            Err(Error::NoAdapter) if std::env::var("XENON_REQUIRE_GPU").as_deref() != Ok("1") => {
+                None
+            }
+            Err(e) => panic!("{e}"),
+        }
+    }
+
+    /// Staging that fills the arena in uneven steps keeps its host copy
+    /// within the arena's size (doubling from 3 MB would reach 24 MB).
+    #[test]
+    fn staged_capacity_stays_within_the_arena() {
+        let Some(mut d) = gpu() else { return };
+        let part = vec![7u8; 3 << 20];
+        for _ in 0..12 {
+            d.stage(&[&part]).unwrap();
+            let arena = d.arena.as_ref().unwrap().size();
+            assert!(d.staged.capacity() as u64 <= arena, "{}", d.staged.capacity());
+        }
+        let big = vec![1u8; 20 << 20];
+        d.stage(&[&big]).unwrap();
+        d.stage(&[&part]).unwrap();
+        assert_eq!(d.arena.as_ref().unwrap().size(), 32 << 20);
+        assert!(d.staged.capacity() <= 32 << 20, "{}", d.staged.capacity());
+        d.flush().unwrap();
     }
 
     #[test]
