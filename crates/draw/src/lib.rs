@@ -536,7 +536,7 @@ type WriteBack = (
 /// takes them at `submit`, which together cost tens of microseconds a draw
 /// on some drivers.
 struct Submitter {
-    tx: Option<std::sync::mpsc::Sender<Vec<wgpu::CommandEncoder>>>,
+    tx: Option<std::sync::mpsc::Sender<SubmitJob>>,
     rx: Mutex<std::sync::mpsc::Receiver<SubmitDone>>,
     /// Batches sent and not yet received back, and what came back: time
     /// spent, the first validation error and the last submission.
@@ -545,6 +545,13 @@ struct Submitter {
 }
 
 type SubmitDone = (Duration, Option<String>, wgpu::SubmissionIndex);
+
+/// Staged bytes to write to `arena` at an offset before the encoders run,
+/// and the encoders.
+type SubmitJob = (
+    Option<(wgpu::Buffer, u64, Vec<u8>)>,
+    Vec<wgpu::CommandEncoder>,
+);
 
 #[derive(Default)]
 struct SubmitState {
@@ -556,16 +563,38 @@ struct SubmitState {
 
 impl Submitter {
     fn new(device: wgpu::Device, queue: wgpu::Queue) -> Submitter {
-        let (tx, jobs) = std::sync::mpsc::channel::<Vec<wgpu::CommandEncoder>>();
+        let (tx, jobs) = std::sync::mpsc::channel::<SubmitJob>();
         let (done, rx) = std::sync::mpsc::channel();
         let thread = std::thread::Builder::new()
             .name("xenon-draw submit".into())
             .spawn(move || {
-                for encs in jobs {
+                // Mapped upload chunks, kept and reused: recalled after each
+                // submit, so mapped again by the next upload.
+                let mut belt = wgpu::util::StagingBelt::new(device.clone(), BELT_CHUNK);
+                for (upload, encs) in jobs {
                     let t = Instant::now();
                     // Error scopes are per thread.
                     let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
-                    let index = queue.submit(encs.into_iter().map(|e| e.finish()));
+                    // Maps the chunks recalled after earlier submits whose
+                    // work the GPU finished.
+                    let _ = device.poll(wgpu::PollType::Poll);
+                    let upload = upload.map(|(arena, base, bytes)| {
+                        let mut enc = device.create_command_encoder(&Default::default());
+                        // In chunk-sized pieces: the belt makes a chunk as
+                        // large as a write and never frees one, so batches
+                        // of growing sizes kept adding larger chunks.
+                        for (i, piece) in bytes.chunks(BELT_CHUNK as usize).enumerate() {
+                            let size =
+                                wgpu::BufferSize::new(piece.len() as u64).expect("non-empty");
+                            let at = base + i as u64 * BELT_CHUNK;
+                            belt.write_buffer(&mut enc, &arena, at, size)
+                                .copy_from_slice(piece);
+                        }
+                        belt.finish();
+                        enc
+                    });
+                    let index = queue.submit(upload.into_iter().chain(encs).map(|e| e.finish()));
+                    belt.recall();
                     let error = block_on(scope.pop()).map(|e| e.to_string());
                     if done.send((t.elapsed(), error, index)).is_err() {
                         break;
@@ -581,20 +610,25 @@ impl Submitter {
         }
     }
 
-    fn send(&self, encs: Vec<wgpu::CommandEncoder>) {
+    fn send(&self, upload: Option<(wgpu::Buffer, u64, Vec<u8>)>, encs: Vec<wgpu::CommandEncoder>) {
         self.state.lock().expect("submit state").pending += 1;
         self.tx
             .as_ref()
             .expect("submit thread")
-            .send(encs)
+            .send((upload, encs))
             .expect("submit thread alive");
     }
 
     /// Waits until every batch sent is submitted.
     fn drain(&self) {
+        self.drain_to(0);
+    }
+
+    /// Waits until at most `n` batches sent are not yet submitted.
+    fn drain_to(&self, n: usize) {
         let mut st = self.state.lock().expect("submit state");
         let rx = self.rx.lock().expect("submit results");
-        while st.pending > 0 {
+        while st.pending > n {
             let (e, error, index) = rx.recv().expect("submit thread alive");
             st.pending -= 1;
             st.queue += e;
@@ -1138,10 +1172,6 @@ pub struct Drawer {
     /// the last ([`GuestMemory::take_written`]), so the arena and
     /// `window_memo` are kept across replays and dropped only where written.
     watching: bool,
-    /// Mapped upload chunks for `staged`, kept and reused across flushes:
-    /// `queue.write_buffer` took a fresh staging buffer per flush, whose
-    /// pages the copy faulted in every time.
-    belt: wgpu::util::StagingBelt,
     submitter: Submitter,
     arena: Option<wgpu::Buffer>,
     arena_align: u64,
@@ -1838,7 +1868,6 @@ impl Drawer {
                 view_formats: &[],
             })
             .create_view(&Default::default());
-        let device_for_belt = device.clone();
         let submitter = Submitter::new(device.clone(), queue.clone());
         let mut d = Drawer {
             instance,
@@ -1902,7 +1931,6 @@ impl Drawer {
             staged_consts: None,
             staged_base: 0,
             watching: false,
-            belt: wgpu::util::StagingBelt::new(device_for_belt, BELT_CHUNK),
             submitter,
             pre: None,
             resolve_pending: false,
@@ -2724,28 +2752,14 @@ impl Drawer {
     fn flush(&mut self) -> Result<(), Skip> {
         // The arena upload counts as submit time too.
         let t = Instant::now();
-        // One batch in flight at most: the previous one's upload chunks are
-        // submitted before the belt maps them again.
-        self.submitter.drain();
-        let _ = self.device.poll(wgpu::PollType::Poll);
-        self.belt.recall();
+        // Two batches in flight at most, so their staged copies stay few;
+        // the drawer records the next batch while the last one submits.
+        self.submitter.drain_to(1);
         let mut upload = None;
         if let (Some(arena), false) = (&self.arena, self.staged.is_empty()) {
-            // Submitted first, so ordered after the work already submitted,
-            // which reads only bytes before `staged_base` (or before a wrap).
-            let mut enc = self.device.create_command_encoder(&Default::default());
-            // In chunk-sized pieces: the belt makes a chunk as large as a
-            // write and never frees one, so batches of growing sizes kept
-            // adding larger chunks (host memory crept by hundreds of MB).
-            for (i, piece) in self.staged.chunks(BELT_CHUNK as usize).enumerate() {
-                let size = wgpu::BufferSize::new(piece.len() as u64).expect("non-empty");
-                let at = self.staged_base + i as u64 * BELT_CHUNK;
-                self.belt
-                    .write_buffer(&mut enc, arena, at, size)
-                    .copy_from_slice(piece);
-            }
-            self.belt.finish();
-            upload = Some(enc);
+            // A copy goes to the submit thread, which writes it to the arena
+            // ahead of this batch; `staged` keeps its reserve.
+            upload = Some((arena.clone(), self.staged_base, self.staged.clone()));
             self.staged_base += self.staged.len() as u64;
             self.staged.clear();
         }
@@ -2766,9 +2780,8 @@ impl Drawer {
         // Decodes first: the draws sample what they write, and they read
         // kept resolves written by work submitted before.
         let clock = &self.gpu_clock;
-        let encs = upload
+        let encs = pre
             .into_iter()
-            .chain(pre)
             .chain(batch.map(|mut b| {
                 drop(b.pass.take());
                 if let Some(c) = clock.as_ref().filter(|c| !c.kinds.is_empty()) {
@@ -2781,7 +2794,7 @@ impl Drawer {
                 b.enc
             }))
             .collect();
-        self.submitter.send(encs);
+        self.submitter.send(upload, encs);
         self.submitted(site);
         // One reading for both, so `queue` never exceeds `submit`.
         let e = t.elapsed();
