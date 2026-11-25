@@ -1,17 +1,20 @@
 //! Integer helpers called by translated code.
 //!
-//! The CPU is in 64-bit mode, so carries and overflows come from the full
-//! 64-bit result. Where the architecture leaves result bits undefined (the
+//! Results are 64-bit and overflows come from the full 64-bit result, but the
+//! carry (CA) comes from the low word, as titles see it on the console. Where the architecture leaves result bits undefined (the
 //! high word of `mulhw` or `divw`, results of division by zero) these helpers
 //! give the same value as the reference CPU emulator the tests were checked
 //! against, so behaviour is at least repeatable.
 
-/// `a + b + cin` with the carry out of bit 0.
+/// `a + b + cin` over all 64 bits, with the carry out of the low word (into
+/// bit 32 in PowerPC numbering): titles see CA, like CR0 of record forms,
+/// from the low 32 bits. A sorted search comparing zero-extended keys with
+/// `subfc`/`subfe` depends on it when the key has stray high bits.
 #[inline]
 pub fn add_ca(a: u64, b: u64, cin: bool) -> (u64, bool) {
-    let (s1, c1) = a.overflowing_add(b);
-    let (s2, c2) = s1.overflowing_add(cin as u64);
-    (s2, c1 | c2)
+    let s = a.wrapping_add(b).wrapping_add(cin as u64);
+    let k = (a as u32 as u64 + b as u32 as u64 + cin as u64) >> 32 != 0;
+    (s, k)
 }
 
 /// Signed overflow of `a + b (+ carry)` given its result `r`.
@@ -227,5 +230,26 @@ mod tests {
             (0xC000_0000_0000_0000, true)
         );
         assert_eq!(srad(5, 0), (5, false));
+    }
+
+    #[test]
+    fn carry_comes_from_the_low_word() {
+        // Plain carry out of bit 31; the sum keeps all 64 bits.
+        assert_eq!(add_ca(0xFFFF_FFFF, 1, false), (0x1_0000_0000, true));
+        assert_eq!(add_ca(u64::MAX, 1, false), (0, true));
+        // A carry out of bit 63 alone is not the low word's carry.
+        assert_eq!(
+            add_ca(0x1_0000_0000, 0xFFFF_FFFF_0000_0000, false),
+            (0, false)
+        );
+        // `subfc t, entry, key; subfe t, t, t` gives -1 when key < entry and
+        // 0 when equal. The key has stray high bits (a hash built with 64-bit
+        // adds), the entry was loaded with lwz.
+        let (key, entry) = (0x0000_0005_1689_FF8C_u64, 0x7D27_B1E8_u64);
+        let (t, ca) = add_ca(!entry, key, true);
+        let (t, _) = add_ca(!t, t, ca);
+        assert_eq!(t, u64::MAX);
+        let (t, ca) = add_ca(!entry, 0x0000_0005_7D27_B1E8, true);
+        assert_eq!(add_ca(!t, t, ca).0, 0);
     }
 }

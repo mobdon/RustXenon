@@ -645,6 +645,38 @@ def console_cr0(word, out):
     out["cr"] = (out["cr"] & 0x0FFF_FFFF) | field << 28
 
 
+# Carrying ops (primary 31, XO form): xo -> (complement rA, second operand, carry in).
+CARRY_XO = {
+    10: (False, "rb", 0), 138: (False, "rb", "ca"), 202: (False, 0, "ca"), 234: (False, "ones", "ca"),
+    8: (True, "rb", 1), 136: (True, "rb", "ca"), 200: (True, 0, "ca"), 232: (True, "ones", "ca"),
+}
+
+
+def console_ca(word, st, out):
+    """The console's titles see CA as the carry out of the low 32 bits (the
+    reference CPU carries out of all 64), as with CR0. Rewrites CA in `out`
+    for addc, adde, addze, addme, subfc, subfe, subfze, subfme, addic(.) and
+    subfic, from the input registers in `st`."""
+    op = word >> 26
+    ra, rb = (word >> 16) & 31, (word >> 11) & 31
+    xer = st.get("xer", 0)
+    cin = (xer >> 29) & 1
+    simm = (word & 0xFFFF) - ((word & 0x8000) << 1)
+    if op == 31 and (word >> 1) & 0x1FF in CARRY_XO:
+        neg, b, c = CARRY_XO[(word >> 1) & 0x1FF]
+        b = {"rb": st.get(f"r{rb}", 0), 0: 0, "ones": M64}[b]
+        c = cin if c == "ca" else c
+    elif op in (12, 13):
+        neg, b, c = False, simm, 0
+    elif op == 8:
+        neg, b, c = True, simm, 1
+    else:
+        return
+    a = st.get(f"r{ra}", 0) ^ (M64 if neg else 0)
+    ca = ((a & 0xFFFF_FFFF) + (b & 0xFFFF_FFFF) + c) >> 32
+    out["xer"] = (out.get("xer", xer) & ~0x2000_0000) | ca << 29
+
+
 def main():
     int_cases()
     branch_cases()
@@ -666,6 +698,7 @@ def main():
         if words is None:
             words = [next(std_words) for _ in lines]
         if len(words) == 1:
+            console_ca(words[0], oracle_input(st, ren), out)
             console_cr0(words[0], out)
         oin = harness.full_state(oracle_input(st, ren))
         diff = {k: v for k, v in out.items() if oin[k] != v and k not in scrub}
@@ -677,7 +710,7 @@ def main():
     path = os.path.join(root, "crates", "cpu-tests", "data", "oracle.txt")
     with open(path, "w") as fh:
         fh.write("# Reference results from a 64-bit PowerPC CPU emulator, with CR0 of integer\n")
-        fh.write("# record forms from the low 32 bits as on the console; regenerate with\n")
+        fh.write("# record forms and CA from the low 32 bits as on the console; regenerate with\n")
         fh.write("# `python3 tools/ppc-oracle/cases.py`. Format: see crates/cpu-tests/src/lib.rs.\n")
         fh.write("\n".join(rows) + "\n")
     print(f"{len(rows)} cases -> {path}")
