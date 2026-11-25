@@ -880,7 +880,7 @@ pub struct Drawer {
     /// drop the entries whose range they write, so later draws skip reading
     /// and hashing the guest bytes of the others.
     texture_memo: HashMap<[u32; 6], (wgpu::TextureView, u64, u64)>,
-    samplers: HashMap<([u8; 3], u8, u8), wgpu::Sampler>,
+    samplers: HashMap<([u8; 3], u8, u8, u8, u32), wgpu::Sampler>,
     /// Draws recorded but not yet submitted (see [`Batch`]).
     batch: Option<Batch>,
     /// Draw buffers (guest window, constants, epilogue, indices) of the
@@ -2917,11 +2917,10 @@ impl Drawer {
         let addr = u64::from(fetch.base_address & PHYSICAL_MASK);
         if let Ok(len) = xenon_texture::bytes_needed(&fetch) {
             let end = addr + len as u64;
-            if let Some(view) = self.kept_texture(&fetch, constant, addr, end, mem)? {
+            if let Some((view, lo, hi)) = self.kept_texture(&fetch, constant, addr, end, mem)? {
                 self.timings.textures_kept += 1;
-                self.timings.kept_bytes += len as u64;
-                self.texture_memo
-                    .insert(constant, (view.clone(), addr, end));
+                self.timings.kept_bytes += hi - lo;
+                self.texture_memo.insert(constant, (view.clone(), lo, hi));
                 return Ok((view, sampler));
             }
             self.sync(mem, addr, end)?;
@@ -2941,7 +2940,10 @@ impl Drawer {
     /// k_8_8_8_8 layouts that host as `Rgba8Unorm`, k_32_FLOAT,
     /// k_16_16_16_16_FLOAT and the depth formats k_24_8 and k_24_8_FLOAT
     /// (any endian, swizzle and resolve format, as the bytes are the
-    /// guest's) are decoded here.
+    /// guest's) are decoded here. Mip levels before the packed tail, up to
+    /// the fetch's last one, that the same kept resolve holds are decoded
+    /// too, so explicit and computed LODs reach them. Returns the view and
+    /// the guest range it was decoded from.
     fn kept_texture(
         &mut self,
         fetch: &xenon_texture::TextureFetch,
@@ -2949,7 +2951,7 @@ impl Drawer {
         addr: u64,
         end: u64,
         mem: &Tracked,
-    ) -> Result<Option<wgpu::TextureView>, Skip> {
+    ) -> Result<Option<(wgpu::TextureView, u64, u64)>, Skip> {
         use xenon_texture::{Dimension, TextureFormat as F};
         let Some(i) = self
             .mirrors
@@ -2986,44 +2988,47 @@ impl Drawer {
         {
             return Ok(None);
         }
+        // (width, height, pitch, guest address) of each level decoded.
+        let mut levels = vec![(w, h, pitch, addr)];
+        let (mut lo, mut hi) = (addr, end);
+        // shortcut: the levels stop at the first one the kept resolve does
+        // not hold (sampled LODs past it clamp to the last decoded level);
+        // read those from guest memory if a capture keeps only some mips.
+        for level in 1..=fetch.mip_range().1 {
+            let Ok(m) = xenon_texture::mip_level(fetch, level) else {
+                break;
+            };
+            let a = u64::from(fetch.mip_address & PHYSICAL_MASK) + m.offset as u64;
+            let b = a + m.extent as u64;
+            let mirror = &self.mirrors[i];
+            if a < mirror.lo || mirror.hi < b || !(a - mirror.lo).is_multiple_of(4) {
+                break;
+            }
+            if !self.verify(i, mem, a, b) {
+                return Ok(None);
+            }
+            levels.push((m.width, m.height, m.pitch_blocks, a));
+            // shortcut: one range spans the base, the mips and any gap between
+            // them, so a resolve into the gap re-decodes the chain; keep a
+            // range per level if mips far from their base show up.
+            (lo, hi) = (lo.min(a), hi.max(b));
+        }
         // Only the rows resolves wrote since the last decode are decoded
-        // again. Nothing in the open batch samples the old texels: the
-        // resolve flushed it, and dropped this texture from the memo.
-        let (y0, y1) = match self.mirrors[i].views.get(&constant) {
+        // again (all levels with mips). Nothing in the open batch samples
+        // the old texels: the resolve flushed it, and dropped this texture
+        // from the memo.
+        let old = self.mirrors[i]
+            .views
+            .get(&constant)
+            .filter(|k| k.tex.mip_level_count() as usize == levels.len());
+        let (y0, y1) = match old {
             Some(k) => match k.stale {
-                None => return Ok(Some(k.view.clone())),
+                None => return Ok(Some((k.view.clone(), k.lo, k.hi))),
                 Some(rows) => rows,
             },
             None => (0, h),
         };
-        let row_words = (w * host_bytes).next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT) / 4;
-        let rows = y1 - y0;
-        let params = [
-            w,
-            rows,
-            pitch,
-            fetch.endian as u32,
-            u32::from(fetch.swizzle),
-            ((addr - self.mirrors[i].lo) / 4) as u32,
-            row_words,
-            y0,
-            mode.unwrap_or(0),
-            0,
-            0,
-            0,
-        ];
-        let uniform = self.buffer(
-            "decode params",
-            &to_bytes(&params),
-            wgpu::BufferUsages::UNIFORM,
-        );
-        let texels = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("decoded texels"),
-            size: u64::from(row_words) * 4 * u64::from(rows),
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
-        let tex = match self.mirrors[i].views.get(&constant) {
+        let tex = match old {
             Some(k) => k.tex.clone(),
             None => self.device.create_texture(&wgpu::TextureDescriptor {
                 label: Some("kept resolve texture"),
@@ -3032,7 +3037,7 @@ impl Drawer {
                     height: h,
                     depth_or_array_layers: 1,
                 },
-                mip_level_count: 1,
+                mip_level_count: levels.len() as u32,
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
                 format: host,
@@ -3043,8 +3048,8 @@ impl Drawer {
         let scope = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
         let device = &self.device;
         let entry = ["decode_8888", "decode_float"][usize::from(mode.is_some())];
-        let pipeline =
-            self.decode_pipelines[usize::from(mode.is_some())].get_or_insert_with(|| {
+        let pipeline = self.decode_pipelines[usize::from(mode.is_some())]
+            .get_or_insert_with(|| {
                 let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
                     label: Some("resolve"),
                     source: wgpu::ShaderSource::Wgsl(include_str!("resolve.wgsl").into()),
@@ -3057,53 +3062,85 @@ impl Drawer {
                     compilation_options: Default::default(),
                     cache: None,
                 })
-            });
-        let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some(entry),
-            layout: &pipeline.get_bind_group_layout(0),
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 5,
-                    resource: self.mirrors[i].buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 6,
-                    resource: texels.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 7,
-                    resource: uniform.as_entire_binding(),
-                },
-            ],
-        });
+            })
+            .clone();
+        let pipeline = &pipeline;
         let mut enc = self.device.create_command_encoder(&Default::default());
-        {
-            let mut pass = enc.begin_compute_pass(&Default::default());
-            pass.set_pipeline(pipeline);
-            pass.set_bind_group(0, &bg, &[]);
-            pass.dispatch_workgroups(w.div_ceil(8), rows.div_ceil(8), 1);
-        }
-        enc.copy_buffer_to_texture(
-            wgpu::TexelCopyBufferInfo {
-                buffer: &texels,
-                layout: wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(row_words * 4),
-                    rows_per_image: Some(rows),
+        for (level, &(lw, lh, lpitch, la)) in levels.iter().enumerate() {
+            let (ly0, rows) = if level == 0 { (y0, y1 - y0) } else { (0, lh) };
+            let row_words =
+                (lw * host_bytes).next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT) / 4;
+            let params = [
+                lw,
+                rows,
+                lpitch,
+                fetch.endian as u32,
+                u32::from(fetch.swizzle),
+                ((la - self.mirrors[i].lo) / 4) as u32,
+                row_words,
+                ly0,
+                mode.unwrap_or(0),
+                0,
+                0,
+                0,
+            ];
+            let uniform = self.buffer(
+                "decode params",
+                &to_bytes(&params),
+                wgpu::BufferUsages::UNIFORM,
+            );
+            let texels = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("decoded texels"),
+                size: u64::from(row_words) * 4 * u64::from(rows),
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            });
+            let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some(entry),
+                layout: &pipeline.get_bind_group_layout(0),
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 5,
+                        resource: self.mirrors[i].buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 6,
+                        resource: texels.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 7,
+                        resource: uniform.as_entire_binding(),
+                    },
+                ],
+            });
+            {
+                let mut pass = enc.begin_compute_pass(&Default::default());
+                pass.set_pipeline(pipeline);
+                pass.set_bind_group(0, &bg, &[]);
+                pass.dispatch_workgroups(lw.div_ceil(8), rows.div_ceil(8), 1);
+            }
+            enc.copy_buffer_to_texture(
+                wgpu::TexelCopyBufferInfo {
+                    buffer: &texels,
+                    layout: wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(row_words * 4),
+                        rows_per_image: Some(rows),
+                    },
                 },
-            },
-            wgpu::TexelCopyTextureInfo {
-                texture: &tex,
-                mip_level: 0,
-                origin: wgpu::Origin3d { x: 0, y: y0, z: 0 },
-                aspect: wgpu::TextureAspect::All,
-            },
-            wgpu::Extent3d {
-                width: w,
-                height: rows,
-                depth_or_array_layers: 1,
-            },
-        );
+                wgpu::TexelCopyTextureInfo {
+                    texture: &tex,
+                    mip_level: level as u32,
+                    origin: wgpu::Origin3d { x: 0, y: ly0, z: 0 },
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::Extent3d {
+                    width: lw,
+                    height: rows,
+                    depth_or_array_layers: 1,
+                },
+            );
+        }
         self.queue.submit([enc.finish()]);
         self.submitted(Site::Decode);
         if let Some(e) = block_on(scope.pop()) {
@@ -3115,13 +3152,13 @@ impl Drawer {
             Kept {
                 tex,
                 view: view.clone(),
-                lo: addr,
-                hi: end,
+                lo,
+                hi,
                 block: u64::from(pitch) * 32 * guest_bytes,
                 stale: None,
             },
         );
-        Ok(Some(view))
+        Ok(Some((view, lo, hi)))
     }
 
     /// Host texture of fetch constant slot `n`, from the cache or decoded.
@@ -3291,8 +3328,21 @@ impl Drawer {
         };
         let modes = fetch.clamp.map(&mut addr_mode);
         let device = &self.device;
+        // As Xenia's sampler: LODs from the first mip level the fetch
+        // samples; base map mip filtering is point at that level (+0.25
+        // keeps magnification apart from minification).
+        // shortcut: the instruction's mip filter override is not applied;
+        // samplers are made per fetch constant.
+        let min_level = fetch.mip_range().0;
+        let base_map = fetch.mip_filter == 2;
         self.samplers
-            .entry((fetch.clamp, fetch.mag_filter, fetch.min_filter))
+            .entry((
+                fetch.clamp,
+                fetch.mag_filter,
+                fetch.min_filter,
+                fetch.mip_filter,
+                min_level,
+            ))
             .or_insert_with(|| {
                 device.create_sampler(&wgpu::SamplerDescriptor {
                     label: Some("guest sampler"),
@@ -3301,6 +3351,17 @@ impl Drawer {
                     address_mode_w: modes[2],
                     mag_filter: filter(fetch.mag_filter),
                     min_filter: filter(fetch.min_filter),
+                    mipmap_filter: if fetch.mip_filter == 1 {
+                        wgpu::MipmapFilterMode::Linear
+                    } else {
+                        wgpu::MipmapFilterMode::Nearest
+                    },
+                    lod_min_clamp: min_level as f32,
+                    lod_max_clamp: if base_map {
+                        min_level as f32 + 0.25
+                    } else {
+                        32.0
+                    },
                     ..Default::default()
                 })
             })
@@ -4348,6 +4409,10 @@ impl Drawer {
         m.dirty.push((a, b));
         m.dirty.sort_unstable();
         for k in m.views.values_mut().filter(|k| lo < k.hi && k.lo < hi) {
+            if k.tex.mip_level_count() > 1 {
+                k.stale = Some((0, k.tex.height()));
+                continue;
+            }
             // Tiled rows 32n..32n+32 are bytes block*n..block*(n+1).
             let y0 = (lo.saturating_sub(k.lo) / k.block * 32) as u32;
             let y1 = ((hi - k.lo).div_ceil(k.block) * 32).min(u64::from(k.tex.height())) as u32;

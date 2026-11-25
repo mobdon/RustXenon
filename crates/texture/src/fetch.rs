@@ -175,6 +175,31 @@ impl TextureFetch {
         }
     }
 
+    /// The mip levels the fetch samples, (first, last), as Xenia's
+    /// GetSubresourcesFromFetchConstant: (0, 0) without a mip page, both
+    /// clamped to the levels the size has, the last at least the first, and
+    /// the first at least 1 when there are mips but no base page. Pages are
+    /// physical: the address bits under 512 MB.
+    pub fn mip_range(&self) -> (u32, u32) {
+        let page = |address: u32| address & 0x1FFF_F000;
+        if page(self.mip_address) == 0 {
+            return (0, 0);
+        }
+        let longest = self.width().max(self.height());
+        let longest = if self.dimension == Dimension::D3 {
+            longest.max(self.depth())
+        } else {
+            longest
+        };
+        let top = longest.ilog2();
+        let mut min = u32::from(self.mip_min_level).min(top);
+        let max = u32::from(self.mip_max_level).min(top).max(min);
+        if max != 0 && page(self.base_address) == 0 {
+            min = min.max(1);
+        }
+        (min, max)
+    }
+
     /// Base row pitch in texels (not blocks).
     pub fn pitch_texels(&self) -> u32 {
         self.pitch << 5

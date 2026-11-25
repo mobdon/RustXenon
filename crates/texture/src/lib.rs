@@ -174,6 +174,89 @@ pub fn decode_base_level_f32(fetch: &TextureFetch, guest_bytes: &[u8]) -> Result
     })
 }
 
+/// Mip level `level` (1 and up) of a 2D mip chain, below its packed tail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MipLevel {
+    /// Size in texels: the base size halved `level` times, at least 1.
+    pub width: u32,
+    pub height: u32,
+    /// Row pitch in blocks (a multiple of 32 when tiled).
+    pub pitch_blocks: u32,
+    /// Byte offset of the level from [`TextureFetch::mip_address`].
+    pub offset: usize,
+    /// Bytes from `offset` that the level touches.
+    pub extent: usize,
+}
+
+/// Layout of mip `level` of `fetch` (level >= 1) per Xenia's
+/// GetGuestTextureLayout: each mip's strides come from the base size
+/// rounded up to a power of two, halved, and aligned to 32x32 blocks
+/// (linear rows to 256 bytes); each level starts on a 4 KB boundary after
+/// the one before. Only single-slice 2D chains; with packed mips, only the
+/// levels before `packed_mip_level` (the tail's levels are an error).
+pub fn mip_level(fetch: &TextureFetch, level: u32) -> Result<MipLevel, Error> {
+    if fetch.dimension != Dimension::D2OrStacked || fetch.stacked {
+        return Err(Error::UnsupportedDimension(fetch.dimension));
+    }
+    if level == 0 || level > 13 {
+        return Err(Error::BadLayout("mip level out of range"));
+    }
+    if fetch.packed_mips && level >= packed_mip_level(fetch.width(), fetch.height()) {
+        return Err(Error::BadLayout("packed mip tail"));
+    }
+    let info = fetch.format.info();
+    let bpb = info.bytes_per_block() as usize;
+    let (w, h) = (fetch.width(), fetch.height());
+    let (pw, ph) = (w.next_power_of_two(), h.next_power_of_two());
+    let geometry = |l: u32| {
+        let pitch_blocks = tile::align_to_tile((pw >> l).max(1).div_ceil(info.block_width));
+        let mut row_bytes = pitch_blocks as usize * bpb;
+        if !fetch.tiled {
+            row_bytes = row_bytes.next_multiple_of(256);
+        }
+        let rows = tile::align_to_tile((ph >> l).max(1).div_ceil(info.block_height)) as usize;
+        (
+            pitch_blocks,
+            row_bytes,
+            (row_bytes * rows).next_multiple_of(4096),
+        )
+    };
+    let offset = (1..level).map(|l| geometry(l).2).sum();
+    let (pitch_blocks, row_bytes, _) = geometry(level);
+    let (width, height) = ((w >> level).max(1), (h >> level).max(1));
+    let (wb, hb) = (
+        width.div_ceil(info.block_width),
+        height.div_ceil(info.block_height),
+    );
+    let extent = if fetch.tiled {
+        tile::tiled_extent_2d(wb, hb, pitch_blocks, bpb as u32)? as usize
+    } else {
+        row_bytes * (hb as usize - 1) + bpb * wb as usize
+    };
+    Ok(MipLevel {
+        width,
+        height,
+        pitch_blocks: if fetch.tiled {
+            pitch_blocks
+        } else {
+            (row_bytes / bpb) as u32
+        },
+        offset,
+        extent,
+    })
+}
+
+/// First level of a `width` x `height` chain stored in the packed mip tail,
+/// as Xenia's GetPackedMipLevel: the levels whose shorter side is 16 or
+/// less. Levels before it keep the unpacked layout.
+fn packed_mip_level(width: u32, height: u32) -> u32 {
+    width
+        .min(height)
+        .next_power_of_two()
+        .ilog2()
+        .saturating_sub(4)
+}
+
 /// Endian swap and detile (or pitch-linear copy) of slice 0's base level to
 /// tightly packed rows of blocks.
 fn linear_base_level(fetch: &TextureFetch, guest_bytes: &[u8]) -> Result<Vec<u8>, Error> {
@@ -232,6 +315,96 @@ mod tests {
     }
 
     const RGBA: u16 = (1 << 3) | (2 << 6) | (3 << 9);
+
+    #[test]
+    fn unpacked_mip_chain_layout() {
+        // 256x256 tiled k_16_16_16_16_EXPAND, mips 0-3 right after the base.
+        let mut words = fetch_words(
+            TextureFormat::K16_16_16_16Expand,
+            Endian::K8in16,
+            true,
+            256,
+            256,
+            256,
+            RGBA,
+        );
+        words[4] = 3 << 6;
+        words[5] |= 0x0008_0000;
+        let fetch = TextureFetch::decode(words);
+        assert_eq!(fetch.mip_range(), (0, 3));
+        let levels: Vec<_> = (1..=3).map(|l| mip_level(&fetch, l).unwrap()).collect();
+        let at = |l: &MipLevel| (l.width, l.height, l.pitch_blocks, l.offset);
+        assert_eq!(at(&levels[0]), (128, 128, 128, 0));
+        assert_eq!(at(&levels[1]), (64, 64, 64, 0x20000));
+        assert_eq!(at(&levels[2]), (32, 32, 32, 0x28000));
+        assert_eq!(levels[0].extent, 128 * 128 * 8);
+        assert_eq!(levels[2].extent, 32 * 32 * 8);
+        // mip_min_level 1, mip_max_level 1.
+        let one = TextureFetch::decode([
+            words[0],
+            words[1],
+            words[2],
+            words[3],
+            (1 << 2) | (1 << 6),
+            words[5],
+        ]);
+        assert_eq!(one.mip_range(), (1, 1));
+        // No mip address: base only, whatever the levels say.
+        let none = TextureFetch::decode([words[0], words[1], words[2], words[3], 3 << 6, 1 << 9]);
+        assert_eq!(none.mip_range(), (0, 0));
+        // Only the physical page counts: a mip address in the 512 MB mirror
+        // of page 0 is none either.
+        let mirror = [
+            words[0],
+            words[1],
+            words[2],
+            words[3],
+            3 << 6,
+            0x2000_0000 | (1 << 9),
+        ];
+        assert_eq!(TextureFetch::decode(mirror).mip_range(), (0, 0));
+        // No base page: sampling starts at level 1, unless there are no mips.
+        let no_base = |w4| {
+            TextureFetch::decode([words[0], words[1] & 0xFFF, words[2], words[3], w4, words[5]])
+        };
+        assert_eq!(no_base(3 << 6).mip_range(), (1, 3));
+        assert_eq!(no_base(0).mip_range(), (0, 0));
+        // A non-power-of-two base: strides from 512x256, sizes from 300x200;
+        // linear rows of 256 bytes at least.
+        let mut w = fetch_words(
+            TextureFormat::K8_8_8_8,
+            Endian::None,
+            false,
+            300,
+            200,
+            320,
+            RGBA,
+        );
+        w[5] |= 0x1000;
+        let l1 = mip_level(&TextureFetch::decode(w), 1).unwrap();
+        assert_eq!(
+            (l1.width, l1.height, l1.pitch_blocks, l1.offset),
+            (150, 100, 256, 0)
+        );
+        let l2 = mip_level(&TextureFetch::decode(w), 2).unwrap();
+        assert_eq!(
+            (l2.width, l2.pitch_blocks, l2.offset),
+            (75, 128, 1024 * 128)
+        );
+        // Packed mips: 200 rounds up to 256, so levels 1-3 keep the layout
+        // above and level 4 (18x12) is in the tail.
+        w[5] |= 1 << 11;
+        let packed = TextureFetch::decode(w);
+        assert_eq!(mip_level(&packed, 1).unwrap(), l1);
+        assert_eq!(mip_level(&packed, 2).unwrap(), l2);
+        assert!(mip_level(&packed, 3).is_ok());
+        assert!(mip_level(&packed, 4).is_err());
+        assert_eq!(
+            [(256, 256), (64, 64), (17, 300), (16, 16), (1, 1)]
+                .map(|(w, h)| packed_mip_level(w, h)),
+            [4, 2, 1, 0, 0]
+        );
+    }
 
     #[test]
     fn linear_8888_with_endian_and_swizzle() {
