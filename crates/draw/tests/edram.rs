@@ -621,3 +621,51 @@ fn depth_restore_takes_the_words_not_a_resampled_copy() {
         assert_eq!(word_at(&mem, DEST2, 33, y), A, "row {y}");
     }
 }
+
+/// A depth restore drawn as colour at the depth target's base is dropped
+/// once a depth draw has written all its rows (the depth target holds its
+/// words), and the next frame, which restores into a new colour target,
+/// resolves the same depth: the restored word on the right, the drawn
+/// depth on the left.
+#[test]
+fn restore_target_is_dropped_after_the_depth_draw() {
+    let Some(mut d) = drawer() else { return };
+    let mut mem = memory();
+    let c = [0; 4];
+    mem.write_words(
+        VERTS + 48,
+        &color_verts(&[(0.0, 0.0, 0.3, c), (32.0, 0.0, 0.3, c), (0.0, 64.0, 0.3, c)]),
+    );
+    let mut s = Stream::default();
+    s.setup().regs(RB_DEPTH_INFO, &[D24S8_AT_0]);
+    draw_word(&mut s, &mut mem, 64.0, 0x4000_0078);
+    // Depth only (colour mask 0): z ALWAYS with z write.
+    s.regs(RB_COLOR_MASK, &[0])
+        .shader(true, &ps_interp())
+        .regs(RB_DEPTHCONTROL, &[2 | 4 | (7 << 4)])
+        .vertex_fetch(0, VERTS + 48, 24)
+        .draw_auto(PRIM_RECT_LIST, 3)
+        .regs(RB_DEPTHCONTROL, &[0])
+        .regs(RB_COLOR_MASK, &[0xF]);
+    resolve_words(&mut s, &mut mem, true, DEST2);
+    let colour = RenderTargetKey {
+        base_tiles: 0,
+        pitch: W,
+        format: TargetFormat::Rgba8,
+    };
+    let mut frames = Vec::new();
+    for frame in 0..2 {
+        mem.data[DEST2 as usize..][..(W * H * 4) as usize].fill(0);
+        let report = run(&mut d, &s, &mut mem);
+        assert_eq!((report.draws, report.resolves), (2, 1), "{report:?}");
+        assert!(report.warnings.is_empty(), "{report:?}");
+        let m = d.memory_line();
+        let drops = format!("targets 1 MB in 1, {} dropped,", frame + 1);
+        assert!(m.contains(&drops), "{m}");
+        assert!(d.read_render_target(colour, 0, 0, 1, 1).is_err());
+        assert_eq!(word_at(&mem, DEST2, 50, 10), 0x4000_0078);
+        assert_ne!(word_at(&mem, DEST2, 10, 10), 0x4000_0078);
+        frames.push(detiled(&mem, DEST2, W, H, W, 4));
+    }
+    assert!(frames[0] == frames[1]);
+}

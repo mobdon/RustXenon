@@ -612,6 +612,23 @@ fn transferable(a: TargetFormat, b: TargetFormat) -> bool {
     word(a) && word(b)
 }
 
+/// Bytes of a texture, estimated from its size and format.
+fn texture_bytes(t: &wgpu::Texture) -> u64 {
+    let f = t.format();
+    let texel = f.block_copy_size(None).map_or_else(
+        // Depth + stencil formats: 4 or 8 bytes a texel.
+        || if f.has_stencil_aspect() { 8 } else { 4 },
+        u64::from,
+    );
+    let e = t.size();
+    texel * u64::from(e.width * e.height * e.depth_or_array_layers * t.sample_count())
+}
+
+/// Bound on the host memory of render targets (EDRAM is 10 MB; host
+/// targets are 2048 rows and wider texels): past it the least recently
+/// written ones are dropped at the end of a replay.
+const TARGET_CAP: u64 = 256 << 20;
+
 /// Replays recorded command lists on a headless wgpu device.
 pub struct Drawer {
     device: wgpu::Device,
@@ -640,6 +657,9 @@ pub struct Drawer {
     /// ownership transfers.
     written: HashMap<RenderTargetKey, Written>,
     clock: u64,
+    /// Render targets dropped so far (see [`Drawer::drop_targets`]).
+    target_drops: u64,
+    target_cap: u64,
     transfer_module: Option<wgpu::ShaderModule>,
     /// Keyed by source and destination host format and pass (stencil bit
     /// 0..8, or 8 for the depth or colour pass).
@@ -1058,6 +1078,8 @@ impl Drawer {
             clear_pipelines: HashMap::new(),
             targets: HashMap::new(),
             written: HashMap::new(),
+            target_drops: 0,
+            target_cap: TARGET_CAP,
             clock: 0,
             transfer_module: None,
             transfer_pipelines: HashMap::new(),
@@ -1105,23 +1127,14 @@ impl Drawer {
     /// targets (bytes estimated from their size and format), the draw upload
     /// arena and its host staging copy, and pipeline and shader counts.
     pub fn memory_line(&self) -> String {
-        let bytes = |t: &wgpu::Texture| {
-            let f = t.format();
-            let texel = f.block_copy_size(None).map_or_else(
-                // Depth + stencil formats: 4 or 8 bytes a texel.
-                || if f.has_stencil_aspect() { 8 } else { 4 },
-                u64::from,
-            );
-            let e = t.size();
-            texel * u64::from(e.width * e.height * e.depth_or_array_layers * t.sample_count())
-        };
-        let rt: u64 = self.targets.values().map(bytes).sum();
+        let rt: u64 = self.targets.values().map(texture_bytes).sum();
         format!(
-            "draw: textures {} MB in {}, targets {} MB in {}, arena {} MB, staged {} MB, pipelines {}, shaders {}",
+            "draw: textures {} MB in {}, targets {} MB in {}, {} dropped, arena {} MB, staged {} MB, pipelines {}, shaders {}",
             self.texture_cache_bytes >> 20,
             self.texture_cache.len(),
             rt >> 20,
             self.targets.len(),
+            self.target_drops,
             self.arena.as_ref().map_or(0, |b| b.size()) >> 20,
             self.staged.capacity() >> 20,
             self.pipelines.len() + self.clear_pipelines.len(),
@@ -1160,6 +1173,7 @@ impl Drawer {
         self.batch = None;
         self.staged.clear();
         done?;
+        self.drop_targets(&mut report);
         // Counts made where only the report is mutable.
         let t = &report.timings;
         let (uploaded, tex_bytes, guest_bytes, hashed_bytes) = (
@@ -1651,6 +1665,63 @@ impl Drawer {
             }
         }
         Ok(tex)
+    }
+
+    /// Drops the host textures of render targets that a newer target on
+    /// the same EDRAM tiles, one their words transfer to, has written all
+    /// the rows of: their next use takes that target's words (or newer
+    /// ones) as it would without the drop. Then, past the cap, drops the
+    /// least recently written targets; one still holding the newest
+    /// pixels of its tiles comes back cleared, as EDRAM garbage would, and
+    /// is reported. Runs with no batch recorded.
+    // shortcut: a dropped target used again at another MSAA mode (no
+    // transfer then), or after a newer target that wrote fewer rows,
+    // starts cleared where it kept its own stale pixels before; track
+    // per-tile ownership if a capture needs those pixels.
+    fn drop_targets(&mut self, report: &mut Report) {
+        let rows_down = |w: Written| w.rows * samples(w.msaa).1;
+        let dead: Vec<RenderTargetKey> = self
+            .written
+            .iter()
+            .filter(|&(&k, &w)| {
+                self.written.iter().any(|(&n, &nw)| {
+                    nw.stamp > w.stamp
+                        && n.base_tiles == k.base_tiles
+                        && row_width(n, nw.msaa) == row_width(k, w.msaa)
+                        && transferable(n.format, k.format)
+                        && rows_down(nw) >= rows_down(w)
+                })
+            })
+            .map(|(&k, _)| k)
+            .collect();
+        for k in dead {
+            self.written.remove(&k);
+            self.targets.remove(&k);
+            self.target_drops += 1;
+        }
+        let mut total: u64 = self.targets.values().map(texture_bytes).sum();
+        if total <= self.target_cap {
+            return;
+        }
+        let mut by_age: Vec<(u64, RenderTargetKey)> = self
+            .targets
+            .keys()
+            .map(|&k| (self.written.get(&k).map_or(0, |w| w.stamp), k))
+            .collect();
+        // Ties (a transfer shares its stamp) in a fixed order.
+        by_age.sort_unstable_by_key(|&(stamp, k)| (stamp, k.base_tiles, k.pitch, k.format as u8));
+        for (_, k) in by_age {
+            if total <= self.target_cap {
+                break;
+            }
+            total -= self.targets.remove(&k).as_ref().map_or(0, texture_bytes);
+            self.target_drops += 1;
+            if self.written.remove(&k).is_some() {
+                report.warn(
+                    "render target memory over its cap: a target still holding its EDRAM tiles' newest pixels was dropped (it comes back cleared)",
+                );
+            }
+        }
     }
 
     /// Records a write to `key`, drawn with `msaa`, down to row `rows`.
@@ -3346,7 +3417,11 @@ mod tests {
         for _ in 0..12 {
             d.stage(&[&part]).unwrap();
             let arena = d.arena.as_ref().unwrap().size();
-            assert!(d.staged.capacity() as u64 <= arena, "{}", d.staged.capacity());
+            assert!(
+                d.staged.capacity() as u64 <= arena,
+                "{}",
+                d.staged.capacity()
+            );
         }
         let big = vec![1u8; 20 << 20];
         d.stage(&[&big]).unwrap();
@@ -3354,6 +3429,36 @@ mod tests {
         assert_eq!(d.arena.as_ref().unwrap().size(), 32 << 20);
         assert!(d.staged.capacity() <= 32 << 20, "{}", d.staged.capacity());
         d.flush().unwrap();
+    }
+
+    /// Past the cap the least recently written targets go first, and
+    /// dropping one that still held its tiles' newest pixels is reported;
+    /// it comes back as a new, cleared target.
+    #[test]
+    fn target_cap_drops_the_least_recently_written() {
+        let Some(mut d) = gpu() else { return };
+        let key = |base_tiles| RenderTargetKey {
+            base_tiles,
+            pitch: 64,
+            format: TargetFormat::Rgba8,
+        };
+        let mut report = Report::default();
+        for base in [0, 100, 200] {
+            d.target(key(base), 64, 0, &mut report).unwrap();
+            d.mark_written(key(base), 64, 0);
+        }
+        // 64 x 2048 x 4 bytes each.
+        d.target_cap = 2 << 20;
+        d.drop_targets(&mut report);
+        assert!(report.warnings.is_empty(), "{report:?}");
+        d.target_cap = 1 << 20;
+        d.drop_targets(&mut report);
+        let mut left = d.render_targets();
+        left.sort_by_key(|k| k.base_tiles);
+        assert_eq!(left, [key(100), key(200)]);
+        assert!(!d.written.contains_key(&key(0)));
+        assert!(d.memory_line().contains("targets 1 MB in 2, 1 dropped,"));
+        assert_eq!(report.warnings.len(), 1, "{report:?}");
     }
 
     #[test]
