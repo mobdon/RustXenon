@@ -1212,7 +1212,7 @@ fn listed_writes_skip_hashing_unwritten_kept_resolves() {
         mem,
         written: Some(vec![]),
     };
-    let mut replay = |d: &mut xenon_draw::Drawer, w: &mut Watched, cmds| {
+    let replay = |d: &mut xenon_draw::Drawer, w: &mut Watched, cmds| {
         let r = d
             .replay(cmds, w as &mut dyn xenon_draw::GuestMemory)
             .unwrap();
