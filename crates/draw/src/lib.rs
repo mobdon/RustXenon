@@ -1152,6 +1152,8 @@ pub struct Drawer {
     /// guest writes listed, an earlier one: guest `lo`, `hi` and the
     /// indices. Dropped with the textures (see `forget_guest`).
     index_memo: HashMap<IndexKey, (u64, u64, Arc<HostIndices>)>,
+    /// Bytes of the indices `index_memo` holds, counted as they go in.
+    index_memo_bytes: usize,
     /// The last `Consts` block staged in the arena and its (offset, size),
     /// bound again by a draw with the same bytes. Cleared with
     /// `window_memo` when the arena wraps or grows.
@@ -1416,9 +1418,6 @@ fn fetch_range(
     (lo, hi.max(lo), clipped)
 }
 
-/// The lowest and highest vertex index the vertex shader starts with for
-/// `indices` (reset markers skipped) and index offset `offset`, as the
-/// shader adds them in 32 bits and keeps 24; `None` when that wraps.
 /// The smallest and largest index but the primitive reset (`u32::MAX`).
 fn min_max(indices: &[u32]) -> Option<(u32, u32)> {
     let mut used = indices.iter().filter(|&&i| i != u32::MAX);
@@ -1426,8 +1425,9 @@ fn min_max(indices: &[u32]) -> Option<(u32, u32)> {
     Some(used.fold((first, first), |(lo, hi), &i| (lo.min(i), hi.max(i))))
 }
 
-/// The guest vertex range indices with this [`min_max`] reach, after
-/// VGT_INDX_OFFSET: None past 24 bits or if it wraps.
+/// The lowest and highest vertex index the vertex shader starts with for
+/// indices with this [`min_max`] and index offset `offset`, as the shader
+/// adds them in 32 bits and keeps 24; `None` when that wraps.
 fn offset_range(min_max: Option<(u32, u32)>, offset: u32) -> Option<(u32, u32)> {
     let (lo, hi) = min_max?;
     let (lo, hi) = (lo.wrapping_add(offset), hi.wrapping_add(offset));
@@ -1446,8 +1446,10 @@ struct HostIndices {
     min_max: Option<(u32, u32)>,
 }
 
-/// [`Drawer::index_memo`] entries held before it starts over.
+/// [`Drawer::index_memo`] entries and index bytes held before it starts
+/// over.
 const INDEX_MEMO_CAP: usize = 1 << 14;
+const INDEX_MEMO_BYTES: usize = 32 << 20;
 
 /// Vertex data ranges closer than this share one window part; farther
 /// ranges are staged apart, so the gap between them is not uploaded.
@@ -1873,6 +1875,7 @@ impl Drawer {
             arena: None,
             window_memo: BTreeMap::new(),
             index_memo: HashMap::default(),
+            index_memo_bytes: 0,
             staged_consts: None,
             staged_base: 0,
             watching: false,
@@ -2241,6 +2244,7 @@ impl Drawer {
                 self.watching = false;
                 self.texture_memo.clear();
                 self.index_memo.clear();
+                self.index_memo_bytes = 0;
                 // Windows staged by a watched replay: anything may have
                 // changed since.
                 self.wrap();
@@ -4531,8 +4535,14 @@ impl Drawer {
                     min_max: min_max(&idx),
                 });
                 if let Some(k) = key {
-                    if self.index_memo.len() >= INDEX_MEMO_CAP {
+                    // Entries dropped by forget_guest still count until
+                    // this clears them all.
+                    self.index_memo_bytes += host.bytes.len();
+                    if self.index_memo.len() >= INDEX_MEMO_CAP
+                        || self.index_memo_bytes > INDEX_MEMO_BYTES
+                    {
                         self.index_memo.clear();
+                        self.index_memo_bytes = host.bytes.len();
                     }
                     self.index_memo.insert(k, (guest.0, guest.1, host.clone()));
                 }
