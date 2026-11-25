@@ -5700,6 +5700,8 @@ impl Drawer {
             let (w, h, p) = old.size;
             return Ok(detile_front(raw, w, h, p, old.endian, old.swizzle));
         }
+        // An older late copy would come out of order after this one.
+        self.late_front = None;
         self.sync(mem, lo, hi)?;
         let raw = mem
             .read_bytes(addr, extent as usize)

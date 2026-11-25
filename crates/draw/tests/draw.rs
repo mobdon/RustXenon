@@ -656,6 +656,13 @@ fn late_front_buffer_is_one_swap_behind() {
     let r = run(&mut d, &next, &mut mem);
     assert_eq!(r.frames.len(), 1, "{r:?}");
     assert!(r.frames[0].rgba8.chunks_exact(4).all(|p| p == CLEAR));
+
+    // A swap of memory no resolve kept is read now and drops the queued
+    // copy, so the next late swap gives no older frame out of order.
+    let mut plain = Stream::default();
+    plain.swap_at(DEST + 0x4_0000, W, H);
+    assert_eq!(run(&mut d, &plain, &mut mem).frames.len(), 1);
+    assert!(run(&mut d, &next, &mut mem).frames.is_empty());
 }
 
 /// A frame bundle of two frames, saved and read back, replays to the same
