@@ -110,6 +110,10 @@ fn resolve_sees_batched_draws() {
         .draw_auto(PRIM_RECT_LIST, 3);
     let report = run(&mut d, &s, &mut mem);
     assert_eq!((report.draws, report.resolves), (2, 1), "{report:?}");
+    let t = &report.timings;
+    assert_eq!(t.submits_by_site.iter().sum::<u32>(), t.submits, "{t:?}");
+    // One resolve copy, a colour and a depth clear.
+    assert_eq!(t.submits_by_site[..4], [1, 2, 0, 0], "{t:?}");
     let copy = detiled(&mem, DEST, W, H, W, 4);
     assert_eq!(px(&copy, W, 40, 40), RED);
     let img = d.read_render_target(COLOR_KEY, 0, 0, W, H).unwrap();
@@ -272,6 +276,8 @@ fn vertex_window_in_a_staged_one_is_reused() {
     assert_eq!(report.draws, 3, "{report:?}");
     assert_eq!(report.timings.windows_reused, 2, "{report:?}");
     assert_eq!(report.timings.reused_bytes, 96, "{report:?}");
+    // Only the first window is read from guest memory.
+    assert_eq!(report.timings.guest_bytes, 96, "{report:?}");
     let img = d.read_render_target(COLOR_KEY, 0, 0, W, H).unwrap();
     assert_eq!(px(&img, W, 8, 8), GREEN);
     assert_eq!(px(&img, W, 40, 40), RED);

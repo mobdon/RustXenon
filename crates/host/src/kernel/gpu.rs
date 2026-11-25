@@ -137,9 +137,9 @@ impl DrawStats {
             "[draw] {:.1} s: {} frames, {} replays; ms per {per}: drawer {:.0} = shaders {:.0}, \
              guest data {:.0}, textures {:.0}, submit {:.0}, gpu wait {:.0}, readback {:.0}, \
              resolve cpu {:.0}, clears {:.0}, swap {:.0} (transfers {:.0}); per {per}: {} draws, \
-             {} resolves, {} submits, {} transfers ({} passes), readback {:.1} MB, \
+             {} resolves, {} submits ({} resolve, {} clear, {} transfer, {} decode, {} flush/other), {} transfers ({} passes), readback {:.1} MB, \
              hashed {:.1} MB (kept resolves {:.1} MB), {} textures uploaded ({:.1} MB, {} evicted before), \
-             {} evicted, {} from kept resolves, {} pipelines created; guest data {:.1} MB; \
+             {} evicted, {} from kept resolves, {} pipelines created; guest data {:.1} MB ({} windows reused, {:.1} MB); \
              uploads by format: rgba8 {}, bc {}, f16 {}, f32 {}, other {}",
             window.as_secs_f64(),
             self.frames,
@@ -158,6 +158,11 @@ impl DrawStats {
             self.draws / n,
             self.resolves / n,
             t.submits / n,
+            t.submits_by_site[0] / n,
+            t.submits_by_site[1] / n,
+            t.submits_by_site[2] / n,
+            t.submits_by_site[3] / n,
+            t.submits_by_site[4] / n,
             t.transfers / n,
             t.transfer_passes / n,
             mb(t.readback_bytes),
@@ -170,6 +175,8 @@ impl DrawStats {
             t.textures_kept / n,
             t.pipelines_created / n,
             mb(t.guest_bytes),
+            t.windows_reused / n,
+            mb(t.reused_bytes),
             by(0),
             by(1),
             by(2),
@@ -647,6 +654,10 @@ mod tests {
         s.t.transfer_passes = 60;
         s.t.readback_bytes = 80_000_000;
         s.t.guest_bytes = 9_000_000;
+        s.t.submits = 280;
+        s.t.submits_by_site = [88, 50, 38, 34, 70];
+        s.t.windows_reused = 900;
+        s.t.reused_bytes = 3_000_000;
         s.t.uploads_by_format = [(600, 200_000_000), (40, 8_000_000), (6, 0), (0, 0), (0, 0)];
         let line = s.line(ms(5000));
         assert!(
@@ -659,7 +670,8 @@ mod tests {
             "42 resolves",
             "6 transfers (30 passes)",
             "readback 40.0 MB",
-            "guest data 4.5 MB",
+            "140 submits (44 resolve, 25 clear, 19 transfer, 17 decode, 35 flush/other)",
+            "guest data 4.5 MB (450 windows reused, 1.5 MB)",
             "rgba8 300 (100.0 MB), bc 20 (4.0 MB), f16 3 (0.0 MB), f32 0 (0.0 MB), other 0",
         ] {
             assert!(line.contains(part), "{part}: {line}");

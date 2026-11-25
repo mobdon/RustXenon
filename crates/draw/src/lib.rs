@@ -377,7 +377,12 @@ pub struct Timings {
     /// Command buffer submissions for draws, clears, EDRAM transfers and
     /// GPU resolves.
     pub submits: u32,
+    /// `submits` by where they come from: 32bpp resolve copies, resolve
+    /// clears, EDRAM transfers, kept resolve texture decodes, and batch
+    /// flushes and resolve write-backs.
+    pub submits_by_site: [u32; 5],
     pub texture_bytes: u64,
+    /// Guest vertex window bytes read (not those of reused windows).
     pub guest_bytes: u64,
     /// EDRAM transfers and their render passes.
     pub transfers: u32,
@@ -425,6 +430,9 @@ impl std::ops::AddAssign<&Timings> for Timings {
         self.pipelines_created += t.pipelines_created;
         self.textures_uploaded += t.textures_uploaded;
         self.submits += t.submits;
+        for (a, b) in self.submits_by_site.iter_mut().zip(t.submits_by_site) {
+            *a += b;
+        }
         self.texture_bytes += t.texture_bytes;
         self.guest_bytes += t.guest_bytes;
         self.transfers += t.transfers;
@@ -942,6 +950,17 @@ struct Batch {
     /// Dropped (ended) before `enc` is finished.
     pass: Option<(PassKey, wgpu::RenderPass<'static>)>,
     enc: wgpu::CommandEncoder,
+}
+
+/// Where a queue submission comes from: the index of
+/// [`Timings::submits_by_site`].
+#[derive(Clone, Copy)]
+enum Site {
+    Resolve,
+    Clear,
+    Transfer,
+    Decode,
+    Other,
 }
 
 /// Colour and depth targets of a render pass.
@@ -1775,7 +1794,7 @@ impl Drawer {
         self.wait_idle()?;
         self.timings.gpu_wait += lap(&mut t);
         let index = self.queue.submit([enc.finish()]);
-        self.timings.submits += 1;
+        self.submitted(Site::Other);
         for (m_lo, dirty, spans, buf) in copies {
             let data = self.map_read(&buf, index.clone())?;
             self.timings.readback += lap(&mut t);
@@ -1882,6 +1901,12 @@ impl Drawer {
         Ok(Some(self.mirrors.len() - 1))
     }
 
+    /// Counts one queue submission, made by `site`.
+    fn submitted(&mut self, site: Site) {
+        self.timings.submits += 1;
+        self.timings.submits_by_site[site as usize] += 1;
+    }
+
     /// Submits the batched draws, with their staged buffers.
     fn flush(&mut self) -> Result<(), Skip> {
         self.window_memo.clear();
@@ -1896,7 +1921,7 @@ impl Drawer {
         let scope = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
         drop(batch.pass.take());
         self.queue.submit([batch.enc.finish()]);
-        self.timings.submits += 1;
+        self.submitted(Site::Other);
         self.timings.submit += t.elapsed();
         match block_on(scope.pop()) {
             Some(e) => Err(Skip::Fatal(Error::Gpu(e.to_string()))),
@@ -2583,7 +2608,7 @@ impl Drawer {
             }
         }
         self.queue.submit([enc.finish()]);
-        self.timings.submits += 1;
+        self.submitted(Site::Transfer);
         self.timings.transfers += 1;
         self.timings.transfer_passes += pipelines.len() as u32;
         match block_on(scope.pop()) {
@@ -2757,7 +2782,6 @@ impl Drawer {
             lo = lo.min(a);
             hi = hi.max(a + 4 * u64::from(vf.size_dwords));
         }
-        report.timings.guest_bytes += hi.saturating_sub(lo);
         let (base, bytes) = if lo >= hi {
             (0, Vec::new())
         } else {
@@ -2772,6 +2796,7 @@ impl Drawer {
                 ));
             }
             self.sync(mem, lo, hi)?;
+            report.timings.guest_bytes += hi - lo;
             let Some(b) = mem.read_bytes(lo as u32, (hi - lo) as usize) else {
                 return unsupported(format!(
                     "vertex data at 0x{lo:08X}..0x{hi:08X} not readable"
@@ -3015,7 +3040,7 @@ impl Drawer {
             },
         );
         self.queue.submit([enc.finish()]);
-        self.timings.submits += 1;
+        self.submitted(Site::Decode);
         if let Some(e) = block_on(scope.pop()) {
             return Err(Skip::Fatal(Error::Gpu(e.to_string())));
         }
@@ -3575,6 +3600,7 @@ impl Drawer {
             _ => {
                 if let Some(((lo, hi, _), _)) = staged {
                     self.sync(mem, lo, hi)?;
+                    report.timings.guest_bytes += hi - lo;
                     let Some(b) = mem.read_bytes(lo as u32, (hi - lo) as usize) else {
                         return unsupported(format!("vertex data at 0x{lo:08X} not readable"));
                     };
@@ -3805,7 +3831,7 @@ impl Drawer {
             pass.draw(0..3, 0..1);
         }
         self.queue.submit([enc.finish()]);
-        self.timings.submits += 1;
+        self.submitted(Site::Clear);
         if let Some(e) = block_on(scope.pop()) {
             return Err(Skip::Fatal(Error::Gpu(e.to_string())));
         }
@@ -4178,7 +4204,7 @@ impl Drawer {
         }
         self.timings.resolve_cpu += lap(&mut t);
         self.queue.submit([enc.finish()]);
-        self.timings.submits += 1;
+        self.submitted(Site::Resolve);
         if let Some(e) = block_on(scope.pop()) {
             return Err(Skip::Fatal(Error::Gpu(e.to_string())));
         }
