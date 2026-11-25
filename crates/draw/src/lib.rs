@@ -425,6 +425,9 @@ pub struct Timings {
     /// EDRAM transfers and their render passes.
     pub transfers: u32,
     pub transfer_passes: u32,
+    /// Transfer pipelines, bind groups and views made, not kept from an
+    /// earlier transfer between the same targets.
+    pub transfer_setups: u32,
     /// Bytes read back from the GPU for resolves.
     pub readback_bytes: u64,
     /// Guest texture bytes read and hashed to look up the texture cache.
@@ -492,6 +495,7 @@ impl std::ops::AddAssign<&Timings> for Timings {
         self.guest_bytes += t.guest_bytes;
         self.transfers += t.transfers;
         self.transfer_passes += t.transfer_passes;
+        self.transfer_setups += t.transfer_setups;
         self.readback_bytes += t.readback_bytes;
         self.hashed_bytes += t.hashed_bytes;
         self.textures_kept += t.textures_kept;
@@ -1154,6 +1158,8 @@ pub struct Drawer {
     index_memo: HashMap<IndexKey, (u64, u64, Arc<HostIndices>)>,
     /// Bytes of the indices `index_memo` holds, counted as they go in.
     index_memo_bytes: usize,
+    /// See [`Drawer::transfer_setup`].
+    transfer_setups: HashMap<(RenderTargetKey, u32, RenderTargetKey, u32), Arc<TransferSetup>>,
     /// The last `Consts` block staged in the arena and its (offset, size),
     /// bound again by a draw with the same bytes. Cleared with
     /// `window_memo` when the arena wraps or grows.
@@ -1288,6 +1294,15 @@ impl Part<'_> {
             Part::Guest(_, len) => len,
         }
     }
+}
+
+/// What [`Drawer::transfer`] records for one pair of targets.
+struct TransferSetup {
+    pipelines: Vec<wgpu::RenderPipeline>,
+    groups: Vec<wgpu::BindGroup>,
+    view: wgpu::TextureView,
+    to_depth: bool,
+    stencil: bool,
 }
 
 /// Where a queue submission comes from: the index of
@@ -1883,6 +1898,7 @@ impl Drawer {
             window_memo: BTreeMap::new(),
             index_memo: HashMap::default(),
             index_memo_bytes: 0,
+            transfer_setups: HashMap::default(),
             staged_consts: None,
             staged_base: 0,
             watching: false,
@@ -3283,6 +3299,7 @@ impl Drawer {
         for k in dead {
             self.written.remove(&k);
             self.targets.remove(&k);
+            self.transfer_setups.retain(|t, _| t.0 != k && t.2 != k);
             self.target_drops += 1;
         }
         let mut total: u64 = self.targets.values().map(texture_bytes).sum();
@@ -3301,6 +3318,7 @@ impl Drawer {
                 break;
             }
             total -= self.targets.remove(&k).as_ref().map_or(0, texture_bytes);
+            self.transfer_setups.retain(|t, _| t.0 != k && t.2 != k);
             self.target_drops += 1;
             if self.written.remove(&k).is_some() {
                 report.warn(
@@ -3435,7 +3453,6 @@ impl Drawer {
         dst_tex: &wgpu::Texture,
         rows: u32,
     ) -> Result<(), Skip> {
-        let src_tex = self.targets[&src].clone();
         let rows = rows.min(dst_tex.height());
         if rows == 0 {
             return Ok(());
@@ -3443,6 +3460,70 @@ impl Drawer {
         // Recorded in the batch after its draws, like a clear: its render
         // pass ends theirs, so the source's draws (and reads of `dst`) land
         // before it and later draws after it, with no submit of its own.
+        let setup = self.transfer_setup((src, src_msaa), (dst, dst_msaa), dst_tex)?;
+        let (view, to_depth) = (&setup.view, setup.to_depth);
+        let color_attachment = [Some(wgpu::RenderPassColorAttachment {
+            view,
+            depth_slice: None,
+            resolve_target: None,
+            ops: wgpu::Operations {
+                load: wgpu::LoadOp::Load,
+                store: wgpu::StoreOp::Store,
+            },
+        })];
+        let keep = wgpu::Operations {
+            load: wgpu::LoadOp::Load,
+            store: wgpu::StoreOp::Store,
+        };
+        let device = &self.device;
+        let batch = self.batch.get_or_insert_with(|| Batch {
+            pass: None,
+            enc: device.create_command_encoder(&Default::default()),
+        });
+        batch.pass = None;
+        {
+            let mut pass = batch.enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("transfer"),
+                color_attachments: if to_depth { &[] } else { &color_attachment },
+                depth_stencil_attachment: to_depth.then(|| {
+                    wgpu::RenderPassDepthStencilAttachment {
+                        view,
+                        depth_ops: Some(keep),
+                        stencil_ops: setup.stencil.then_some(wgpu::Operations {
+                            load: wgpu::LoadOp::Load,
+                            store: wgpu::StoreOp::Store,
+                        }),
+                    }
+                }),
+                ..Default::default()
+            });
+            pass.set_scissor_rect(0, 0, dst_tex.width(), rows);
+            for (i, (p, g)) in setup.pipelines.iter().zip(&setup.groups).enumerate() {
+                pass.set_pipeline(p);
+                pass.set_bind_group(0, g, &[]);
+                pass.set_stencil_reference(if i == 0 { 0 } else { 0xFF });
+                pass.draw(0..3, 0..1);
+            }
+        }
+        self.timings.transfers += 1;
+        self.timings.transfer_passes += setup.pipelines.len() as u32;
+        Ok(())
+    }
+
+    /// The pipelines, bind groups and `dst` view of a transfer from `src`
+    /// to `dst`, made once per pair of targets and kept until a target is
+    /// dropped (their textures go with it).
+    fn transfer_setup(
+        &mut self,
+        (src, src_msaa): (RenderTargetKey, u32),
+        (dst, dst_msaa): (RenderTargetKey, u32),
+        dst_tex: &wgpu::Texture,
+    ) -> Result<Arc<TransferSetup>, Skip> {
+        let key = (src, src_msaa, dst, dst_msaa);
+        if let Some(setup) = self.transfer_setups.get(&key) {
+            return Ok(setup.clone());
+        }
+        let src_tex = self.targets[&src].clone();
         let (sf, df) = (self.host_format(src.format), self.host_format(dst.format));
         let to_depth = df.is_depth_stencil_format();
         // Without a source stencil the depth pass's stencil 0 is the word's.
@@ -3512,55 +3593,19 @@ impl Drawer {
             })
             .collect();
         let view = dst_tex.create_view(&Default::default());
-        let color_attachment = [Some(wgpu::RenderPassColorAttachment {
-            view: &view,
-            depth_slice: None,
-            resolve_target: None,
-            ops: wgpu::Operations {
-                load: wgpu::LoadOp::Load,
-                store: wgpu::StoreOp::Store,
-            },
-        })];
-        let keep = wgpu::Operations {
-            load: wgpu::LoadOp::Load,
-            store: wgpu::StoreOp::Store,
-        };
-        let device = &self.device;
-        let batch = self.batch.get_or_insert_with(|| Batch {
-            pass: None,
-            enc: device.create_command_encoder(&Default::default()),
+        if let Some(e) = block_on(scope.pop()) {
+            return Err(Skip::Fatal(Error::Gpu(e.to_string())));
+        }
+        let setup = Arc::new(TransferSetup {
+            pipelines,
+            groups,
+            view,
+            to_depth,
+            stencil: df.has_stencil_aspect(),
         });
-        batch.pass = None;
-        {
-            let mut pass = batch.enc.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("transfer"),
-                color_attachments: if to_depth { &[] } else { &color_attachment },
-                depth_stencil_attachment: to_depth.then(|| {
-                    wgpu::RenderPassDepthStencilAttachment {
-                        view: &view,
-                        depth_ops: Some(keep),
-                        stencil_ops: df.has_stencil_aspect().then_some(wgpu::Operations {
-                            load: wgpu::LoadOp::Load,
-                            store: wgpu::StoreOp::Store,
-                        }),
-                    }
-                }),
-                ..Default::default()
-            });
-            pass.set_scissor_rect(0, 0, dst_tex.width(), rows);
-            for (i, (p, g)) in pipelines.iter().zip(&groups).enumerate() {
-                pass.set_pipeline(p);
-                pass.set_bind_group(0, g, &[]);
-                pass.set_stencil_reference(if i == 0 { 0 } else { 0xFF });
-                pass.draw(0..3, 0..1);
-            }
-        }
-        self.timings.transfers += 1;
-        self.timings.transfer_passes += pipelines.len() as u32;
-        match block_on(scope.pop()) {
-            Some(e) => Err(Skip::Fatal(Error::Gpu(e.to_string()))),
-            None => Ok(()),
-        }
+        self.transfer_setups.insert(key, setup.clone());
+        self.timings.transfer_setups += 1;
+        Ok(setup)
     }
 
     /// Whether `kD24FS8` keeps its stencil (the host has
