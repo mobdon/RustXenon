@@ -118,7 +118,8 @@ fn resolve_sees_batched_draws() {
 }
 
 /// A texture read again after a resolve rewrote its guest memory shows the
-/// new texels: the per-replay texture lookup memo is dropped at resolves.
+/// new texels: the per-replay texture lookup memo is dropped at resolves
+/// that write its bytes.
 #[test]
 fn resolve_into_a_texture_is_sampled_by_later_draws() {
     let Some(mut d) = drawer() else { return };

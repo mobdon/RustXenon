@@ -5,7 +5,9 @@
 //!   into a 128x128 depth target and its raw depth resolve;
 //! - three 1280x256 tiles, each starting with a depth restore (a k_8_8_8_8
 //!   rectangle at the depth buffer's EDRAM base and pitch, which the drawer
-//!   transfers into the D24FS8 target), 117 + 30 quads into three k_8_8_8_8
+//!   transfers into the D24FS8 target; a frame that restores
+//!   at another pitch and MSAA mode is not transferred today, so this
+//!   overstates the transfer cost), 117 + 30 quads into three k_8_8_8_8
 //!   targets with depth, 24 point draws, then five resolves: raw depth,
 //!   colour 0 twice (the second clearing colour and depth), colours 1 and 2
 //!   with clears;
