@@ -1,12 +1,13 @@
 //! Audio calls, headless: render clients are asked for frames at the
-//! console's rate, and nothing is played.
+//! console's rate, and nothing is played. Decoding, mixing and the .wav
+//! are in [`super::sound`].
 
 use super::*;
 
 /// (callback record, driver out). The record holds the callback and its
 /// argument. The callback asks the title for the next 256-sample frame;
 /// it runs on a thread of its own at the console's rate (48 kHz / 256, one
-/// call every 5.33 ms) and the frames it submits are dropped.
+/// call every 5.33 ms). The first client's thread also ticks the mixer.
 pub fn x_audio_register_render_driver_client(rt: &Runtime, c: &mut Context) {
     let (rec, out) = (arg(rt, c, 0), arg(rt, c, 1));
     let (f, user) = (rt.mem.read_u32(rec), rt.mem.read_u32(rec + 4));
@@ -28,6 +29,9 @@ pub fn x_audio_register_render_driver_client(rt: &Runtime, c: &mut Context) {
                     let mut c = base.clone();
                     c.r[3] = user as u64;
                     rt.call(&mut c, f);
+                    if n == 0 {
+                        super::sound::tick();
+                    }
                 }
             })
             .expect("cannot start a host thread");
@@ -40,7 +44,8 @@ static CLIENTS: AtomicU32 = AtomicU32::new(0);
 pub fn x_audio_unregister_render_driver_client(_: &Runtime, c: &mut Context) {
     ret(c, STATUS_SUCCESS);
 }
-pub fn x_audio_submit_render_driver_frame(_: &Runtime, c: &mut Context) {
+pub fn x_audio_submit_render_driver_frame(rt: &Runtime, c: &mut Context) {
+    super::sound::submit(rt, arg(rt, c, 0), arg(rt, c, 1));
     ret(c, STATUS_SUCCESS);
 }
 pub fn x_audio_get_voice_category_volume_change_mask(rt: &Runtime, c: &mut Context) {
@@ -70,9 +75,9 @@ static XMA: Mutex<Option<(u32, Vec<bool>)>> = Mutex::new(None);
 /// word 2: input read offset (0..26); word 4: current input buffer (31);
 /// word 7: output buffer; word 9: output read offset (0..5).
 ///
-/// shortcut: no audio is decoded. Each round consumes the current input
-/// buffer at once and fills the output ring with silence, so streams move
-/// on as if played; upgrade when the decoder lands (step 6).
+/// With FFmpeg loaded, [`super::sound::decode`] does the round. Without it
+/// each round consumes the current input buffer at once and fills the
+/// output ring with silence, so streams move on as if played.
 fn drain(rt: &Runtime, ctx: u32) {
     let w0 = rt.mem.read_u32(ctx);
     let w1 = rt.mem.read_u32(ctx + 4);
@@ -97,7 +102,7 @@ fn drain(rt: &Runtime, ctx: u32) {
             }
         }
     }
-    if w1 >> 31 == 0 {
+    if w1 >> 31 == 0 || super::sound::decode(rt, ctx) {
         return;
     }
     let mut w0n = w0;
@@ -166,6 +171,7 @@ pub fn xma_create_context(rt: &Runtime, c: &mut Context) {
     used[i] = true;
     let a = *base + 64 * i as u32;
     fill(rt, a, 64, 0);
+    super::sound::forget(a);
     rt.mem.write_u32(out, a);
     ret(c, STATUS_SUCCESS);
 }
@@ -179,6 +185,7 @@ pub fn xma_release_context(rt: &Runtime, c: &mut Context) {
             .and_then(|i| used.get_mut(i as usize))
         {
             *u = false;
+            super::sound::forget(a);
         }
     }
     ret(c, STATUS_SUCCESS);

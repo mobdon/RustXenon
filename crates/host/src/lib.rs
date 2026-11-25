@@ -293,7 +293,7 @@ USAGE: game --exe <patched executable> --game <unpacked game folder>
             [--update <unpacked title update>] [--data <writable folder>]
             [--seconds <n>] [--press <ms>:<button>[+<button>],...]
             [--no-controller] [--window] [--capture <dir> [--capture-at <s>,<s>...]] [--render]
-            [--capture-frames <n>,<n>... --capture-dir <dir>]
+            [--capture-frames <n>,<n>... --capture-dir <dir>] [--audio-wav <file>]
 
 Runs the title headless for --seconds (default 30) and reports how far it
 got: frames presented, threads, imports called, memory in use. A
@@ -308,7 +308,10 @@ frames (counted from 1, one per swap) as <dir>/frame-<n>.png; it implies
 --render. --window opens a window that shows each drawn frame (it implies
 --render), plugs in the controller and keyboard as the pad on port 0 (unless
 --press or --no-controller is given) and runs until the window is closed
-(or for --seconds when given).";
+(or for --seconds when given). --audio-wav writes the game's sound (the
+render clients' frames mixed to 48 kHz stereo) to a .wav file; compressed
+sound is decoded through an LGPL FFmpeg found at run time (XENON_FFMPEG_DIR),
+silence without one. Nothing is ever played.";
 
 fn opt(args: &[String], name: &str) -> Option<String> {
     args.iter()
@@ -352,6 +355,12 @@ pub fn run(sha256: &str, regs: &[fn(&mut Runtime)]) -> ExitCode {
             .filter_map(|x| x.trim().parse().ok())
             .collect();
         let _ = kernel::gpu::capture::SETTINGS.set((PathBuf::from(d), at));
+    }
+    if let Some(p) = opt(&args, "--audio-wav") {
+        if let Err(e) = kernel::sound::start_wav(&p) {
+            eprintln!("--audio-wav {p}: {e}");
+            return ExitCode::FAILURE;
+        }
     }
     if window {
         kernel::gpu::capture::RENDER.store(true, Ordering::Relaxed);
@@ -493,12 +502,13 @@ fn growth_line() -> String {
     let rss = host_rss().map_or("?".into(), |b| (b >> 20).to_string());
     let r = |i: usize| kernel::files::READS[i].load(Ordering::Relaxed);
     format!(
-        "handles {}, threads {} live, host {rss} MB, file reads {} ({} MB, {} ms)",
+        "handles {}, threads {} live, host {rss} MB, file reads {} ({} MB, {} ms), {}",
         kx.handle_count(),
         started.saturating_sub(ended),
         r(0),
         r(1) >> 20,
-        r(2) / 1000
+        r(2) / 1000,
+        kernel::sound::line()
     )
 }
 
@@ -540,6 +550,7 @@ fn host_rss() -> Option<u64> {
 }
 
 fn report() {
+    kernel::sound::finish();
     let kx = kernel::k();
     log(&format!(
         "frames presented: {}",
