@@ -107,11 +107,19 @@ pub fn interrupt(f: impl FnOnce()) {
     INTERRUPTS.1.fetch_add(1, Ordering::Relaxed);
 }
 
-/// Imports that block until something else happens.
+/// Imports that block until something else happens. An ended thread's
+/// host thread stays parked in `ExTerminateThread` for the rest of the run.
 pub fn is_wait(name: &str) -> bool {
-    ["Wait", "Delay", "Sleep", "EnterCriticalSection", "SpinLock"]
-        .iter()
-        .any(|w| name.contains(w))
+    [
+        "Wait",
+        "Delay",
+        "Sleep",
+        "EnterCriticalSection",
+        "SpinLock",
+        "TerminateThread",
+    ]
+    .iter()
+    .any(|w| name.contains(w))
 }
 
 #[derive(Clone, Default)]
@@ -192,12 +200,23 @@ fn lines(
         "[cpu]   top kernel calls, ms (calls) per {per}: {}",
         top.join(", ")
     ));
-    if let Some(r) = rows.first().filter(|_| frames > 0) {
+    // A thread busy for the whole frame at any frame rate is polling (a
+    // spin on a fence or the vertical blank), not doing that much work.
+    let frame_ms = secs * 1e3 / n;
+    let (spin, work): (Vec<&Row>, Vec<&Row>) =
+        rows.iter().partition(|r| busy(r) / n >= 0.95 * frame_ms);
+    if let Some(r) = work.first().filter(|_| frames > 0) {
         let b = busy(r) / n;
+        let spin: Vec<&str> = spin.iter().map(|r| r.name.as_str()).collect();
         out.push(format!(
-            "[cpu]   busiest thread {} {b:.2} ms per frame busy (guest + kernel - waiting); with drawing free, about {:.0} fps at most",
+            "[cpu]   busiest thread {} {b:.2} ms per frame busy (guest + kernel - waiting); with drawing free, about {:.0} fps at most{}",
             r.name,
-            1000.0 / b.max(0.001)
+            1000.0 / b.max(0.001),
+            if spin.is_empty() {
+                String::new()
+            } else {
+                format!(" (left out, busy the whole frame, likely polling: {})", spin.join(" "))
+            }
         ));
     }
     out
@@ -284,6 +303,7 @@ mod tests {
         assert!(is_wait("KeDelayExecutionThread"));
         assert!(!is_wait("RtlLeaveCriticalSection"));
         assert!(!is_wait("NtReadFile"));
+        assert!(is_wait("ExTerminateThread"));
     }
 
     #[test]
@@ -303,20 +323,24 @@ mod tests {
                 row("guest-2", 30.0, 4000.0, 4000.0),
                 row("guest-1", 3000.0, 600.0, 300.0),
                 row("guest-9", 1.0, 4999.0, 4999.0),
+                row("guest-5", 4990.0, 1.0, 0.0),
             ],
             vec![("KeWaitForSingleObject".into(), 4299.0, 600)],
             (60.0, 300),
         );
         assert!(l[0].contains("300 frames (60.0/s)"), "{}", l[0]);
-        assert!(l[1].contains("guest-1") && l[1].contains("10.00 /    2.00 (   1.00)"));
-        assert!(l[2].contains("guest-2"));
+        assert!(l[1].contains("guest-5"));
+        assert!(l[2].contains("guest-1") && l[2].contains("10.00 /    2.00 (   1.00)"));
+        assert!(l[3].contains("guest-2"));
         assert!(l.iter().any(|x| x.contains("1 threads under 0.05 ms busy")));
         assert!(l
             .iter()
             .any(|x| x.contains("KeWaitForSingleObject 14.33 (2)")));
         let last = l.last().unwrap();
         assert!(
-            last.contains("guest-1 11.00 ms") && last.contains("about 91 fps"),
+            last.contains("guest-1 11.00 ms")
+                && last.contains("about 91 fps")
+                && last.contains("likely polling: guest-5"),
             "{last}"
         );
     }
