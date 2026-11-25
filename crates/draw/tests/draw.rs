@@ -526,6 +526,94 @@ fn cull_mode_and_front_face() {
     }
 }
 
+/// States that differ only where the pipeline does not look share one:
+/// the winding without culling, an alpha blend with alpha masked off, and
+/// a stencil test that always passes and keeps next to a depth test that
+/// always passes. Five draws, two pipelines, the same pixels.
+#[test]
+fn pipeline_keys_drop_what_the_pipeline_ignores() {
+    let Some(mut d) = drawer() else { return };
+    let mut mem = memory();
+    mem.write_words(VERTS, &full_triangle(WHITE, 0.0));
+    let mut s = Stream::default();
+    s.setup()
+        .resolve(&mut mem, W, H, false, Some((rgba(CLEAR), 0)))
+        .shader(false, &vs_color())
+        .shader(true, &ps_interp())
+        .vertex_fetch(0, VERTS, 12)
+        .regs(RB_COLOR_MASK, &[0b0111])
+        .draw_auto(PRIM_TRI_LIST, 3)
+        .regs(PA_SU_SC_MODE_CNTL, &[4])
+        .draw_auto(PRIM_TRI_LIST, 3)
+        // Alpha: src alpha, one minus src alpha.
+        .regs(RB_BLENDCONTROL0, &[1 | (6 << 16) | (7 << 24)])
+        .draw_auto(PRIM_TRI_LIST, 3)
+        // Stencil on, ALWAYS, all ops KEEP.
+        .regs(RB_DEPTHCONTROL, &[1 | (7 << 8)])
+        .draw_auto(PRIM_TRI_LIST, 3)
+        // Depth test ALWAYS without write.
+        .regs(RB_DEPTHCONTROL, &[2 | (7 << 4)])
+        .draw_auto(PRIM_TRI_LIST, 3);
+    let report = run(&mut d, &s, &mut mem);
+    assert_eq!(report.draws, 5, "{report:?}");
+    assert!(report.unsupported.is_empty(), "{report:?}");
+    assert_eq!(report.timings.pipelines_created, 2, "{report:?}");
+    let img = d.read_render_target(COLOR_KEY, 0, 0, W, H).unwrap();
+    assert_eq!(px(&img, W, 10, 10), [255, 255, 255, 255]);
+}
+
+/// Past the pipeline cap the least recently used pipeline goes, with the
+/// pixel shader only it used; drawing with it again makes it again and
+/// draws the same pixels as a drawer that kept it.
+#[test]
+fn dropped_pipeline_is_made_again_and_draws_the_same() {
+    let Some(mut d) = drawer() else { return };
+    let mut mem = memory();
+    mem.write_words(VERTS, &full_triangle(WHITE, 0.0));
+    mem.write_words(VERTS + 48, &winding_pair());
+    let mut s = Stream::default();
+    s.setup()
+        .resolve(&mut mem, W, H, false, Some((rgba(CLEAR), 0)))
+        .shader(false, &vs_color())
+        .shader(true, &ps_interp())
+        .vertex_fetch(0, VERTS + 48, 24)
+        .draw_auto(PRIM_TRI_LIST, 6)
+        .shader(true, &ps_const())
+        .regs(
+            SHADER_CONSTANT_FLOAT + 256 * 4,
+            &[0.5, 0.25, 0.0, 1.0].map(f),
+        )
+        .regs(RB_BLENDCONTROL0, &[1 | (1 << 8)])
+        .vertex_fetch(0, VERTS, 12)
+        .draw_auto(PRIM_TRI_LIST, 3)
+        .shader(true, &ps_interp())
+        .regs(RB_BLENDCONTROL0, &[0x0001_0001])
+        .vertex_fetch(0, VERTS + 48, 24)
+        .draw_auto(PRIM_TRI_LIST, 6);
+    let report = run(&mut d, &s, &mut mem);
+    assert_eq!(report.timings.pipelines_created, 2, "{report:?}");
+    let kept = d.read_render_target(COLOR_KEY, 0, 0, W, H).unwrap();
+    let m = d.memory_line();
+    assert!(
+        m.contains("(2 vs/ps pairs, 0 dropped), shaders 3, translated 3 ("),
+        "{m}"
+    );
+
+    drop(d);
+    let Some(mut d) = drawer() else { return };
+    d.set_pipeline_cap(1);
+    let report = run(&mut d, &s, &mut mem);
+    assert_eq!(report.draws, 3, "{report:?}");
+    assert_eq!(report.timings.pipelines_created, 3, "{report:?}");
+    let m = d.memory_line();
+    assert!(
+        m.contains("(1 vs/ps pairs, 2 dropped), shaders 2, translated 2 ("),
+        "{m}"
+    );
+    assert!(!m.contains("(0 KB WGSL)"), "{m}");
+    assert!(kept == d.read_render_target(COLOR_KEY, 0, 0, W, H).unwrap());
+}
+
 /// RB_COLOR_MASK keeps the masked channels of the render target.
 #[test]
 fn colour_write_mask() {

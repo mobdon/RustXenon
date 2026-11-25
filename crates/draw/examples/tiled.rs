@@ -455,4 +455,5 @@ fn main() {
         t.transfers / n,
         t.transfer_passes / n
     );
+    println!("  {}", d.memory_line());
 }

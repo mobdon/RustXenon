@@ -61,6 +61,11 @@
 //! [`Report::warnings`]; colour targets of different formats at one base
 //! and pitch are not reported.
 //!
+//! At the end of a replay a target is dropped when a newer one on the same
+//! tiles, whose words transfer to it, has written all its rows: used again,
+//! it is made anew and takes that newer target's words. Past a bound on
+//! their host memory the least recently written targets are dropped too.
+//!
 //! Colour targets ([`TargetFormat`]; formats with one bit layout share a
 //! key):
 //!
@@ -546,6 +551,7 @@ impl RenderTargetKey {
 }
 
 /// Why one draw or resolve was not done.
+#[derive(Debug)]
 enum Skip {
     Unsupported(String),
     Fatal(Error),
@@ -594,9 +600,11 @@ struct PipelineKey {
         Option<wgpu::BlendState>,
         wgpu::ColorWrites,
     )>; 4],
+    /// Format, depth write, depth compare and stencil.
     depth: Option<(
         wgpu::TextureFormat,
-        state::Depth,
+        bool,
+        wgpu::CompareFunction,
         Option<wgpu::StencilState>,
     )>,
     cull: (wgpu::FrontFace, Option<wgpu::Face>),
@@ -675,6 +683,97 @@ fn transferable(a: TargetFormat, b: TargetFormat) -> bool {
     word(a) && word(b)
 }
 
+/// Draw pipelines kept: a long run made about 300, each with its shaders
+/// about 1.6 MB of driver memory.
+const PIPELINE_CAP: usize = 1024;
+
+/// Key of a shader module: program hash, vertex stage, extra vertex
+/// outputs, variant and pixel parameter generation.
+type ModuleKey = (u64, bool, u16, Variant, Option<ParamGen>);
+
+/// The vertex and pixel shader modules a pipeline is made from.
+fn module_keys(k: &PipelineKey) -> [ModuleKey; 2] {
+    [
+        (k.vs, true, k.vs_extra, k.vs_variant, None),
+        (k.ps, false, 0, k.ps_variant, k.ps_param_gen),
+    ]
+}
+
+/// `blend` as the pipeline needs it with colour write mask `mask`: a
+/// component whose channels are not written is left as replace, and a
+/// state that is all replace is no blending.
+fn pipeline_blend(
+    blend: Option<wgpu::BlendState>,
+    mask: wgpu::ColorWrites,
+) -> Option<wgpu::BlendState> {
+    let mut b = blend?;
+    if !mask.contains(wgpu::ColorWrites::ALPHA) {
+        b.alpha = wgpu::BlendComponent::REPLACE;
+    }
+    if !mask.intersects(wgpu::ColorWrites::COLOR) {
+        b.color = wgpu::BlendComponent::REPLACE;
+    }
+    (b != wgpu::BlendState::REPLACE).then_some(b)
+}
+
+/// `st` as the pipeline needs it under `cull`: a culled face takes the
+/// other's state, operations are keep when nothing is written, the read
+/// mask is 0 when nothing compares, and a state that neither tests nor
+/// writes is no stencil.
+fn pipeline_stencil(
+    mut st: wgpu::StencilState,
+    cull: Option<wgpu::Face>,
+) -> Option<wgpu::StencilState> {
+    use wgpu::{CompareFunction as C, StencilOperation as Op};
+    match cull {
+        Some(wgpu::Face::Back) => st.back = st.front,
+        Some(wgpu::Face::Front) => st.front = st.back,
+        None => {}
+    }
+    for f in [&mut st.front, &mut st.back] {
+        if st.write_mask == 0 {
+            (f.fail_op, f.depth_fail_op, f.pass_op) = (Op::Keep, Op::Keep, Op::Keep);
+        }
+        if f.compare == C::Always {
+            f.fail_op = Op::Keep;
+        }
+    }
+    let always = st.front.compare == C::Always && st.back.compare == C::Always;
+    if always {
+        st.read_mask = 0;
+    }
+    let keeps = |f: &wgpu::StencilFaceState| f.depth_fail_op == Op::Keep && f.pass_op == Op::Keep;
+    if always && keeps(&st.front) && keeps(&st.back) {
+        return None;
+    }
+    if st.write_mask != 0
+        && keeps(&st.front)
+        && keeps(&st.back)
+        && st.front.fail_op == Op::Keep
+        && st.back.fail_op == Op::Keep
+    {
+        st.write_mask = 0;
+    }
+    Some(st)
+}
+
+/// Bytes of a texture, estimated from its size and format.
+fn texture_bytes(t: &wgpu::Texture) -> u64 {
+    let f = t.format();
+    let texel = f.block_copy_size(None).map_or_else(
+        // Depth + stencil formats: 4 or 8 bytes a texel.
+        || if f.has_stencil_aspect() { 8 } else { 4 },
+        u64::from,
+    );
+    let e = t.size();
+    texel * u64::from(e.width * e.height * e.depth_or_array_layers * t.sample_count())
+}
+
+/// Bound on the host memory of render targets (EDRAM is 10 MB; host
+/// targets are 2048 rows and wider texels): past it the least recently
+/// written ones are dropped at the end of a replay.
+const TARGET_CAP: u64 = 256 << 20;
+
 /// Replays recorded command lists on a headless wgpu device.
 pub struct Drawer {
     device: wgpu::Device,
@@ -690,8 +789,13 @@ pub struct Drawer {
     /// Keyed by program hash, stage, extra vertex outputs, variant (the
     /// rectangle list wrapper or the pixel output bias and clamp) and pixel parameter
     /// generation.
-    modules: HashMap<(u64, bool, u16, Variant, Option<ParamGen>), wgpu::ShaderModule>,
-    pipelines: HashMap<PipelineKey, wgpu::RenderPipeline>,
+    modules: HashMap<ModuleKey, wgpu::ShaderModule>,
+    /// With the use that last drew with each, for least recently used
+    /// eviction past `pipeline_cap`.
+    pipelines: HashMap<PipelineKey, (wgpu::RenderPipeline, u64)>,
+    pipeline_uses: u64,
+    pipeline_cap: usize,
+    pipeline_drops: u64,
     texture_layouts: HashMap<u32, (wgpu::BindGroupLayout, wgpu::PipelineLayout)>,
     group0: wgpu::BindGroupLayout,
     clear_layout: wgpu::BindGroupLayout,
@@ -703,6 +807,9 @@ pub struct Drawer {
     /// ownership transfers.
     written: HashMap<RenderTargetKey, Written>,
     clock: u64,
+    /// Render targets dropped so far (see [`Drawer::drop_targets`]).
+    target_drops: u64,
+    target_cap: u64,
     transfer_module: Option<wgpu::ShaderModule>,
     /// Keyed by source and destination host format and pass (stencil bit
     /// 0..8, or 8 for the depth or colour pass).
@@ -1155,6 +1262,9 @@ impl Drawer {
             translated: HashMap::new(),
             modules: HashMap::new(),
             pipelines: HashMap::new(),
+            pipeline_uses: 0,
+            pipeline_cap: PIPELINE_CAP,
+            pipeline_drops: 0,
             texture_layouts: HashMap::new(),
             group0,
             clear_layout,
@@ -1162,6 +1272,8 @@ impl Drawer {
             clear_pipelines: HashMap::new(),
             targets: HashMap::new(),
             written: HashMap::new(),
+            target_drops: 0,
+            target_cap: TARGET_CAP,
             clock: 0,
             transfer_module: None,
             transfer_pipelines: HashMap::new(),
@@ -1213,42 +1325,90 @@ impl Drawer {
 
     /// What the drawer holds, for the run log: cached textures, render
     /// targets (bytes estimated from their size and format), the draw upload
-    /// arena and its host staging copy, and pipeline and shader counts.
+    /// arena and its host staging copy, pipeline counts (with the distinct
+    /// vertex and pixel shader pairs of the draw pipelines and how many were
+    /// dropped), shader module counts and the translated shaders with the
+    /// bytes of their WGSL.
     pub fn memory_line(&self) -> String {
-        let bytes = |t: &wgpu::Texture| {
-            let f = t.format();
-            let texel = f.block_copy_size(None).map_or_else(
-                // Depth + stencil formats: 4 or 8 bytes a texel.
-                || if f.has_stencil_aspect() { 8 } else { 4 },
-                u64::from,
-            );
-            let e = t.size();
-            texel * u64::from(e.width * e.height * e.depth_or_array_layers * t.sample_count())
-        };
-        let rt: u64 = self.targets.values().map(bytes).sum();
+        let rt: u64 = self.targets.values().map(texture_bytes).sum();
         let kept: u64 = self.mirrors.iter().map(|m| m.buf.size()).sum::<u64>()
             + self
                 .mirrors
                 .iter()
                 .flat_map(|m| m.views.values())
-                .map(|k| bytes(&k.tex))
+                .map(|k| texture_bytes(&k.tex))
                 .sum::<u64>();
+        let pairs: std::collections::HashSet<(u64, u64)> =
+            self.pipelines.keys().map(|k| (k.vs, k.ps)).collect();
+        let wgsl: Vec<usize> = self
+            .translated
+            .values()
+            .flatten()
+            .map(|t| t.wgsl.len())
+            .collect();
         format!(
-            "draw: textures {} MB in {}, targets {} MB in {}, kept resolves {} MB in {}, arena {} MB, staged {} MB, pipelines {}, shaders {}",
+            "draw: textures {} MB in {}, targets {} MB in {}, {} dropped, kept resolves {} MB in {}, arena {} MB, staged {} MB, pipelines {} ({} vs/ps pairs, {} dropped), shaders {}, translated {} ({} KB WGSL)",
             self.texture_cache_bytes >> 20,
             self.texture_cache.len(),
             rt >> 20,
             self.targets.len(),
+            self.target_drops,
             kept >> 20,
             self.mirrors.len(),
             self.arena.as_ref().map_or(0, |b| b.size()) >> 20,
             self.staged.capacity() >> 20,
             self.pipelines.len() + self.clear_pipelines.len(),
+            pairs.len(),
+            self.pipeline_drops,
             self.modules.len(),
+            wgsl.len(),
+            wgsl.iter().sum::<usize>().div_ceil(1024),
         )
     }
 
-    /// Keys of every render target created so far.
+    /// Sets how many draw pipelines are kept (least recently used ones
+    /// past it are dropped, with the shaders only they used). For tests.
+    #[doc(hidden)]
+    pub fn set_pipeline_cap(&mut self, pipelines: usize) {
+        self.pipeline_cap = pipelines;
+        self.drop_pipelines();
+    }
+
+    /// Drops the least recently used draw pipelines past the cap, and the
+    /// shader modules and translations no kept pipeline uses.
+    fn drop_pipelines(&mut self) {
+        while self.pipelines.len() > self.pipeline_cap {
+            let Some(old) = self
+                .pipelines
+                .iter()
+                .min_by_key(|(_, (_, used))| *used)
+                .map(|(k, _)| k.clone())
+            else {
+                break;
+            };
+            self.pipelines.remove(&old);
+            self.pipeline_drops += 1;
+            for m in module_keys(&old) {
+                if self.pipelines.keys().any(|k| module_keys(k).contains(&m)) {
+                    continue;
+                }
+                self.modules.remove(&m);
+                let (hash, vertex, _, _, param_gen) = m;
+                if !self
+                    .modules
+                    .keys()
+                    .any(|n| (n.0, n.1, n.4) == (hash, vertex, param_gen))
+                {
+                    self.translated.remove(&(hash, vertex, param_gen));
+                }
+            }
+        }
+    }
+
+    /// Keys of the render targets the drawer holds: every one created so
+    /// far, less those dropped at the end of a replay (a newer target on
+    /// the same EDRAM tiles holds their words, or targets were over their
+    /// memory cap). Reading a dropped one gives [`Error::NoRenderTarget`].
     pub fn render_targets(&self) -> Vec<RenderTargetKey> {
         self.targets.keys().copied().collect()
     }
@@ -1286,6 +1446,7 @@ impl Drawer {
         let kept = self.finish_mirrors(&mut mem);
         done?;
         kept?;
+        self.drop_targets(&mut report);
         // Counts made where only the report is mutable (durations there
         // are zero).
         let mut t = std::mem::take(&mut self.timings);
@@ -1591,9 +1752,14 @@ impl Drawer {
                 if need > self.max_buffer {
                     return unsupported(format!("{need} bytes of draw data"));
                 }
+                let size = need.max(ARENA_MIN).next_power_of_two().min(self.max_buffer);
+                // Flushed, so empty: the batch never stages more than the
+                // arena holds, so it never grows past this (a Vec doubling
+                // from an odd size would).
+                self.staged = Vec::with_capacity(size as usize);
                 self.arena = Some(self.device.create_buffer(&wgpu::BufferDescriptor {
                     label: Some("draw arena"),
-                    size: need.max(ARENA_MIN).next_power_of_two().min(self.max_buffer),
+                    size,
                     usage: wgpu::BufferUsages::STORAGE
                         | wgpu::BufferUsages::UNIFORM
                         | wgpu::BufferUsages::INDEX
@@ -1934,6 +2100,63 @@ impl Drawer {
             }
         }
         Ok(tex)
+    }
+
+    /// Drops the host textures of render targets that a newer target on
+    /// the same EDRAM tiles, one their words transfer to, has written all
+    /// the rows of: their next use takes that target's words (or newer
+    /// ones) as it would without the drop. Then, past the cap, drops the
+    /// least recently written targets; one still holding the newest
+    /// pixels of its tiles comes back cleared, as EDRAM garbage would, and
+    /// is reported. Runs with no batch recorded.
+    // shortcut: a dropped target used again at another MSAA mode (no
+    // transfer then), or after a newer target that wrote fewer rows,
+    // starts cleared where it kept its own stale pixels before; track
+    // per-tile ownership if a capture needs those pixels.
+    fn drop_targets(&mut self, report: &mut Report) {
+        let rows_down = |w: Written| w.rows * samples(w.msaa).1;
+        let dead: Vec<RenderTargetKey> = self
+            .written
+            .iter()
+            .filter(|&(&k, &w)| {
+                self.written.iter().any(|(&n, &nw)| {
+                    nw.stamp > w.stamp
+                        && n.base_tiles == k.base_tiles
+                        && row_width(n, nw.msaa) == row_width(k, w.msaa)
+                        && transferable(n.format, k.format)
+                        && rows_down(nw) >= rows_down(w)
+                })
+            })
+            .map(|(&k, _)| k)
+            .collect();
+        for k in dead {
+            self.written.remove(&k);
+            self.targets.remove(&k);
+            self.target_drops += 1;
+        }
+        let mut total: u64 = self.targets.values().map(texture_bytes).sum();
+        if total <= self.target_cap {
+            return;
+        }
+        let mut by_age: Vec<(u64, RenderTargetKey)> = self
+            .targets
+            .keys()
+            .map(|&k| (self.written.get(&k).map_or(0, |w| w.stamp), k))
+            .collect();
+        // Ties (a transfer shares its stamp) in a fixed order.
+        by_age.sort_unstable_by_key(|&(stamp, k)| (stamp, k.base_tiles, k.pitch, k.format as u8));
+        for (_, k) in by_age {
+            if total <= self.target_cap {
+                break;
+            }
+            total -= self.targets.remove(&k).as_ref().map_or(0, texture_bytes);
+            self.target_drops += 1;
+            if self.written.remove(&k).is_some() {
+                report.warn(
+                    "render target memory over its cap: a target still holding its EDRAM tiles' newest pixels was dropped (it comes back cleared)",
+                );
+            }
+        }
     }
 
     /// Records a write to `key`, drawn with `msaa`, down to row `rows`.
@@ -2997,6 +3220,14 @@ impl Drawer {
         let ps_mod = self.module(ps.hash, false, 0, ps_variant, param_gen, &ps_t)?;
         let (g1_layout, layout) = self.texture_layout(tex_mask);
 
+        let key_stencil = stencil
+            .as_ref()
+            .and_then(|s| pipeline_stencil(s.0.clone(), cull.1));
+        // The winding only matters to culling, two-sided stencil and the
+        // facing flag of polygon parameter generation.
+        let facing = cull.1.is_some()
+            || key_stencil.as_ref().is_some_and(|s| s.front != s.back)
+            || param_gen.is_some_and(|p| p.primitive == ParamGenPrimitive::Polygon);
         let key = PipelineKey {
             vs: vs.hash,
             vs_extra: extra,
@@ -3007,19 +3238,20 @@ impl Drawer {
             topology,
             color: std::array::from_fn(|rt| {
                 color[rt].map(|k| {
-                    (
-                        k.format.wgpu(),
-                        blends[rt],
-                        state::write_mask(color_mask, rt as u32),
-                    )
+                    let mask = state::write_mask(color_mask, rt as u32);
+                    (k.format.wgpu(), pipeline_blend(blends[rt], mask), mask)
                 })
             }),
-            depth: depth_format.map(|f| (f, depth, stencil.as_ref().map(|s| s.0.clone()))),
-            cull,
+            depth: depth_format.map(|f| (f, depth.write, depth.compare, key_stencil)),
+            cull: (if facing { cull.0 } else { wgpu::FrontFace::Ccw }, cull.1),
             textures: tex_mask,
         };
-        let pipeline = match self.pipelines.get(&key) {
-            Some(p) => p.clone(),
+        self.pipeline_uses += 1;
+        let pipeline = match self.pipelines.get_mut(&key) {
+            Some((p, used)) => {
+                *used = self.pipeline_uses;
+                p.clone()
+            }
             None => {
                 let k = key.clone();
                 let p = self.validated("render pipeline", |dev| {
@@ -3039,12 +3271,14 @@ impl Drawer {
                             cull_mode: k.cull.1,
                             ..Default::default()
                         },
-                        depth_stencil: k.depth.map(|(format, d, st)| wgpu::DepthStencilState {
-                            format,
-                            depth_write_enabled: Some(d.write),
-                            depth_compare: Some(d.compare),
-                            stencil: st.unwrap_or_default(),
-                            bias: Default::default(),
+                        depth_stencil: k.depth.map(|(format, write, compare, st)| {
+                            wgpu::DepthStencilState {
+                                format,
+                                depth_write_enabled: Some(write),
+                                depth_compare: Some(compare),
+                                stencil: st.unwrap_or_default(),
+                                bias: Default::default(),
+                            }
                         }),
                         multisample: Default::default(),
                         fragment: Some(wgpu::FragmentState {
@@ -3063,8 +3297,9 @@ impl Drawer {
                         cache: None,
                     })
                 })?;
-                self.pipelines.insert(key, p.clone());
+                self.pipelines.insert(key, (p.clone(), self.pipeline_uses));
                 self.timings.pipelines_created += 1;
+                self.drop_pipelines();
                 p
             }
         };
@@ -3855,6 +4090,71 @@ mod tests {
                 assert_eq!(got, want.to_bits(), "{float} {:06X}", n(i));
             }
         }
+    }
+
+    /// A drawer on the test adapter, or None without one (unless
+    /// XENON_REQUIRE_GPU=1).
+    fn gpu() -> Option<Drawer> {
+        match Drawer::new() {
+            Ok(d) => Some(d),
+            Err(Error::NoAdapter) if std::env::var("XENON_REQUIRE_GPU").as_deref() != Ok("1") => {
+                None
+            }
+            Err(e) => panic!("{e}"),
+        }
+    }
+
+    /// Staging that fills the arena in uneven steps keeps its host copy
+    /// within the arena's size (doubling from 3 MB would reach 24 MB).
+    #[test]
+    fn staged_capacity_stays_within_the_arena() {
+        let Some(mut d) = gpu() else { return };
+        let part = vec![7u8; 3 << 20];
+        for _ in 0..12 {
+            d.stage(&[&part]).unwrap();
+            let arena = d.arena.as_ref().unwrap().size();
+            assert!(
+                d.staged.capacity() as u64 <= arena,
+                "{}",
+                d.staged.capacity()
+            );
+        }
+        let big = vec![1u8; 20 << 20];
+        d.stage(&[&big]).unwrap();
+        d.stage(&[&part]).unwrap();
+        assert_eq!(d.arena.as_ref().unwrap().size(), 32 << 20);
+        assert!(d.staged.capacity() <= 32 << 20, "{}", d.staged.capacity());
+        d.flush().unwrap();
+    }
+
+    /// Past the cap the least recently written targets go first, and
+    /// dropping one that still held its tiles' newest pixels is reported;
+    /// it comes back as a new, cleared target.
+    #[test]
+    fn target_cap_drops_the_least_recently_written() {
+        let Some(mut d) = gpu() else { return };
+        let key = |base_tiles| RenderTargetKey {
+            base_tiles,
+            pitch: 64,
+            format: TargetFormat::Rgba8,
+        };
+        let mut report = Report::default();
+        for base in [0, 100, 200] {
+            d.target(key(base), 64, 0, &mut report).unwrap();
+            d.mark_written(key(base), 64, 0);
+        }
+        // 64 x 2048 x 4 bytes each.
+        d.target_cap = 2 << 20;
+        d.drop_targets(&mut report);
+        assert!(report.warnings.is_empty(), "{report:?}");
+        d.target_cap = 1 << 20;
+        d.drop_targets(&mut report);
+        let mut left = d.render_targets();
+        left.sort_by_key(|k| k.base_tiles);
+        assert_eq!(left, [key(100), key(200)]);
+        assert!(!d.written.contains_key(&key(0)));
+        assert!(d.memory_line().contains("targets 1 MB in 2, 1 dropped,"));
+        assert_eq!(report.warnings.len(), 1, "{report:?}");
     }
 
     #[test]
