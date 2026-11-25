@@ -414,8 +414,9 @@ and every thread's last calls instead of reading zeros. XENON_CPU_PROFILE=1
 logs, every 5 s, the ms per frame each guest thread spends in its own code,
 in kernel calls and waiting, the top kernel calls by time, and a frame rate
 bound with drawing free; run it without --render to keep drawing off.
-XENON_DRAW_AHEAD=<frames> (with --render) draws on a thread of its own so the
-GPU command processor runs up to that many frames ahead of drawing.";
+With --render, drawing runs on a thread of its own and the GPU command
+processor runs up to XENON_DRAW_AHEAD=<frames> frames ahead of it (default
+1); XENON_DRAW_AHEAD=0 draws inline.";
 
 fn opt(args: &[String], name: &str) -> Option<String> {
     args.iter()
