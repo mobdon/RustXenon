@@ -370,6 +370,8 @@ pub struct Timings {
     /// Finishing and submitting batches on the submit thread, alongside
     /// the drawer's own phases (not part of them).
     pub submit_thread: Duration,
+    /// Kept resolve write-backs to guest memory: each waits for the GPU.
+    pub writebacks: u32,
     /// Waiting for queued GPU work before a resolve readback: where the
     /// rendering itself shows up.
     pub gpu_wait: Duration,
@@ -487,6 +489,7 @@ impl std::ops::AddAssign<&Timings> for Timings {
         self.queue += t.queue;
         self.upload += t.upload;
         self.submit_thread += t.submit_thread;
+        self.writebacks += t.writebacks;
         self.render_passes += t.render_passes;
         for (a, b) in self.gpu_passes.iter_mut().zip(t.gpu_passes) {
             *a += b;
@@ -2351,14 +2354,20 @@ impl Drawer {
                 Skip::Unsupported(why) => Error::Gpu(why),
             })?;
         }
+        // No wait for idle first: the copies are queued after the work
+        // that wrote the buffers, and the first map waits for them.
         let mut t = Instant::now();
-        self.wait_idle()?;
-        self.timings.gpu_wait += lap(&mut t);
+        self.timings.writebacks += 1;
         let index = self.submit_now([enc.finish()]);
         self.submitted(Site::Other);
+        let mut first = true;
         for (m_lo, dirty, spans, buf) in copies {
             let data = self.map_read(&buf, index.clone())?;
-            self.timings.readback += lap(&mut t);
+            if std::mem::take(&mut first) {
+                self.timings.gpu_wait += lap(&mut t);
+            } else {
+                self.timings.readback += lap(&mut t);
+            }
             self.timings.readback_bytes += data.len() as u64;
             // Index in `data` of each span's first byte.
             let starts: Vec<u64> = spans
