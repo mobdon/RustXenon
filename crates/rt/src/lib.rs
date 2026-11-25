@@ -22,6 +22,7 @@ pub mod runtime;
 pub mod sync;
 mod thread;
 pub mod vmx;
+mod watch;
 
 pub use cpu::{Context, Reservation, V128};
 pub use mem::GuestMemory;

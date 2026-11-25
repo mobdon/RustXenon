@@ -195,6 +195,15 @@ pub trait GuestMemory: GuestRead {
     /// Writes `bytes` at guest physical `addr`; false (and nothing written)
     /// if any byte is unmapped.
     fn write_bytes(&mut self, addr: u32, bytes: &[u8]) -> bool;
+
+    /// The physical `[start, end)` ranges the CPU (or anything else) wrote
+    /// since the last call, merged, with the record reset; `None` (the
+    /// default) when writes are not recorded and any byte may have changed.
+    /// Lets textures looked up in one replay be used in the next without
+    /// reading their guest bytes again.
+    fn take_written(&mut self) -> Option<Vec<(u64, u64)>> {
+        None
+    }
 }
 
 /// Guest memory that remembers the ranges written through it, so the
@@ -1079,12 +1088,15 @@ pub struct Drawer {
     texture_evicted: HashSet<u64>,
     /// Replays started, the clock of `texture_cache` uses.
     replays: u64,
-    /// Textures already looked up this replay by fetch constant, with the
-    /// physical `[start, end)` guest range they were read from. Guest
-    /// memory only changes at a resolve or MEM_WRITE during a replay, which
-    /// drop the entries whose range they write, so later draws skip reading
-    /// and hashing the guest bytes of the others.
-    texture_memo: HashMap<[u32; 6], (wgpu::TextureView, u64, u64)>,
+    /// Textures already looked up by fetch constant, with the physical
+    /// `[start, end)` guest range they were read from and their
+    /// `texture_cache` key (none for kept-resolve decodes). Guest memory
+    /// only changes at a resolve or MEM_WRITE during a replay, which drop
+    /// the entries whose range they write, so later draws skip reading and
+    /// hashing the guest bytes of the others. Cleared at each replay, unless
+    /// guest memory lists the pages the CPU wrote between replays
+    /// ([`GuestMemory::take_written`]): then only those entries go.
+    texture_memo: HashMap<[u32; 6], TextureMemo>,
     /// Guest texture bytes are read into this buffer, kept across lookups:
     /// a fresh one per texture costs zeroing and page faults every frame.
     texture_scratch: Vec<u8>,
@@ -1383,6 +1395,12 @@ fn index_range(indices: &[u32], offset: u32) -> Option<(u32, u32)> {
 /// Vertex data ranges closer than this share one window part; farther
 /// ranges are staged apart, so the gap between them is not uploaded.
 const WINDOW_GAP: u64 = 4096;
+
+/// A [`Drawer::texture_memo`] entry: view, guest range, cache key.
+type TextureMemo = (wgpu::TextureView, u64, u64, Option<([u32; 6], u64)>);
+
+/// Entries [`Drawer::texture_memo`] holds before it starts over.
+const TEXTURE_MEMO_CAP: usize = 1 << 14;
 
 /// Cached textures are dropped wholesale past this many bytes.
 const TEXTURE_CACHE_LIMIT: u64 = 256 << 20;
@@ -2150,7 +2168,14 @@ impl Drawer {
     ) -> Result<Report, Error> {
         let mut report = Report::default();
         self.timings = Timings::default();
-        self.texture_memo.clear();
+        match mem.take_written() {
+            Some(written) if self.texture_memo.len() < TEXTURE_MEMO_CAP => {
+                for (lo, hi) in written {
+                    self.forget_guest(lo, hi);
+                }
+            }
+            _ => self.texture_memo.clear(),
+        }
         self.replays += 1;
         for m in &mut self.mirrors {
             m.checked.fill(false);
@@ -2288,7 +2313,7 @@ impl Drawer {
     /// `[lo, hi)`, which just changed.
     fn forget_guest(&mut self, lo: u64, hi: u64) {
         self.texture_memo
-            .retain(|_, &mut (_, a, b)| b <= lo || hi <= a);
+            .retain(|_, &mut (_, a, b, _)| b <= lo || hi <= a);
         self.window_memo
             .retain(|&a, &mut (b, _)| b <= lo || hi <= a);
     }
@@ -3688,8 +3713,13 @@ impl Drawer {
         }
         let sampler = self.sampler(&fetch, report);
         let constant = self.regs.fetch_constant(n);
-        if let Some((view, ..)) = self.texture_memo.get(&constant) {
-            return Ok((view.clone(), sampler));
+        if let Some((view, _, _, key)) = self.texture_memo.get(&constant) {
+            let view = view.clone();
+            // Kept in use, so eviction does not take it for an old one.
+            if let Some((_, _, used)) = key.and_then(|k| self.texture_cache.get_mut(&k)) {
+                *used = self.replays;
+            }
+            return Ok((view, sampler));
         }
         let addr = u64::from(fetch.base_address & PHYSICAL_MASK);
         if let Ok(len) = xenon_texture::bytes_needed(&fetch) {
@@ -3697,7 +3727,8 @@ impl Drawer {
             if let Some((view, lo, hi)) = self.kept_texture(&fetch, constant, addr, end, mem)? {
                 self.timings.textures_kept += 1;
                 self.timings.kept_bytes += hi - lo;
-                self.texture_memo.insert(constant, (view.clone(), lo, hi));
+                self.texture_memo
+                    .insert(constant, (view.clone(), lo, hi, None));
                 return Ok((view, sampler));
             }
             self.sync(mem, addr, end)?;
@@ -4001,7 +4032,7 @@ impl Drawer {
             *used = self.replays;
             let view = view.clone();
             self.texture_memo
-                .insert(constant, (view.clone(), range.0, range.1));
+                .insert(constant, (view.clone(), range.0, range.1, Some(key)));
             return Ok(view);
         }
         let signed = fetch.sign.contains(&1);
@@ -4091,7 +4122,7 @@ impl Drawer {
         self.texture_cache
             .insert(key, (view.clone(), len, self.replays));
         self.texture_memo
-            .insert(constant, (view.clone(), range.0, range.1));
+            .insert(constant, (view.clone(), range.0, range.1, Some(key)));
         Ok(view)
     }
 
@@ -4106,8 +4137,9 @@ impl Drawer {
             .map(|(k, &(_, len, used))| (used, len, *k))
             .collect();
         by_age.sort_unstable_by_key(|e| e.0);
-        // Groups hold their views; drop them so evicted textures go too.
+        // Groups and the memo hold views; drop them so evicted textures go too.
         self.texture_groups.clear();
+        self.texture_memo.clear();
         // shortcut: the evicted-key set only feeds a counter; cleared
         // when large, which undercounts re-uploads after that.
         if self.texture_evicted.len() > 1 << 16 {
