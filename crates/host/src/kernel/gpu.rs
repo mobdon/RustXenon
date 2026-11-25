@@ -287,9 +287,9 @@ impl DrawStats {
 }
 
 impl Gpu {
-    /// Draws with `drawer` from now on. `XENON_DRAW_AHEAD=<frames>` (1 or
-    /// more) runs it on a thread of its own, the command processor going on
-    /// up to that many swaps ahead of it; unset or 0 draws inline. Ahead, a
+    /// Draws with `drawer` from now on, on a thread of its own: the command
+    /// processor goes on up to `XENON_DRAW_AHEAD=<frames>` swaps ahead of
+    /// it (default 1, so guest code and drawing overlap); 0 draws inline. Ahead, a
     /// title may reuse a buffer the drawer has not read yet, since fences
     /// are written when the command processor passes them.
     pub fn set_drawer(&mut self, rt: &Arc<Runtime>, drawer: xenon_draw::Drawer) {
@@ -302,7 +302,7 @@ impl Gpu {
         let ahead = std::env::var("XENON_DRAW_AHEAD")
             .ok()
             .and_then(|v| v.trim().parse::<u32>().ok())
-            .unwrap_or(0);
+            .unwrap_or(1);
         if ahead == 0 {
             self.draw = Some(Draw::Inline(Box::new(side)));
             return;
