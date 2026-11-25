@@ -627,6 +627,36 @@ fn swap_applies_fetch_constant_0_swizzle() {
     assert_eq!(run(&mut d, &s, &mut mem).frames[0].rgba8, rt);
 }
 
+/// With late front buffers a swap gives the frame of the swap before it,
+/// copied out on the GPU, and the first swap none.
+#[test]
+fn late_front_buffer_is_one_swap_behind() {
+    let Some(mut d) = drawer() else { return };
+    let mut mem = memory();
+    let mut s = Stream::default();
+    draw_pattern(&mut mem, &mut s);
+    s.swap(W, H);
+    let sync = run(&mut d, &s, &mut mem).frames.remove(0);
+    let cleared = |mem: &mut xenon_gpu::SliceMemory| {
+        let mut s = Stream::default();
+        s.setup()
+            .resolve(mem, W, H, true, Some((rgba(CLEAR), 0)))
+            .swap(W, H);
+        s
+    };
+
+    d.late_front_buffer = true;
+    assert!(run(&mut d, &s, &mut mem).frames.is_empty());
+    let next = cleared(&mut mem);
+    let r = run(&mut d, &next, &mut mem);
+    assert_eq!(r.frames.len(), 1, "{r:?}");
+    assert_eq!(r.frames[0].rgba8, sync.rgba8);
+    // The cleared copy (a resolve copies before it clears) shows two later.
+    run(&mut d, &next, &mut mem);
+    let r = run(&mut d, &next, &mut mem);
+    assert!(r.frames[0].rgba8.chunks_exact(4).all(|p| p == CLEAR));
+}
+
 /// A frame bundle of two frames, saved and read back, replays to the same
 /// last frame; with that frame's draw skipped, only the clear is left.
 #[test]
