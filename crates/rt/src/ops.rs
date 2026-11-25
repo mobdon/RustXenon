@@ -237,7 +237,11 @@ mod tests {
         // Plain carry out of bit 31; the sum keeps all 64 bits.
         assert_eq!(add_ca(0xFFFF_FFFF, 1, false), (0x1_0000_0000, true));
         assert_eq!(add_ca(u64::MAX, 1, false), (0, true));
-        assert_eq!(add_ca(0x1_0000_0000, 0xFFFF_FFFF_0000_0000, false).1, false);
+        // A carry out of bit 63 alone is not the low word's carry.
+        assert_eq!(
+            add_ca(0x1_0000_0000, 0xFFFF_FFFF_0000_0000, false),
+            (0, false)
+        );
         // `subfc t, entry, key; subfe t, t, t` gives -1 when key < entry and
         // 0 when equal. The key has stray high bits (a hash built with 64-bit
         // adds), the entry was loaded with lwz.
