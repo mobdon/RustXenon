@@ -6,7 +6,7 @@
 mod common;
 
 use common::*;
-use xenon_draw::RenderTargetKey;
+use xenon_draw::{RenderTargetKey, TargetFormat};
 use xenon_gpu::regs::*;
 use xenon_gpu::SliceMemory;
 
@@ -566,4 +566,175 @@ fn wider_destination_pitch_keeps_the_columns() {
     drop(d);
     assert_eq!(kept, painted);
     assert_eq!(kept, guest_path(&mem, wide));
+}
+
+const RT_2_10_10_10_FLOAT: u32 = 3;
+const RT_16_16_16_16_FLOAT: u32 = 7;
+const RT_32_FLOAT: u32 = 14;
+const FETCH_16_16_16_16_FLOAT: u32 = 32;
+const FETCH_32_FLOAT: u32 = 36;
+
+/// A float resolve and the texture fetched from it: source target, its
+/// resolve destination format, the fetch format, and the target (and its
+/// format) the fetch is sampled into, which holds the sampled floats
+/// exactly.
+struct FloatCase {
+    rt: u32,
+    dest_format: u32,
+    fetch_format: u32,
+    out_rt: u32,
+    out: TargetFormat,
+}
+
+const HALF4: FloatCase = FloatCase {
+    rt: RT_2_10_10_10_FLOAT,
+    dest_format: FETCH_16_16_16_16_FLOAT,
+    fetch_format: FETCH_16_16_16_16_FLOAT,
+    out_rt: RT_16_16_16_16_FLOAT,
+    out: TargetFormat::Rgba16Float,
+};
+
+const FLOAT32: FloatCase = FloatCase {
+    rt: RT_32_FLOAT,
+    dest_format: FETCH_32_FLOAT,
+    fetch_format: FETCH_32_FLOAT,
+    out_rt: RT_32_FLOAT,
+    out: TargetFormat::Float32,
+};
+
+impl FloatCase {
+    fn out_key(&self) -> RenderTargetKey {
+        RenderTargetKey {
+            format: self.out,
+            ..OUT
+        }
+    }
+
+    /// Paints the gradient into a target of `rt` and resolves it whole to
+    /// DEST with `endian` and exponent bias 2.
+    fn paint_and_resolve(&self, s: &mut Stream, mem: &mut SliceMemory, endian: u32) {
+        let (wf, hf) = (W as f32, H as f32);
+        mem.write_words(RECT, &[f(0.0), f(0.0), f(wf), f(0.0), f(wf), f(hf)]);
+        s.regs(RB_COLOR_INFO, &[COLOR_BASE | (self.rt << 16)]);
+        paint(s)
+            .vertex_fetch(0, RECT, 6)
+            .regs(RB_MODECONTROL, &[6])
+            .regs(
+                RB_COPY_CONTROL,
+                &[
+                    COPY_CONVERT,
+                    DEST,
+                    W | (H << 16),
+                    (dest_info(self.dest_format, 2, false) & !7) | endian,
+                ],
+            )
+            .draw_auto(PRIM_RECT_LIST, 3)
+            .regs(RB_MODECONTROL, &[4]);
+    }
+
+    /// Samples `fetch` texel for texel into the output target.
+    fn sample(&self, s: &mut Stream, fetch: [u32; 6]) {
+        s.regs(RB_COLOR_INFO, &[OUT.base_tiles | (self.out_rt << 16)])
+            .shader(false, &vs_uv())
+            .shader(true, &ps_texture(1))
+            .regs(SHADER_CONSTANT_FETCH + 6, &fetch)
+            .vertex_fetch(0, SCREEN, 20)
+            .draw_auto(PRIM_QUAD_LIST, 4)
+            .regs(RB_COLOR_INFO, &[COLOR_BASE]);
+    }
+
+    /// What a drawer that never resolved samples from `mem` with `fetch`.
+    fn guest_path(&self, mem: &SliceMemory, fetch: [u32; 6]) -> Vec<u8> {
+        let mut d = drawer().expect("a drawer");
+        let mut mem = mem.clone();
+        let mut s = Stream::default();
+        self.sample(s.setup(), fetch);
+        let r = run(&mut d, &s, &mut mem);
+        assert_eq!((r.draws, r.timings.textures_kept), (1, 0), "{r:?}");
+        d.read_render_target_raw(self.out_key(), 0, 0, W, H)
+            .unwrap()
+    }
+}
+
+/// 7e3 resolved to k_16_16_16_16_FLOAT and k_32_FLOAT resolved to
+/// k_32_FLOAT, fetched in the same replay at several endians (8in64 for
+/// 64bpp) and swizzles: decoded on the GPU, nothing read back or uploaded,
+/// and bit for bit the floats the guest path samples.
+#[test]
+fn float_resolves_are_kept_and_match_the_guest_path() {
+    for (case, endian, swizzle, bytes) in [
+        (&HALF4, 2, IDENTITY, 8),
+        (&HALF4, 4, BGR1, 8),
+        (&HALF4, 1, IDENTITY, 8),
+        (&FLOAT32, 2, IDENTITY, 4),
+        (&FLOAT32, 0, IDENTITY, 4),
+        (&FLOAT32, 3, BGR1, 4),
+    ] {
+        // The fetch endian undoes the resolve's within each word; 8in64
+        // also swaps the words, which a fetch cannot undo.
+        let fetch_endian = if endian == 4 { 2 } else { endian };
+        let f = fetch(case.fetch_format, fetch_endian, swizzle);
+        let Some(mut d) = drawer() else { return };
+        let mut mem = memory();
+        vertices(&mut mem);
+        let mut s = Stream::default();
+        case.paint_and_resolve(s.setup(), &mut mem, endian);
+        case.sample(&mut s, f);
+        let r = run(&mut d, &s, &mut mem);
+        assert!(r.unsupported.is_empty(), "{r:?}");
+        let t = &r.timings;
+        assert_eq!(
+            (t.textures_kept, t.kept_bytes),
+            (1, u64::from(W * H * bytes)),
+            "{r:?}"
+        );
+        assert_eq!((t.textures_uploaded, t.hashed_bytes), (0, 0), "{r:?}");
+        let kept = d
+            .read_render_target_raw(case.out_key(), 0, 0, W, H)
+            .unwrap();
+        drop(d);
+        let n = kept.len() / (W * H) as usize;
+        let distinct: std::collections::HashSet<_> = kept.chunks(n).collect();
+        // Red, all a k_32_FLOAT target keeps, changes only along x.
+        assert!(
+            distinct.len() >= 64,
+            "{} {}",
+            case.fetch_format,
+            distinct.len()
+        );
+        assert!(
+            kept == case.guest_path(&mem, f),
+            "format {} endian {endian}",
+            case.fetch_format
+        );
+    }
+}
+
+/// A float resolve sampled by the next replay is still on the GPU.
+#[test]
+fn float_resolve_is_kept_for_the_next_replay() {
+    for (case, bytes) in [(&HALF4, 8), (&FLOAT32, 4)] {
+        let f = fetch(case.fetch_format, 2, IDENTITY);
+        let Some(mut d) = drawer() else { return };
+        let mut mem = memory();
+        vertices(&mut mem);
+        let mut s = Stream::default();
+        case.paint_and_resolve(s.setup(), &mut mem, 2);
+        run(&mut d, &s, &mut mem);
+        let mut s = Stream::default();
+        case.sample(s.setup(), f);
+        let r = run(&mut d, &s, &mut mem);
+        let t = &r.timings;
+        assert_eq!(
+            (t.textures_kept, t.textures_uploaded, t.hashed_bytes),
+            (1, 0, 0),
+            "{r:?}"
+        );
+        assert_eq!(t.kept_hashed_bytes, u64::from(W * H * bytes), "{r:?}");
+        let kept = d
+            .read_render_target_raw(case.out_key(), 0, 0, W, H)
+            .unwrap();
+        drop(d);
+        assert!(kept == case.guest_path(&mem, f), "{}", case.fetch_format);
+    }
 }
