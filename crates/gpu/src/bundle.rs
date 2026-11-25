@@ -14,8 +14,9 @@ pub const MEMORY: &str = "memory.bin";
 
 pub fn write_commands(dir: &Path, cmds: &[Command]) -> io::Result<()> {
     std::fs::create_dir_all(dir)?;
-    let f = io::BufWriter::new(std::fs::File::create(dir.join(COMMANDS))?);
-    serde_json::to_writer(f, cmds).map_err(io::Error::other)
+    let mut f = io::BufWriter::new(std::fs::File::create(dir.join(COMMANDS))?);
+    serde_json::to_writer(&mut f, cmds).map_err(io::Error::other)?;
+    io::Write::flush(&mut f)
 }
 
 pub fn read(dir: &Path) -> io::Result<(Vec<Command>, SliceMemory)> {
@@ -37,10 +38,15 @@ pub fn last_frame_start(cmds: &[Command]) -> usize {
     swaps.next().map_or(0, |(i, _)| i + 1)
 }
 
-/// The commands with draws `lo..=hi` of the last frame left out, counted
-/// from 1 as the capture's draw list counts them. Returns the commands and
-/// the number of draws in the last frame.
+/// The commands up to the last swap, with draws `lo..=hi` of the last frame
+/// left out, counted from 1 as the capture's draw list counts them. Returns
+/// the commands and the number of draws in the last frame.
 pub fn skip_draws(cmds: &[Command], lo: u32, hi: u32) -> (Vec<Command>, u32) {
+    // Commands after the last swap draw nothing that frame shows.
+    let cmds = match cmds.iter().rposition(|c| matches!(c, Command::Swap { .. })) {
+        Some(i) => &cmds[..=i],
+        None => cmds,
+    };
     let start = last_frame_start(cmds);
     let mut n = 0;
     let mut out = cmds[..start].to_vec();
@@ -82,11 +88,14 @@ mod tests {
 
     #[test]
     fn skips_draws_of_the_last_frame_only() {
-        let cmds = vec![draw(1), swap(), draw(2), draw(3), draw(4), draw(5), swap()];
+        let mut cmds = vec![draw(1), swap(), draw(2), draw(3), draw(4), draw(5), swap()];
+        let whole = cmds.clone();
+        // A draw of the next frame, kept with the span that held the swap.
+        cmds.push(draw(6));
         let (out, n) = skip_draws(&cmds, 2, 3);
         assert_eq!(n, 4);
         assert_eq!(out, vec![draw(1), swap(), draw(2), draw(5), swap()]);
-        assert_eq!(skip_draws(&cmds, 1, 0).0, cmds);
+        assert_eq!(skip_draws(&cmds, 1, 0).0, whole);
     }
 
     #[test]
