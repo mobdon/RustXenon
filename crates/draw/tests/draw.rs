@@ -1368,7 +1368,8 @@ fn pipeline_cache_persists_across_drawers() {
     };
     let saved = std::fs::read(&file).unwrap();
     assert!(saved.starts_with(b"WGPUPLCH"), "{} bytes", saved.len());
-    assert!(!file.with_extension("tmp").exists());
+    // No temporary file left behind.
+    assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
     // Reloaded: same drawing, and saved again (the driver's data may
     // grow but keeps wgpu's header).
     {

@@ -1566,9 +1566,11 @@ impl Drawer {
     }
 
     /// Writes the pipeline cache file, if there is one (see
-    /// [`Drawer::set_pipeline_cache_dir`]), through a temporary file so a
-    /// crash leaves the old file or the new one.
+    /// [`Drawer::set_pipeline_cache_dir`]), through a temporary file of its
+    /// own so a crash, or another process saving to the same directory,
+    /// leaves a whole file (the last one renamed wins).
     pub fn save_pipeline_cache(&mut self) -> std::io::Result<()> {
+        static SAVES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let Some(c) = &mut self.disk_cache else {
             return Ok(());
         };
@@ -1576,9 +1578,15 @@ impl Drawer {
         let Some(data) = c.cache.get_data() else {
             return Ok(());
         };
-        let tmp = c.path.with_extension("tmp");
-        std::fs::write(&tmp, data)?;
-        std::fs::rename(&tmp, &c.path)
+        let n = SAVES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tmp = c
+            .path
+            .with_extension(format!("{}-{n}.tmp", std::process::id()));
+        let r = std::fs::write(&tmp, data).and_then(|()| std::fs::rename(&tmp, &c.path));
+        if r.is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+        r
     }
 
     /// The pipeline cache, for pipeline descriptors.
