@@ -248,6 +248,16 @@ impl Tracked<'_> {
     }
 }
 
+/// A front buffer copy on its way back: the buffer, its submission, and
+/// how to read it (width, height, pitch, endian, swizzle).
+struct LateFront {
+    buf: wgpu::Buffer,
+    index: wgpu::SubmissionIndex,
+    size: (u32, u32, u32),
+    endian: xenon_texture::Endian,
+    swizzle: Option<u16>,
+}
+
 /// Guest bytes that GPU resolves wrote, kept in a GPU buffer so that
 /// textures fetched from them are decoded on the GPU instead of read back,
 /// hashed, decoded and uploaded. The buffer always holds what guest memory
@@ -1247,6 +1257,15 @@ pub struct Drawer {
     /// wait at the end of every replay. `XENON_RESOLVE_WRITEBACK=late`
     /// turns it on at [`Drawer::new`].
     pub late_writeback: bool,
+    /// Copy each front buffer held by a kept resolve out on the GPU and
+    /// hand it over at the next swap, so a swap never waits for the GPU to
+    /// finish the frame; the frame image is then one swap late, and the
+    /// first swap gives none. `XENON_LATE_FRAME=1` turns it on at
+    /// [`Drawer::new`]; the host turns it on unless that variable is `0`.
+    pub late_front_buffer: bool,
+    /// The front buffer copy queued at the last swap, see
+    /// [`Drawer::late_front_buffer`].
+    late_front: Option<LateFront>,
     late: Option<(Vec<Vec<Option<u64>>>, WriteBack)>,
     /// Bytes of decoded guest textures the texture cache keeps before
     /// evicting the least recently used ones (default 256 MiB).
@@ -1956,6 +1975,8 @@ impl Drawer {
             decode_pipelines: [None, None],
             skip_resolve_writeback: std::env::var("XENON_RESOLVE_WRITEBACK").as_deref() == Ok("skip"),
             late_writeback: std::env::var("XENON_RESOLVE_WRITEBACK").as_deref() == Ok("late"),
+            late_front_buffer: std::env::var("XENON_LATE_FRAME").as_deref() == Ok("1"),
+            late_front: None,
             late: None,
             texture_cache_limit: TEXTURE_CACHE_LIMIT,
             texture_cache_count: TEXTURE_CACHE_COUNT,
@@ -5637,44 +5658,97 @@ impl Drawer {
             Err(e) => return Ok(Err(e.to_string())),
         };
         let addr = addr & PHYSICAL_MASK;
-        self.sync(mem, u64::from(addr), u64::from(addr) + u64::from(extent))?;
-        Ok(self.detile_front_buffer(addr, width, height, pitch, extent, mem))
+        let (lo, hi) = (u64::from(addr), u64::from(addr) + u64::from(extent));
+        let mut kept = self.mirrors.iter().position(|m| m.lo <= lo && hi <= m.hi);
+        // A CPU write to the front buffer since the resolve drops the kept
+        // copy, as the synchronous path's check does.
+        if let Some(i) = kept.filter(|_| self.late_front_buffer) {
+            if !self.verify(i, mem, lo, hi) {
+                kept = None;
+            }
+        }
+        if let (true, Some(i)) = (self.late_front_buffer, kept) {
+            let buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("front buffer"),
+                size: u64::from(extent),
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            });
+            let mut enc = self.device.create_command_encoder(&Default::default());
+            let m = &self.mirrors[i];
+            enc.copy_buffer_to_buffer(&m.buf, lo - m.lo, &buf, 0, u64::from(extent));
+            if self.resolve_pending {
+                self.flush().map_err(|e| match e {
+                    Skip::Fatal(e) => e,
+                    Skip::Unsupported(why) => Error::Gpu(why),
+                })?;
+            }
+            let index = self.submit_now([enc.finish()]);
+            self.submitted(Site::Other);
+            let (endian, swizzle) = self.front_buffer_read(addr);
+            let new = LateFront {
+                buf,
+                index,
+                size: (width, height, pitch),
+                endian,
+                swizzle,
+            };
+            let Some(old) = self.late_front.replace(new) else {
+                return Ok(Err("first late front buffer: no frame yet".into()));
+            };
+            let raw = self.map_read(&old.buf, old.index)?;
+            let (w, h, p) = old.size;
+            return Ok(detile_front(raw, w, h, p, old.endian, old.swizzle));
+        }
+        // An older late copy would come out of order after this one.
+        self.late_front = None;
+        self.sync(mem, lo, hi)?;
+        let raw = mem
+            .read_bytes(addr, extent as usize)
+            .ok_or_else(|| format!("front buffer at 0x{addr:08X} not readable"));
+        let (endian, swizzle) = self.front_buffer_read(addr);
+        Ok(raw.and_then(|raw| detile_front(raw, width, height, pitch, endian, swizzle)))
     }
 
-    fn detile_front_buffer(
-        &self,
-        addr: u32,
-        width: u32,
-        height: u32,
-        pitch: u32,
-        extent: u32,
-        mem: &Tracked,
-    ) -> Result<Frame, String> {
-        use xenon_texture::tile;
-        let mut raw = mem
-            .read_bytes(addr, extent as usize)
-            .ok_or_else(|| format!("front buffer at 0x{addr:08X} not readable"))?;
+    /// The endian the front buffer at `addr` was resolved with, and the
+    /// swizzle scan-out reads it through: fetch constant 0's, as Xenia's
+    /// swap texture, when it is a texture fetch of this address (it undoes
+    /// a red/blue swap the final resolve put in with copy_dest_swap).
+    fn front_buffer_read(&self, addr: u32) -> (xenon_texture::Endian, Option<u16>) {
         let endian = match self.resolved_endian.get(&addr) {
             Some(&e) if e <= 3 => xenon_texture::Endian::from_bits(e),
             _ => xenon_texture::Endian::K8in32,
         };
-        xenon_texture::endian::swap_in_place(&mut raw, endian);
-        let mut rgba8 =
-            tile::detile_2d(&raw, width, height, pitch, 4).map_err(|e| e.to_string())?;
-        // Scan-out samples the front buffer through fetch constant 0, as
-        // Xenia's swap texture does: its swizzle undoes a red/blue swap the
-        // final resolve put in (copy_dest_swap with a zyxw fetch).
         let f = xenon_texture::TextureFetch::decode(self.regs.fetch_constant(0));
-        if f.fetch_type == 2 && f.base_address & PHYSICAL_MASK == addr {
-            xenon_texture::apply_swizzle(&mut rgba8, f.swizzle);
-        }
-        Ok(Frame {
-            width,
-            height,
-            rgba8,
-        })
+        let swizzle =
+            (f.fetch_type == 2 && f.base_address & PHYSICAL_MASK == addr).then_some(f.swizzle);
+        (endian, swizzle)
     }
 }
+
+/// A tiled front buffer's bytes as a frame.
+fn detile_front(
+    mut raw: Vec<u8>,
+    width: u32,
+    height: u32,
+    pitch: u32,
+    endian: xenon_texture::Endian,
+    swizzle: Option<u16>,
+) -> Result<Frame, String> {
+    xenon_texture::endian::swap_in_place(&mut raw, endian);
+    let mut rgba8 =
+        xenon_texture::tile::detile_2d(&raw, width, height, pitch, 4).map_err(|e| e.to_string())?;
+    if let Some(s) = swizzle {
+        xenon_texture::apply_swizzle(&mut rgba8, s);
+    }
+    Ok(Frame {
+        width,
+        height,
+        rgba8,
+    })
+}
+
+impl Drawer {}
 
 /// The base level of an unsigned DXT1, DXT2/3 or DXT4/5 `fetch` as linear
 /// BC1, BC2 or BC3 blocks (endian swapped and detiled, as the CPU decoder

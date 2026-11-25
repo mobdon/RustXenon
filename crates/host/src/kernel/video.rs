@@ -195,6 +195,9 @@ pub fn start(rt: std::sync::Arc<Runtime>) {
                         // visual change and saved about 23 ms a frame.
                         let mode = std::env::var("XENON_RESOLVE_WRITEBACK");
                         d.skip_resolve_writeback = !matches!(mode.as_deref(), Ok("on" | "late"));
+                        // Frame images come one swap late, so a swap never
+                        // waits for the GPU (XENON_LATE_FRAME=0 turns it off).
+                        d.late_front_buffer = std::env::var("XENON_LATE_FRAME").as_deref() != Ok("0");
                         if d.skip_resolve_writeback {
                             crate::log("[draw] resolve write-back: skipped (the CPU never sees resolve output; XENON_RESOLVE_WRITEBACK=on writes it back)");
                         }
