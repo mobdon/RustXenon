@@ -1300,6 +1300,9 @@ const ARENA_GROUP_CAP: usize = 4096;
 /// Texture bind groups kept between evictions and replay ends.
 const TEXTURE_GROUP_CAP: usize = 4096;
 
+/// Bytes of each upload staging chunk, and the most one belt write takes.
+const BELT_CHUNK: u64 = 4 << 20;
+
 /// Smallest draw upload arena; it grows to fit a larger draw.
 const ARENA_MIN: u64 = 16 << 20;
 
@@ -1839,7 +1842,7 @@ impl Drawer {
             staged_consts: None,
             staged_base: 0,
             watching: false,
-            belt: wgpu::util::StagingBelt::new(device_for_belt, 4 << 20),
+            belt: wgpu::util::StagingBelt::new(device_for_belt, BELT_CHUNK),
             submitter,
             pre: None,
             resolve_pending: false,
@@ -2639,15 +2642,20 @@ impl Drawer {
         let _ = self.device.poll(wgpu::PollType::Poll);
         self.belt.recall();
         let mut upload = None;
-        if let (Some(arena), Some(size)) =
-            (&self.arena, wgpu::BufferSize::new(self.staged.len() as u64))
-        {
+        if let (Some(arena), false) = (&self.arena, self.staged.is_empty()) {
             // Submitted first, so ordered after the work already submitted,
             // which reads only bytes before `staged_base` (or before a wrap).
             let mut enc = self.device.create_command_encoder(&Default::default());
-            self.belt
-                .write_buffer(&mut enc, arena, self.staged_base, size)
-                .copy_from_slice(&self.staged);
+            // In chunk-sized pieces: the belt makes a chunk as large as a
+            // write and never frees one, so batches of growing sizes kept
+            // adding larger chunks (host memory crept by hundreds of MB).
+            for (i, piece) in self.staged.chunks(BELT_CHUNK as usize).enumerate() {
+                let size = wgpu::BufferSize::new(piece.len() as u64).expect("non-empty");
+                let at = self.staged_base + i as u64 * BELT_CHUNK;
+                self.belt
+                    .write_buffer(&mut enc, arena, at, size)
+                    .copy_from_slice(piece);
+            }
             self.belt.finish();
             upload = Some(enc);
             self.staged_base += self.staged.len() as u64;
