@@ -13,6 +13,7 @@ license.workspace = true
 # the WGSL front end are enabled.
 wgpu = { version = "30", default-features = false, features = ["std", "parking_lot", "vulkan", "gles", "wgsl", "counters"] }
 pollster = "0.4"
+rustc-hash = "1.1"
 png = "0.18"
 xenon-gpu = { path = "../gpu" }
 xenon-texture = { path = "../texture" }

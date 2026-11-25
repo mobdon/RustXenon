@@ -167,7 +167,13 @@ pub mod state;
 
 use std::collections::hash_map::DefaultHasher;
 use std::collections::hash_map::Entry;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::BTreeMap;
+
+/// The drawer's maps are looked up several times per draw with keys it
+/// makes itself; Fx hashing costs a fraction of std's SipHash there.
+type HashMap<K, V> =
+    std::collections::HashMap<K, V, std::hash::BuildHasherDefault<rustc_hash::FxHasher>>;
+type HashSet<K> = std::collections::HashSet<K, std::hash::BuildHasherDefault<rustc_hash::FxHasher>>;
 use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex};
@@ -1761,35 +1767,35 @@ impl Drawer {
             regs: RegisterFile::default(),
             vs: None,
             ps: None,
-            translated: HashMap::new(),
-            modules: HashMap::new(),
-            pipelines: HashMap::new(),
+            translated: HashMap::default(),
+            modules: HashMap::default(),
+            pipelines: HashMap::default(),
             pipeline_uses: 0,
             pipeline_cap: PIPELINE_CAP,
             pipeline_drops: 0,
-            texture_layouts: HashMap::new(),
+            texture_layouts: HashMap::default(),
             group0,
             clear_layout,
             clear_module,
-            clear_pipelines: HashMap::new(),
-            targets: HashMap::new(),
-            written: HashMap::new(),
+            clear_pipelines: HashMap::default(),
+            targets: HashMap::default(),
+            written: HashMap::default(),
             target_drops: 0,
             target_cap: TARGET_CAP,
             clock: 0,
             transfer_module: None,
-            transfer_pipelines: HashMap::new(),
-            resolved_endian: HashMap::new(),
-            texture_cache: HashMap::new(),
+            transfer_pipelines: HashMap::default(),
+            resolved_endian: HashMap::default(),
+            texture_cache: HashMap::default(),
             texture_cache_bytes: 0,
-            texture_evicted: HashSet::new(),
+            texture_evicted: HashSet::default(),
             replays: 0,
-            texture_memo: HashMap::new(),
+            texture_memo: HashMap::default(),
             texture_scratch: Vec::new(),
-            samplers: HashMap::new(),
+            samplers: HashMap::default(),
             batch: None,
-            texture_groups: HashMap::new(),
-            arena_groups: HashMap::new(),
+            texture_groups: HashMap::default(),
+            arena_groups: HashMap::default(),
             staged: Vec::new(),
             arena: None,
             window_memo: BTreeMap::new(),
@@ -1812,7 +1818,7 @@ impl Drawer {
             float_stencil,
             snorm16,
             snorm16_blend,
-            half_luts: HashMap::new(),
+            half_luts: HashMap::default(),
             mirrors: Vec::new(),
             decode_pipelines: [None, None],
             skip_resolve_writeback: false,
@@ -2020,8 +2026,7 @@ impl Drawer {
                 .flat_map(|m| m.views.values())
                 .map(|k| texture_bytes(&k.tex))
                 .sum::<u64>();
-        let pairs: std::collections::HashSet<(u64, u64)> =
-            self.pipelines.keys().map(|k| (k.vs, k.ps)).collect();
+        let pairs: HashSet<(u64, u64)> = self.pipelines.keys().map(|k| (k.vs, k.ps)).collect();
         let wgsl: Vec<usize> = self
             .translated
             .values()
@@ -2557,7 +2562,7 @@ impl Drawer {
             dirty: Vec::new(),
             hashes,
             checked,
-            views: HashMap::new(),
+            views: HashMap::default(),
         });
         Ok(Some(self.mirrors.len() - 1))
     }
