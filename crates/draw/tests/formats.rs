@@ -586,6 +586,16 @@ fn sample_fetch(
     fetch: [u32; 6],
     texel_bytes: &[u8],
 ) -> Vec<u8> {
+    sample_fetch_report(d, rt_format, fetch, texel_bytes).0
+}
+
+/// As `sample_fetch`, also returning the draw's report.
+fn sample_fetch_report(
+    d: &mut xenon_draw::Drawer,
+    rt_format: u32,
+    fetch: [u32; 6],
+    texel_bytes: &[u8],
+) -> (Vec<u8>, xenon_draw::Report) {
     let mut mem = memory();
     mem.data[TEXTURE as usize..][..texel_bytes.len()].copy_from_slice(texel_bytes);
     let q = W as f32;
@@ -612,7 +622,7 @@ fn sample_fetch(
         (TargetFormat::Rgba16Float, 8)
     };
     let raw = d.read_render_target_raw(key(target), 0, 0, W, H).unwrap();
-    texel(&raw, W, bytes, 8, 8)
+    (texel(&raw, W, bytes, 8, 8), report)
 }
 
 const PRIM_QUAD_LIST: u32 = 13;
@@ -1232,6 +1242,31 @@ fn signed_texels_filter_after_conversion() {
     // Every component within 2^-8 of 0 (either sign).
     let h = halves(&raw);
     assert!(h.iter().all(|&h| h & 0x7FFF <= 0x1C00), "{h:x?}");
+}
+
+/// A texture signed in every component uploads as halves: a signed 8_8_8_8
+/// texel 0x40 reads 64/127 rounded to the nearest half, 1032/2048 (within
+/// 2^-12 of it), and 0x81 reads -1 exactly.
+#[test]
+fn all_signed_8_8_8_8_texel_rounds_to_a_half() {
+    let Some(mut d) = drawer() else { return };
+    let fetch = [
+        2 | (0x55 << 2) | (2 << 10) | (2 << 13) | (1 << 22),
+        6 | TEXTURE, // 8_8_8_8
+        0,
+        ((1 << 3) | (2 << 6) | (3 << 9)) << 1, // swizzle XYZW
+        0,
+        1 << 9,
+    ];
+    let bytes = [0x40, 0x81, 0, 0];
+    let red = |raw: Vec<u8>| f32::from_le_bytes(raw.try_into().unwrap());
+    let (raw, report) = sample_fetch_report(&mut d, RT_32_FLOAT, fetch, &bytes);
+    assert_eq!(red(raw), 1032.0 / 2048.0);
+    // Bucket 2 is Rgba16Float: one 1x1 texel of four halves.
+    assert_eq!(report.timings.uploads_by_format[2], (1, 8), "{report:?}");
+    let mut fetch = fetch;
+    fetch[3] = (1 | (2 << 6) | (3 << 9)) << 1; // swizzle YXZW
+    assert_eq!(red(sample_fetch(&mut d, RT_32_FLOAT, fetch, &bytes)), -1.0);
 }
 
 /// A signed 16_16 texel reads its fields exactly as two's complement:

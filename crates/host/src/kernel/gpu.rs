@@ -129,13 +129,18 @@ impl DrawStats {
         let ms = |d: std::time::Duration| d.as_secs_f64() * 1e3 / f64::from(n);
         let mb = |b: u64| b as f64 / 1e6 / f64::from(n);
         let t = &self.t;
+        let by = |i: usize| {
+            let (count, bytes) = t.uploads_by_format[i];
+            format!("{} ({:.1} MB)", count / n, mb(bytes))
+        };
         format!(
             "[draw] {:.1} s: {} frames, {} replays; ms per {per}: drawer {:.0} = shaders {:.0}, \
              guest data {:.0}, textures {:.0}, submit {:.0}, gpu wait {:.0}, readback {:.0}, \
              resolve cpu {:.0}, clears {:.0}, swap {:.0} (transfers {:.0}); per {per}: {} draws, \
              {} resolves, {} submits, {} transfers ({} passes), readback {:.1} MB, \
              hashed {:.1} MB, {} textures uploaded ({:.1} MB, {} evicted before), \
-             {} evicted, {} from kept resolves, {} pipelines created",
+             {} evicted, {} from kept resolves, {} pipelines created; guest data {:.1} MB; \
+             uploads by format: rgba8 {}, bc {}, f16 {}, f32 {}, other {}",
             window.as_secs_f64(),
             self.frames,
             self.replays,
@@ -163,6 +168,12 @@ impl DrawStats {
             t.textures_evicted / n,
             t.textures_kept / n,
             t.pipelines_created / n,
+            mb(t.guest_bytes),
+            by(0),
+            by(1),
+            by(2),
+            by(3),
+            by(4),
         )
     }
 }
@@ -629,6 +640,8 @@ mod tests {
         s.t.transfers = 12;
         s.t.transfer_passes = 60;
         s.t.readback_bytes = 80_000_000;
+        s.t.guest_bytes = 9_000_000;
+        s.t.uploads_by_format = [(600, 200_000_000), (40, 8_000_000), (6, 0), (0, 0), (0, 0)];
         let line = s.line(ms(5000));
         assert!(
             line.starts_with("[draw] 5.0 s: 2 frames, 7 replays; ms per frame: drawer 1000 ="),
@@ -640,6 +653,8 @@ mod tests {
             "42 resolves",
             "6 transfers (30 passes)",
             "readback 40.0 MB",
+            "guest data 4.5 MB",
+            "rgba8 300 (100.0 MB), bc 20 (4.0 MB), f16 3 (0.0 MB), f32 0 (0.0 MB), other 0",
         ] {
             assert!(line.contains(part), "{part}: {line}");
         }

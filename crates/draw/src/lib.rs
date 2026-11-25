@@ -392,6 +392,9 @@ pub struct Timings {
     /// evicted, and the textures it evicted.
     pub textures_reuploaded: u32,
     pub textures_evicted: u32,
+    /// `textures_uploaded` and `texture_bytes` by host format: `Rgba8Unorm`,
+    /// BC blocks, `Rgba16Float`, `Rgba32Float`, other.
+    pub uploads_by_format: [(u32, u64); 5],
     /// Draws whose vertex window lies in one already staged in the same
     /// batch, bound from there instead of read and staged again; and the
     /// guest bytes of their windows.
@@ -426,6 +429,10 @@ impl std::ops::AddAssign<&Timings> for Timings {
         self.kept_hashed_bytes += t.kept_hashed_bytes;
         self.textures_reuploaded += t.textures_reuploaded;
         self.textures_evicted += t.textures_evicted;
+        for (a, b) in self.uploads_by_format.iter_mut().zip(t.uploads_by_format) {
+            a.0 += b.0;
+            a.1 += b.1;
+        }
         self.windows_reused += t.windows_reused;
         self.reused_bytes += t.reused_bytes;
     }
@@ -2754,12 +2761,11 @@ impl Drawer {
         };
         let (w, h) = (fetch.width(), fetch.height());
         let pitch = xenon_texture::tile::align_to_tile(fetch.pitch_texels());
-        let signed = fetch.sign.contains(&1);
         if !fetch.tiled
             || fetch.format.data_format() != F::K8_8_8_8
             || fetch.dimension != Dimension::D2OrStacked
             || fetch.stacked
-            || host_texture_format(fetch.format, signed, self.float32_filterable)
+            || host_texture_format(fetch.format, fetch.sign, self.float32_filterable)
                 != wgpu::TextureFormat::Rgba8Unorm
             || !(addr - self.mirrors[i].lo).is_multiple_of(4)
             || pitch < w
@@ -2936,7 +2942,7 @@ impl Drawer {
             return Ok(view);
         }
         let signed = fetch.sign.contains(&1);
-        let mut host = host_texture_format(fetch.format, signed, self.float32_filterable);
+        let mut host = host_texture_format(fetch.format, fetch.sign, self.float32_filterable);
         let bc = if self.bc_textures && !signed {
             bc_blocks(fetch, &bytes).map_err(|e| e.to_string())?
         } else {
@@ -2971,6 +2977,16 @@ impl Drawer {
         };
         report.timings.textures_uploaded += 1;
         report.timings.texture_bytes += data.len() as u64;
+        let bucket = match host {
+            wgpu::TextureFormat::Rgba8Unorm => 0,
+            _ if host.is_compressed() => 1,
+            wgpu::TextureFormat::Rgba16Float => 2,
+            wgpu::TextureFormat::Rgba32Float => 3,
+            _ => 4,
+        };
+        let by = &mut report.timings.uploads_by_format[bucket];
+        by.0 += 1;
+        by.1 += data.len() as u64;
         // Rows of blocks: a BC row holds four rows of texels.
         let rows = height / host.block_dimensions().1;
         let tex = self.device.create_texture(&wgpu::TextureDescriptor {
@@ -4145,16 +4161,21 @@ fn bc_blocks(
 /// a magnitude of 65520 or more become infinity and values below about 2^-25
 /// flush to zero.
 ///
-/// `signed` (a fetch sign of 1 on any component) moves the 8-bit formats to
-/// the wide float format too: the decoder writes signed values in -1..1,
-/// which the host then filters directly, and the texture's unsigned
-/// components keep their 8-bit values exactly (a half would not).
+/// A fetch sign of 1 (signed) on any component moves the 8-bit formats to
+/// a float format too: the decoder writes signed values in -1..1, which the
+/// host then filters directly. With every component signed that is
+/// `Rgba16Float`: n/127 (and the other fields of 11 bits or less) round by
+/// at most 2^-12 relative, far below a step. Otherwise it is the wide
+/// format, so the texture's unsigned components keep their 8-bit values
+/// exactly (a half would not, and the biased and gamma conversions in the
+/// shader would carry the rounding to the result).
 fn host_texture_format(
     format: xenon_texture::TextureFormat,
-    signed: bool,
+    sign: [u8; 4],
     float32: bool,
 ) -> wgpu::TextureFormat {
     use xenon_texture::TextureFormat as F;
+    let signed = sign.contains(&1);
     let wide = if float32 {
         wgpu::TextureFormat::Rgba32Float
     } else {
@@ -4171,6 +4192,7 @@ fn host_texture_format(
         | F::K32_32Float
         | F::K32_32_32Float
         | F::K32_32_32_32Float => wide,
+        _ if sign == [1; 4] => wgpu::TextureFormat::Rgba16Float,
         _ if signed => wide,
         _ => wgpu::TextureFormat::Rgba8Unorm,
     }
@@ -4342,24 +4364,39 @@ mod tests {
     fn host_texture_formats() {
         use wgpu::TextureFormat as H;
         use xenon_texture::TextureFormat as F;
-        assert_eq!(host_texture_format(F::K8_8_8_8, false, true), H::Rgba8Unorm);
-        assert_eq!(host_texture_format(F::K8_8_8_8, true, true), H::Rgba32Float);
-        assert_eq!(host_texture_format(F::Dxt1, true, false), H::Rgba16Float);
-        assert_eq!(host_texture_format(F::Dxt1, false, true), H::Rgba8Unorm);
+        let (unsigned, signed, mixed) = ([0; 4], [1; 4], [1, 0, 3, 1]);
         assert_eq!(
-            host_texture_format(F::K16Expand, false, true),
+            host_texture_format(F::K8_8_8_8, unsigned, true),
+            H::Rgba8Unorm
+        );
+        assert_eq!(
+            host_texture_format(F::K8_8_8_8, signed, true),
             H::Rgba16Float
         );
         assert_eq!(
-            host_texture_format(F::K24_8Float, false, true),
+            host_texture_format(F::K8_8_8_8, mixed, true),
+            H::Rgba32Float
+        );
+        assert_eq!(host_texture_format(F::Dxt1, signed, true), H::Rgba16Float);
+        assert_eq!(host_texture_format(F::Dxt1, mixed, false), H::Rgba16Float);
+        assert_eq!(host_texture_format(F::Dxt1, unsigned, true), H::Rgba8Unorm);
+        assert_eq!(
+            host_texture_format(F::K16Expand, unsigned, true),
+            H::Rgba16Float
+        );
+        assert_eq!(
+            host_texture_format(F::K24_8Float, unsigned, true),
             H::Rgba32Float
         );
         assert_eq!(
-            host_texture_format(F::K24_8Float, false, false),
+            host_texture_format(F::K24_8Float, unsigned, false),
             H::Rgba16Float
         );
-        assert_eq!(host_texture_format(F::K16_16, false, true), H::Rgba32Float);
-        assert_eq!(host_texture_format(F::K16_16, true, true), H::Rgba32Float);
+        assert_eq!(
+            host_texture_format(F::K16_16, unsigned, true),
+            H::Rgba32Float
+        );
+        assert_eq!(host_texture_format(F::K16_16, signed, true), H::Rgba32Float);
     }
 
     #[test]

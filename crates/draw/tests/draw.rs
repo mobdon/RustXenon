@@ -162,6 +162,8 @@ fn textured_quad_samples_tiled_texture() {
     }
     assert_eq!(px(&img, W, n, n), CLEAR);
     assert_eq!(report.timings.textures_uploaded, 1);
+    let rgba8 = (1, report.timings.texture_bytes);
+    assert_eq!(report.timings.uploads_by_format[0], rgba8, "{report:?}");
 
     // Unchanged guest bytes come from the texture cache.
     let report = run(&mut d, &s, &mut mem);
@@ -265,6 +267,9 @@ fn draw_dxt(
     assert_eq!(report.draws, 1, "{report:?}");
     assert!(report.warnings.is_empty(), "{report:?}");
     assert_eq!(report.timings.textures_uploaded, 1, "{report:?}");
+    // Bucket 1 is BC blocks, bucket 0 the CPU decode's Rgba8Unorm.
+    let by = report.timings.uploads_by_format[usize::from(bc)];
+    assert_eq!(by, (1, report.timings.texture_bytes), "{report:?}");
     let img = d.read_render_target(COLOR_KEY, 0, 0, W, H).unwrap();
     let pixels = (0..qw * qh).map(|i| px(&img, W, i % qw, i / qw)).collect();
     Some((pixels, report.timings.texture_bytes))
