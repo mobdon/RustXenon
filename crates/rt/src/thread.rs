@@ -1,7 +1,7 @@
 //! Per-guest-thread state: suspend count, exit value and host join handle.
 //! The runtime's public API is on [`crate::Runtime`].
 
-use std::cell::RefCell;
+use std::cell::OnceCell;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
@@ -23,7 +23,9 @@ pub(crate) struct GuestThread {
 }
 
 thread_local! {
-    static CURRENT: RefCell<Option<Arc<GuestThread>>> = const { RefCell::new(None) };
+    // Set once per host thread and never borrowed mutably, so the per-call
+    // checkpoint has no borrow flag that could panic (seen once in a game run).
+    static CURRENT: OnceCell<Arc<GuestThread>> = const { OnceCell::new() };
 }
 
 impl GuestThread {
@@ -101,22 +103,26 @@ pub(crate) struct Exit;
 
 impl Drop for Exit {
     fn drop(&mut self) {
-        if let Some(t) = CURRENT.with(|c| c.borrow_mut().take()) {
-            t.mark_done(None);
-        }
+        CURRENT.with(|c| {
+            if let Some(t) = c.get() {
+                t.mark_done(None);
+            }
+        });
     }
 }
 
 /// Binds `t` to the calling host thread.
 pub(crate) fn enter(t: Arc<GuestThread>) -> Exit {
-    CURRENT.with(|c| *c.borrow_mut() = Some(t));
+    CURRENT.with(|c| {
+        assert!(c.set(t).is_ok(), "host thread already runs a guest thread");
+    });
     Exit
 }
 
 /// Records a normal return with exit value `code`.
 pub(crate) fn finish(code: u64) {
     CURRENT.with(|c| {
-        if let Some(t) = &*c.borrow() {
+        if let Some(t) = c.get() {
             t.mark_done(Some(code));
         }
     });
@@ -127,12 +133,43 @@ pub(crate) fn finish(code: u64) {
 #[inline]
 pub(crate) fn checkpoint() {
     CURRENT.with(|c| {
-        if let Some(t) = &*c.borrow() {
+        if let Some(t) = c.get() {
             t.wait_while_suspended();
         }
     });
 }
 
 pub(crate) fn current_id() -> Option<u32> {
-    CURRENT.with(|c| c.borrow().as_ref().map(|t| t.id))
+    CURRENT.with(|c| c.get().map(|t| t.id))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Hammers the per-call checkpoint while another thread suspends and
+    /// resumes it, then checks the exit value and that a host thread cannot
+    /// be bound twice.
+    #[test]
+    fn checkpoint_survives_suspend_resume_storm() {
+        let t = Arc::new(GuestThread::new(7, 0));
+        let t2 = t.clone();
+        let h = std::thread::spawn(move || {
+            let _exit = enter(t2.clone());
+            assert_eq!(current_id(), Some(7));
+            for _ in 0..200_000 {
+                checkpoint();
+            }
+            let again = std::panic::catch_unwind(|| drop(enter(t2)));
+            assert!(again.is_err());
+            finish(42);
+        });
+        for _ in 0..2_000 {
+            t.suspend();
+            t.resume();
+        }
+        assert_eq!(t.join(), 42);
+        h.join().unwrap();
+        assert_eq!(current_id(), None);
+    }
 }
