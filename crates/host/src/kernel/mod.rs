@@ -242,6 +242,14 @@ pub fn write_cstr(rt: &Runtime, a: u32, s: &str) {
     rt.mem.write_u8(a + s.len() as u32, 0);
 }
 
+/// The command line the title reads: its own name, then `extra` if given.
+pub fn command_line(extra: Option<&str>) -> String {
+    match extra.map(str::trim).filter(|e| !e.is_empty()) {
+        Some(e) => format!("\"default.xex\" {e}"),
+        None => "\"default.xex\"".to_string(),
+    }
+}
+
 /// What the host was given to run.
 pub struct Setup<'a> {
     pub file: &'a [u8],
@@ -339,10 +347,12 @@ pub fn install(rt: &mut Runtime, s: &Setup) {
                 rt.mem.write_u32(a, module);
                 a
             }
-            // ExLoadedCommandLine
+            // ExLoadedCommandLine; `XENON_ARGS` adds switches after the name.
             430 => {
                 let a = alloc(1024);
-                write_cstr(rt, a, "\"default.xex\"");
+                let line = command_line(std::env::var("XENON_ARGS").ok().as_deref());
+                assert!(line.len() < 1024, "XENON_ARGS is too long");
+                write_cstr(rt, a, &line);
                 a
             }
             // VdGpuClockInMHz
@@ -362,6 +372,7 @@ pub fn install(rt: &mut Runtime, s: &Setup) {
         };
         rt.mem.write_u32(slot, a);
     }
+    rtl::install_game_log(rt, s.image);
     let thunks: Vec<u32> = calls.keys().copied().collect();
     crate::set_thunk_range(
         thunks.iter().min().copied().unwrap_or(0),
