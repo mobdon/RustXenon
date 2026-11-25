@@ -61,6 +61,11 @@
 //! [`Report::warnings`]; colour targets of different formats at one base
 //! and pitch are not reported.
 //!
+//! At the end of a replay a target is dropped when a newer one on the same
+//! tiles, whose words transfer to it, has written all its rows: used again,
+//! it is made anew and takes that newer target's words. Past a bound on
+//! their host memory the least recently written targets are dropped too.
+//!
 //! Colour targets ([`TargetFormat`]; formats with one bit layout share a
 //! key):
 //!
@@ -1280,7 +1285,10 @@ impl Drawer {
         }
     }
 
-    /// Keys of every render target created so far.
+    /// Keys of the render targets the drawer holds: every one created so
+    /// far, less those dropped at the end of a replay (a newer target on
+    /// the same EDRAM tiles holds their words, or targets were over their
+    /// memory cap). Reading a dropped one gives [`Error::NoRenderTarget`].
     pub fn render_targets(&self) -> Vec<RenderTargetKey> {
         self.targets.keys().copied().collect()
     }
