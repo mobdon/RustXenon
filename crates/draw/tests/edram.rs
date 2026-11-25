@@ -280,3 +280,50 @@ fn untransferred_aliasing_is_reported() {
         "{report:?}"
     );
 }
+
+/// A transfer makes both targets current: reading the depth target's
+/// words through the colour target does not make the colour target newer,
+/// so the depth target is not transferred back. Back through kD24FS8's
+/// 20e4 word, a depth of 0.3 written by a draw would become a little less
+/// and fail a coplanar EQUAL test after the colour resolve.
+#[test]
+fn transfer_does_not_bounce_back() {
+    let Some(mut d) = drawer() else { return };
+    let mut mem = memory();
+    let mut s = Stream::default();
+    mem.write_words(
+        VERTS,
+        &color_verts(&[
+            (0.0, 0.0, 0.3, RED),
+            (64.0, 0.0, 0.3, RED),
+            (0.0, 64.0, 0.3, RED),
+        ]),
+    );
+    // Depth only (colour mask 0): z ALWAYS with z write.
+    s.setup()
+        .regs(RB_DEPTH_INFO, &[D24FS8_AT_0])
+        .regs(RB_COLOR_MASK, &[0])
+        .shader(false, &vs_color())
+        .shader(true, &ps_interp())
+        .regs(RB_DEPTHCONTROL, &[2 | 4 | (7 << 4)])
+        .vertex_fetch(0, VERTS, 24)
+        .draw_auto(PRIM_RECT_LIST, 3)
+        .regs(RB_DEPTHCONTROL, &[0])
+        .regs(RB_COLOR_MASK, &[0xF]);
+    resolve_words(&mut s, &mut mem, false, DEST2);
+    // The same rectangle into colour at tile 100, z EQUAL.
+    s.regs(RB_COLOR_INFO, &[100])
+        .regs(RB_DEPTHCONTROL, &[2 | (2 << 4)])
+        .vertex_fetch(0, VERTS, 24)
+        .draw_auto(PRIM_RECT_LIST, 3);
+    let report = run(&mut d, &s, &mut mem);
+    assert_eq!((report.draws, report.resolves), (2, 1), "{report:?}");
+    assert!(report.warnings.is_empty(), "{report:?}");
+    let key = RenderTargetKey {
+        base_tiles: 100,
+        pitch: W,
+        format: TargetFormat::Rgba8,
+    };
+    let img = d.read_render_target(key, 0, 0, W, H).unwrap();
+    assert_eq!(px(&img, W, 10, 10), RED);
+}

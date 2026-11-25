@@ -49,13 +49,17 @@ fn from_unorm24(n: u32) -> f32 {
     return bitcast<f32>(((126u - lz) << 23u) + ((n << lz) & 0x7FFFFFu) + 1u);
 }
 
-@fragment
-fn color_to_depth(@builtin(position) pos: vec4<f32>) -> @builtin(frag_depth) f32 {
-    let d = color_word(pos) >> 8u;
+// The depth of 24-bit EDRAM depth `d`, as the depth clear makes it.
+fn word_depth(d: u32) -> f32 {
     if transfer_20e4 {
         return from_20e4(d);
     }
-    return f32(d) * (1.0 / 16777215.0);
+    return from_unorm24(d);
+}
+
+@fragment
+fn color_to_depth(@builtin(position) pos: vec4<f32>) -> @builtin(frag_depth) f32 {
+    return word_depth(color_word(pos) >> 8u);
 }
 
 // wgpu has no stencil export: one pass per stencil bit after the stencil

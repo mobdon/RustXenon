@@ -32,7 +32,8 @@
 //! is `pitch` pixels wide and [`RENDER_TARGET_HEIGHT`] pixels high (the
 //! EDRAM holds 2048 rows of 1280 32-bit pixels).
 //!
-//! Each target records when it was last written (draw, clear or transfer).
+//! Each target records when it was last written (draw or clear; a transfer
+//! gives the target its source's stamp, so neither is transferred back).
 //! When a draw, clear or resolve uses a target and a `k_8_8_8_8` colour
 //! and a depth target at the same base and pitch were written later by
 //! the other one, that one's pixels are first transferred into it, as
@@ -494,8 +495,9 @@ pub struct Drawer {
     clear_module: wgpu::ShaderModule,
     clear_pipelines: HashMap<wgpu::TextureFormat, wgpu::RenderPipeline>,
     targets: HashMap<RenderTargetKey, wgpu::Texture>,
-    /// When each render target was last written (draw, clear or transfer)
-    /// and how many rows down, for EDRAM ownership transfers.
+    /// When each render target was last written (draw or clear; a transfer
+    /// copies its source's stamp) and how many rows down, for EDRAM
+    /// ownership transfers.
     written: HashMap<RenderTargetKey, Written>,
     clock: u64,
     transfer_module: Option<wgpu::ShaderModule>,
@@ -1195,7 +1197,11 @@ impl Drawer {
         if let Some((src, w)) = newest {
             if transferable(src.format, key.format) {
                 self.transfer(src, key, &tex, w.rows)?;
-                self.mark_written(key, w.rows);
+                // Both now hold the same words: the source's stamp, so
+                // using the source again does not transfer them back.
+                let own = self.written.entry(key).or_default();
+                own.stamp = w.stamp;
+                own.rows = own.rows.max(w.rows);
             } else {
                 report.warn(format!(
                     "{:?} render target aliases a newer {:?} one at its EDRAM base; not transferred",
@@ -2689,6 +2695,87 @@ fn host_texture_format(format: xenon_texture::TextureFormat, float32: bool) -> w
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// transfer.wgsl's `word_depth` makes exactly the depth the depth clear
+    /// makes: n / 0xFFFFFF rounded to the nearest f32 for kD24S8 (a host
+    /// that keeps Depth24PlusStencil8 as 32-bit float stores it as is;
+    /// lavapipe's 24-bit store would hide a mismatch), float20e4 for kD24FS8.
+    #[test]
+    fn transfer_word_depth_matches_the_clear() {
+        let d = match Drawer::new() {
+            Ok(d) => d,
+            Err(Error::NoAdapter) if std::env::var("XENON_REQUIRE_GPU").as_deref() != Ok("1") => {
+                return
+            }
+            Err(e) => panic!("{e}"),
+        };
+        // Odd n (the ones a reciprocal multiply gets wrong) across 24 bits.
+        const N: u32 = 1 << 20;
+        let n = |i: u32| (i << 4) | 15;
+        let wgsl = [
+            include_str!("resolve.wgsl"),
+            include_str!("transfer.wgsl"),
+            "@compute @workgroup_size(64)\n\
+             fn word_depth_test(@builtin(global_invocation_id) id: vec3<u32>) {\n\
+             \x20   dest[id.x] = bitcast<u32>(word_depth((id.x << 4u) | 15u));\n}\n",
+        ]
+        .concat();
+        let module = d.device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: None,
+            source: wgpu::ShaderSource::Wgsl(wgsl.into()),
+        });
+        for float in [false, true] {
+            let pipeline = d
+                .device
+                .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                    label: None,
+                    layout: None,
+                    module: &module,
+                    entry_point: Some("word_depth_test"),
+                    compilation_options: wgpu::PipelineCompilationOptions {
+                        constants: &[("transfer_20e4", if float { 1.0 } else { 0.0 })],
+                        ..Default::default()
+                    },
+                    cache: None,
+                });
+            let buffer = |usage| {
+                d.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: None,
+                    size: u64::from(N) * 4,
+                    usage,
+                    mapped_at_creation: false,
+                })
+            };
+            let out = buffer(wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC);
+            let read = buffer(wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST);
+            let group = d.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None,
+                layout: &pipeline.get_bind_group_layout(0),
+                entries: &[wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: out.as_entire_binding(),
+                }],
+            });
+            let mut enc = d.device.create_command_encoder(&Default::default());
+            {
+                let mut pass = enc.begin_compute_pass(&Default::default());
+                pass.set_pipeline(&pipeline);
+                pass.set_bind_group(0, &group, &[]);
+                pass.dispatch_workgroups(N / 64, 1, 1);
+            }
+            enc.copy_buffer_to_buffer(&out, 0, &read, 0, None);
+            let data = d.map_read(&read, d.queue.submit([enc.finish()])).unwrap();
+            for i in 0..N {
+                let got = u32::from_le_bytes(data[i as usize * 4..][..4].try_into().unwrap());
+                let want = if float {
+                    float20e4(n(i))
+                } else {
+                    (f64::from(n(i)) / f64::from(0xFF_FFFFu32)) as f32
+                };
+                assert_eq!(got, want.to_bits(), "{float} {:06X}", n(i));
+            }
+        }
+    }
 
     #[test]
     fn slice_memory_writes_inside_only() {
