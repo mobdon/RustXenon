@@ -1239,10 +1239,10 @@ impl Drop for Drawer {
 }
 
 /// Draws recorded into one command encoder, in one render pass while the
-/// render targets stay the same, and the resolve clears between them, each
-/// in a pass of its own. Submitted by [`Drawer::flush`] before anything
-/// that reads or writes the targets outside the batch (resolves and EDRAM
-/// transfers) and at the end of a replay.
+/// render targets stay the same, and the resolves, resolve clears and EDRAM
+/// transfers between them, each in a pass of its own. Submitted by
+/// [`Drawer::flush`] before anything that reads the targets outside the
+/// batch (write-backs, readbacks) and at the end of a replay.
 struct Batch {
     /// Dropped (ended) before `enc` is finished.
     pass: Option<(PassKey, wgpu::RenderPass<'static>, Bound)>,
