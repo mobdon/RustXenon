@@ -592,6 +592,50 @@ pub fn run(sha256: &str, regs: &[fn(&mut Runtime)]) -> ExitCode {
 
 /// Counts that grow if something is never released: open handles, live
 /// guest threads and host resident memory.
+/// The system allocator, counting the bytes Rust code holds, so the run
+/// log can tell Rust heap growth from memory a driver or C library takes.
+struct Counting;
+
+static RUST_HEAP: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+// SAFETY: forwards to System with the same layouts; only adds counting.
+unsafe impl std::alloc::GlobalAlloc for Counting {
+    unsafe fn alloc(&self, l: std::alloc::Layout) -> *mut u8 {
+        let p = unsafe { std::alloc::System.alloc(l) };
+        if !p.is_null() {
+            RUST_HEAP.fetch_add(l.size(), Ordering::Relaxed);
+        }
+        p
+    }
+    unsafe fn alloc_zeroed(&self, l: std::alloc::Layout) -> *mut u8 {
+        let p = unsafe { std::alloc::System.alloc_zeroed(l) };
+        if !p.is_null() {
+            RUST_HEAP.fetch_add(l.size(), Ordering::Relaxed);
+        }
+        p
+    }
+    unsafe fn dealloc(&self, p: *mut u8, l: std::alloc::Layout) {
+        unsafe { std::alloc::System.dealloc(p, l) };
+        RUST_HEAP.fetch_sub(l.size(), Ordering::Relaxed);
+    }
+    unsafe fn realloc(&self, p: *mut u8, l: std::alloc::Layout, n: usize) -> *mut u8 {
+        let q = unsafe { std::alloc::System.realloc(p, l, n) };
+        if !q.is_null() {
+            RUST_HEAP.fetch_add(n, Ordering::Relaxed);
+            RUST_HEAP.fetch_sub(l.size(), Ordering::Relaxed);
+        }
+        q
+    }
+}
+
+#[global_allocator]
+static ALLOC: Counting = Counting;
+
+/// Bytes the Rust heap holds now.
+pub fn rust_heap() -> usize {
+    RUST_HEAP.load(Ordering::Relaxed)
+}
+
 fn growth_line() -> String {
     let kx = kernel::k();
     let started = kx.threads.lock().map(|t| t.len()).unwrap_or(0) as u32;
@@ -599,9 +643,10 @@ fn growth_line() -> String {
     let rss = host_rss().map_or("?".into(), |b| (b >> 20).to_string());
     let r = |i: usize| kernel::files::READS[i].load(Ordering::Relaxed);
     format!(
-        "handles {}, threads {} live, host {rss} MB, file reads {} ({} MB, {} ms), {}",
+        "handles {}, threads {} live, host {rss} MB (Rust heap {} MB), file reads {} ({} MB, {} ms), {}",
         kx.handle_count(),
         started.saturating_sub(ended),
+        rust_heap() >> 20,
         r(0),
         r(1) >> 20,
         r(2) / 1000,
@@ -766,6 +811,23 @@ fn start_clock(rt: Arc<Runtime>) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn rust_heap_counts_allocations_and_frees() {
+        // Other tests allocate and free at the same time, so one clean try
+        // out of a few is enough.
+        let clean = (0..5).any(|_| {
+            let before = super::rust_heap();
+            let mut v = std::hint::black_box(vec![1u8; 32 << 20]);
+            let grown = super::rust_heap() >= before + (32 << 20);
+            v.resize(64 << 20, 0);
+            std::hint::black_box(&mut v);
+            let resized = super::rust_heap() >= before + (64 << 20);
+            drop(v);
+            grown && resized && super::rust_heap() < before + (16 << 20)
+        });
+        assert!(clean);
+    }
+
     #[test]
     fn ring_keeps_the_last_eight_calls_and_wait_marker_clears() {
         let c = xenon_rt::Context::new();
