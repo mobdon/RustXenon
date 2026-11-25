@@ -242,10 +242,11 @@ struct Mirror {
     dirty: Vec<(u64, u64)>,
     /// Hash of each [`KEPT_BLOCK`] bytes of the buffer from `lo`, as it held
     /// them when made from guest memory or last read back, to notice CPU
-    /// writes to guest memory since.
-    hashes: Vec<u64>,
-    /// Checked against guest memory (or made from it) this replay.
-    verified: bool,
+    /// writes to guest memory since; `None` until a resolve that covers
+    /// the block writes it back.
+    hashes: Vec<Option<u64>>,
+    /// Blocks checked against guest memory (or made from it) this replay.
+    checked: Vec<bool>,
     /// Textures decoded from the buffer, by fetch constant.
     views: HashMap<[u32; 6], Kept>,
 }
@@ -1430,7 +1431,7 @@ impl Drawer {
         self.texture_memo.clear();
         self.replays += 1;
         for m in &mut self.mirrors {
-            m.verified = false;
+            m.checked.fill(false);
         }
         let mut mem = Tracked {
             mem,
@@ -1563,32 +1564,38 @@ impl Drawer {
             .retain(|_, &mut (_, a, b)| b <= lo || hi <= a);
     }
 
-    /// [`KEPT_BLOCK`] hashes of `bytes`.
-    fn block_hashes(&mut self, bytes: &[u8]) -> Vec<u64> {
+    /// Hash of one [`KEPT_BLOCK`] of a kept resolve.
+    fn block_hash(&mut self, bytes: &[u8]) -> u64 {
         self.timings.kept_hashed_bytes += bytes.len() as u64;
-        bytes.chunks(KEPT_BLOCK as usize).map(hash_bytes).collect()
+        hash_bytes(bytes)
     }
 
-    /// Whether kept resolve `i` still matches guest memory, which the CPU
-    /// may have written since the last replay. A mismatch drops it (in
-    /// `skip_resolve_writeback` mode with its unwritten pixels, as the CPU
-    /// wrote after them).
-    fn verify(&mut self, i: usize, mem: &Tracked) -> bool {
-        if self.mirrors[i].verified {
-            return true;
+    /// Whether the blocks of kept resolve `i` over `[lo, hi)` still match
+    /// guest memory, which the CPU may have written since the last replay.
+    /// Only the blocks about to be used are checked, so a replay that uses
+    /// one tile of a large buffer does not hash all of it. A mismatch drops
+    /// it (in `skip_resolve_writeback` mode with its unwritten pixels, as
+    /// the CPU wrote after them).
+    fn verify(&mut self, i: usize, mem: &Tracked, lo: u64, hi: u64) -> bool {
+        let (m_lo, m_hi) = (self.mirrors[i].lo, self.mirrors[i].hi);
+        let k0 = (lo.max(m_lo) - m_lo) / KEPT_BLOCK;
+        let k1 = (hi.min(m_hi) - m_lo).div_ceil(KEPT_BLOCK);
+        for k in k0 as usize..k1 as usize {
+            if self.mirrors[i].checked[k] {
+                continue;
+            }
+            let a = m_lo + k as u64 * KEPT_BLOCK;
+            let b = (a + KEPT_BLOCK).min(m_hi);
+            let now = mem
+                .read_bytes(a as u32, (b - a) as usize)
+                .map(|b| self.block_hash(&b));
+            if now.is_none() || now != self.mirrors[i].hashes[k] {
+                self.mirrors.remove(i);
+                return false;
+            }
+            self.mirrors[i].checked[k] = true;
         }
-
-        let (lo, hi) = (self.mirrors[i].lo, self.mirrors[i].hi);
-        let now = mem
-            .read_bytes(lo as u32, (hi - lo) as usize)
-            .map(|b| self.block_hashes(&b));
-        let m = &mut self.mirrors[i];
-        if now.as_ref() == Some(&m.hashes) {
-            m.verified = true;
-            return true;
-        }
-        self.mirrors.remove(i);
-        false
+        true
     }
 
     /// Writes back to guest memory every kept resolve over `[lo, hi)` that
@@ -1605,7 +1612,8 @@ impl Drawer {
                 continue;
             }
             // A failed check removed mirror i; the next one moved to i.
-            if !self.verify(i, mem) {
+            let dirty = m.dirty.clone();
+            if !dirty.iter().all(|&(a, b)| self.verify(i, mem, a, b)) {
                 continue;
             }
             // Whole blocks come back, not only the dirty ranges: their
@@ -1668,9 +1676,11 @@ impl Drawer {
             self.mirrors[i].dirty.clear();
             if ok {
                 for (&(s, e), &at) in spans.iter().zip(&starts) {
-                    let h = self.block_hashes(&data[at as usize..(at + e - s) as usize]);
-                    let k = (s / KEPT_BLOCK) as usize;
-                    self.mirrors[i].hashes[k..k + h.len()].copy_from_slice(&h);
+                    let span = &data[at as usize..(at + e - s) as usize];
+                    for (j, block) in span.chunks(KEPT_BLOCK as usize).enumerate() {
+                        let h = self.block_hash(block);
+                        self.mirrors[i].hashes[(s / KEPT_BLOCK) as usize + j] = Some(h);
+                    }
                 }
             } else {
                 // Readable when made, so not expected; the pixels are lost.
@@ -1682,7 +1692,9 @@ impl Drawer {
     }
 
     /// End of a replay: writes back every kept resolve (unless
-    /// `skip_resolve_writeback`).
+    /// `skip_resolve_writeback`). A block left unhashed, made for a resolve
+    /// that failed before writing to it, fails its next check: hashing
+    /// guest memory now could miss a CPU write made after it was filled.
     fn finish_mirrors(&mut self, mem: &mut Tracked) -> Result<(), Error> {
         if !self.skip_resolve_writeback {
             self.sync(mem, 0, u64::MAX)?;
@@ -1690,13 +1702,13 @@ impl Drawer {
         Ok(())
     }
 
-    /// Index of the kept resolve buffer holding `[lo, hi)`, made from guest
-    /// memory if there is none. Kept buffers it overlaps or touches are
+    /// Index of the kept resolve buffer holding `[lo, hi)`, which a resolve
+    /// is about to write, made from guest memory if there is none. Kept buffers it overlaps or touches are
     /// written back and merged into it, so a texture over several resolves
     /// (tiles, one under the other) is in one buffer.
     fn mirror(&mut self, mem: &mut Tracked, lo: u64, hi: u64) -> Result<Option<usize>, Error> {
         if let Some(i) = self.mirrors.iter().position(|m| m.lo <= lo && hi <= m.hi) {
-            if self.verify(i, mem) {
+            if self.verify(i, mem, lo, hi) {
                 return Ok(Some(i));
             }
         }
@@ -1720,7 +1732,19 @@ impl Drawer {
         let Some(bytes) = mem.read_bytes(a as u32, (b - a) as usize) else {
             return Ok(None);
         };
-        let hashes = self.block_hashes(&bytes);
+        // With write-back, the blocks the resolve covers are hashed when
+        // it writes them back.
+        let covers = |k: u64| {
+            let s = a + k * KEPT_BLOCK;
+            !self.skip_resolve_writeback && lo <= s && (s + KEPT_BLOCK).min(b) <= hi
+        };
+        let covered: Vec<bool> = (0..(b - a).div_ceil(KEPT_BLOCK)).map(covers).collect();
+        let hashes = bytes
+            .chunks(KEPT_BLOCK as usize)
+            .zip(&covered)
+            .map(|(block, &c)| (!c).then(|| self.block_hash(block)))
+            .collect();
+        let checked = vec![true; covered.len()];
         let buf = self.buffer(
             "kept resolve",
             &bytes,
@@ -1732,7 +1756,7 @@ impl Drawer {
             buf,
             dirty: Vec::new(),
             hashes,
-            verified: true,
+            checked,
             views: HashMap::new(),
         });
         Ok(Some(self.mirrors.len() - 1))
@@ -2710,7 +2734,7 @@ impl Drawer {
             || pitch < w
             || w > self.max_dim
             || h > self.max_dim
-            || !self.verify(i, mem)
+            || !self.verify(i, mem, addr, end)
         {
             return Ok(None);
         }

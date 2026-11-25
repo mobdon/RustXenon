@@ -451,8 +451,10 @@ fn cpu_write_during_a_replay_takes_the_guest_path() {
 
 /// A kept buffer over three 64x32 tiles, resolved whole by one replay; the
 /// next replays (two per frame) resolve the first tile, then the first and
-/// last: each reads back only the tiles it resolved, not the middle one or
-/// the whole buffer, and writes back exactly those to guest memory.
+/// last: each reads back and hashes only the tiles it resolved, not the
+/// middle one or the whole buffer, and writes back exactly those to guest
+/// memory. The CPU wrote the middle tile, which no replay uses, so a
+/// write-back of the buffer's older copy of it would show.
 #[test]
 fn write_back_reads_back_only_resolved_bytes() {
     let tile = W * 32 * 4;
@@ -467,6 +469,7 @@ fn write_back_reads_back_only_resolved_bytes() {
         resolve_to(&mut s, &mut mem, W, 32, t);
     }
     run(&mut d, &s, &mut mem);
+    mem.data[tiles[1] as usize..][..tile as usize].fill(0x55);
     for (resolved, read) in [(&tiles[..1], tile), (&[tiles[0], tiles[2]][..], 2 * tile)] {
         let mut s = Stream::default();
         paint_small(s.setup());
@@ -477,6 +480,8 @@ fn write_back_reads_back_only_resolved_bytes() {
         let r = run(&mut d, &s, &mut mem);
         assert!(r.unsupported.is_empty(), "{r:?}");
         assert_eq!(r.timings.readback_bytes, u64::from(read), "{r:?}");
+        // Checked before the resolves, hashed again at write-back.
+        assert_eq!(r.timings.kept_hashed_bytes, u64::from(2 * read), "{r:?}");
         let top = d.read_render_target(COLOR_KEY, 0, 0, W, 32).unwrap();
         assert_eq!(px(&top, W, 5, 5), [10, 20, 230, 255]);
         for t in tiles {
@@ -487,4 +492,40 @@ fn write_back_reads_back_only_resolved_bytes() {
             }
         }
     }
+}
+
+/// A resolve into a kept buffer at a word aligned destination that is not
+/// block aligned: the guest bytes under it are the target's, and the bytes
+/// beside it in the same blocks keep what guest memory held.
+#[test]
+fn write_back_mid_block_keeps_the_bytes_beside_it() {
+    let tile = W * 32 * 4;
+    let at = DEST + 0x100;
+    let Some(mut d) = drawer() else { return };
+    let mut mem = memory();
+    vertices(&mut mem);
+    let mut s = Stream::default();
+    paint(s.setup());
+    resolve_to(&mut s, &mut mem, W, 32, DEST);
+    resolve_to(&mut s, &mut mem, W, 32, DEST + tile);
+    run(&mut d, &s, &mut mem);
+    let mut s = Stream::default();
+    paint_small(s.setup());
+    resolve_to(&mut s, &mut mem, W, 32, at);
+    let before = mem.clone();
+    let r = run(&mut d, &s, &mut mem);
+    assert!(r.unsupported.is_empty(), "{r:?}");
+    // Still the kept buffer: two blocks of the first tile and one of the
+    // second come back, not the whole buffer.
+    assert_eq!(r.timings.readback_bytes, u64::from(tile + 4096), "{r:?}");
+    let top = d.read_render_target(COLOR_KEY, 0, 0, W, 32).unwrap();
+    assert_eq!(detiled(&mem, at, W, 32, W, 4), top);
+    let around = |m: &SliceMemory| {
+        let (lo, hi) = (DEST as usize, (at + tile) as usize);
+        (
+            m.data[lo..lo + 0x100].to_vec(),
+            m.data[hi..hi + 4096 - 0x100].to_vec(),
+        )
+    };
+    assert_eq!(around(&mem), around(&before));
 }
