@@ -87,6 +87,8 @@ pub struct ShaderInfo {
     /// Bit n: some fetch of slot n picks its LOD itself (a fixed or register
     /// LOD, or register gradients) instead of the hardware-computed one.
     pub texture_explicit_lod: u32,
+    /// Bit n: some fetch of slot n adds a non-zero instruction LOD bias.
+    pub texture_lod_bias: u32,
     /// Vertex stage: bit i means `@location(i)` is an output.
     pub interpolators_written: u16,
     /// Pixel stage: bit i means `@location(i)` is an input (copied to r<i>).
@@ -1202,6 +1204,9 @@ impl Gen {
             || !(t.use_computed_lod && self.stage == ShaderStage::Pixel)
         {
             self.info.texture_explicit_lod |= 1 << n;
+        }
+        if t.lod_bias != 0 {
+            self.info.texture_lod_bias |= 1 << n;
         }
         let sample = if grad_lod {
             // Register gradients scaled by 2^lod (Xenia's gradient form of

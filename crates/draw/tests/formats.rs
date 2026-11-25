@@ -1262,10 +1262,14 @@ fn texture_log_reports_sampled_fetch_fields() {
     for part in [
         " t1 type 2 K8_8_8_8 1x1 ",
         " swizzle zyxw sign 2301 exp_adjust -1 endian K8in32 ",
-        " mips 0-0 at 00000000 lod_bias 0 computed lod |",
+        " mips 0-0 at 00000000 lod_bias 0 instr_bias 0 computed lod |",
     ] {
         assert!(l.contains(part), "{l}");
     }
+    // Filtered to the draw's own pixel shader hash, the line is kept.
+    let ps = &l["texture log: ps ".len()..][..16];
+    d.texture_log = Some(Some(u64::from_str_radix(ps, 16).unwrap()));
+    assert_eq!(line(&mut d), lines);
 }
 
 /// Signed components convert before filtering: a 2x1 signed 8_8_8_8 texture

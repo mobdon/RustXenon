@@ -196,6 +196,7 @@ fn pixel_shader_texture_fetch() {
     assert_eq!(t.info.textures_used, 1 << 5);
     assert_eq!(t.info.texture_filter_overrides, 1 << 5);
     assert_eq!(t.info.texture_explicit_lod, 0);
+    assert_eq!(t.info.texture_lod_bias, 1 << 5);
     // A fixed LOD (no computed LOD) counts as explicit.
     let mut fixed = tf;
     fixed.use_computed_lod = false;
