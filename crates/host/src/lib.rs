@@ -485,15 +485,15 @@ pub fn run(sha256: &str, regs: &[fn(&mut Runtime)]) -> ExitCode {
 
     let guarded = args.iter().any(|a| a == "--guard-memory")
         || std::env::var_os("XENON_GUARD_MEMORY").is_some();
-    let mut mem = if guarded {
+    let mem = if guarded {
         log("guarded guest memory: a never-allocated address stops the run");
         GuestMemory::new_guarded(GUEST_MEMORY)
     } else {
         GuestMemory::new(GUEST_MEMORY)
     };
     xenon_rt::guard::commit(image.base, image.data.len() as u32);
-    let base = image.base as usize;
-    mem.bytes_mut()[base..base + image.data.len()].copy_from_slice(&image.data);
+    // Not bytes_mut: with guarded memory most of the range is inaccessible.
+    mem.write_bytes(image.base, &image.data);
     let mut rt = Runtime::new(mem);
     for r in regs {
         r(&mut rt);

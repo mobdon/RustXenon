@@ -254,6 +254,8 @@ impl GuestMemory {
     /// All of guest memory as plain bytes, for loaders before any guest
     /// thread runs (needs exclusive access).
     pub fn bytes_mut(&mut self) -> &mut [u8] {
+        // A slice must be readable throughout; reserved pages are not.
+        assert!(!self.guarded, "bytes_mut on guarded guest memory");
         // SAFETY: `&mut self` rules out concurrent access.
         unsafe { std::slice::from_raw_parts_mut(self.base.as_ptr(), self.len) }
     }
