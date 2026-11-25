@@ -7,6 +7,7 @@
 
 use super::video::GPU_REGS;
 use super::*;
+use std::sync::Arc;
 use xenon_gpu::{Command, Endian, EventKind, GuestRead, Recorder, WaitRegMem};
 
 pub const CP_RB_RPTR: u32 = 0x01C4;
@@ -83,12 +84,56 @@ pub struct Gpu {
     pub vblanks: u32,
     /// When set, applied commands are also kept here (see [`capture`]).
     pub keep: Option<Vec<Command>>,
-    /// Renders every command when set (`--render`).
-    pub drawer: Option<xenon_draw::Drawer>,
-    /// The newest frame the drawer produced, and how many it produced.
-    pub last_frame: Option<xenon_draw::Frame>,
-    pub frames_drawn: u32,
+    /// Renders every command when set (`--render`), see [`Gpu::set_drawer`].
+    draw: Option<Draw>,
+    /// The newest frame the drawer produced.
+    pub last_frame: Arc<Mutex<Option<xenon_draw::Frame>>>,
+}
+
+enum Draw {
+    Inline(Box<DrawSide>),
+    /// Batches go to the draw thread through this queue.
+    Thread(Arc<xenon_gpu::ahead::Ahead<Vec<Command>>>),
+}
+
+/// The drawer and what it reports, on the GPU thread or the draw thread.
+struct DrawSide {
+    drawer: xenon_draw::Drawer,
     stats: DrawStats,
+    frames_drawn: u32,
+    last_frame: Arc<Mutex<Option<xenon_draw::Frame>>>,
+}
+
+impl DrawSide {
+    /// Replays one ring span; false once the drawer stopped.
+    fn replay(&mut self, rt: &Runtime, cmds: &[Command]) -> bool {
+        // Every 30 s, what the drawer holds, to tell cache growth from a leak.
+        static NEXT: AtomicU32 = AtomicU32::new(0);
+        let now = crate::ms();
+        if now >= NEXT.load(Ordering::Relaxed) {
+            NEXT.store(now + 30_000, Ordering::Relaxed);
+            crate::log(&self.drawer.memory_line());
+        }
+        let start = std::time::Instant::now();
+        match self.drawer.replay(cmds, &mut Physical(rt)) {
+            Ok(r) => {
+                self.stats.add(&r, start.elapsed());
+                for u in r.unsupported.iter().chain(&r.warnings) {
+                    capture::note(u);
+                }
+                for f in r.frames {
+                    self.frames_drawn += 1;
+                    capture::frame_done(self.frames_drawn, &f);
+                    *self.last_frame.lock().unwrap() = Some(f);
+                }
+                true
+            }
+            Err(e) => {
+                crate::log(&format!("[draw] stopped: {e}"));
+                false
+            }
+        }
+    }
 }
 
 /// Drawer replays summed over a window, logged every [`DrawStats::EVERY`].
@@ -189,6 +234,51 @@ impl DrawStats {
 }
 
 impl Gpu {
+    /// Draws with `drawer` from now on. `XENON_DRAW_AHEAD=<frames>` (1 or
+    /// more) runs it on a thread of its own, the command processor going on
+    /// up to that many swaps ahead of it; unset or 0 draws inline. Ahead, a
+    /// title may reuse a buffer the drawer has not read yet, since fences
+    /// are written when the command processor passes them.
+    pub fn set_drawer(&mut self, rt: &Arc<Runtime>, drawer: xenon_draw::Drawer) {
+        let mut side = DrawSide {
+            drawer,
+            stats: DrawStats::default(),
+            frames_drawn: 0,
+            last_frame: self.last_frame.clone(),
+        };
+        let ahead = std::env::var("XENON_DRAW_AHEAD")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .unwrap_or(0);
+        if ahead == 0 {
+            self.draw = Some(Draw::Inline(Box::new(side)));
+            return;
+        }
+        // 256 ring spans between swaps bound what the queue holds.
+        let q = Arc::new(xenon_gpu::ahead::Ahead::<Vec<Command>>::new(ahead, 256));
+        let (q2, rt) = (q.clone(), rt.clone());
+        let spawned = std::thread::Builder::new()
+            .name("draw".into())
+            .spawn(move || {
+                while let Some((cmds, swaps)) = q2.pop() {
+                    let ok = side.replay(&rt, &cmds);
+                    q2.done(swaps);
+                    if !ok {
+                        q2.close();
+                    }
+                }
+            });
+        match spawned {
+            Ok(_) => {
+                crate::log(&format!(
+                    "[draw] on its own thread, up to {ahead} frames behind"
+                ));
+                self.draw = Some(Draw::Thread(q));
+            }
+            Err(e) => crate::log(&format!("[draw] no draw thread: {e}")),
+        }
+    }
+
     fn write_reg(&mut self, rt: &Runtime, i: u32, v: u32) {
         let mut v = v;
         if (SCRATCH_REG0..SCRATCH_REG0 + 8).contains(&i) {
@@ -237,32 +327,24 @@ impl Gpu {
         for c in &cmds {
             self.apply(rt, c, idle);
         }
-        if let Some(d) = self.drawer.as_mut() {
-            // Every 30 s, what the drawer holds, to tell cache growth from a leak.
-            static NEXT: AtomicU32 = AtomicU32::new(0);
-            let now = crate::ms();
-            if now >= NEXT.load(Ordering::Relaxed) {
-                NEXT.store(now + 30_000, Ordering::Relaxed);
-                crate::log(&d.memory_line());
+        let mut cmds = cmds;
+        let going = match &mut self.draw {
+            Some(Draw::Inline(d)) => d.replay(rt, &cmds),
+            Some(Draw::Thread(q)) => {
+                let swaps = cmds
+                    .iter()
+                    .filter(|c| matches!(c, Command::Swap { .. }))
+                    .count() as u32;
+                let batch = match self.keep {
+                    Some(_) => cmds.clone(),
+                    None => std::mem::take(&mut cmds),
+                };
+                q.push(batch, swaps)
             }
-            let start = std::time::Instant::now();
-            match d.replay(&cmds, &mut Physical(rt)) {
-                Ok(r) => {
-                    self.stats.add(&r, start.elapsed());
-                    for u in r.unsupported.iter().chain(&r.warnings) {
-                        capture::note(u);
-                    }
-                    for f in r.frames {
-                        self.frames_drawn += 1;
-                        capture::frame_done(self.frames_drawn, &f);
-                        self.last_frame = Some(f);
-                    }
-                }
-                Err(e) => {
-                    crate::log(&format!("[draw] stopped: {e}"));
-                    self.drawer = None;
-                }
-            }
+            None => true,
+        };
+        if !going {
+            self.draw = None;
         }
         if let Some(k) = self.keep.as_mut() {
             k.extend(cmds);
@@ -471,7 +553,8 @@ pub mod capture {
             }
             let frame = &kept[swaps[0] + 1..=swaps[1]];
             let out = dir.join(format!("t{}", t / 1000));
-            if let Some(f) = &g.last_frame {
+            // With the draw thread this frame can be up to its frames behind.
+            if let Some(f) = &*g.last_frame.lock().unwrap() {
                 let _ = std::fs::create_dir_all(&out);
                 match f.write_png(out.join("frame.png")) {
                     Ok(()) => crate::log(&format!(

@@ -1003,3 +1003,125 @@ fn persist_display_block_is_freed_as_physical() {
         0
     );
 }
+
+/// Writes content data (type, display name, file name) at `p`.
+fn content_data(rt: &Runtime, p: u32, ty: u32, display: &str, file: &str) {
+    for (i, b) in xenon_host::kernel::xam::content_record(ty, display, file)
+        .into_iter()
+        .enumerate()
+    {
+        rt.mem.write_u8(p + i as u32, b);
+    }
+}
+
+#[test]
+fn saves_are_created_listed_and_reopened() {
+    use xenon_host::kernel::xam;
+    let e = env();
+    let rt = &e.rt;
+    let mut c = ctx(0x2_7000);
+    rt.mem.write_bytes(0xF000, b"save\0");
+    content_data(rt, 0xF100, 1, "Slot 1", "SLOT1");
+    // No request block (ninth argument, on the stack).
+    rt.mem.write_u32(0x2_7054, 0);
+    let create = |c: &mut Context, flags: u64| {
+        call(
+            rt,
+            c,
+            xam::xam_content_create_ex,
+            &[0, 0xF000, 0xF100, flags, 0xF400, 0, 0, 0],
+        )
+    };
+    // Open existing of a save that is not there fails; open always makes it.
+    assert_eq!(create(&mut c, 3), 3);
+    assert_eq!(create(&mut c, 4), 0);
+    assert_eq!(rt.mem.read_u32(0xF400), 1, "created");
+    // A file written through the root lands in the save folder.
+    // Disposition 5: overwrite if it exists, else create.
+    let r = call(
+        rt,
+        &mut c,
+        files::nt_create_file,
+        &[
+            0xF500,
+            0x4000_0000,
+            attrs(rt, 0xF600, "save:\\data.bin"),
+            0xF700,
+            0,
+            0,
+            0,
+            5,
+        ],
+    );
+    assert_eq!(r, 0);
+    let h = rt.mem.read_u32(0xF500);
+    assert_ne!(h, 0, "file in the save opened");
+    rt.mem.write_bytes(0xF800, b"progress");
+    call(
+        rt,
+        &mut c,
+        files::nt_write_file,
+        &[h as u64, 0, 0, 0, 0xF700, 0xF800, 8, 0],
+    );
+    call(rt, &mut c, objects::nt_close, &[h as u64]);
+    call(rt, &mut c, xam::xam_content_close, &[0xF000, 0]);
+    // Create new of an existing save fails; open existing finds it.
+    assert_eq!(create(&mut c, 1), 183);
+    assert_eq!(create(&mut c, 3), 0);
+    assert_eq!(rt.mem.read_u32(0xF400), 2, "opened");
+    call(rt, &mut c, xam::xam_content_close, &[0xF000, 0]);
+    let data = e.game.parent().unwrap().join("data/content/SLOT1/data.bin");
+    assert_eq!(std::fs::read(data).unwrap(), b"progress");
+    // Listed by type with its display name, one per call, then the end.
+    rt.mem.write_u32(0x2_7054, 0);
+    call(
+        rt,
+        &mut c,
+        xam::xam_content_create_enumerator,
+        &[0, 1, 1, 0, 1, 0xF900, 0xF904],
+    );
+    assert_eq!(rt.mem.read_u32(0xF900), 0x134);
+    let en = rt.mem.read_u32(0xF904) as u64;
+    let r = call(
+        rt,
+        &mut c,
+        xam::xam_enumerate,
+        &[en, 0, 0xFA00, 0x134, 0xF908, 0],
+    );
+    assert_eq!((r, rt.mem.read_u32(0xF908)), (0, 1));
+    let mut got = vec![0; 0x134];
+    rt.mem.read_bytes(0xFA00, &mut got);
+    assert_eq!(got, xam::content_record(1, "Slot 1", "SLOT1"));
+    let r = call(
+        rt,
+        &mut c,
+        xam::xam_enumerate,
+        &[en, 0, 0xFA00, 0x134, 0xF908, 0],
+    );
+    assert_eq!((r, rt.mem.read_u32(0xF908)), (18, 0));
+    // Another type lists nothing.
+    call(
+        rt,
+        &mut c,
+        xam::xam_content_create_enumerator,
+        &[0, 1, 2, 0, 1, 0xF900, 0xF904],
+    );
+    let en = rt.mem.read_u32(0xF904) as u64;
+    let r = call(
+        rt,
+        &mut c,
+        xam::xam_enumerate,
+        &[en, 0, 0xFA00, 0x134, 0xF908, 0],
+    );
+    assert_eq!(r, 18);
+    // Create always empties the save.
+    assert_eq!(create(&mut c, 2), 0);
+    assert_eq!(rt.mem.read_u32(0xF400), 1);
+    call(rt, &mut c, xam::xam_content_close, &[0xF000, 0]);
+    assert!(!e
+        .game
+        .parent()
+        .unwrap()
+        .join("data/content/SLOT1/data.bin")
+        .exists());
+}
