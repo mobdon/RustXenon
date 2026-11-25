@@ -1206,7 +1206,12 @@ pub struct Drawer {
     /// The last `Consts` block staged in the arena and its (offset, size),
     /// bound again by a draw with the same bytes. Cleared with
     /// `window_memo` when the arena wraps or grows.
-    staged_consts: Option<(Vec<u8>, (u64, u64))>,
+    staged_consts: Option<(ConstsBlock, (u64, u64))>,
+    /// Bumped by every register write to the constants a `Consts` block
+    /// holds, so a draw rebuilds the block only after one.
+    consts_gen: u64,
+    /// The last `Consts` block built, by (generation, window base, rebase).
+    consts_built: Option<(ConstsKey, ConstsBlock)>,
     /// Kept-resolve texture decodes recorded since the last flush,
     /// submitted with (before) the batch's draws.
     pre: Option<wgpu::CommandEncoder>,
@@ -1546,6 +1551,18 @@ fn to_bytes(words: &[u32]) -> Vec<u8> {
     }
     out
 }
+
+/// A built `Consts` block, shared by the draws that bind it.
+type ConstsBlock = Arc<Vec<u8>>;
+/// (register generation, window base, rebase words) of a `Consts` block.
+type ConstsKey = (u64, u32, [i32; 96]);
+
+/// The registers a `Consts` block is built from (see [`consts`]).
+const CONSTS_REGS: [std::ops::Range<u32>; 3] = [
+    regs::SHADER_CONSTANT_FLOAT..regs::SHADER_CONSTANT_FLOAT + 2048 + 192,
+    regs::SHADER_CONSTANT_BOOL..regs::SHADER_CONSTANT_BOOL + 8 + 32,
+    regs::VGT_INDX_OFFSET..regs::VGT_INDX_OFFSET + 1,
+];
 
 /// The `Consts` uniform of the shader binding contract: float, fetch, bool
 /// and loop constants, then the window base, the index offset and the 96
@@ -1952,6 +1969,8 @@ impl Drawer {
             index_memo_bytes: 0,
             transfer_setups: HashMap::default(),
             staged_consts: None,
+            consts_gen: 0,
+            consts_built: None,
             staged_base: 0,
             watching: false,
             submitter,
@@ -2395,6 +2414,10 @@ impl Drawer {
                 Command::WriteRegisters { base, values } => {
                     for (i, &v) in values.iter().enumerate() {
                         self.regs.set(base.wrapping_add(i as u32), v);
+                    }
+                    let end = base.saturating_add(values.len() as u32);
+                    if CONSTS_REGS.iter().any(|r| *base < r.end && r.start < end) {
+                        self.consts_gen += 1;
                     }
                     Ok(())
                 }
@@ -4813,7 +4836,15 @@ impl Drawer {
         let indices = offset_range(idx.min_max, self.regs.get(regs::VGT_INDX_OFFSET));
         let (mut read, window_base, rebase, staged) =
             self.guest_window(vf_mask, &reach, indices, mem, report)?;
-        let consts = self.consts(window_base, &rebase);
+        let key = (self.consts_gen, window_base, rebase);
+        let consts = match &self.consts_built {
+            Some((k, c)) if *k == key => c.clone(),
+            _ => {
+                let c = Arc::new(self.consts(window_base, &rebase));
+                self.consts_built = Some((key, c.clone()));
+                c
+            }
+        };
         let epi = to_bytes(&state::epilogue(&self.regs, w, h));
         // Rectangle lists read their guest indices in the vertex shader and
         // draw 6 host vertices per rectangle without an index buffer.
@@ -4825,7 +4856,7 @@ impl Drawer {
         let mut kept_window =
             staged.filter(|((a, b, s), _)| self.window_memo.get(a) == Some(&(*b, *s)));
         let mut kept_consts = (self.staged_consts.as_ref())
-            .filter(|(b, _)| *b == consts)
+            .filter(|(b, _)| Arc::ptr_eq(b, &consts) || **b == *consts)
             .map(|&(_, s)| s);
         fn parts<'a>(
             w: Option<Vec<Part<'a>>>,
@@ -4849,7 +4880,7 @@ impl Drawer {
         if (kept_window.is_some() || kept_consts.is_some())
             && !self.fits(&parts(
                 kept_window.is_none().then(|| window(&read)),
-                kept_consts.is_none().then_some(&consts),
+                kept_consts.is_none().then_some(consts.as_slice()),
                 rest,
             ))
         {
@@ -4870,7 +4901,7 @@ impl Drawer {
             &*mem,
             &parts(
                 kept_window.is_none().then(|| window(&read)),
-                kept_consts.is_none().then_some(&consts),
+                kept_consts.is_none().then_some(consts.as_slice()),
                 rest,
             ),
         )?)
