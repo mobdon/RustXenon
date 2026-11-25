@@ -128,8 +128,9 @@ pub fn bytes_needed(fetch: &TextureFetch) -> Result<usize, Error> {
 /// pitch-linear copy, format conversion, swizzle. `guest_bytes` start at the
 /// base address; only slice 0's extent must be present.
 ///
-/// Signedness, `exp_adjust` and gamma are ignored: texels decode as unsigned
-/// normalized (or float) values.
+/// Signedness, `exp_adjust` and gamma are not applied here: texels decode as
+/// unsigned normalized (or float) values, and the translated shader applies
+/// them to the sampled value (see `xenon-shader`).
 pub fn decode_base_level(fetch: &TextureFetch, guest_bytes: &[u8]) -> Result<Image, Error> {
     let layout = base_layout(fetch)?;
     if !fetch.format.can_convert() {
