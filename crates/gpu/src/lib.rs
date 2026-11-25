@@ -7,6 +7,8 @@
 //! or GPU involved in the parsing.
 
 pub mod ahead;
+#[cfg(feature = "bundle")]
+pub mod bundle;
 pub mod command;
 pub mod memory;
 pub mod pm4;

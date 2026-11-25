@@ -596,6 +596,39 @@ fn swap_frame_png_round_trip() {
     assert_eq!(&buf[..info.buffer_size()], &frame.rgba8[..]);
 }
 
+/// A frame bundle of two frames, saved and read back, replays to the same
+/// last frame; with that frame's draw skipped, only the clear is left.
+#[test]
+fn bundle_replays_with_a_draw_skipped() {
+    let Some(mut d) = drawer() else { return };
+    let mut mem = memory();
+    let mut s = Stream::default();
+    draw_pattern(&mut mem, &mut s);
+    s.swap(W, H);
+    draw_pattern(&mut mem, &mut s);
+    s.swap(W, H);
+    mem.write_words(CMD, &s.0);
+    let mut rec = xenon_gpu::Recorder::new();
+    rec.record_buffer(&mem, CMD, s.0.len() as u32).unwrap();
+    let dir = std::env::temp_dir().join(format!("xenon-draw-bundle-{}", std::process::id()));
+    xenon_gpu::bundle::write_commands(&dir, &rec.commands).unwrap();
+    std::fs::write(dir.join(xenon_gpu::bundle::MEMORY), &mem.data).unwrap();
+    let (cmds, mut back) = xenon_gpu::bundle::read(&dir).unwrap();
+    std::fs::remove_dir_all(&dir).unwrap();
+
+    let (all, n) = xenon_gpu::bundle::skip_draws(&cmds, 1, 0);
+    assert_eq!(n, 1);
+    let whole = d.replay(&all, &mut back).unwrap();
+    let frame = &whole.frames.last().unwrap().rgba8;
+    assert_ne!(px(frame, W, 2, 2), CLEAR);
+
+    let (skipped, _) = xenon_gpu::bundle::skip_draws(&cmds, 1, 1);
+    let r = d.replay(&skipped, &mut back).unwrap();
+    assert_eq!((r.frames.len(), r.draws), (2, 1), "{r:?}");
+    let frame = &r.frames[1].rgba8;
+    assert!(frame.chunks_exact(4).all(|p| p == CLEAR));
+}
+
 /// Unsupported render target formats and primitive types are reported and
 /// skipped, and replay goes on.
 #[test]

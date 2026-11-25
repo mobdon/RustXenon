@@ -101,6 +101,9 @@ pub struct Gpu {
     pub vblanks: u32,
     /// When set, applied commands are also kept here (see [`capture`]).
     pub keep: Option<Vec<Command>>,
+    /// The last vertex and pixel shader loads, kept for a frame bundle
+    /// (`--capture-bundle`) so that it starts with the shaders bound.
+    shaders: [Option<Command>; 2],
     /// Renders every command when set (`--render`), see [`Gpu::set_drawer`].
     draw: Option<Draw>,
     /// The newest frame the drawer produced.
@@ -374,6 +377,13 @@ impl Gpu {
             .unwrap_or(wptr);
         let cmds = std::mem::take(&mut self.rec.commands);
         self.rec.warnings.clear();
+        if capture::BUNDLE.load(std::sync::atomic::Ordering::Relaxed) {
+            for c in &cmds {
+                if let Command::LoadShader { stage, .. } = c {
+                    self.shaders[*stage as usize] = Some(c.clone());
+                }
+            }
+        }
         for c in &cmds {
             self.apply(rt, c, idle);
         }
@@ -502,6 +512,7 @@ pub mod capture {
     use std::collections::BTreeSet;
     use std::fmt::Write as _;
     use std::path::Path;
+    use xenon_gpu::regs::REGISTER_COUNT;
     use xenon_gpu::RegisterFile;
     use xenon_texture::{bytes_needed, decode_base_level, TextureFetch};
 
@@ -512,6 +523,11 @@ pub mod capture {
 
     /// `--render`: draw every frame with the headless drawer.
     pub static RENDER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+    /// `--capture-bundle`: each capture also writes a frame bundle (see
+    /// [`xenon_gpu::bundle`]): the register file and shaders at the start,
+    /// a warm-up frame and the captured frame, and guest memory after it.
+    pub static BUNDLE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
     /// `--capture-frames N,M --capture-dir DIR`: frame numbers (counted
     /// from 1, one per swap) to write as `DIR/frame-N.png`.
@@ -587,7 +603,16 @@ pub mod capture {
             let Some(&t) = self.at.last() else { return };
             if g.keep.is_none() {
                 if crate::ms() >= t {
-                    g.keep = Some(Vec::new());
+                    g.keep = Some(if bundling() {
+                        let mut k = vec![Command::WriteRegisters {
+                            base: 0,
+                            values: g.rec.regs.slice(0, REGISTER_COUNT as u32).to_vec(),
+                        }];
+                        k.extend(g.shaders.iter().flatten().cloned());
+                        k
+                    } else {
+                        Vec::new()
+                    });
                 }
                 return;
             }
@@ -598,10 +623,12 @@ pub mod capture {
                 .filter(|(_, c)| matches!(c, Command::Swap { .. }))
                 .map(|(i, _)| i)
                 .collect();
-            if swaps.len() < 2 {
+            // A bundle keeps a warm-up frame before the captured one.
+            let n = swaps.len();
+            if n < 2 + usize::from(bundling()) {
                 return;
             }
-            let frame = &kept[swaps[0] + 1..=swaps[1]];
+            let frame = &kept[swaps[n - 2] + 1..=swaps[n - 1]];
             let out = dir.join(format!("t{}", t / 1000));
             // With the draw thread this frame can be up to its frames behind.
             if let Some(f) = &*g.last_frame.lock().unwrap() {
@@ -622,9 +649,38 @@ pub mod capture {
                 )),
                 Err(e) => crate::log(&format!("[capture] {}: {e}", out.display())),
             }
+            if bundling() {
+                let dir = out.join("bundle");
+                match write_bundle(rt, kept, &dir) {
+                    Ok(()) => crate::log(&format!("[capture] frame bundle in {}", dir.display())),
+                    Err(e) => crate::log(&format!("[capture] bundle {}: {e}", dir.display())),
+                }
+            }
             g.keep = None;
             self.at.pop();
         }
+    }
+
+    fn bundling() -> bool {
+        BUNDLE.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// GPU physical memory the bundle saves: 512 MB from address 0.
+    const BUNDLE_MEMORY: u32 = 0x2000_0000;
+
+    fn write_bundle(rt: &Runtime, cmds: &[Command], dir: &Path) -> std::io::Result<()> {
+        use std::io::Write as _;
+        xenon_gpu::bundle::write_commands(dir, cmds)?;
+        let mut f =
+            std::io::BufWriter::new(std::fs::File::create(dir.join(xenon_gpu::bundle::MEMORY))?);
+        let mut buf = vec![0u8; 16 << 20];
+        for a in (0..BUNDLE_MEMORY).step_by(buf.len()) {
+            if !Physical(rt).read_into(a, &mut buf) {
+                buf.fill(0);
+            }
+            f.write_all(&buf)?;
+        }
+        f.flush()
     }
 
     /// Returns (draws, textures written).

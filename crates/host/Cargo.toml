@@ -12,7 +12,7 @@ sha1 = { version = "0.10", features = ["compress"] }
 sha2 = "0.10"
 xenon-audio = { path = "../audio" }
 xenon-draw = { path = "../draw" }
-xenon-gpu = { path = "../gpu" }
+xenon-gpu = { path = "../gpu", features = ["bundle"] }
 xenon-input = { path = "../input" }
 xenon-recomp = { path = "../recomp" }
 xenon-rt = { path = "../rt" }
