@@ -6,6 +6,7 @@
 //! register state, so a drawer can later replay the commands with no window
 //! or GPU involved in the parsing.
 
+pub mod ahead;
 pub mod command;
 pub mod memory;
 pub mod pm4;

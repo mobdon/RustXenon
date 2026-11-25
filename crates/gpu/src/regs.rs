@@ -157,6 +157,12 @@ impl RegisterFile {
         self.values.get(index as usize).copied().unwrap_or(0)
     }
 
+    /// Registers `base..base + n` as one slice, for blocks read whole.
+    /// Panics when the range runs past the register file.
+    pub fn slice(&self, base: u32, n: u32) -> &[u32] {
+        &self.values[base as usize..][..n as usize]
+    }
+
     /// Sets register `index`. Returns false (and writes nothing) when out of
     /// range, as Xenia's `WriteRegister` drops such writes.
     pub fn set(&mut self, index: u32, value: u32) -> bool {

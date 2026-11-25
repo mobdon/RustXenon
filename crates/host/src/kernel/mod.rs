@@ -61,6 +61,8 @@ pub const STATUS_MUTANT_NOT_OWNED: u32 = 0xC000_0046;
 pub const STATUS_SEMAPHORE_LIMIT_EXCEEDED: u32 = 0xC000_0047;
 
 pub const ERROR_SUCCESS: u32 = 0;
+pub const ERROR_PATH_NOT_FOUND: u32 = 3;
+pub const ERROR_ALREADY_EXISTS: u32 = 183;
 pub const ERROR_NO_MORE_FILES: u32 = 18;
 pub const ERROR_IO_PENDING: u32 = 997;
 pub const ERROR_DEVICE_NOT_CONNECTED: u32 = 1167;
@@ -69,11 +71,13 @@ pub const ERROR_NO_SUCH_USER: u32 = 1317;
 pub const ERROR_FUNCTION_FAILED: u32 = 1627;
 
 /// Handles: a guest object (by the guest address of its dispatcher header),
-/// an open file, or something only the host tracks.
+/// an open file, a list being enumerated (records left, records per call),
+/// or something only the host tracks.
 #[derive(Clone)]
 pub enum Handle {
     Object(u32),
     File(std::sync::Arc<Mutex<files::File>>),
+    Items(std::sync::Arc<Mutex<(std::collections::VecDeque<Vec<u8>>, u32)>>),
     Other(u32),
 }
 
