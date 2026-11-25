@@ -347,12 +347,6 @@ pub fn run(sha256: &str, regs: &[fn(&mut Runtime)]) -> ExitCode {
         let _ = kernel::gpu::capture::FRAMES.set((PathBuf::from(dir), n));
         kernel::gpu::capture::RENDER.store(true, Ordering::Relaxed);
     }
-    if let Some(w) = opt(&args, "--audio-wav") {
-        if let Err(e) = kernel::audio::start_wav(w.as_ref()) {
-            eprintln!("{w}: {e}");
-            return ExitCode::FAILURE;
-        }
-    }
     if args.iter().any(|a| a == "--render") {
         kernel::gpu::capture::RENDER.store(true, Ordering::Relaxed);
     }
@@ -454,6 +448,12 @@ pub fn run(sha256: &str, regs: &[fn(&mut Runtime)]) -> ExitCode {
         std::process::exit(101);
     }));
 
+    if let Some(w) = opt(&args, "--audio-wav") {
+        if let Err(e) = kernel::audio::start_wav(w.as_ref()) {
+            eprintln!("{w}: {e}");
+            return ExitCode::FAILURE;
+        }
+    }
     start_clock(rt.clone());
     start_memwatch(rt.clone());
     kernel::video::start(rt.clone());
