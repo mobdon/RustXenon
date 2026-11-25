@@ -4034,12 +4034,11 @@ impl Drawer {
             (lo, hi) = (lo.min(a), hi.max(b));
         }
         // Only the rows resolves wrote since the last decode are decoded
-        // again (all levels with mips). Nothing in the open batch samples
-        // the old texels: the resolve flushed it, and dropped this texture
-        // from the memo. So the decode is recorded to run before the whole
-        // batch (`pre`), after the resolves submitted before it. A chain
-        // with a new mip count gets a new texture, decoded whole, which no
-        // recorded draw can sample yet.
+        // again (all levels with mips). With a resolve in the open batch the
+        // decode is recorded after it, so the batch's earlier draws sample
+        // the old texels and later ones the new; otherwise it runs before
+        // the batch (`pre`). A chain with a new mip count gets a new
+        // texture, decoded whole, which no recorded draw can sample yet.
         let old = self.mirrors[i]
             .views
             .get(&constant)
@@ -4094,15 +4093,31 @@ impl Drawer {
         if let Some(t0) = t0 {
             self.pipeline_made(t0);
         }
-        // The decode runs before the batch, so after a resolve in it.
-        if self.resolve_pending {
-            self.flush()?;
-        }
+        // After a resolve recorded in the batch, the decode is recorded
+        // there too, after it, instead of flushing the batch to run it
+        // before the next one: the batch's earlier draws still sample the
+        // old texels first. Otherwise it runs before the batch (`pre`).
+        let mut batch = match self.resolve_pending {
+            true => self.batch.take(),
+            false => None,
+        };
+        let mut pre = match batch {
+            Some(ref mut b) => {
+                b.pass = None;
+                None
+            }
+            None => Some(
+                self.pre
+                    .take()
+                    .unwrap_or_else(|| self.device.create_command_encoder(&Default::default())),
+            ),
+        };
+        let enc = match (&mut batch, &mut pre) {
+            (Some(b), _) => &mut b.enc,
+            (None, Some(e)) => e,
+            (None, None) => unreachable!("one encoder"),
+        };
         let pipeline = &pipeline;
-        let mut enc = self
-            .pre
-            .take()
-            .unwrap_or_else(|| self.device.create_command_encoder(&Default::default()));
         for (level, &(lw, lh, lpitch, la)) in levels.iter().enumerate() {
             let (ly0, rows) = if level == 0 { (y0, y1 - y0) } else { (0, lh) };
             let row_words =
@@ -4178,7 +4193,10 @@ impl Drawer {
                 },
             );
         }
-        self.pre = Some(enc);
+        match batch {
+            Some(b) => self.batch = Some(b),
+            None => self.pre = pre,
+        }
         if let Some(e) = block_on(scope.pop()) {
             return Err(Skip::Fatal(Error::Gpu(e.to_string())));
         }
