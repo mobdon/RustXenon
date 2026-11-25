@@ -1211,6 +1211,9 @@ pub struct Drawer {
     /// Bytes of decoded guest textures the texture cache keeps before
     /// evicting the least recently used ones (default 256 MiB).
     pub texture_cache_limit: u64,
+    /// Decoded guest textures the texture cache keeps however small
+    /// (default [`TEXTURE_CACHE_COUNT`]).
+    pub texture_cache_count: usize,
     /// Upload unsigned DXT textures as BC blocks for the host to decode
     /// (default: whether the adapter has BC textures). Turning it on
     /// without them makes those uploads fail.
@@ -1463,6 +1466,10 @@ const TEXTURE_MEMO_CAP: usize = 1 << 14;
 
 /// Cached textures are dropped wholesale past this many bytes.
 const TEXTURE_CACHE_LIMIT: u64 = 256 << 20;
+
+/// Cached textures past this many are dropped too: small ones each cost a
+/// texture and view in the driver however few bytes they hold.
+const TEXTURE_CACHE_COUNT: usize = 2048;
 
 fn to_bytes(words: &[u32]) -> Vec<u8> {
     let mut out = Vec::with_capacity(4 * words.len());
@@ -1903,6 +1910,7 @@ impl Drawer {
             late_writeback: std::env::var("XENON_RESOLVE_WRITEBACK").as_deref() == Ok("late"),
             late: None,
             texture_cache_limit: TEXTURE_CACHE_LIMIT,
+            texture_cache_count: TEXTURE_CACHE_COUNT,
             bc_textures: required_features.contains(wgpu::Features::TEXTURE_COMPRESSION_BC),
             texture_log: std::env::var("XENON_TEXTURE_LOG")
                 .ok()
@@ -4207,7 +4215,9 @@ impl Drawer {
             report.timings.textures_reuploaded += 1;
         }
         let limit = self.texture_cache_limit;
-        if self.texture_cache_bytes + len > limit {
+        if self.texture_cache_bytes + len > limit
+            || self.texture_cache.len() >= self.texture_cache_count
+        {
             self.evict_textures(limit.saturating_sub(len), report);
         }
         self.texture_cache_bytes += len;
@@ -4219,7 +4229,8 @@ impl Drawer {
     }
 
     /// Evicts least recently used textures until the cache holds at most
-    /// 3/4 of `room` bytes, so evictions come in batches, not per upload.
+    /// 3/4 of `room` bytes and of `texture_cache_count` textures, so
+    /// evictions come in batches, not per upload.
     /// Views still bound in the open batch stay alive through their clones.
     fn evict_textures(&mut self, room: u64, report: &mut Report) {
         let goal = room / 4 * 3;
@@ -4238,7 +4249,9 @@ impl Drawer {
             self.texture_evicted.clear();
         }
         for (_, len, k) in by_age {
-            if self.texture_cache_bytes <= goal {
+            if self.texture_cache_bytes <= goal
+                && self.texture_cache.len() <= self.texture_cache_count * 3 / 4
+            {
                 break;
             }
             self.texture_cache.remove(&k);
