@@ -448,3 +448,43 @@ fn cpu_write_during_a_replay_takes_the_guest_path() {
     assert_eq!(img, guest_path(&mem, f));
     assert!(img.chunks(4).any(|p| p == [0x55; 4]));
 }
+
+/// A kept buffer over three 64x32 tiles, resolved whole by one replay; the
+/// next replays (two per frame) resolve the first tile, then the first and
+/// last: each reads back only the tiles it resolved, not the middle one or
+/// the whole buffer, and writes back exactly those to guest memory.
+#[test]
+fn write_back_reads_back_only_resolved_bytes() {
+    let tile = W * 32 * 4;
+    let tiles = [DEST, DEST + tile, DEST + 2 * tile];
+    let bytes = |mem: &SliceMemory, t: u32| mem.data[t as usize..][..tile as usize].to_vec();
+    let Some(mut d) = drawer() else { return };
+    let mut mem = memory();
+    vertices(&mut mem);
+    let mut s = Stream::default();
+    paint(s.setup());
+    for t in tiles {
+        resolve_to(&mut s, &mut mem, W, 32, t);
+    }
+    run(&mut d, &s, &mut mem);
+    for (resolved, read) in [(&tiles[..1], tile), (&[tiles[0], tiles[2]][..], 2 * tile)] {
+        let mut s = Stream::default();
+        paint_small(s.setup());
+        for &t in resolved {
+            resolve_to(&mut s, &mut mem, W, 32, t);
+        }
+        let before = mem.clone();
+        let r = run(&mut d, &s, &mut mem);
+        assert!(r.unsupported.is_empty(), "{r:?}");
+        assert_eq!(r.timings.readback_bytes, u64::from(read), "{r:?}");
+        let top = d.read_render_target(COLOR_KEY, 0, 0, W, 32).unwrap();
+        assert_eq!(px(&top, W, 5, 5), [10, 20, 230, 255]);
+        for t in tiles {
+            if resolved.contains(&t) {
+                assert_eq!(detiled(&mem, t, W, 32, W, 4), top, "tile 0x{t:X}");
+            } else {
+                assert_eq!(bytes(&mem, t), bytes(&before, t), "tile 0x{t:X}");
+            }
+        }
+    }
+}

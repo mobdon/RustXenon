@@ -237,13 +237,13 @@ struct Mirror {
     lo: u64,
     hi: u64,
     buf: wgpu::Buffer,
-    /// Physical range written by resolves and not yet written back to guest
-    /// memory.
-    dirty: Option<(u64, u64)>,
-    /// Hash of the bytes over `[lo, hi)` that guest memory held when the
-    /// buffer was made from it or last written back (the buffer's bytes
-    /// then), to notice CPU writes since; `None` until computed.
-    hash: Option<u64>,
+    /// Physical ranges written by resolves and not yet written back to
+    /// guest memory, sorted, apart and not touching.
+    dirty: Vec<(u64, u64)>,
+    /// Hash of each [`KEPT_BLOCK`] bytes of the buffer from `lo`, as it held
+    /// them when made from guest memory or last read back, to notice CPU
+    /// writes to guest memory since.
+    hashes: Vec<u64>,
     /// Checked against guest memory (or made from it) this replay.
     verified: bool,
     /// Textures decoded from the buffer, by fetch constant.
@@ -264,6 +264,10 @@ struct Kept {
 
 /// Kept resolve buffers are written back and dropped past this many bytes.
 const MIRROR_LIMIT: u64 = 256 << 20;
+
+/// Bytes of a kept resolve buffer hashed (and read back) as one: a
+/// write-back reads only the blocks a resolve wrote.
+const KEPT_BLOCK: u64 = 4096;
 
 impl GuestMemory for SliceMemory {
     fn write_bytes(&mut self, addr: u32, bytes: &[u8]) -> bool {
@@ -1538,7 +1542,7 @@ impl Drawer {
                 // Any write but a resolve's makes a kept copy stale; the
                 // writer wrote it back first (see `sync`).
                 self.mirrors.retain(|m| {
-                    debug_assert!(m.hi <= lo || hi <= m.lo || m.dirty.is_none());
+                    debug_assert!(m.hi <= lo || hi <= m.lo || m.dirty.is_empty());
                     m.hi <= lo || hi <= m.lo
                 });
             }
@@ -1559,11 +1563,10 @@ impl Drawer {
             .retain(|_, &mut (_, a, b)| b <= lo || hi <= a);
     }
 
-    /// Hash of guest memory over `[lo, hi)`, if readable.
-    fn guest_hash(&mut self, mem: &Tracked, lo: u64, hi: u64) -> Option<u64> {
-        let b = mem.read_bytes(lo as u32, (hi - lo) as usize)?;
-        self.timings.kept_hashed_bytes += b.len() as u64;
-        Some(hash_bytes(&b))
+    /// [`KEPT_BLOCK`] hashes of `bytes`.
+    fn block_hashes(&mut self, bytes: &[u8]) -> Vec<u64> {
+        self.timings.kept_hashed_bytes += bytes.len() as u64;
+        bytes.chunks(KEPT_BLOCK as usize).map(hash_bytes).collect()
     }
 
     /// Whether kept resolve `i` still matches guest memory, which the CPU
@@ -1576,9 +1579,11 @@ impl Drawer {
         }
 
         let (lo, hi) = (self.mirrors[i].lo, self.mirrors[i].hi);
-        let now = self.guest_hash(mem, lo, hi);
+        let now = mem
+            .read_bytes(lo as u32, (hi - lo) as usize)
+            .map(|b| self.block_hashes(&b));
         let m = &mut self.mirrors[i];
-        if now.is_some() && now == m.hash {
+        if now.as_ref() == Some(&m.hashes) {
             m.verified = true;
             return true;
         }
@@ -1595,7 +1600,7 @@ impl Drawer {
         let mut enc = None;
         while i < self.mirrors.len() {
             let m = &self.mirrors[i];
-            if m.hi <= lo || hi <= m.lo || m.dirty.is_none() {
+            if m.hi <= lo || hi <= m.lo || m.dirty.is_empty() {
                 i += 1;
                 continue;
             }
@@ -1603,21 +1608,36 @@ impl Drawer {
             if !self.verify(i, mem) {
                 continue;
             }
-            // The whole buffer comes back, not only the dirty range: its
-            // hash must be of what the buffer holds, as guest memory may
+            // Whole blocks come back, not only the dirty ranges: their
+            // hashes must be of what the buffer holds, as guest memory may
             // have changed under it since it was made (a CPU write during
             // the replay), and then the next replay's check drops it.
             let m = &self.mirrors[i];
-            let (a, b) = m.dirty.expect("dirty");
+            let len = m.hi - m.lo;
+            // Buffer offsets of the dirty blocks, merged.
+            let mut spans: Vec<(u64, u64)> = Vec::new();
+            for &(a, b) in &m.dirty {
+                let s = (a - m.lo) / KEPT_BLOCK * KEPT_BLOCK;
+                let e = ((b - m.lo).div_ceil(KEPT_BLOCK) * KEPT_BLOCK).min(len);
+                match spans.last_mut() {
+                    Some(l) if s <= l.1 => l.1 = l.1.max(e),
+                    _ => spans.push((s, e)),
+                }
+            }
             let buf = self.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("resolve write-back"),
-                size: m.hi - m.lo,
+                size: spans.iter().map(|(s, e)| e - s).sum(),
                 usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
                 mapped_at_creation: false,
             });
-            enc.get_or_insert_with(|| self.device.create_command_encoder(&Default::default()))
-                .copy_buffer_to_buffer(&m.buf, 0, &buf, 0, m.hi - m.lo);
-            copies.push((m.lo, a, b, buf));
+            let enc =
+                enc.get_or_insert_with(|| self.device.create_command_encoder(&Default::default()));
+            let mut at = 0;
+            for &(s, e) in &spans {
+                enc.copy_buffer_to_buffer(&m.buf, s, &buf, at, e - s);
+                at += e - s;
+            }
+            copies.push((m.lo, m.dirty.clone(), spans, buf));
             i += 1;
         }
         let Some(enc) = enc else {
@@ -1628,19 +1648,30 @@ impl Drawer {
         self.timings.gpu_wait += lap(&mut t);
         let index = self.queue.submit([enc.finish()]);
         self.timings.submits += 1;
-        for (m_lo, a, b, buf) in copies {
+        for (m_lo, dirty, spans, buf) in copies {
             let data = self.map_read(&buf, index.clone())?;
             self.timings.readback += lap(&mut t);
             self.timings.readback_bytes += data.len() as u64;
-            let ok = mem.write_back(a as u32, &data[(a - m_lo) as usize..(b - m_lo) as usize]);
+            // Index in `data` of each span's first byte.
+            let starts: Vec<u64> = spans
+                .iter()
+                .scan(0, |at, (s, e)| Some(std::mem::replace(at, *at + e - s)))
+                .collect();
+            let ok = dirty.iter().all(|&(a, b)| {
+                let k = spans.partition_point(|&(_, e)| e <= a - m_lo);
+                let from = (starts[k] + a - m_lo - spans[k].0) as usize;
+                mem.write_back(a as u32, &data[from..from + (b - a) as usize])
+            });
             let Some(i) = self.mirrors.iter().position(|m| m.lo == m_lo) else {
                 continue;
             };
-            let m = &mut self.mirrors[i];
-            m.dirty = None;
+            self.mirrors[i].dirty.clear();
             if ok {
-                m.hash = Some(hash_bytes(&data));
-                self.timings.kept_hashed_bytes += data.len() as u64;
+                for (&(s, e), &at) in spans.iter().zip(&starts) {
+                    let h = self.block_hashes(&data[at as usize..(at + e - s) as usize]);
+                    let k = (s / KEPT_BLOCK) as usize;
+                    self.mirrors[i].hashes[k..k + h.len()].copy_from_slice(&h);
+                }
             } else {
                 // Readable when made, so not expected; the pixels are lost.
                 self.mirrors.remove(i);
@@ -1651,15 +1682,11 @@ impl Drawer {
     }
 
     /// End of a replay: writes back every kept resolve (unless
-    /// `skip_resolve_writeback`). Every kept buffer then has the hash of
-    /// its bytes for the next replay's check, except one made for a resolve
-    /// that failed before writing to it, which is dropped: hashing guest
-    /// memory now could miss a CPU write made after the buffer was filled.
+    /// `skip_resolve_writeback`).
     fn finish_mirrors(&mut self, mem: &mut Tracked) -> Result<(), Error> {
         if !self.skip_resolve_writeback {
             self.sync(mem, 0, u64::MAX)?;
         }
-        self.mirrors.retain(|m| m.hash.is_some());
         Ok(())
     }
 
@@ -1693,12 +1720,7 @@ impl Drawer {
         let Some(bytes) = mem.read_bytes(a as u32, (b - a) as usize) else {
             return Ok(None);
         };
-        // Without write-back guest memory keeps these bytes; else the
-        // write-back hashes them.
-        let hash = self.skip_resolve_writeback.then(|| {
-            self.timings.kept_hashed_bytes += bytes.len() as u64;
-            hash_bytes(&bytes)
-        });
+        let hashes = self.block_hashes(&bytes);
         let buf = self.buffer(
             "kept resolve",
             &bytes,
@@ -1708,8 +1730,8 @@ impl Drawer {
             lo: a,
             hi: b,
             buf,
-            dirty: None,
-            hash,
+            dirty: Vec::new(),
+            hashes,
             verified: true,
             views: HashMap::new(),
         });
@@ -3903,7 +3925,16 @@ impl Drawer {
         // A software driver finishes the rendering before it here.
         self.timings.gpu_wait += lap(&mut t);
         let m = &mut self.mirrors[i];
-        m.dirty = Some(m.dirty.map_or((lo, hi), |(a, b)| (a.min(lo), b.max(hi))));
+        let (mut a, mut b) = (lo, hi);
+        m.dirty.retain(|&(x, y)| {
+            let apart = y < a || b < x;
+            if !apart {
+                (a, b) = (a.min(x), b.max(y));
+            }
+            apart
+        });
+        m.dirty.push((a, b));
+        m.dirty.sort_unstable();
         for k in m.views.values_mut().filter(|k| lo < k.hi && k.lo < hi) {
             // Tiled 32bpp rows 32n..32n+32 are bytes block*n..block*(n+1).
             let y0 = (lo.saturating_sub(k.lo) / k.block * 32) as u32;
