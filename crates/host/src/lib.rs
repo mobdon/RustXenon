@@ -490,10 +490,14 @@ fn growth_line() -> String {
     let started = kx.threads.lock().map(|t| t.len()).unwrap_or(0) as u32;
     let ended = kernel::threads::ENDED.load(Ordering::Relaxed);
     let rss = host_rss().map_or("?".into(), |b| (b >> 20).to_string());
+    let r = |i: usize| kernel::files::READS[i].load(Ordering::Relaxed);
     format!(
-        "handles {}, threads {} live, host {rss} MB",
+        "handles {}, threads {} live, host {rss} MB, file reads {} ({} MB, {} ms)",
         kx.handle_count(),
-        started.saturating_sub(ended)
+        started.saturating_sub(ended),
+        r(0),
+        r(1) >> 20,
+        r(2) / 1000
     )
 }
 
