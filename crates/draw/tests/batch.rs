@@ -22,6 +22,38 @@ fn rect(mem: &mut xenon_gpu::SliceMemory, addr: u32, w: f32, h: f32, c: [u8; 4])
     );
 }
 
+/// Fills the 64x64 8_8_8_8 texture at TEXTURE with green and writes, at
+/// VERTS + 0x100, a `vs_uv` quad list quad (32,32)-(64,64) showing its
+/// top-left quarter. Returns the texture fetch constant.
+fn green_texture_quad(mem: &mut xenon_gpu::SliceMemory) -> [u32; 6] {
+    let linear: Vec<u8> = (0..W * H).flat_map(|_| GREEN).collect();
+    let mut tiled = tile::tile_2d(&linear, W, H, W, 4).unwrap();
+    endian::swap_in_place(&mut tiled, xenon_texture::Endian::K8in32);
+    mem.data[TEXTURE as usize..][..tiled.len()].copy_from_slice(&tiled);
+    let quad: Vec<u32> = [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)]
+        .iter()
+        .flat_map(|&(u, v): &(f32, f32)| {
+            [
+                f(32.0 + u * 32.0),
+                f(32.0 + v * 32.0),
+                f(0.0),
+                f(u / 2.0),
+                f(v / 2.0),
+            ]
+        })
+        .collect();
+    mem.write_words(VERTS + 0x100, &quad);
+    let swizzle_rgba = (1 << 3) | (2 << 6) | (3 << 9);
+    [
+        2 | (2 << 10) | (2 << 13) | ((W >> 5) << 22) | (1 << 31), // clamp, tiled
+        6 | (2 << 6) | TEXTURE,                                   // 8_8_8_8, k8in32
+        (W - 1) | ((H - 1) << 13),
+        swizzle_rgba << 1, // point filters
+        0,
+        1 << 9, // 2D
+    ]
+}
+
 /// Draws to one target, another, then the first again: one submission for
 /// the three draws (two render passes), in order.
 #[test]
@@ -91,35 +123,9 @@ fn resolve_sees_batched_draws() {
 fn resolve_into_a_texture_is_sampled_by_later_draws() {
     let Some(mut d) = drawer() else { return };
     let mut mem = memory();
-    let linear: Vec<u8> = (0..W * H).flat_map(|_| GREEN).collect();
-    let mut tiled = tile::tile_2d(&linear, W, H, W, 4).unwrap();
-    endian::swap_in_place(&mut tiled, xenon_texture::Endian::K8in32);
-    mem.data[TEXTURE as usize..][..tiled.len()].copy_from_slice(&tiled);
     let wf = W as f32;
     rect(&mut mem, VERTS, wf, wf, RED);
-    // Quad (32,32)-(64,64) showing the texture's top-left quarter.
-    let quad: Vec<u32> = [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)]
-        .iter()
-        .flat_map(|&(u, v): &(f32, f32)| {
-            [
-                f(32.0 + u * 32.0),
-                f(32.0 + v * 32.0),
-                f(0.0),
-                f(u / 2.0),
-                f(v / 2.0),
-            ]
-        })
-        .collect();
-    mem.write_words(VERTS + 0x100, &quad);
-    let swizzle_rgba = (1 << 3) | (2 << 6) | (3 << 9);
-    let fetch = [
-        2 | (2 << 10) | (2 << 13) | ((W >> 5) << 22) | (1 << 31), // clamp, tiled
-        6 | (2 << 6) | TEXTURE,                                   // 8_8_8_8, k8in32
-        (W - 1) | ((H - 1) << 13),
-        swizzle_rgba << 1, // point filters
-        0,
-        1 << 9, // 2D
-    ];
+    let fetch = green_texture_quad(&mut mem);
     let mut s = Stream::default();
     s.setup()
         .shader(false, &vs_color())
@@ -146,6 +152,42 @@ fn resolve_into_a_texture_is_sampled_by_later_draws() {
     assert!(report.unsupported.is_empty(), "{report:?}");
     let img = d.read_render_target(COLOR_KEY, 0, 0, W, H).unwrap();
     assert_eq!(px(&img, W, 10, 10), RED);
+    assert_eq!(px(&img, W, 40, 40), RED);
+}
+
+/// A MEM_WRITE over a texture's guest memory between two draws with the
+/// same fetch constant shows the new texels: the memo is dropped there too.
+#[test]
+fn mem_write_into_a_texture_is_sampled_by_later_draws() {
+    let Some(mut d) = drawer() else { return };
+    let mut mem = memory();
+    let fetch = green_texture_quad(&mut mem);
+    // The same texture in red, as the words MEM_WRITE (endian 0) stores.
+    let linear: Vec<u8> = (0..W * H).flat_map(|_| RED).collect();
+    let mut tiled = tile::tile_2d(&linear, W, H, W, 4).unwrap();
+    endian::swap_in_place(&mut tiled, xenon_texture::Endian::K8in32);
+    let mut packet = vec![TEXTURE];
+    packet.extend(
+        tiled
+            .chunks(4)
+            .map(|b| u32::from_le_bytes(b.try_into().unwrap())),
+    );
+    let mut s = Stream::default();
+    s.setup()
+        .shader(false, &vs_uv())
+        .shader(true, &ps_texture(1))
+        .regs(SHADER_CONSTANT_FETCH + 6, &fetch)
+        .vertex_fetch(0, VERTS + 0x100, 20)
+        .draw_auto(PRIM_QUAD_LIST, 4);
+    s.0.extend(xenon_gpu::pm4::build::type3(
+        xenon_gpu::pm4::PM4_MEM_WRITE,
+        &packet,
+    ));
+    s.draw_auto(PRIM_QUAD_LIST, 4);
+    let report = run(&mut d, &s, &mut mem);
+    assert_eq!(report.draws, 2, "{report:?}");
+    assert!(report.unsupported.is_empty(), "{report:?}");
+    let img = d.read_render_target(COLOR_KEY, 0, 0, W, H).unwrap();
     assert_eq!(px(&img, W, 40, 40), RED);
 }
 
