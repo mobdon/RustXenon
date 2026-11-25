@@ -56,6 +56,9 @@ struct Activity {
 
 static ACTIVITY: std::sync::Mutex<Vec<(String, Arc<Activity>)>> = std::sync::Mutex::new(Vec::new());
 
+/// Source commit this host was built from (`-dirty` with local edits).
+pub const BUILD: &str = env!("XENON_BUILD");
+
 /// Milliseconds since the host started.
 pub fn ms() -> u32 {
     START.get_or_init(Instant::now).elapsed().as_millis() as u32
@@ -293,7 +296,7 @@ USAGE: game --exe <patched executable> --game <unpacked game folder>
             [--update <unpacked title update>] [--data <writable folder>]
             [--seconds <n>] [--press <ms>:<button>[+<button>],...]
             [--no-controller] [--window] [--capture <dir> [--capture-at <s>,<s>...]] [--render]
-            [--capture-frames <n>,<n>... --capture-dir <dir>]
+            [--capture-frames <n>,<n>... --capture-dir <dir>] [--audio-wav <file>]
 
 Runs the title headless for --seconds (default 30) and reports how far it
 got: frames presented, threads, imports called, memory in use. A
@@ -305,7 +308,8 @@ the textures bound at its draws and a list of the draws: local files,
 derived from the game. --render draws every frame headless on the host GPU
 and adds the frame image to each capture. --capture-frames writes the listed
 frames (counted from 1, one per swap) as <dir>/frame-<n>.png; it implies
---render. --window opens a window that shows each drawn frame (it implies
+--render. --audio-wav writes the sound the title submits to a 48 kHz
+stereo .wav (nothing is played). --window opens a window that shows each drawn frame (it implies
 --render), plugs in the controller and keyboard as the pad on port 0 (unless
 --press or --no-controller is given) and runs until the window is closed
 (or for --seconds when given).";
@@ -320,6 +324,7 @@ fn opt(args: &[String], name: &str) -> Option<String> {
 /// Entry point of a generated game crate.
 pub fn run(sha256: &str, regs: &[fn(&mut Runtime)]) -> ExitCode {
     START.get_or_init(Instant::now);
+    log(&format!("build {BUILD}"));
     let args: Vec<String> = std::env::args().skip(1).collect();
     let (Some(exe), Some(game)) = (opt(&args, "--exe"), opt(&args, "--game")) else {
         eprintln!("{USAGE}");
@@ -342,6 +347,12 @@ pub fn run(sha256: &str, regs: &[fn(&mut Runtime)]) -> ExitCode {
         let _ = kernel::gpu::capture::FRAMES.set((PathBuf::from(dir), n));
         kernel::gpu::capture::RENDER.store(true, Ordering::Relaxed);
     }
+    if let Some(w) = opt(&args, "--audio-wav") {
+        if let Err(e) = kernel::audio::start_wav(w.as_ref()) {
+            eprintln!("{w}: {e}");
+            return ExitCode::FAILURE;
+        }
+    }
     if args.iter().any(|a| a == "--render") {
         kernel::gpu::capture::RENDER.store(true, Ordering::Relaxed);
     }
@@ -358,7 +369,7 @@ pub fn run(sha256: &str, regs: &[fn(&mut Runtime)]) -> ExitCode {
         if opt(&args, "--press").is_none() && !args.iter().any(|a| a == "--no-controller") {
             kernel::input::set_script(kernel::input::Script::Live);
         }
-        let link = xenon_window::spawn("RustXenon".into(), || {
+        let link = xenon_window::spawn(format!("RustXenon {BUILD}"), || {
             report();
             std::process::exit(0);
         });
@@ -420,6 +431,7 @@ pub fn run(sha256: &str, regs: &[fn(&mut Runtime)]) -> ExitCode {
     );
     let rt = rt.share();
     set_runtime(rt.clone());
+    log(&format!("call table: {} MB", rt.table_bytes() >> 20));
 
     std::panic::set_hook(Box::new(|info| {
         let recent = RECENT.with(|r| r.get());
@@ -455,9 +467,10 @@ pub fn run(sha256: &str, regs: &[fn(&mut Runtime)]) -> ExitCode {
         std::thread::sleep(Duration::from_secs(1));
         let swaps = kernel::k().swaps.load(Ordering::Relaxed);
         log(&format!(
-            "frames {swaps} (+{}), {}",
+            "frames {swaps} (+{}), {}, {}",
             swaps - last,
-            kernel::k().usage_line()
+            kernel::k().usage_line(),
+            growth_line()
         ));
         if swaps == last {
             stalled += 1;
@@ -482,7 +495,63 @@ pub fn run(sha256: &str, regs: &[fn(&mut Runtime)]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// Counts that grow if something is never released: open handles, live
+/// guest threads and host resident memory.
+fn growth_line() -> String {
+    let kx = kernel::k();
+    let started = kx.threads.lock().map(|t| t.len()).unwrap_or(0) as u32;
+    let ended = kernel::threads::ENDED.load(Ordering::Relaxed);
+    let rss = host_rss().map_or("?".into(), |b| (b >> 20).to_string());
+    let r = |i: usize| kernel::files::READS[i].load(Ordering::Relaxed);
+    format!(
+        "handles {}, threads {} live, host {rss} MB, file reads {} ({} MB, {} ms)",
+        kx.handle_count(),
+        started.saturating_sub(ended),
+        r(0),
+        r(1) >> 20,
+        r(2) / 1000
+    )
+}
+
+/// Resident memory of this process in bytes.
+#[cfg(target_os = "linux")]
+fn host_rss() -> Option<u64> {
+    let s = std::fs::read_to_string("/proc/self/statm").ok()?;
+    Some(s.split_whitespace().nth(1)?.parse::<u64>().ok()? * 4096)
+}
+
+#[cfg(windows)]
+fn host_rss() -> Option<u64> {
+    // PROCESS_MEMORY_COUNTERS; kernel32 exports K32GetProcessMemoryInfo.
+    #[repr(C)]
+    #[derive(Default)]
+    struct Counters {
+        cb: u32,
+        page_faults: u32,
+        peak_working_set: usize,
+        working_set: usize,
+        rest: [usize; 6],
+    }
+    extern "system" {
+        fn GetCurrentProcess() -> isize;
+        fn K32GetProcessMemoryInfo(p: isize, c: *mut Counters, cb: u32) -> i32;
+    }
+    let mut c = Counters {
+        cb: std::mem::size_of::<Counters>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: c is a correctly sized PROCESS_MEMORY_COUNTERS.
+    let ok = unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut c, c.cb) };
+    (ok != 0).then_some(c.working_set as u64)
+}
+
+#[cfg(not(any(target_os = "linux", windows)))]
+fn host_rss() -> Option<u64> {
+    None
+}
+
 fn report() {
+    kernel::audio::finish_wav();
     let kx = kernel::k();
     log(&format!(
         "frames presented: {}",
@@ -492,7 +561,12 @@ fn report() {
         "threads started: {}",
         kx.threads.lock().map(|t| t.len()).unwrap_or(0)
     ));
-    log(&format!("memory: {}", kx.usage_line()));
+    log(&format!(
+        "memory: {}, {}, unknown frees {}",
+        kx.usage_line(),
+        growth_line(),
+        kernel::memory::UNKNOWN_FREES.load(Ordering::Relaxed)
+    ));
     if let Some(p) = PROFILE.lock().unwrap().as_ref() {
         let mut v: Vec<_> = p.iter().collect();
         v.sort_by(|a, b| b.1.cmp(a.1));
@@ -573,4 +647,17 @@ fn start_clock(rt: Arc<Runtime>) {
             std::thread::sleep(Duration::from_millis(1));
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn build_id_is_a_commit_or_unknown() {
+        let c = super::BUILD.trim_end_matches("-dirty");
+        assert!(
+            c == "unknown" || (c.len() == 12 && c.bytes().all(|b| b.is_ascii_hexdigit())),
+            "{}",
+            super::BUILD
+        );
+    }
 }

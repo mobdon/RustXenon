@@ -293,10 +293,15 @@ fn offset(rt: &Runtime, p: u32, f: &File) -> u64 {
     }
 }
 
+/// Game file reads since start: calls, bytes, and time spent in them (µs).
+/// Logged once a second to see whether a read cache would pay off.
+pub static READS: [AtomicU64; 3] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+
 fn read_into(rt: &Runtime, f: &mut File, at: u64, dst: &[(u32, u32)]) -> std::io::Result<u32> {
     let Some(h) = f.file.as_mut() else {
         return Ok(0);
     };
+    let t = std::time::Instant::now();
     h.seek(SeekFrom::Start(at))?;
     let mut total = 0;
     for &(a, n) in dst {
@@ -315,6 +320,9 @@ fn read_into(rt: &Runtime, f: &mut File, at: u64, dst: &[(u32, u32)]) -> std::io
         }
     }
     f.pos = at + total as u64;
+    READS[0].fetch_add(1, Ordering::Relaxed);
+    READS[1].fetch_add(total.into(), Ordering::Relaxed);
+    READS[2].fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
     Ok(total)
 }
 

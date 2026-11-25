@@ -139,8 +139,23 @@ impl Kernel {
         self.handles.lock().unwrap().get(&id).cloned()
     }
 
-    pub fn close(&self, id: u32) -> bool {
-        self.handles.lock().unwrap().remove(&id).is_some()
+    /// Removes handle `id`; gives what it held.
+    pub fn close(&self, id: u32) -> Option<Handle> {
+        self.handles.lock().unwrap().remove(&id)
+    }
+
+    /// Whether any open handle refers to the object at `a`.
+    pub fn referenced(&self, a: u32) -> bool {
+        self.handles
+            .lock()
+            .unwrap()
+            .values()
+            .any(|h| matches!(h, Handle::Object(x) if *x == a))
+    }
+
+    /// Open handles, for the memory line of the run log.
+    pub fn handle_count(&self) -> usize {
+        self.handles.lock().unwrap().len()
     }
 
     /// Kernel pool allocation, zeroed.
@@ -164,7 +179,10 @@ impl Kernel {
                 p >> 20
             )
         };
-        format!("{}, {}, {}", mb(&self.virt), mb(&self.phys), mb(&self.pool))
+        // The pool is small and leaks there are small, so it is in KB.
+        let (u, p, t) = self.pool.lock().unwrap().usage();
+        let pool = format!("pool {}/{} KB (peak {})", u >> 10, t >> 10, p >> 10);
+        format!("{}, {}, {pool}", mb(&self.virt), mb(&self.phys))
     }
 }
 
