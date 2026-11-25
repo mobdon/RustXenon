@@ -316,8 +316,8 @@ fn mem_write_into_a_staged_window_reads_it_again() {
     assert_eq!(px(&img, W, 40, 40), RED);
 }
 
-/// A resolve between two draws submits the batch, so the second draw stages
-/// its window again and reads the resolved bytes: all its vertices are the
+/// A resolve into a staged window between two draws makes the second draw
+/// stage it again and read the resolved bytes: all its vertices are the
 /// clear colour's word, so it draws nothing over the cleared target.
 #[test]
 fn resolve_into_a_staged_window_reads_it_again() {
@@ -339,6 +339,64 @@ fn resolve_into_a_staged_window_reads_it_again() {
     assert_eq!(report.draws, 2, "{report:?}");
     assert_eq!(report.timings.windows_reused, 0, "{report:?}");
     assert!(report.timings.submits >= 2, "{report:?}");
+    let img = d.read_render_target(COLOR_KEY, 0, 0, W, H).unwrap();
+    assert_eq!(px(&img, W, 8, 8), clear);
+    assert_eq!(px(&img, W, 40, 40), clear);
+}
+
+/// A window staged before a resolve elsewhere is bound again after it: the
+/// resolve submits the batch, but the arena keeps the window.
+#[test]
+fn vertex_window_is_reused_across_a_resolve() {
+    let Some(mut d) = drawer() else { return };
+    let mut mem = memory();
+    rect(&mut mem, VERTS, W as f32, H as f32, RED);
+    rect(&mut mem, VERTS + 48, 32.0, 32.0, GREEN);
+    let clear = [10, 20, 30, 255];
+    let mut s = Stream::default();
+    s.setup()
+        .shader(false, &vs_color())
+        .shader(true, &ps_interp())
+        .vertex_fetch(0, VERTS, 24)
+        .draw_auto(PRIM_RECT_LIST, 3)
+        .resolve(&mut mem, W, H, true, Some((rgba(clear), 0)))
+        .vertex_fetch(0, VERTS + 48, 12)
+        .draw_auto(PRIM_RECT_LIST, 3);
+    let report = run(&mut d, &s, &mut mem);
+    assert_eq!((report.draws, report.resolves), (2, 1), "{report:?}");
+    assert_eq!(report.timings.windows_reused, 1, "{report:?}");
+    assert_eq!(report.timings.guest_bytes, 96, "{report:?}");
+    let copy = detiled(&mem, DEST, W, H, W, 4);
+    assert_eq!(px(&copy, W, 40, 40), RED);
+    let img = d.read_render_target(COLOR_KEY, 0, 0, W, H).unwrap();
+    assert_eq!(px(&img, W, 8, 8), GREEN);
+    assert_eq!(px(&img, W, 40, 40), clear);
+}
+
+/// A staged window that starts before a resolve destination and runs into
+/// it is read again after the resolve: the draw from the destination sees
+/// the resolved words (one point, drawing nothing), not the old red
+/// rectangle there.
+#[test]
+fn vertex_window_over_a_resolve_destination_reads_it_again() {
+    let Some(mut d) = drawer() else { return };
+    let mut mem = memory();
+    rect(&mut mem, DEST - 48, 32.0, 32.0, GREEN);
+    rect(&mut mem, DEST, W as f32, H as f32, RED);
+    let clear = [10, 20, 30, 255];
+    let mut s = Stream::default();
+    s.setup()
+        .shader(false, &vs_color())
+        .shader(true, &ps_interp())
+        .vertex_fetch(0, DEST - 48, 24)
+        .draw_auto(PRIM_RECT_LIST, 3)
+        .resolve(&mut mem, W, H, false, Some((rgba(clear), 0)))
+        .resolve(&mut mem, W, H, true, None)
+        .vertex_fetch(0, DEST, 12)
+        .draw_auto(PRIM_RECT_LIST, 3);
+    let report = run(&mut d, &s, &mut mem);
+    assert_eq!((report.draws, report.resolves), (2, 2), "{report:?}");
+    assert_eq!(report.timings.windows_reused, 0, "{report:?}");
     let img = d.read_render_target(COLOR_KEY, 0, 0, W, H).unwrap();
     assert_eq!(px(&img, W, 8, 8), clear);
     assert_eq!(px(&img, W, 40, 40), clear);
