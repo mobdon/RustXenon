@@ -657,6 +657,9 @@ pub struct Drawer {
     snorm16: bool,
     /// The snorm16 targets blend (else their blending is dropped).
     snorm16_blend: bool,
+    /// [`formats::half_lut`] tables by source format and exponent bias, for
+    /// CPU resolves to 16-bit float destinations.
+    half_luts: HashMap<(TargetFormat, i32), Option<Vec<[u16; 2]>>>,
     timings: Timings,
     uncaptured: Arc<Mutex<Vec<String>>>,
     max_dim: u32,
@@ -1053,6 +1056,7 @@ impl Drawer {
             float_stencil,
             snorm16,
             snorm16_blend,
+            half_luts: HashMap::new(),
             timings: Timings::default(),
             uncaptured,
             max_dim: limits.max_texture_dimension_2d,
@@ -2852,12 +2856,29 @@ impl Drawer {
         self.timings.readback_bytes += px.len() as u64;
         let src_bytes = px.len() / (rect.width() * rect.height()) as usize;
         let mut out = vec![0; px.len() / src_bytes * dest_bytes];
+        let half_dest = matches!(
+            r.dest_format,
+            formats::DEST_16_16_FLOAT | formats::DEST_16_16_16_16_FLOAT
+        );
+        let lut = if half_dest {
+            self.half_luts
+                .entry((format, r.dest_exp_bias))
+                .or_insert_with(|| formats::half_lut(format, r.dest_exp_bias))
+                .as_ref()
+        } else {
+            None
+        };
         for (src, dst) in px
             .chunks_exact(src_bytes)
             .zip(out.chunks_exact_mut(dest_bytes))
         {
-            let rgba = formats::edram_rgba(format, src);
-            formats::resolve_pixel(rgba, r.dest_exp_bias, r.dest_swap, r.dest_format, dst);
+            match lut {
+                Some(lut) => formats::resolve_half_pixel(lut, src, r.dest_swap, dst),
+                None => {
+                    let rgba = formats::edram_rgba(format, src);
+                    formats::resolve_pixel(rgba, r.dest_exp_bias, r.dest_swap, r.dest_format, dst);
+                }
+            }
         }
         let done = resolve::write_tiled_texels(
             mem,

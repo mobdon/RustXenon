@@ -303,9 +303,78 @@ pub fn resolve_pixel(rgba: [f32; 4], exp_bias: i32, swap: bool, dest_format: u32
     }
 }
 
+/// For a source format whose four channels are independent 16-bit halves
+/// in the EDRAM texel (k_16_16_16_16_FLOAT, and 7e3 as the host keeps it)
+/// and a 16-bit float destination: what [`resolve_pixel`] makes of each
+/// half value with `exp_bias`, as `[colour, alpha]` halves indexed by the
+/// source half's bits. None for other formats.
+pub fn half_lut(format: TargetFormat, exp_bias: i32) -> Option<Vec<[u16; 2]>> {
+    if !matches!(format, TargetFormat::Float7e3 | TargetFormat::Rgba16Float) {
+        return None;
+    }
+    let lut = (0..=u16::MAX)
+        .map(|h| {
+            let b = h.to_le_bytes();
+            let mut out = [0; 8];
+            let rgba = edram_rgba(format, &[b, b, b, b].concat());
+            resolve_pixel(rgba, exp_bias, false, DEST_16_16_16_16_FLOAT, &mut out);
+            [
+                u16::from_le_bytes([out[0], out[1]]),
+                u16::from_le_bytes([out[6], out[7]]),
+            ]
+        })
+        .collect();
+    Some(lut)
+}
+
+/// [`resolve_pixel`] of an EDRAM texel to a 16-bit float destination
+/// through a [`half_lut`] table of the texel's format.
+pub fn resolve_half_pixel(lut: &[[u16; 2]], texel: &[u8], swap: bool, out: &mut [u8]) {
+    for (i, o) in out.chunks_exact_mut(2).enumerate() {
+        let j = if swap { [2, 1, 0, 3][i] } else { i };
+        let h = u16::from_le_bytes([texel[2 * j], texel[2 * j + 1]]);
+        o.copy_from_slice(&lut[h as usize][usize::from(j == 3)].to_le_bytes());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The table path gives resolve_pixel's bytes for both source formats,
+    /// several biases, both swaps and both 16-bit float destinations,
+    /// including NaN, infinity and denormal halves.
+    #[test]
+    fn half_lut_matches_resolve_pixel() {
+        let halves = [
+            0u16, 1, 0x3C00, 0x3555, 0x7BFF, 0x7C00, 0x7E01, 0x8001, 0xBC00, 0xFC00, 0x4B80, 0x0400,
+        ];
+        for format in [TargetFormat::Float7e3, TargetFormat::Rgba16Float] {
+            for bias in [-5, 0, 3] {
+                let lut = half_lut(format, bias).unwrap();
+                for (k, &a) in halves.iter().enumerate() {
+                    let texel: Vec<u8> = [
+                        a,
+                        halves[(k + 3) % 12],
+                        halves[(k + 7) % 12],
+                        halves[(k + 5) % 12],
+                    ]
+                    .iter()
+                    .flat_map(|h| h.to_le_bytes())
+                    .collect();
+                    for swap in [false, true] {
+                        for (dest, n) in [(DEST_16_16_16_16_FLOAT, 8), (DEST_16_16_FLOAT, 4)] {
+                            let (mut want, mut got) = (vec![0; n], vec![0; n]);
+                            resolve_pixel(edram_rgba(format, &texel), bias, swap, dest, &mut want);
+                            resolve_half_pixel(&lut, &texel, swap, &mut got);
+                            assert_eq!(got, want, "{format:?} {bias} {swap} {dest} {texel:?}");
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(half_lut(TargetFormat::Rgba8, 0), None);
+    }
 
     #[test]
     fn float7e3_known_values_and_round_trip() {
