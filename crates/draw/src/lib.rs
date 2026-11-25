@@ -5659,7 +5659,15 @@ impl Drawer {
             _ => xenon_texture::Endian::K8in32,
         };
         xenon_texture::endian::swap_in_place(&mut raw, endian);
-        let rgba8 = tile::detile_2d(&raw, width, height, pitch, 4).map_err(|e| e.to_string())?;
+        let mut rgba8 =
+            tile::detile_2d(&raw, width, height, pitch, 4).map_err(|e| e.to_string())?;
+        // Scan-out samples the front buffer through fetch constant 0, as
+        // Xenia's swap texture does: its swizzle undoes a red/blue swap the
+        // final resolve put in (copy_dest_swap with a zyxw fetch).
+        let f = xenon_texture::TextureFetch::decode(self.regs.fetch_constant(0));
+        if f.fetch_type == 2 && f.base_address & PHYSICAL_MASK == addr {
+            xenon_texture::apply_swizzle(&mut rgba8, f.swizzle);
+        }
         Ok(Frame {
             width,
             height,

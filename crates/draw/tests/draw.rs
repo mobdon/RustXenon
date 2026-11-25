@@ -596,6 +596,37 @@ fn swap_frame_png_round_trip() {
     assert_eq!(&buf[..info.buffer_size()], &frame.rgba8[..]);
 }
 
+/// The front buffer is shown through fetch constant 0, as Xenia does: a
+/// zyxw swizzle there undoes the red/blue swap of a BGRA front buffer.
+#[test]
+fn swap_applies_fetch_constant_0_swizzle() {
+    let Some(mut d) = drawer() else { return };
+    let mut mem = memory();
+    let mut s = Stream::default();
+    draw_pattern(&mut mem, &mut s);
+    let zyxw = 2 | (1 << 3) | (3 << 9);
+    s.regs(SHADER_CONSTANT_FETCH, &[2, DEST, 0, zyxw << 1, 0, 0])
+        .swap(W, H);
+    let report = run(&mut d, &s, &mut mem);
+    let rt = d.read_render_target(COLOR_KEY, 0, 0, W, H).unwrap();
+    let swapped: Vec<u8> = rt
+        .chunks_exact(4)
+        .flat_map(|p| [p[2], p[1], p[0], p[3]])
+        .collect();
+    assert_ne!(rt, swapped);
+    assert_eq!(report.frames[0].rgba8, swapped);
+
+    // Fetch constant 0 describing another address leaves the frame as is.
+    let mut s = Stream::default();
+    draw_pattern(&mut mem, &mut s);
+    s.regs(
+        SHADER_CONSTANT_FETCH,
+        &[2, DEST + 0x1000, 0, zyxw << 1, 0, 0],
+    )
+    .swap(W, H);
+    assert_eq!(run(&mut d, &s, &mut mem).frames[0].rgba8, rt);
+}
+
 /// A frame bundle of two frames, saved and read back, replays to the same
 /// last frame; with that frame's draw skipped, only the clear is left.
 #[test]
