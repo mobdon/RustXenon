@@ -252,7 +252,8 @@ impl Tracked<'_> {
 /// how to read it (width, height, pitch, endian, swizzle).
 struct LateFront {
     buf: wgpu::Buffer,
-    index: wgpu::SubmissionIndex,
+    /// The submitter's batch number of the batch that copies into `buf`.
+    sent: u64,
     size: (u32, u32, u32),
     endian: xenon_texture::Endian,
     swizzle: Option<u16>,
@@ -567,6 +568,9 @@ type SubmitJob = (
 #[derive(Default)]
 struct SubmitState {
     pending: usize,
+    /// Batches sent, and batches submitted, since the start.
+    sent: u64,
+    done: u64,
     queue: Duration,
     error: Option<String>,
     last: Option<wgpu::SubmissionIndex>,
@@ -641,7 +645,10 @@ impl Submitter {
     }
 
     fn send(&self, upload: Option<(wgpu::Buffer, u64, Vec<u8>)>, encs: Vec<wgpu::CommandEncoder>) {
-        self.state.lock().expect("submit state").pending += 1;
+        let mut st = self.state.lock().expect("submit state");
+        st.pending += 1;
+        st.sent += 1;
+        drop(st);
         self.tx
             .as_ref()
             .expect("submit thread")
@@ -661,12 +668,30 @@ impl Submitter {
         while st.pending > n {
             let (e, error, index) = rx.recv().expect("submit thread alive");
             st.pending -= 1;
+            st.done += 1;
             st.queue += e;
             if st.error.is_none() {
                 st.error = error;
             }
             st.last = Some(index);
         }
+    }
+
+    /// Waits until batch number `sent` is submitted, and returns that
+    /// submission or a later one.
+    fn wait_for(&self, sent: u64) -> wgpu::SubmissionIndex {
+        let pending = {
+            let st = self.state.lock().expect("submit state");
+            st.sent - sent.min(st.sent)
+        };
+        self.drain_to(pending as usize);
+        let st = self.state.lock().expect("submit state");
+        st.last.clone().expect("a batch was submitted")
+    }
+
+    /// The number of batches sent so far.
+    fn sent(&self) -> u64 {
+        self.state.lock().expect("submit state").sent
     }
 
     /// The submit time and first error since the last call.
@@ -3202,6 +3227,16 @@ impl Drawer {
     /// Waits for submission `index` and copies out the mapped `buf`.
     fn map_read(&self, buf: &wgpu::Buffer, index: wgpu::SubmissionIndex) -> Result<Vec<u8>, Error> {
         self.submitter.drain();
+        self.map_submitted(buf, index)
+    }
+
+    /// [`Drawer::map_read`] of a buffer that no batch still queued on the
+    /// submit thread uses, so without waiting for those.
+    fn map_submitted(
+        &self,
+        buf: &wgpu::Buffer,
+        index: wgpu::SubmissionIndex,
+    ) -> Result<Vec<u8>, Error> {
         let slot = Arc::new(Mutex::new(None));
         let sink = slot.clone();
         buf.slice(..).map_async(wgpu::MapMode::Read, move |r| {
@@ -5743,21 +5778,27 @@ impl Drawer {
                 usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
                 mapped_at_creation: false,
             });
-            let mut enc = self.device.create_command_encoder(&Default::default());
+            // The copy goes at the end of the batch, after this frame's
+            // resolves, through the submit thread: the swap does not wait
+            // for the queued batches, only for last frame's copy below.
+            let device = &self.device;
+            let b = self.batch.get_or_insert_with(|| Batch {
+                pass: None,
+                enc: device.create_command_encoder(&Default::default()),
+            });
+            b.pass = None;
             let m = &self.mirrors[i];
-            enc.copy_buffer_to_buffer(&m.buf, lo - m.lo, &buf, 0, u64::from(extent));
-            if self.resolve_pending {
-                self.flush().map_err(|e| match e {
-                    Skip::Fatal(e) => e,
-                    Skip::Unsupported(why) => Error::Gpu(why),
-                })?;
-            }
-            let index = self.submit_now([enc.finish()]);
-            self.submitted(Site::Other);
+            b.enc
+                .copy_buffer_to_buffer(&m.buf, lo - m.lo, &buf, 0, u64::from(extent));
+            self.flush().map_err(|e| match e {
+                Skip::Fatal(e) => e,
+                Skip::Unsupported(why) => Error::Gpu(why),
+            })?;
+            let sent = self.submitter.sent();
             let (endian, swizzle) = self.front_buffer_read(addr);
             let new = LateFront {
                 buf,
-                index,
+                sent,
                 size: (width, height, pitch),
                 endian,
                 swizzle,
@@ -5765,7 +5806,9 @@ impl Drawer {
             let Some(old) = self.late_front.replace(new) else {
                 return Ok(Err("first late front buffer: no frame yet".into()));
             };
-            let raw = self.map_read(&old.buf, old.index)?;
+            // A frame later, its batch is most likely submitted already.
+            let index = self.submitter.wait_for(old.sent);
+            let raw = self.map_submitted(&old.buf, index)?;
             let (w, h, p) = old.size;
             return Ok(detile_front(raw, w, h, p, old.endian, old.swizzle));
         }
