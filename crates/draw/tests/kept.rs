@@ -832,12 +832,6 @@ fn mip_fetch(min: u32) -> [u32; 6] {
     f
 }
 
-/// A 7e3 gradient resolved to k_16_16_16_16_FLOAT as the base level and a
-/// blue rectangle resolved as its 32x32 mip right after it, the way games
-/// build blurred chains. The mip lives in the same kept resolve and is
-/// decoded with the base: a fetch that starts at level 1 samples only
-/// blue, and one that starts at level 0 (texel for texel, so LOD 0) still
-/// samples the base exactly as the guest path does.
 /// Draws `paint` and resolves its top-left 32x32 to MIP as
 /// k_16_16_16_16_FLOAT.
 fn paint_mip(s: &mut Stream, mem: &mut SliceMemory, paint: fn(&mut Stream) -> &mut Stream) {
@@ -859,6 +853,12 @@ fn paint_mip(s: &mut Stream, mem: &mut SliceMemory, paint: fn(&mut Stream) -> &m
         .regs(RB_MODECONTROL, &[4]);
 }
 
+/// A 7e3 gradient resolved to k_16_16_16_16_FLOAT as the base level and a
+/// blue rectangle resolved as its 32x32 mip right after it, the way games
+/// build blurred chains. The mip lives in the same kept resolve and is
+/// decoded with the base: a fetch that starts at level 1 samples only
+/// blue, and one that starts at level 0 (texel for texel, so LOD 0) still
+/// samples the base exactly as the guest path does.
 #[test]
 fn kept_mip_level_is_sampled() {
     let case = &HALF4;
