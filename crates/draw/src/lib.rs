@@ -375,6 +375,10 @@ pub struct Timings {
     /// EDRAM ownership transfers between colour and depth targets (also
     /// counted in the phase that needed the target).
     pub transfer: Duration,
+    /// Of all the phases, the time spent in `create_render_pipeline` and
+    /// `create_compute_pipeline` (where a driver compiles to machine
+    /// code), including the pipelines' share of `shaders`.
+    pub pipeline: Duration,
     /// Counts: pipelines and shader modules created, textures uploaded.
     pub pipelines_created: u32,
     pub textures_uploaded: u32,
@@ -437,6 +441,7 @@ impl std::ops::AddAssign<&Timings> for Timings {
         self.clears += t.clears;
         self.swap += t.swap;
         self.transfer += t.transfer;
+        self.pipeline += t.pipeline;
         self.pipelines_created += t.pipelines_created;
         self.textures_uploaded += t.textures_uploaded;
         self.submits += t.submits;
@@ -729,6 +734,17 @@ fn transferable(a: TargetFormat, b: TargetFormat) -> bool {
 /// about 1.6 MB of driver memory.
 const PIPELINE_CAP: usize = 1024;
 
+/// New pipelines between writes of the pipeline cache file.
+const PIPELINE_SAVE_EVERY: u32 = 16;
+
+/// A pipeline cache loaded from and saved to a file.
+struct DiskCache {
+    cache: wgpu::PipelineCache,
+    path: std::path::PathBuf,
+    /// Pipelines created since the file was last written.
+    unsaved: u32,
+}
+
 /// A draw's texture slot mask and its slots' views and samplers, in slot
 /// order.
 type TextureGroupKey = (u32, Vec<(wgpu::TextureView, wgpu::Sampler)>);
@@ -976,11 +992,23 @@ pub struct Drawer {
     /// (such as a cube or 3D fetch) do not log.
     pub texture_log: Option<Option<u64>>,
     timings: Timings,
+    /// File name for the pipeline cache of this adapter, when the device
+    /// has `PIPELINE_CACHE` (Vulkan only).
+    cache_key: Option<String>,
+    disk_cache: Option<DiskCache>,
     uncaptured: Arc<Mutex<Vec<String>>>,
     max_dim: u32,
     max_storage: u64,
     /// Last, so it drops after the device and every resource made from it.
     instance: wgpu::Instance,
+}
+
+impl Drop for Drawer {
+    fn drop(&mut self) {
+        if let Err(e) = self.save_pipeline_cache() {
+            eprintln!("[draw] pipeline cache not saved: {e}");
+        }
+    }
 }
 
 /// Draws recorded into one command encoder, in one render pass while the
@@ -1337,6 +1365,7 @@ impl Drawer {
             & (wgpu::Features::FLOAT32_FILTERABLE | wgpu::Features::TEXTURE_COMPRESSION_BC);
         required_features.set(wgpu::Features::DEPTH32FLOAT_STENCIL8, float_stencil);
         required_features.set(snorm16_features, snorm16);
+        required_features |= adapter.features() & wgpu::Features::PIPELINE_CACHE;
         let (device, queue) = block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("xenon-draw"),
             required_limits: limits.clone(),
@@ -1489,10 +1518,113 @@ impl Drawer {
                     }
                 }),
             timings: Timings::default(),
+            cache_key: required_features
+                .contains(wgpu::Features::PIPELINE_CACHE)
+                .then(|| wgpu::util::pipeline_cache_key(&info))
+                .flatten(),
+            disk_cache: None,
             uncaptured,
             max_dim: limits.max_texture_dimension_2d,
             max_storage: limits.max_storage_buffer_binding_size,
         })
+    }
+
+    /// Keeps compiled pipelines in a file under `dir` (made if missing),
+    /// loaded now and written every few new pipelines, when the drawer
+    /// drops and on [`Drawer::save_pipeline_cache`] (an owner that never
+    /// drops the drawer calls it now and then), so pipelines compiled in
+    /// earlier runs are not compiled again. Returns the file, or `None`
+    /// where the device has no pipeline cache (GL). A file from another
+    /// driver version, or unreadable, is replaced once a pipeline is made. Pipelines made before this call are not in the cache.
+    pub fn set_pipeline_cache_dir(
+        &mut self,
+        dir: &std::path::Path,
+    ) -> std::io::Result<Option<std::path::PathBuf>> {
+        let Some(key) = &self.cache_key else {
+            return Ok(None);
+        };
+        std::fs::create_dir_all(dir)?;
+        let path = dir.join(key);
+        let data = match std::fs::read(&path) {
+            Ok(d) => Some(d),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(e),
+        };
+        let create = |data: Option<&[u8]>| {
+            let scope = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
+            // SAFETY: the data was written by `get_data` (from the file named
+            // by this adapter's cache key); wgpu checks its header, version
+            // and adapter and falls back to an empty cache for a stale one.
+            let cache = unsafe {
+                self.device
+                    .create_pipeline_cache(&wgpu::PipelineCacheDescriptor {
+                        label: Some("pipelines"),
+                        data,
+                        fallback: true,
+                    })
+            };
+            block_on(scope.pop()).is_none().then_some(cache)
+        };
+        // wgpu refuses data for another adapter even with `fallback` (a
+        // copied file): start empty then.
+        let cache = create(data.as_deref())
+            .or_else(|| create(None))
+            .ok_or_else(|| std::io::Error::other("could not create a pipeline cache"))?;
+        self.disk_cache = Some(DiskCache {
+            cache,
+            path: path.clone(),
+            unsaved: 0,
+        });
+        Ok(Some(path))
+    }
+
+    /// Writes the pipeline cache file, if there is one (see
+    /// [`Drawer::set_pipeline_cache_dir`]) and pipelines were created since
+    /// it was last written, so it is cheap to call often; through a
+    /// temporary file of its
+    /// own so a crash, or another process saving to the same directory,
+    /// leaves a whole file (the last one renamed wins).
+    pub fn save_pipeline_cache(&mut self) -> std::io::Result<()> {
+        static SAVES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let Some(c) = &mut self.disk_cache else {
+            return Ok(());
+        };
+        if c.unsaved == 0 {
+            return Ok(());
+        }
+        c.unsaved = 0;
+        let Some(data) = c.cache.get_data() else {
+            return Ok(());
+        };
+        let n = SAVES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tmp = c
+            .path
+            .with_extension(format!("{}-{n}.tmp", std::process::id()));
+        let r = std::fs::write(&tmp, data).and_then(|()| std::fs::rename(&tmp, &c.path));
+        if r.is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+        r
+    }
+
+    /// The pipeline cache, for pipeline descriptors.
+    fn pipeline_cache(&self) -> Option<&wgpu::PipelineCache> {
+        self.disk_cache.as_ref().map(|c| &c.cache)
+    }
+
+    /// Counts a pipeline created since `t0` and writes the cache file every
+    /// [`PIPELINE_SAVE_EVERY`] new ones.
+    fn pipeline_made(&mut self, t0: Instant) {
+        self.timings.pipeline += t0.elapsed();
+        let Some(c) = &mut self.disk_cache else {
+            return;
+        };
+        c.unsaved += 1;
+        if c.unsaved >= PIPELINE_SAVE_EVERY {
+            if let Err(e) = self.save_pipeline_cache() {
+                eprintln!("[draw] pipeline cache not saved: {e}");
+            }
+        }
     }
 
     /// The drawer's register file (the state after the commands replayed).
@@ -2582,6 +2714,8 @@ impl Drawer {
             blend: None,
             write_mask: wgpu::ColorWrites::ALL,
         })];
+        let cache = self.pipeline_cache();
+        let t0 = Instant::now();
         let p = self.validated("transfer pipeline", |dev| {
             dev.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some("transfer"),
@@ -2615,9 +2749,10 @@ impl Drawer {
                     targets: if to_depth { &[] } else { &color_target },
                 }),
                 multiview_mask: None,
-                cache: None,
+                cache,
             })
         })?;
+        self.pipeline_made(t0);
         self.transfer_pipelines.insert((src, dst, bit), p.clone());
         Ok(p)
     }
@@ -3129,23 +3264,30 @@ impl Drawer {
         };
         let scope = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
         let device = &self.device;
+        let cache = self.disk_cache.as_ref().map(|c| &c.cache);
         let entry = ["decode_8888", "decode_float"][usize::from(mode.is_some())];
+        // Set once the shader module is made, so it times the pipeline alone.
+        let mut t0 = None;
         let pipeline = self.decode_pipelines[usize::from(mode.is_some())]
             .get_or_insert_with(|| {
                 let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
                     label: Some("resolve"),
                     source: wgpu::ShaderSource::Wgsl(include_str!("resolve.wgsl").into()),
                 });
+                t0 = Some(Instant::now());
                 device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                     label: Some(entry),
                     layout: None,
                     module: &module,
                     entry_point: Some(entry),
                     compilation_options: Default::default(),
-                    cache: None,
+                    cache,
                 })
             })
             .clone();
+        if let Some(t0) = t0 {
+            self.pipeline_made(t0);
+        }
         let pipeline = &pipeline;
         let mut enc = self
             .pre
@@ -3720,6 +3862,8 @@ impl Drawer {
             }
             None => {
                 let k = key.clone();
+                let cache = self.pipeline_cache();
+                let t0 = Instant::now();
                 let p = self.validated("render pipeline", |dev| {
                     dev.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                         label: Some("draw"),
@@ -3760,9 +3904,10 @@ impl Drawer {
                             }),
                         }),
                         multiview_mask: None,
-                        cache: None,
+                        cache,
                     })
                 })?;
+                self.pipeline_made(t0);
                 self.pipelines.insert(key, (p.clone(), self.pipeline_uses));
                 self.timings.pipelines_created += 1;
                 self.drop_pipelines();
@@ -4010,6 +4155,8 @@ impl Drawer {
             blend: None,
             write_mask: wgpu::ColorWrites::ALL,
         })];
+        let cache = self.pipeline_cache();
+        let t0 = Instant::now();
         let p = self.validated("clear pipeline", |dev| {
             dev.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some("clear"),
@@ -4046,9 +4193,10 @@ impl Drawer {
                     targets: if is_depth { &[] } else { &color_target },
                 }),
                 multiview_mask: None,
-                cache: None,
+                cache,
             })
         })?;
+        self.pipeline_made(t0);
         self.clear_pipelines.insert(format, p.clone());
         Ok(p)
     }
@@ -4450,20 +4598,28 @@ impl Drawer {
         );
         let scope = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
         let device = &self.device;
+        let cache = self.disk_cache.as_ref().map(|c| &c.cache);
+        // Set once the shader module is made, so it times the pipeline alone.
+        let mut t0 = None;
         let pipeline = self.resolve_pipelines[entry].get_or_insert_with(|| {
             let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("resolve"),
                 source: wgpu::ShaderSource::Wgsl(include_str!("resolve.wgsl").into()),
             });
+            t0 = Some(Instant::now());
             device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                 label: Some("resolve"),
                 layout: None,
                 module: &module,
                 entry_point: Some(["main", "depth_main", "depth_stencil_main"][entry]),
                 compilation_options: Default::default(),
-                cache: None,
+                cache,
             })
         });
+        let pipeline = &pipeline.clone();
+        if let Some(t0) = t0 {
+            self.pipeline_made(t0);
+        }
         let aspect = |aspect| {
             tex.create_view(&wgpu::TextureViewDescriptor {
                 aspect,
