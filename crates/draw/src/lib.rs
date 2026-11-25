@@ -1,5 +1,7 @@
-// float20e4 is ported from Xenia src/xenia/gpu/xenos.cc (Float20e4To32) and
-// unorm24 from src/xenia/gpu/xenos.h (UNorm24To32); the
+// float20e4 (Xenia src/xenia/gpu/xenos.cc Float20e4To32) lives in
+// xenon-texture; the zero
+// texture bound for a slot without a usable texture matches the null images
+// (cleared to 0, 0, 0, 0) of src/xenia/gpu/vulkan/vulkan_texture_cache.cc; the
 // 8_8_8_8 colour clear packing (red in the low byte) follows
 // src/xenia/gpu/shaders/pixel_formats.xesli; render target formats and
 // RB_*_INFO fields follow src/xenia/gpu/xenos.h and registers.h; resolve
@@ -81,9 +83,10 @@
 //! commands are described at `Drawer::resolve` (`Raw` and `Convert` alike,
 //! `Null` clears only, `ConstantOne` unsupported).
 //!
-//! A depth copy (to any 32bpp destination format) writes the raw EDRAM word,
-//! as Xenia's fast resolve does: depth in bits 8..31 (`kD24S8` as 24-bit
-//! unorm, rounded; `kD24FS8` as 20e4, rounded to nearest even) and stencil in
+//! A depth copy writes the raw 32-bit EDRAM word whatever the destination
+//! format, as Xenia's fast resolve does: depth in bits 8..31 (`kD24S8` as
+//! 24-bit unorm, rounded to nearest even; `kD24FS8` as 20e4, truncated like
+//! Xenia's default) and stencil in
 //! bits 0..7 (0 for a `kD24FS8` hosted without stencil), with the destination
 //! endian and no bias or swap.
 //!
@@ -125,6 +128,7 @@ use xenon_gpu::{
     SliceMemory, PHYSICAL_MASK,
 };
 use xenon_shader::{ShaderInfo, Translated};
+use xenon_texture::convert::float20e4_to_f32 as float20e4;
 
 pub use frame::Frame;
 
@@ -481,6 +485,12 @@ pub struct Drawer {
     /// guest bytes they read, so an unchanged texture is not decoded again.
     texture_cache: HashMap<([u32; 6], u64), wgpu::TextureView>,
     texture_cache_bytes: u64,
+    /// 1x1 texture of zeros bound for a slot without a usable texture.
+    zero_texture: wgpu::TextureView,
+    zero_sampler: wgpu::Sampler,
+    /// Whether `Rgba32Float` textures can be sampled with filtering; without
+    /// it wide formats are uploaded as `Rgba16Float`.
+    float32_filterable: bool,
     /// Compute pipeline of resolve.wgsl, made on the first 32bpp resolve.
     /// Colour, depth and depth + stencil entry points of resolve.wgsl.
     resolve_pipelines: [Option<wgpu::ComputePipeline>; 3],
@@ -746,13 +756,13 @@ impl Drawer {
         });
         let snorm16_blend = snorm16
             && snorm16_all(&|f| f.flags.contains(wgpu::TextureFormatFeatureFlags::BLENDABLE));
-        let mut required_features = wgpu::Features::empty();
+        let mut required_features = adapter.features() & wgpu::Features::FLOAT32_FILTERABLE;
         required_features.set(wgpu::Features::DEPTH32FLOAT_STENCIL8, float_stencil);
         required_features.set(snorm16_features, snorm16);
         let (device, queue) = block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("xenon-draw"),
-            required_features,
             required_limits: limits.clone(),
+            required_features,
             ..Default::default()
         }))
         .map_err(|e| Error::RequestDevice(e.to_string()))?;
@@ -797,6 +807,24 @@ impl Drawer {
             label: Some("clear"),
             source: wgpu::ShaderSource::Wgsl(CLEAR_WGSL.into()),
         });
+        let zero_sampler = device.create_sampler(&Default::default());
+        // wgpu zero-initialises new textures, so nothing is written.
+        let zero_texture = device
+            .create_texture(&wgpu::TextureDescriptor {
+                label: Some("zero texture"),
+                size: wgpu::Extent3d {
+                    width: 1,
+                    height: 1,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8Unorm,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            })
+            .create_view(&Default::default());
         Ok(Drawer {
             device,
             queue,
@@ -817,6 +845,9 @@ impl Drawer {
             resolved_endian: HashMap::new(),
             texture_cache: HashMap::new(),
             texture_cache_bytes: 0,
+            zero_texture,
+            zero_sampler,
+            float32_filterable: required_features.contains(wgpu::Features::FLOAT32_FILTERABLE),
             resolve_pipelines: [None, None, None],
             float_stencil,
             snorm16,
@@ -831,6 +862,12 @@ impl Drawer {
     /// The drawer's register file (the state after the commands replayed).
     pub fn registers(&self) -> &RegisterFile {
         &self.regs
+    }
+
+    /// Whether depth, 16-bit unorm and 32-bit float textures upload as
+    /// `Rgba32Float` (full precision) rather than `Rgba16Float`.
+    pub fn float32_textures(&self) -> bool {
+        self.float32_filterable
     }
 
     /// Keys of every render target created so far.
@@ -1337,7 +1374,10 @@ impl Drawer {
         to_bytes(&v)
     }
 
-    /// Texture and sampler for fetch constant slot `n`.
+    /// Texture and sampler for fetch constant slot `n`. A slot without a
+    /// texture fetch constant, or whose texture cannot be read or decoded,
+    /// gets a 1x1 texture of zeros (as Xenia binds its null image) and a
+    /// warning, so the draw still happens.
     fn texture(
         &mut self,
         n: u32,
@@ -1346,10 +1386,30 @@ impl Drawer {
     ) -> Result<(wgpu::TextureView, wgpu::Sampler), Skip> {
         let fetch = xenon_texture::TextureFetch::decode(self.regs.fetch_constant(n));
         if fetch.fetch_type != 2 {
-            return unsupported(format!("texture slot {n} has no texture fetch constant"));
+            report.warn("texture slot without a texture fetch constant drawn with zeros");
+            return Ok((self.zero_texture.clone(), self.zero_sampler.clone()));
         }
+        let sampler = self.sampler(&fetch, report);
+        let view = self
+            .guest_texture(n, &fetch, mem, report)
+            .unwrap_or_else(|why| {
+                report.warn(format!("{why}; drawn with zeros"));
+                self.zero_texture.clone()
+            });
+        Ok((view, sampler))
+    }
+
+    /// Host texture of fetch constant slot `n`, from the cache or decoded.
+    /// Formats whose values do not fit 8-bit unorm upload as floats.
+    fn guest_texture(
+        &mut self,
+        n: u32,
+        fetch: &xenon_texture::TextureFetch,
+        mem: &dyn GuestMemory,
+        report: &mut Report,
+    ) -> Result<wgpu::TextureView, String> {
         let addr = fetch.base_address & PHYSICAL_MASK;
-        let bytes = xenon_texture::bytes_needed(&fetch)
+        let bytes = xenon_texture::bytes_needed(fetch)
             .and_then(|len| {
                 mem.read_bytes(addr, len)
                     .ok_or(xenon_texture::Error::TooShort {
@@ -1357,31 +1417,45 @@ impl Drawer {
                         got: 0,
                     })
             })
-            .map_err(|e| Skip::Unsupported(format!("texture slot {n}: {e}")))?;
+            .map_err(|e| e.to_string())?;
         let key = (self.regs.fetch_constant(n), hash_bytes(&bytes));
-        let sampler = self.sampler(&fetch, report);
         if let Some(view) = self.texture_cache.get(&key) {
-            return Ok((view.clone(), sampler));
+            return Ok(view.clone());
         }
-        let img = xenon_texture::decode_base_level(&fetch, &bytes)
-            .map_err(|e| Skip::Unsupported(format!("texture slot {n}: {e}")))?;
-        if img.width > self.max_dim || img.height > self.max_dim {
-            return unsupported(format!("texture {}x{}", img.width, img.height));
+        let host = host_texture_format(fetch.format, self.float32_filterable);
+        let (width, height, data) = if host == wgpu::TextureFormat::Rgba8Unorm {
+            let img = xenon_texture::decode_base_level(fetch, &bytes).map_err(|e| e.to_string())?;
+            (img.width, img.height, img.rgba8)
+        } else {
+            let img =
+                xenon_texture::decode_base_level_f32(fetch, &bytes).map_err(|e| e.to_string())?;
+            let data = if host == wgpu::TextureFormat::Rgba32Float {
+                img.rgba.iter().flat_map(|v| v.to_le_bytes()).collect()
+            } else {
+                img.rgba
+                    .iter()
+                    .flat_map(|&v| formats::f32_to_half(v).to_le_bytes())
+                    .collect()
+            };
+            (img.width, img.height, data)
+        };
+        if width > self.max_dim || height > self.max_dim {
+            return Err(format!("texture {width}x{height}"));
         }
         let size = wgpu::Extent3d {
-            width: img.width,
-            height: img.height,
+            width,
+            height,
             depth_or_array_layers: 1,
         };
         report.timings.textures_uploaded += 1;
-        report.timings.texture_bytes += img.rgba8.len() as u64;
+        report.timings.texture_bytes += data.len() as u64;
         let tex = self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("guest texture"),
             size,
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8Unorm,
+            format: host,
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
@@ -1392,23 +1466,23 @@ impl Drawer {
                 origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,
             },
-            &img.rgba8,
+            &data,
             wgpu::TexelCopyBufferLayout {
                 offset: 0,
-                bytes_per_row: Some(img.width * 4),
-                rows_per_image: Some(img.height),
+                bytes_per_row: Some(data.len() as u32 / height),
+                rows_per_image: Some(height),
             },
             size,
         );
         let view = tex.create_view(&Default::default());
-        let len = img.rgba8.len() as u64;
+        let len = data.len() as u64;
         if self.texture_cache_bytes + len > TEXTURE_CACHE_LIMIT {
             self.texture_cache.clear();
             self.texture_cache_bytes = 0;
         }
         self.texture_cache_bytes += len;
         self.texture_cache.insert(key, view.clone());
-        Ok((view, sampler))
+        Ok(view)
     }
 
     fn sampler(&self, fetch: &xenon_texture::TextureFetch, report: &mut Report) -> wgpu::Sampler {
@@ -2033,7 +2107,10 @@ impl Drawer {
             let d = r.depth_clear >> 8;
             let depth = match key.format {
                 TargetFormat::D24FS8 => float20e4(d),
-                _ => unorm24(d),
+                // Not Xenia's UNorm24To32: n / 0xFFFFFF is the value the
+                // depth resolve's round(d * 0xFFFFFF) gives back exactly for
+                // every 24-bit n, as the EDRAM keeps it.
+                _ => (f64::from(d) / f64::from(0xFF_FFFFu32)) as f32,
             };
             let t = Instant::now();
             self.clear(key, rect, [0.0; 4], depth, r.depth_clear & 0xFF)?;
@@ -2065,7 +2142,14 @@ impl Drawer {
             };
             format
         };
-        let Some(dest_bytes) = formats::dest_bytes(r.dest_format) else {
+        // A depth copy always writes 32bpp words whatever the destination
+        // format says (Xenia GetResolveInfo replaces it with k_24_8).
+        let dest_bytes = if r.is_depth {
+            Some(4)
+        } else {
+            formats::dest_bytes(r.dest_format)
+        };
+        let Some(dest_bytes) = dest_bytes else {
             return unsupported(format!(
                 "resolve copy to destination format {}",
                 r.dest_format
@@ -2095,12 +2179,6 @@ impl Drawer {
         };
         if rect.is_empty() {
             return Ok(());
-        }
-        if r.is_depth && dest_bytes != 4 {
-            return unsupported(format!(
-                "depth resolve to {dest_bytes}-byte destination format {}",
-                r.dest_format
-            ));
         }
         // shortcut: 16_16_FLOAT colour copies take the CPU path (WGSL's
         // pack2x16float does not promise rounding); port f32_to_half to
@@ -2341,27 +2419,35 @@ impl Drawer {
     }
 }
 
-/// 24-bit unorm depth to float (Xenia xenos.h UNorm24To32): exact, unlike a
-/// division by 0xFFFFFF.
-fn unorm24(n24: u32) -> f32 {
-    let n24 = n24 & 0xFF_FFFF;
-    (n24 + (n24 >> 23)) as f32 / (1 << 24) as f32
-}
-
-/// Xenos 20e4 depth (Xenia xenos.cc Float20e4To32).
-fn float20e4(f24: u32) -> f32 {
-    let f24 = f24 & 0xFF_FFFF;
-    if f24 == 0 {
-        return 0.0;
+/// Host format of a guest texture: `Rgba16Float` for half floats,
+/// `Rgba32Float` for depth, 16-bit unorm and 32-bit floats (16-bit unorm and
+/// 24-bit depth need more than a half's 11 bits), `Rgba8Unorm` for the rest.
+/// Without filterable 32-bit floats the wide formats fall back to
+/// `Rgba16Float`. That keeps the [-1, 1] range of 16-bit unorm and 24-bit
+/// depth but not their precision. 32-bit floats also lose range: values with
+/// a magnitude of 65520 or more become infinity and values below about 2^-25
+/// flush to zero.
+fn host_texture_format(format: xenon_texture::TextureFormat, float32: bool) -> wgpu::TextureFormat {
+    use xenon_texture::TextureFormat as F;
+    match format.data_format() {
+        F::K16Float | F::K16_16Float | F::K16_16_16_16Float => wgpu::TextureFormat::Rgba16Float,
+        F::K24_8
+        | F::K24_8Float
+        | F::K16
+        | F::K16_16
+        | F::K16_16_16_16
+        | F::K32Float
+        | F::K32_32Float
+        | F::K32_32_32Float
+        | F::K32_32_32_32Float => {
+            if float32 {
+                wgpu::TextureFormat::Rgba32Float
+            } else {
+                wgpu::TextureFormat::Rgba16Float
+            }
+        }
+        _ => wgpu::TextureFormat::Rgba8Unorm,
     }
-    let mut mantissa = f24 & 0xF_FFFF;
-    let mut exponent = f24 >> 20;
-    if exponent == 0 {
-        let lz = mantissa.leading_zeros() - (32 - 21);
-        exponent = (1 - lz as i32) as u32;
-        mantissa = (mantissa << lz) & 0xF_FFFF;
-    }
-    f32::from_bits((exponent.wrapping_add(112) << 23) | (mantissa << 3))
 }
 
 #[cfg(test)]
@@ -2381,18 +2467,15 @@ mod tests {
     }
 
     #[test]
-    fn unorm24_end_points() {
-        assert_eq!(unorm24(0), 0.0);
-        assert_eq!(unorm24(0xFF_FFFF), 1.0);
-        assert_eq!(unorm24(0x80_0000), 0.5 + 1.0 / (1 << 24) as f32);
-    }
-
-    #[test]
-    fn float20e4_known_values() {
-        assert_eq!(float20e4(0), 0.0);
-        // Exponent 15 (bias 15), mantissa 0: 1.0.
-        assert_eq!(float20e4(15 << 20), 1.0);
-        assert_eq!(float20e4((15 << 20) | (1 << 19)), 1.5);
+    fn host_texture_formats() {
+        use wgpu::TextureFormat as H;
+        use xenon_texture::TextureFormat as F;
+        assert_eq!(host_texture_format(F::K8_8_8_8, true), H::Rgba8Unorm);
+        assert_eq!(host_texture_format(F::Dxt1, true), H::Rgba8Unorm);
+        assert_eq!(host_texture_format(F::K16Expand, true), H::Rgba16Float);
+        assert_eq!(host_texture_format(F::K24_8Float, true), H::Rgba32Float);
+        assert_eq!(host_texture_format(F::K24_8Float, false), H::Rgba16Float);
+        assert_eq!(host_texture_format(F::K16_16, true), H::Rgba32Float);
     }
 
     #[test]
