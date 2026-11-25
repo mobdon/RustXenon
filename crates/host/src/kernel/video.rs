@@ -191,20 +191,21 @@ pub fn start(rt: std::sync::Arc<Runtime>) {
                 match xenon_draw::Drawer::new() {
                     Ok(mut d) => {
                         crate::log(&format!("[draw] adapter: {}", d.adapter));
-                        // Compiled pipelines persist across runs, next to the
-                        // title's saves unless XENON_PIPELINE_CACHE names a
-                        // directory.
-                        let dir = std::env::var_os("XENON_PIPELINE_CACHE")
-                            .map_or_else(|| k().data_dir.join("pipeline-cache"), Into::into);
-                        match d.set_pipeline_cache_dir(&dir) {
-                            Ok(Some(f)) => {
-                                crate::log(&format!("[draw] pipeline cache: {}", f.display()))
+                        // Opt-in: loading the cache cost about 900 MB of host
+                        // memory in a warm run and gained no speed over the
+                        // driver's own shader cache.
+                        if let Some(dir) = std::env::var_os("XENON_PIPELINE_CACHE") {
+                            let dir = std::path::PathBuf::from(dir);
+                            match d.set_pipeline_cache_dir(&dir) {
+                                Ok(Some(f)) => {
+                                    crate::log(&format!("[draw] pipeline cache: {}", f.display()))
+                                }
+                                Ok(None) => crate::log("[draw] no pipeline cache on this device"),
+                                Err(e) => crate::log(&format!(
+                                    "[draw] no pipeline cache in {}: {e}",
+                                    dir.display()
+                                )),
                             }
-                            Ok(None) => crate::log("[draw] no pipeline cache on this device"),
-                            Err(e) => crate::log(&format!(
-                                "[draw] no pipeline cache in {}: {e}",
-                                dir.display()
-                            )),
                         }
                         gpu.set_drawer(&rt, d);
                     }
