@@ -1074,33 +1074,35 @@ fn hash_bytes(bytes: &[u8]) -> u64 {
 /// fetches in `reach` when the vertex shader's starting indices (index plus
 /// VGT_INDX_OFFSET, 24 bits) lie in `indices`; `None` when they are not
 /// known. Clipped to the constant's buffer, which is all of it for a fetch
-/// with an unbounded index or a constant without a reach entry.
+/// with an unbounded index or a constant without a reach entry. The flag is
+/// set when some fetch's words were clipped: the draw reads past the buffer.
 fn fetch_range(
     a: u64,
     size_dwords: u32,
     k: u32,
     reach: &[VertexFetchReach],
     indices: Option<(u32, u32)>,
-) -> (u64, u64) {
+) -> (u64, u64, bool) {
     let end = a + 4 * u64::from(size_dwords);
     let mut entries = reach.iter().filter(|r| r.fetch_const == k).peekable();
     if entries.peek().is_none() {
-        return (a, end);
+        return (a, end, false);
     }
-    let (mut lo, mut hi) = (end, a);
+    let (mut lo, mut hi, mut clipped) = (end, a, false);
     for r in entries {
         let (i0, i1) = match (r.stride, indices) {
             (0, _) => (0, 0),
             (_, Some(i)) if r.bounded => i,
-            _ => return (a, end),
+            _ => return (a, end, false),
         };
         let stride = i64::from(r.stride);
         let first = a as i64 + 4 * (i64::from(i0) * stride + i64::from(r.first));
         let last = a as i64 + 4 * (i64::from(i1) * stride + i64::from(r.end));
+        clipped |= first < a as i64 || last > end as i64;
         lo = lo.min(first.clamp(a as i64, end as i64) as u64);
         hi = hi.max(last.clamp(a as i64, end as i64) as u64);
     }
-    (lo, hi.max(lo))
+    (lo, hi.max(lo), clipped)
 }
 
 /// The lowest and highest vertex index the vertex shader starts with for
@@ -2919,8 +2921,9 @@ impl Drawer {
     /// The guest memory the vertex fetch constants in `mask` point at, as
     /// far as `reach` reads with vertex indices in `indices` (see
     /// [`fetch_range`]), made ready to read (kept resolves under it written
-    /// back). Ranges less than [`WINDOW_GAP`] apart share one part; the
-    /// parts are staged one after the other as one window. Returns the
+    /// back). Ranges less than [`WINDOW_GAP`] apart share one part (all of
+    /// them when some fetch reads past its buffer); the parts are staged
+    /// one after the other as one window. Returns the
     /// parts' physical `[lo, hi)` (none for no window), the window base and
     /// each constant's rebase words (see the shader binding contract); or,
     /// when the window is one part and a window staged in this batch holds
@@ -2944,6 +2947,7 @@ impl Drawer {
         Skip,
     > {
         let mut ranges = Vec::new();
+        let mut clipped = false;
         for k in (0..96).filter(|k| mask & (1u128 << k) != 0) {
             let vf = self.regs.vertex_fetch(k);
             if vf.fetch_type != FetchConstantType::Vertex {
@@ -2951,7 +2955,8 @@ impl Drawer {
             }
             // Physical, as the translated shader masks fetch addresses.
             let a = u64::from(vf.address & PHYSICAL_MASK);
-            let (lo, hi) = fetch_range(a, vf.size_dwords, k, reach, indices);
+            let (lo, hi, c) = fetch_range(a, vf.size_dwords, k, reach, indices);
+            clipped |= c;
             if lo < hi {
                 ranges.push((lo, hi, k));
             }
@@ -2959,9 +2964,14 @@ impl Drawer {
         ranges.sort_unstable();
         let mut parts: Vec<(u64, u64)> = Vec::new();
         let mut part_of = Vec::new();
+        // A read past its constant's buffer must find the guest's word or 0,
+        // not another part's, so such a draw stages one span with no rebase.
+        // shortcut: an unbounded index past the buffer is not seen and may
+        // still read another part; bound fetches in the shader if that shows.
+        let gap = if clipped { u64::MAX } else { WINDOW_GAP };
         for &(lo, hi, k) in &ranges {
             match parts.last_mut() {
-                Some(p) if lo <= p.1 + WINDOW_GAP => p.1 = p.1.max(hi),
+                Some(p) if lo <= p.1.saturating_add(gap) => p.1 = p.1.max(hi),
                 _ => parts.push((lo, hi)),
             }
             part_of.push((k, parts.len() - 1));
@@ -5140,27 +5150,28 @@ mod tests {
         let reach = [r(4, true, 0, 3), r(4, true, 1, 4)];
         assert_eq!(
             fetch_range(a, 256, 2, &reach, Some((4, 6))),
-            (a + 64, a + 112)
+            (a + 64, a + 112, false)
         );
         // Another constant's reach, or unknown indices: the whole buffer.
-        assert_eq!(fetch_range(a, 256, 3, &reach, Some((4, 6))), (a, a + 1024));
-        assert_eq!(fetch_range(a, 256, 2, &reach, None), (a, a + 1024));
+        let whole = (a, a + 1024, false);
+        assert_eq!(fetch_range(a, 256, 3, &reach, Some((4, 6))), whole);
+        assert_eq!(fetch_range(a, 256, 2, &reach, None), whole);
         assert_eq!(
             fetch_range(a, 256, 2, &[r(4, false, 0, 1)], Some((0, 0))),
-            (a, a + 1024)
+            whole
         );
         // Stride 0 needs no indices; a negative offset and an end past the
         // buffer are clipped.
         assert_eq!(
             fetch_range(a, 256, 2, &[r(0, true, 5, 7)], None),
-            (a + 20, a + 28)
+            (a + 20, a + 28, false)
         );
         assert_eq!(
             fetch_range(a, 16, 2, &[r(4, true, -2, 1)], Some((0, 9))),
-            (a, a + 64)
+            (a, a + 64, true)
         );
-        // Entirely past the buffer: nothing.
-        let (lo, hi) = fetch_range(a, 16, 2, &[r(4, true, 0, 1)], Some((20, 30)));
-        assert_eq!(lo, hi);
+        // Entirely past the buffer: nothing, and clipped.
+        let (lo, hi, clipped) = fetch_range(a, 16, 2, &[r(4, true, 0, 1)], Some((20, 30)));
+        assert_eq!((lo == hi, clipped), (true, true));
     }
 }

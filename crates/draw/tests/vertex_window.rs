@@ -130,3 +130,26 @@ fn far_apart_buffers_upload_only_their_vertices() {
         }
     }
 }
+
+/// A colour constant two words long read for three vertices: the third
+/// read passes its buffer, so the window is one span that holds the
+/// guest's word there instead of a part next to the positions.
+#[test]
+fn read_past_a_buffer_finds_the_guest_word() {
+    let colours = 0x8_0000;
+    let mut mem = big_memory();
+    let (wf, hf) = (W as f32, H as f32);
+    let pos = [0.0, 0.0, 0.0, wf, 0.0, 0.0, 0.0, hf, 0.0].map(f);
+    mem.write_words(BIG, &pos);
+    mem.write_words(colours, &[rgba(RED); 3]);
+    let mut s = Stream::default();
+    s.setup()
+        .shader(false, &vs_two_buffers())
+        .shader(true, &ps_interp())
+        .vertex_fetch(0, BIG, BIG_DWORDS)
+        .vertex_fetch(1, colours, 2)
+        .draw_auto(PRIM_RECT_LIST, 3);
+    if let Some(bytes) = draw(&mut mem, &s) {
+        assert_eq!(bytes, u64::from(BIG - colours) + 36);
+    }
+}
