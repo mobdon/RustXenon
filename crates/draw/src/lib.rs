@@ -1231,6 +1231,10 @@ impl Drawer {
             label: Some("xenon-draw"),
             required_limits: limits.clone(),
             required_features,
+            // 8-64 MB allocator blocks instead of 128-256 MB: with textures
+            // evicted and uploaded all the time, big blocks fragment and stay
+            // reserved (a 360 s run held 1,344 MB for 510 MB used).
+            memory_hints: wgpu::MemoryHints::MemoryUsage,
             ..Default::default()
         }))
         .map_err(|e| Error::RequestDevice(e.to_string()))?;
