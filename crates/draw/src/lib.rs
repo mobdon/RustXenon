@@ -166,6 +166,7 @@ pub mod resolve;
 pub mod state;
 
 use std::collections::hash_map::DefaultHasher;
+use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::hash::{Hash, Hasher};
@@ -418,6 +419,8 @@ pub struct Timings {
     /// Draws whose constants block equals the last one staged in the same
     /// batch, bound from there instead of staged again.
     pub consts_reused: u32,
+    /// Draws that bound a texture bind group made earlier in their batch.
+    pub texture_groups_reused: u32,
 }
 
 impl std::ops::AddAssign<&Timings> for Timings {
@@ -457,6 +460,7 @@ impl std::ops::AddAssign<&Timings> for Timings {
         self.windows_reused += t.windows_reused;
         self.reused_bytes += t.reused_bytes;
         self.consts_reused += t.consts_reused;
+        self.texture_groups_reused += t.texture_groups_reused;
     }
 }
 
@@ -724,6 +728,10 @@ fn transferable(a: TargetFormat, b: TargetFormat) -> bool {
 /// about 1.6 MB of driver memory.
 const PIPELINE_CAP: usize = 1024;
 
+/// A draw's texture slot mask and its slots' views and samplers, in slot
+/// order.
+type TextureGroupKey = (u32, Vec<(wgpu::TextureView, wgpu::Sampler)>);
+
 /// A program's translation, or why it failed.
 type Translation = Result<Arc<Translated>, String>;
 
@@ -888,6 +896,10 @@ pub struct Drawer {
     samplers: HashMap<([u8; 3], u8, u8), wgpu::Sampler>,
     /// Draws recorded but not yet submitted (see [`Batch`]).
     batch: Option<Batch>,
+    /// Texture bind groups made in the batch, by texture slot mask and the
+    /// slots' views and samplers. Cleared with the batch, so they keep
+    /// nothing alive past the batch that already holds them.
+    texture_groups: HashMap<TextureGroupKey, wgpu::BindGroup>,
     /// Draw buffers (guest window, constants, epilogue, indices) of the
     /// batch, as slices of `arena`, written to it once at submit.
     staged: Vec<u8>,
@@ -1414,6 +1426,7 @@ impl Drawer {
             texture_memo: HashMap::new(),
             samplers: HashMap::new(),
             batch: None,
+            texture_groups: HashMap::new(),
             staged: Vec::new(),
             arena: None,
             window_memo: Vec::new(),
@@ -1643,6 +1656,7 @@ impl Drawer {
         self.staged.clear();
         self.window_memo.clear();
         self.staged_consts = None;
+        self.texture_groups.clear();
         // Resolves done before an error still reach guest memory.
         let kept = self.finish_mirrors(&mut mem);
         done?;
@@ -1971,6 +1985,7 @@ impl Drawer {
         let t = Instant::now();
         self.window_memo.clear();
         self.staged_consts = None;
+        self.texture_groups.clear();
         if let (Some(arena), false) = (&self.arena, self.staged.is_empty()) {
             self.queue.write_buffer(arena, 0, &self.staged);
             self.staged.clear();
@@ -3733,7 +3748,7 @@ impl Drawer {
         }
         let mut textures = Vec::new();
         for n in (0..32).filter(|n| tex_mask & (1 << n) != 0) {
-            textures.push((n, self.texture(n, mem, report)?));
+            textures.push(self.texture(n, mem, report)?);
         }
         self.timings.textures += lap(&mut t);
         let arena = self.arena.clone().expect("staged");
@@ -3753,22 +3768,32 @@ impl Drawer {
                 resource: binding(i),
             }),
         });
-        let mut entries = Vec::new();
-        for (n, (view, sampler)) in &textures {
-            entries.push(wgpu::BindGroupEntry {
-                binding: 2 * n,
-                resource: wgpu::BindingResource::TextureView(view),
-            });
-            entries.push(wgpu::BindGroupEntry {
-                binding: 2 * n + 1,
-                resource: wgpu::BindingResource::Sampler(sampler),
-            });
-        }
-        let g1 = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("draw group 1"),
-            layout: &g1_layout,
-            entries: &entries,
-        });
+        let g1 = match self.texture_groups.entry((tex_mask, textures)) {
+            Entry::Occupied(g) => {
+                self.timings.texture_groups_reused += 1;
+                g.get().clone()
+            }
+            Entry::Vacant(v) => {
+                let slots = (0..32).filter(|n| tex_mask & (1 << n) != 0);
+                let mut entries = Vec::new();
+                for (n, (view, sampler)) in slots.zip(&v.key().1) {
+                    entries.push(wgpu::BindGroupEntry {
+                        binding: 2 * n,
+                        resource: wgpu::BindingResource::TextureView(view),
+                    });
+                    entries.push(wgpu::BindGroupEntry {
+                        binding: 2 * n + 1,
+                        resource: wgpu::BindingResource::Sampler(sampler),
+                    });
+                }
+                let g = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("draw group 1"),
+                    layout: &g1_layout,
+                    entries: &entries,
+                });
+                v.insert(g).clone()
+            }
+        };
         let pass = self.pass((color, depth_key), &color_tex, depth_tex.as_ref());
         pass.set_pipeline(&pipeline);
         pass.set_bind_group(0, &g0, &[]);
