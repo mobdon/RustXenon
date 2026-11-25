@@ -1234,6 +1234,29 @@ fn signed_texels_filter_after_conversion() {
     assert!(h.iter().all(|&h| h & 0x7FFF <= 0x1C00), "{h:x?}");
 }
 
+/// A texture signed in every component uploads as halves: a signed 8_8_8_8
+/// texel 0x40 reads 64/127 rounded to the nearest half, 1032/2048 (within
+/// 2^-12 of it), and 0x81 reads -1 exactly.
+#[test]
+fn all_signed_8_8_8_8_texel_rounds_to_a_half() {
+    let Some(mut d) = drawer() else { return };
+    let fetch = [
+        2 | (0x55 << 2) | (2 << 10) | (2 << 13) | (1 << 22),
+        6 | TEXTURE, // 8_8_8_8
+        0,
+        ((1 << 3) | (2 << 6) | (3 << 9)) << 1, // swizzle XYZW
+        0,
+        1 << 9,
+    ];
+    let bytes = [0x40, 0x81, 0, 0];
+    let red = |raw: Vec<u8>| f32::from_le_bytes(raw.try_into().unwrap());
+    let x = red(sample_fetch(&mut d, RT_32_FLOAT, fetch, &bytes));
+    assert_eq!(x, 1032.0 / 2048.0);
+    let mut fetch = fetch;
+    fetch[3] = (1 | (2 << 6) | (3 << 9)) << 1; // swizzle YXZW
+    assert_eq!(red(sample_fetch(&mut d, RT_32_FLOAT, fetch, &bytes)), -1.0);
+}
+
 /// A signed 16_16 texel reads its fields exactly as two's complement:
 /// 0x8001 is -1 and 0x4000 is 16384/32767, both exact in a 32-bit float
 /// target.
