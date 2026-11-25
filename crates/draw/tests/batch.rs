@@ -372,3 +372,37 @@ fn equal_constants_are_staged_once_per_batch() {
     assert_eq!(px(&img, W, 8, 8), BLUE);
     assert_eq!(px(&img, W, 40, 40), GREEN);
 }
+
+/// A draw whose vertex window is not in guest memory is skipped, with the
+/// window in the report, and the draws staged around it still land.
+#[test]
+fn unreadable_vertex_window_skips_only_its_draw() {
+    let Some(mut d) = drawer() else { return };
+    let mut mem = memory();
+    rect(&mut mem, VERTS, W as f32, H as f32, RED);
+    rect(&mut mem, VERTS + 48, 32.0, 32.0, GREEN);
+    let outside = mem.data.len() as u32;
+    let mut s = Stream::default();
+    s.setup()
+        .shader(false, &vs_color())
+        .shader(true, &ps_interp())
+        .vertex_fetch(0, VERTS, 12)
+        .draw_auto(PRIM_RECT_LIST, 3)
+        .vertex_fetch(0, outside, 12)
+        .draw_auto(PRIM_RECT_LIST, 3)
+        .vertex_fetch(0, VERTS + 48, 12)
+        .draw_auto(PRIM_RECT_LIST, 3);
+    let report = run(&mut d, &s, &mut mem);
+    assert_eq!(report.draws, 2, "{report:?}");
+    let why = format!(
+        "vertex data at 0x{outside:08X}..0x{:08X} not readable",
+        outside + 48
+    );
+    assert!(
+        report.unsupported.iter().any(|u| u.contains(&why)),
+        "{report:?}"
+    );
+    let img = d.read_render_target(COLOR_KEY, 0, 0, W, H).unwrap();
+    assert_eq!(px(&img, W, 8, 8), GREEN);
+    assert_eq!(px(&img, W, 40, 40), RED);
+}

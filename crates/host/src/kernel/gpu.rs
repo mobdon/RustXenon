@@ -38,13 +38,16 @@ impl GuestRead for Physical<'_> {
         Some(self.0.mem.read_u32(gpu_to_cpu(addr)))
     }
     fn read_bytes(&self, addr: u32, len: usize) -> Option<Vec<u8>> {
-        let a = gpu_to_cpu(addr);
-        if a as u64 + len as u64 > 0xC000_0000 {
-            return None;
-        }
         let mut b = vec![0; len];
-        self.0.mem.read_bytes(a, &mut b);
-        Some(b)
+        self.read_into(addr, &mut b).then_some(b)
+    }
+    fn read_into(&self, addr: u32, out: &mut [u8]) -> bool {
+        let a = gpu_to_cpu(addr);
+        if a as u64 + out.len() as u64 > 0xC000_0000 {
+            return false;
+        }
+        self.0.mem.read_bytes(a, out);
+        true
     }
 }
 
