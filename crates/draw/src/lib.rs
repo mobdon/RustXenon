@@ -178,7 +178,7 @@ use xenon_gpu::{
     Command, CopyCommand, Draw, FetchConstantType, GuestRead, RegisterFile, Resolve, ShaderStage,
     SliceMemory, PHYSICAL_MASK,
 };
-use xenon_shader::{ParamGen, ParamGenPrimitive, ShaderInfo, Translated};
+use xenon_shader::{ParamGen, ParamGenPrimitive, ShaderInfo, Translated, VertexFetchReach};
 use xenon_texture::convert::float20e4_to_f32 as float20e4;
 
 pub use frame::Frame;
@@ -1067,6 +1067,51 @@ fn hash_bytes(bytes: &[u8]) -> u64 {
         h = (h.rotate_left(5) ^ u64::from(b)).wrapping_mul(K);
     }
     h
+}
+
+/// The physical byte range `[lo, hi)` vertex fetch constant `k`, at
+/// physical byte address `a` with `size_dwords` words, has read by the
+/// fetches in `reach` when the vertex shader's starting indices (index plus
+/// VGT_INDX_OFFSET, 24 bits) lie in `indices`; `None` when they are not
+/// known. Clipped to the constant's buffer, which is all of it for a fetch
+/// with an unbounded index or a constant without a reach entry.
+fn fetch_range(
+    a: u64,
+    size_dwords: u32,
+    k: u32,
+    reach: &[VertexFetchReach],
+    indices: Option<(u32, u32)>,
+) -> (u64, u64) {
+    let end = a + 4 * u64::from(size_dwords);
+    let mut entries = reach.iter().filter(|r| r.fetch_const == k).peekable();
+    if entries.peek().is_none() {
+        return (a, end);
+    }
+    let (mut lo, mut hi) = (end, a);
+    for r in entries {
+        let (i0, i1) = match (r.stride, indices) {
+            (0, _) => (0, 0),
+            (_, Some(i)) if r.bounded => i,
+            _ => return (a, end),
+        };
+        let stride = i64::from(r.stride);
+        let first = a as i64 + 4 * (i64::from(i0) * stride + i64::from(r.first));
+        let last = a as i64 + 4 * (i64::from(i1) * stride + i64::from(r.end));
+        lo = lo.min(first.clamp(a as i64, end as i64) as u64);
+        hi = hi.max(last.clamp(a as i64, end as i64) as u64);
+    }
+    (lo, hi.max(lo))
+}
+
+/// The lowest and highest vertex index the vertex shader starts with for
+/// `indices` (reset markers skipped) and index offset `offset`, as the
+/// shader adds them in 32 bits and keeps 24; `None` when that wraps.
+fn index_range(indices: &[u32], offset: u32) -> Option<(u32, u32)> {
+    let mut used = indices.iter().filter(|&&i| i != u32::MAX);
+    let first = *used.next()?;
+    let (lo, hi) = used.fold((first, first), |(lo, hi), &i| (lo.min(i), hi.max(i)));
+    let (lo, hi) = (lo.wrapping_add(offset), hi.wrapping_add(offset));
+    (lo <= hi && lo >> 24 == hi >> 24).then_some((lo & 0xFF_FFFF, hi & 0xFF_FFFF))
 }
 
 /// Cached textures are dropped wholesale past this many bytes.
@@ -2865,7 +2910,8 @@ impl Drawer {
     }
 
     /// The guest memory the vertex fetch constants in `mask` point at, as
-    /// one window, made ready to read (kept resolves under it written
+    /// far as `reach` reads with vertex indices in `indices` (see
+    /// [`fetch_range`]), as one window, made ready to read (kept resolves under it written
     /// back). Returns its physical `[lo, hi)` (none for no window) and base
     /// address; or, when a window staged in this batch holds it, none, that
     /// window's base and its memo entry, with this window's size.
@@ -2873,6 +2919,8 @@ impl Drawer {
     fn guest_window(
         &mut self,
         mask: u128,
+        reach: &[VertexFetchReach],
+        indices: Option<(u32, u32)>,
         mem: &mut Tracked,
         report: &mut Report,
     ) -> Result<
@@ -2891,8 +2939,11 @@ impl Drawer {
             }
             // Physical, as the translated shader masks fetch addresses.
             let a = u64::from(vf.address & PHYSICAL_MASK);
-            lo = lo.min(a);
-            hi = hi.max(a + 4 * u64::from(vf.size_dwords));
+            let (a_lo, a_hi) = fetch_range(a, vf.size_dwords, k, reach, indices);
+            if a_lo < a_hi {
+                lo = lo.min(a_lo);
+                hi = hi.max(a_hi);
+            }
         }
         if lo >= hi {
             return Ok((None, 0, None));
@@ -3723,7 +3774,13 @@ impl Drawer {
         };
         self.timings.shaders += lap(&mut t);
 
-        let (mut read, window_base, staged) = self.guest_window(vf_mask, mem, report)?;
+        let reach: Vec<VertexFetchReach> = (vs_t.info.vertex_fetch_reach.iter())
+            .chain(&ps_t.info.vertex_fetch_reach)
+            .copied()
+            .collect();
+        let indices = index_range(&idx, self.regs.get(regs::VGT_INDX_OFFSET));
+        let (mut read, window_base, staged) =
+            self.guest_window(vf_mask, &reach, indices, mem, report)?;
         let consts = self.consts(window_base);
         let epi = to_bytes(&state::epilogue(&self.regs, w, h));
         // Rectangle lists read their guest indices in the vertex shader and
@@ -5005,5 +5062,55 @@ mod tests {
         assert!(
             ps.contains("out.c3 = vec4<f32>((o_col[3] * 2.0).xyz, (o_col[3] * 2.0).w) * 0.03125;")
         );
+    }
+
+    #[test]
+    fn index_range_skips_resets_and_applies_the_offset() {
+        assert_eq!(index_range(&[7, u32::MAX, 3, 9], 0), Some((3, 9)));
+        assert_eq!(index_range(&[u32::MAX], 0), None);
+        assert_eq!(index_range(&[1, 2], 10), Some((11, 12)));
+        // The shader keeps 24 bits of the 32-bit sum.
+        assert_eq!(index_range(&[1, 2], 0xFF00_0000), Some((1, 2)));
+        assert_eq!(index_range(&[0, 5], 0xFF_FFFE), None);
+        assert_eq!(index_range(&[0, 5], u32::MAX - 1), None);
+        assert_eq!(index_range(&[3, 5], u32::MAX - 1), Some((1, 3)));
+    }
+
+    #[test]
+    fn fetch_range_bounds_clips_and_falls_back() {
+        let r = |stride, bounded, first, end| VertexFetchReach {
+            fetch_const: 2,
+            stride,
+            bounded,
+            first,
+            end,
+        };
+        let a = 0x1000;
+        // Vertices 4..=6 of stride 4, words 0..3 and 1..4.
+        let reach = [r(4, true, 0, 3), r(4, true, 1, 4)];
+        assert_eq!(
+            fetch_range(a, 256, 2, &reach, Some((4, 6))),
+            (a + 64, a + 112)
+        );
+        // Another constant's reach, or unknown indices: the whole buffer.
+        assert_eq!(fetch_range(a, 256, 3, &reach, Some((4, 6))), (a, a + 1024));
+        assert_eq!(fetch_range(a, 256, 2, &reach, None), (a, a + 1024));
+        assert_eq!(
+            fetch_range(a, 256, 2, &[r(4, false, 0, 1)], Some((0, 0))),
+            (a, a + 1024)
+        );
+        // Stride 0 needs no indices; a negative offset and an end past the
+        // buffer are clipped.
+        assert_eq!(
+            fetch_range(a, 256, 2, &[r(0, true, 5, 7)], None),
+            (a + 20, a + 28)
+        );
+        assert_eq!(
+            fetch_range(a, 16, 2, &[r(4, true, -2, 1)], Some((0, 9))),
+            (a, a + 64)
+        );
+        // Entirely past the buffer: nothing.
+        let (lo, hi) = fetch_range(a, 16, 2, &[r(4, true, 0, 1)], Some((20, 30)));
+        assert_eq!(lo, hi);
     }
 }
