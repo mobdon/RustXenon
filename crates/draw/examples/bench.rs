@@ -205,4 +205,5 @@ fn main() {
         t.pipelines_created / n,
         t.submits / n
     );
+    println!("  {}", d.memory_line());
 }
