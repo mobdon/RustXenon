@@ -3479,7 +3479,7 @@ impl Drawer {
         };
         let ps_t = self.translate(&ps, ShaderStage::Pixel, param_gen);
         if let Some(dump) = &mut self.shader_dump {
-            fn wgsl(t: &Result<Translated, Skip>) -> Result<&str, String> {
+            fn wgsl(t: &Result<Arc<Translated>, Skip>) -> Result<&str, String> {
                 match t {
                     Ok(t) => Ok(&t.wgsl),
                     Err(e) => Err(format!("{e:?}")),
