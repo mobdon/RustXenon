@@ -31,6 +31,8 @@ pub enum Expand {
 pub fn topology(p: PrimitiveType) -> Result<(wgpu::PrimitiveTopology, Expand), String> {
     use wgpu::PrimitiveTopology as T;
     Ok(match p {
+        // shortcut: points are one host pixel, PA_SU_POINT_SIZE ignored;
+        // expand each to a quad as Xenia does once sized points show.
         PrimitiveType::PointList => (T::PointList, Expand::None),
         PrimitiveType::LineList => (T::LineList, Expand::None),
         PrimitiveType::LineStrip => (T::LineStrip, Expand::None),

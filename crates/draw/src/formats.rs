@@ -12,7 +12,14 @@
 // and pixel_formats.xesli (XeUnpackR10G10B10A2Float, XePackR8G8B8A8UNorm,
 // XePackR10G10B10A2UNorm, the 16_16_16_16_FLOAT packing); the output clamp
 // of 7e3 targets follows GetPSIColorFormatInfo and AddPSIColorFormatFlags in
-// src/xenia/gpu/render_target_cache.cc / .h (BSD 3-Clause, see CREDITS.md).
+// src/xenia/gpu/render_target_cache.cc / .h; k_16_16 / k_16_16_16_16 follow
+// the full-range snorm16 path of Xenia's host render targets (shader output
+// divided by 32 in d3d12/d3d12_command_processor.cc, R16G16[B16A16]_SNORM in
+// d3d12/d3d12_render_target_cache.cc, clears as raw 16-bit values in
+// vulkan/vulkan_render_target_cache.cc) and XeUnpackR16G16Edram /
+// XeUnpackR16G16B16A16Edram, XePackR16G16UNorm, XePackR16G16B16A16UNorm and
+// the 16_16_FLOAT / 32_32_FLOAT packing in pixel_formats.xesli (BSD 3-Clause,
+// see CREDITS.md).
 
 //! Colour formats without the GPU: clear values, the EDRAM view of host
 //! render target texels and the resolve packing into guest formats.
@@ -22,8 +29,22 @@ use crate::TargetFormat;
 /// `xenos::ColorFormat` values a resolve can write.
 pub const DEST_8_8_8_8: u32 = 6;
 pub const DEST_2_10_10_10: u32 = 7;
+pub const DEST_16_16: u32 = 25;
+pub const DEST_16_16_16_16: u32 = 26;
+pub const DEST_16_16_FLOAT: u32 = 31;
 pub const DEST_16_16_16_16_FLOAT: u32 = 32;
 pub const DEST_32_FLOAT: u32 = 36;
+pub const DEST_32_32_FLOAT: u32 = 37;
+
+/// k_16_16 and k_16_16_16_16 hold [-32, 32]; the snorm16 host target
+/// holds the value / 32, as Xenia's full-range host render targets do.
+pub const FIXED16_SCALE: f32 = 1.0 / 32.0;
+
+/// A k_16_16 EDRAM value (signed 16 bits) as Xenia's resolve unpacks it:
+/// x * 32 / 32767, floored at -1 (XeUnpackR16G16Edram).
+pub fn fixed16_to_f32(bits: u16) -> f32 {
+    (f32::from(bits as i16) * (32.0 / 32767.0)).max(-1.0)
+}
 
 /// Largest 7e3 value (exponent 7, mantissa 127).
 pub const FLOAT7E3_MAX: f32 = 31.875;
@@ -142,19 +163,43 @@ pub fn clear_color(format: TargetFormat, value: u64) -> [f32; 4] {
         // half -> f32 -> half round trip of the clear shader is exact.
         TargetFormat::Rgba16Float => [0, 16, 32, 48].map(|s| half_to_f32(field(s, 16) as u16)),
         TargetFormat::Float32 => [f32::from_bits(value as u32), 0.0, 0.0, 0.0],
+        // Xenia clears these with the raw 16-bit values: snorm x / 32767.
+        // shortcut: 0x8000 clears as 0x8001 (snorm has two -1s), clear
+        // through a uint view if a game clears to it.
+        TargetFormat::Rg16Fixed | TargetFormat::Rgba16Fixed => {
+            [0, 16, 32, 48].map(|s| (f32::from(field(s, 16) as u16 as i16) / 32767.0).max(-1.0))
+        }
+        TargetFormat::Rg16Float => [
+            half_to_f32(field(0, 16) as u16),
+            half_to_f32(field(16, 16) as u16),
+            0.0,
+            0.0,
+        ],
+        TargetFormat::Rg32Float => [
+            f32::from_bits(value as u32),
+            f32::from_bits((value >> 32) as u32),
+            0.0,
+            0.0,
+        ],
         TargetFormat::D24S8 | TargetFormat::D24FS8 => [0.0; 4],
     }
 }
 
-/// Output clamp of a pixel shader drawing into `format`: `(rgb_high,
-/// alpha_high)` with low bounds 0, or None. Xenia's EDRAM emulation clamps
-/// 7e3 outputs to [0, 31.875] / [0, 1] when blending is off; with blending
-/// only the alpha (fixed point in this format) is clamped, the colour is
-/// blended as float.
-pub fn output_clamp(format: TargetFormat, blending: bool) -> Option<(f32, f32)> {
+/// Output clamp and scale of a pixel shader drawing into `format`:
+/// `(rgb_high, alpha_high, scale)` with low bounds 0 (an infinite bound
+/// does not clamp), or None. Xenia's EDRAM emulation clamps 7e3 outputs to
+/// [0, 31.875] / [0, 1] when blending is off; with blending only the alpha
+/// (fixed point in this format) is clamped, the colour is blended as float.
+/// k_16_16 outputs are divided by 32 into their snorm16 host target, whose
+/// conversion clamps them to [-32, 32] (and blends them / 32, which Xenia
+/// accepts too).
+pub fn output_clamp(format: TargetFormat, blending: bool) -> Option<(f32, f32, f32)> {
     match (format, blending) {
-        (TargetFormat::Float7e3, false) => Some((FLOAT7E3_MAX, 1.0)),
-        (TargetFormat::Float7e3, true) => Some((f32::INFINITY, 1.0)),
+        (TargetFormat::Float7e3, false) => Some((FLOAT7E3_MAX, 1.0, 1.0)),
+        (TargetFormat::Float7e3, true) => Some((f32::INFINITY, 1.0, 1.0)),
+        (TargetFormat::Rg16Fixed | TargetFormat::Rgba16Fixed, _) => {
+            Some((f32::INFINITY, f32::INFINITY, FIXED16_SCALE))
+        }
         _ => None,
     }
 }
@@ -187,6 +232,17 @@ pub fn edram_rgba(format: TargetFormat, texel: &[u8]) -> [f32; 4] {
         TargetFormat::Rgba16Float => [half(0), half(1), half(2), half(3)],
         // XeResolveUnpack32bpp: red only.
         TargetFormat::Float32 => [f32::from_bits(word(0)), 0.0, 0.0, 0.0],
+        // The snorm16 host bits are the EDRAM bits.
+        TargetFormat::Rg16Fixed | TargetFormat::Rgba16Fixed => {
+            let c = |i: usize| fixed16_to_f32(u16::from_le_bytes([texel[2 * i], texel[2 * i + 1]]));
+            if format == TargetFormat::Rg16Fixed {
+                [c(0), c(1), 0.0, 0.0]
+            } else {
+                [c(0), c(1), c(2), c(3)]
+            }
+        }
+        TargetFormat::Rg16Float => [half(0), half(1), 0.0, 0.0],
+        TargetFormat::Rg32Float => [f32::from_bits(word(0)), f32::from_bits(word(4)), 0.0, 0.0],
         TargetFormat::D24S8 | TargetFormat::D24FS8 => [0.0; 4],
     }
 }
@@ -195,8 +251,8 @@ pub fn edram_rgba(format: TargetFormat, texel: &[u8]) -> [f32; 4] {
 /// drawer cannot write it.
 pub fn dest_bytes(dest_format: u32) -> Option<usize> {
     match dest_format {
-        DEST_8_8_8_8 | DEST_2_10_10_10 | DEST_32_FLOAT => Some(4),
-        DEST_16_16_16_16_FLOAT => Some(8),
+        DEST_8_8_8_8 | DEST_2_10_10_10 | DEST_16_16 | DEST_16_16_FLOAT | DEST_32_FLOAT => Some(4),
+        DEST_16_16_16_16 | DEST_16_16_16_16_FLOAT | DEST_32_32_FLOAT => Some(8),
         _ => None,
     }
 }
@@ -229,10 +285,19 @@ pub fn resolve_pixel(rgba: [f32; 4], exp_bias: i32, swap: bool, dest_format: u32
         }
         // XePack32bpp: the red channel's bits, not saturated.
         DEST_32_FLOAT => out.copy_from_slice(&p[0].to_bits().to_le_bytes()),
-        DEST_16_16_16_16_FLOAT => {
-            for (i, c) in p.iter().enumerate() {
-                out[2 * i..2 * i + 2].copy_from_slice(&f32_to_half(*c).to_le_bytes());
+        DEST_16_16 | DEST_16_16_16_16 => {
+            for (o, c) in out.chunks_exact_mut(2).zip(p) {
+                o.copy_from_slice(&(unorm(c, 65535.0) as u16).to_le_bytes());
             }
+        }
+        DEST_16_16_FLOAT | DEST_16_16_16_16_FLOAT => {
+            for (o, c) in out.chunks_exact_mut(2).zip(p) {
+                o.copy_from_slice(&f32_to_half(c).to_le_bytes());
+            }
+        }
+        DEST_32_32_FLOAT => {
+            out[..4].copy_from_slice(&p[0].to_bits().to_le_bytes());
+            out[4..].copy_from_slice(&p[1].to_bits().to_le_bytes());
         }
         _ => unreachable!("checked by dest_bytes"),
     }
@@ -355,5 +420,40 @@ mod tests {
         );
         assert_eq!(out[3], 170);
         assert_eq!(output_clamp(TargetFormat::Rgba8, false), None);
+    }
+
+    #[test]
+    fn fixed16_and_two_channel_formats() {
+        assert_eq!(fixed16_to_f32(0x7FFF), 32.0);
+        assert_eq!(fixed16_to_f32(0), 0.0);
+        // Floored at -1, as Xenia's resolve unpacks it.
+        assert_eq!(fixed16_to_f32(0x8001), -1.0);
+        assert_eq!(fixed16_to_f32(0xFC00), -1.0);
+        assert_eq!(fixed16_to_f32(0xFF00), -256.0 * (32.0 / 32767.0));
+        let v = clear_value(0xC000_7FFF, 0x8001_0000);
+        assert_eq!(
+            clear_color(TargetFormat::Rgba16Fixed, v),
+            [1.0, -16384.0 / 32767.0, 0.0, -1.0]
+        );
+        assert_eq!(
+            clear_color(
+                TargetFormat::Rg32Float,
+                clear_value(0x3F80_0000, 0x4000_0000)
+            ),
+            [1.0, 2.0, 0.0, 0.0]
+        );
+        let texel = [0x00, 0x3C, 0x00, 0xB8];
+        assert_eq!(
+            edram_rgba(TargetFormat::Rg16Float, &texel),
+            [1.0, -0.5, 0.0, 0.0]
+        );
+        let mut out = [0u8; 8];
+        resolve_pixel([1.0, 0.5, 2.0, -1.0], 0, true, DEST_16_16_16_16, &mut out);
+        assert_eq!(out, [0xFF, 0xFF, 0x00, 0x80, 0xFF, 0xFF, 0x00, 0x00]);
+        resolve_pixel([1.5, -2.0, 0.0, 0.0], 0, false, DEST_32_32_FLOAT, &mut out);
+        assert_eq!(
+            out,
+            [1.5f32.to_le_bytes(), (-2.0f32).to_le_bytes()].concat()[..]
+        );
     }
 }
