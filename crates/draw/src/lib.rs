@@ -1148,6 +1148,10 @@ pub struct Drawer {
     /// holds another, so `hi` grows with `lo` and the one window that can
     /// hold a range is the last starting at or before it.
     window_memo: BTreeMap<u64, (u64, (u64, u64))>,
+    /// Host indices of guest index buffers read this replay or, with
+    /// guest writes listed, an earlier one: guest `lo`, `hi` and the
+    /// indices. Dropped with the textures (see `forget_guest`).
+    index_memo: HashMap<IndexKey, (u64, u64, Arc<HostIndices>)>,
     /// The last `Consts` block staged in the arena and its (offset, size),
     /// bound again by a draw with the same bytes. Cleared with
     /// `window_memo` when the arena wraps or grows.
@@ -1412,13 +1416,35 @@ fn fetch_range(
 /// The lowest and highest vertex index the vertex shader starts with for
 /// `indices` (reset markers skipped) and index offset `offset`, as the
 /// shader adds them in 32 bits and keeps 24; `None` when that wraps.
-fn index_range(indices: &[u32], offset: u32) -> Option<(u32, u32)> {
+/// The smallest and largest index but the primitive reset (`u32::MAX`).
+fn min_max(indices: &[u32]) -> Option<(u32, u32)> {
     let mut used = indices.iter().filter(|&&i| i != u32::MAX);
     let first = *used.next()?;
-    let (lo, hi) = used.fold((first, first), |(lo, hi), &i| (lo.min(i), hi.max(i)));
+    Some(used.fold((first, first), |(lo, hi), &i| (lo.min(i), hi.max(i))))
+}
+
+/// The guest vertex range indices with this [`min_max`] reach, after
+/// VGT_INDX_OFFSET: None past 24 bits or if it wraps.
+fn offset_range(min_max: Option<(u32, u32)>, offset: u32) -> Option<(u32, u32)> {
+    let (lo, hi) = min_max?;
     let (lo, hi) = (lo.wrapping_add(offset), hi.wrapping_add(offset));
     (lo <= hi && lo >> 24 == hi >> 24).then_some((lo & 0xFF_FFFF, hi & 0xFF_FFFF))
 }
+
+/// A draw's guest index buffer and how its indices become host ones:
+/// address, buffer length, format, endian, count, reset index (when on),
+/// expansion and whether the topology is a strip.
+type IndexKey = (u32, u32, u8, u8, u32, Option<u32>, u8, bool);
+
+/// A draw's host indices, as staged, with their count and [`min_max`].
+struct HostIndices {
+    bytes: Vec<u8>,
+    len: u32,
+    min_max: Option<(u32, u32)>,
+}
+
+/// [`Drawer::index_memo`] entries held before it starts over.
+const INDEX_MEMO_CAP: usize = 1 << 14;
 
 /// Vertex data ranges closer than this share one window part; farther
 /// ranges are staged apart, so the gap between them is not uploaded.
@@ -1434,7 +1460,11 @@ const TEXTURE_MEMO_CAP: usize = 1 << 14;
 const TEXTURE_CACHE_LIMIT: u64 = 256 << 20;
 
 fn to_bytes(words: &[u32]) -> Vec<u8> {
-    words.iter().flat_map(|w| w.to_le_bytes()).collect()
+    let mut out = Vec::with_capacity(4 * words.len());
+    for w in words {
+        out.extend_from_slice(&w.to_le_bytes());
+    }
+    out
 }
 
 /// The `Consts` uniform of the shader binding contract: float, fetch, bool
@@ -1839,6 +1869,7 @@ impl Drawer {
             staged: Vec::new(),
             arena: None,
             window_memo: BTreeMap::new(),
+            index_memo: HashMap::default(),
             staged_consts: None,
             staged_base: 0,
             watching: false,
@@ -2206,6 +2237,7 @@ impl Drawer {
             _ => {
                 self.watching = false;
                 self.texture_memo.clear();
+                self.index_memo.clear();
                 // Windows staged by a watched replay: anything may have
                 // changed since.
                 self.wrap();
@@ -2353,6 +2385,8 @@ impl Drawer {
             .retain(|_, &mut (_, a, b, _)| b <= lo || hi <= a);
         self.window_memo
             .retain(|&a, &mut (b, _)| b <= lo || hi <= a);
+        self.index_memo
+            .retain(|_, &mut (a, b, _)| b <= lo || hi <= a);
     }
 
     /// Hash of one [`KEPT_BLOCK`] of a kept resolve.
@@ -4433,31 +4467,73 @@ impl Drawer {
         }
 
         let t_state = Instant::now();
-        let mut idx = {
-            if let xenon_gpu::IndexSource::Dma {
-                address, format, ..
-            } = &d.source
-            {
-                let a = u64::from(*address & PHYSICAL_MASK);
-                let len = u64::from(d.index_count) * format.bytes() as u64;
-                self.sync(mem, a, a + len)?;
-            }
-            indices::guest_indices(&*mem, &d.source, d.index_count).map_err(Skip::Unsupported)?
-        };
         let strip = matches!(
             topology,
             wgpu::PrimitiveTopology::TriangleStrip | wgpu::PrimitiveTopology::LineStrip
         );
         let reset_on = self.regs.get(regs::PA_SU_SC_MODE_CNTL) & (1 << 21) != 0;
-        if reset_on
-            && matches!(d.source, xenon_gpu::IndexSource::Dma { .. })
-            && indices::mark_resets(&mut idx, self.regs.get(regs::VGT_MULTI_PRIM_IB_RESET_INDX))
-            && !strip
-        {
-            return unsupported("primitive reset outside strips");
-        }
-        let idx = indices::expand(idx, expand);
-        if idx.is_empty() {
+        let key = match d.source {
+            xenon_gpu::IndexSource::Dma {
+                address,
+                buffer_indices,
+                format,
+                endian,
+            } => Some((
+                address,
+                buffer_indices,
+                format as u8,
+                endian as u8,
+                d.index_count,
+                reset_on.then(|| self.regs.get(regs::VGT_MULTI_PRIM_IB_RESET_INDX)),
+                expand as u8,
+                strip,
+            )),
+            _ => None,
+        };
+        let memo = key
+            .and_then(|k| self.index_memo.get(&k))
+            .map(|e| e.2.clone());
+        let idx = match memo {
+            Some(idx) => idx,
+            None => {
+                let mut guest = (0, 0);
+                if let xenon_gpu::IndexSource::Dma {
+                    address, format, ..
+                } = &d.source
+                {
+                    let a = u64::from(*address & PHYSICAL_MASK);
+                    let len = u64::from(d.index_count) * format.bytes() as u64;
+                    self.sync(mem, a, a + len)?;
+                    guest = (a, a + len);
+                }
+                let mut idx = indices::guest_indices(&*mem, &d.source, d.index_count)
+                    .map_err(Skip::Unsupported)?;
+                if reset_on
+                    && matches!(d.source, xenon_gpu::IndexSource::Dma { .. })
+                    && indices::mark_resets(
+                        &mut idx,
+                        self.regs.get(regs::VGT_MULTI_PRIM_IB_RESET_INDX),
+                    )
+                    && !strip
+                {
+                    return unsupported("primitive reset outside strips");
+                }
+                let idx = indices::expand(idx, expand);
+                let host = Arc::new(HostIndices {
+                    bytes: to_bytes(&idx),
+                    len: idx.len() as u32,
+                    min_max: min_max(&idx),
+                });
+                if let Some(k) = key {
+                    if self.index_memo.len() >= INDEX_MEMO_CAP {
+                        self.index_memo.clear();
+                    }
+                    self.index_memo.insert(k, (guest.0, guest.1, host.clone()));
+                }
+                host
+            }
+        };
+        if idx.len == 0 {
             return Ok(false);
         }
 
@@ -4593,16 +4669,15 @@ impl Drawer {
             .chain(&ps_t.info.vertex_fetch_reach)
             .copied()
             .collect();
-        let indices = index_range(&idx, self.regs.get(regs::VGT_INDX_OFFSET));
+        let indices = offset_range(idx.min_max, self.regs.get(regs::VGT_INDX_OFFSET));
         let (mut read, window_base, rebase, staged) =
             self.guest_window(vf_mask, &reach, indices, mem, report)?;
         let consts = self.consts(window_base, &rebase);
         let epi = to_bytes(&state::epilogue(&self.regs, w, h));
         // Rectangle lists read their guest indices in the vertex shader and
         // draw 6 host vertices per rectangle without an index buffer.
-        let idx_bytes = to_bytes(&idx);
-        let rect_indices: &[u8] = if rect_list { &idx_bytes } else { &[] };
-        let rest = [&epi[..], rect_indices, &idx_bytes].map(Part::Bytes);
+        let rect_indices: &[u8] = if rect_list { &idx.bytes } else { &[] };
+        let rest = [&epi[..], rect_indices, &idx.bytes].map(Part::Bytes);
         // The window and constants staged earlier (in this batch or one
         // submitted since) are bound again, unless the arena wrapped since
         // (it is then overwritten) or would wrap to stage the rest.
@@ -4825,11 +4900,11 @@ impl Drawer {
             bound.blend = Some(blend);
         }
         if rect_list {
-            pass.draw(0..idx.len() as u32 * 2, 0..1);
+            pass.draw(0..idx.len * 2, 0..1);
         } else {
             // Staged at the arena's alignment, so a whole u32 index.
             let first = (slices[4].0 / 4) as u32;
-            pass.draw_indexed(first..first + idx.len() as u32, 0, 0..1);
+            pass.draw_indexed(first..first + idx.len, 0, 0..1);
         }
         self.timings.submit += lap(&mut t);
         // Recorded, not yet submitted: everything else that touches the
@@ -5964,14 +6039,15 @@ mod tests {
 
     #[test]
     fn index_range_skips_resets_and_applies_the_offset() {
-        assert_eq!(index_range(&[7, u32::MAX, 3, 9], 0), Some((3, 9)));
-        assert_eq!(index_range(&[u32::MAX], 0), None);
-        assert_eq!(index_range(&[1, 2], 10), Some((11, 12)));
+        let range = |i: &[u32], o| offset_range(min_max(i), o);
+        assert_eq!(range(&[7, u32::MAX, 3, 9], 0), Some((3, 9)));
+        assert_eq!(range(&[u32::MAX], 0), None);
+        assert_eq!(range(&[1, 2], 10), Some((11, 12)));
         // The shader keeps 24 bits of the 32-bit sum.
-        assert_eq!(index_range(&[1, 2], 0xFF00_0000), Some((1, 2)));
-        assert_eq!(index_range(&[0, 5], 0xFF_FFFE), None);
-        assert_eq!(index_range(&[0, 5], u32::MAX - 1), None);
-        assert_eq!(index_range(&[3, 5], u32::MAX - 1), Some((1, 3)));
+        assert_eq!(range(&[1, 2], 0xFF00_0000), Some((1, 2)));
+        assert_eq!(range(&[0, 5], 0xFF_FFFE), None);
+        assert_eq!(range(&[0, 5], u32::MAX - 1), None);
+        assert_eq!(range(&[3, 5], u32::MAX - 1), Some((1, 3)));
     }
 
     #[test]
