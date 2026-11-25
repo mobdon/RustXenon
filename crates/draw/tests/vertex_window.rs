@@ -194,3 +194,48 @@ fn unbounded_read_past_a_buffer_finds_the_guest_word() {
         assert_eq!(bytes, u64::from(BIG - colours) + 36);
     }
 }
+
+/// MB of live wgpu buffers in the drawer's memory line.
+fn buffer_mb(d: &xenon_draw::Drawer) -> u64 {
+    let line = d.memory_line();
+    let at = line.find("buffers ").expect("buffers in the memory line") + 8;
+    let rest = &line[at..];
+    let open = rest.find('(').unwrap() + 1;
+    let close = rest.find(" MB)").unwrap();
+    rest[open..close].parse().unwrap()
+}
+
+/// Uploads of growing size (1 to 12 MB of vertex windows a replay) reuse
+/// the same staging chunks instead of adding a larger one each time.
+#[test]
+fn growing_uploads_do_not_pile_up_staging() {
+    let Some(mut d) = drawer() else { return };
+    let mut mem = xenon_gpu::SliceMemory {
+        base: 0,
+        data: vec![0; 0x200_0000],
+    };
+    // 1 MiB windows: vertices 0 and 65535 of a 16-byte stride from each
+    // index offset; draws far apart never share a window.
+    mem.write_words(INDICES, &[0xFFFF, 0]);
+    let mut grew = Vec::new();
+    for n in 1..=12u32 {
+        let mut s = Stream::default();
+        s.setup()
+            .shader(false, &vs_color())
+            .shader(true, &ps_interp())
+            .vertex_fetch(0, BIG, (0x200_0000 - BIG) / 4);
+        for i in 0..n {
+            s.regs(VGT_INDX_OFFSET, &[i * 0x1_0000])
+                .draw_dma16(PRIM_RECT_LIST, 3);
+        }
+        let report = run(&mut d, &s, &mut mem);
+        assert!(report.unsupported.is_empty(), "{report:?}");
+        assert!(
+            report.timings.guest_bytes >= u64::from(n) << 20,
+            "{report:?}"
+        );
+        grew.push(buffer_mb(&d));
+    }
+    // 16 MB arena, a few 4 MB chunks: well under the 12 MB-batch sum.
+    assert!(grew[11] - grew[3] <= 16, "{grew:?}");
+}
