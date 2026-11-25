@@ -634,23 +634,7 @@ fn depth_restore_takes_the_words_not_a_resampled_copy() {
 fn restore_target_is_dropped_after_the_depth_draw() {
     let Some(mut d) = drawer() else { return };
     let mut mem = memory();
-    let c = [0; 4];
-    mem.write_words(
-        VERTS + 48,
-        &color_verts(&[(0.0, 0.0, 0.3, c), (32.0, 0.0, 0.3, c), (0.0, 64.0, 0.3, c)]),
-    );
-    let mut s = Stream::default();
-    s.setup().regs(RB_DEPTH_INFO, &[D24S8_AT_0]);
-    draw_word(&mut s, &mut mem, 64.0, 0x4000_0078);
-    // Depth only (colour mask 0): z ALWAYS with z write.
-    s.regs(RB_COLOR_MASK, &[0])
-        .shader(true, &ps_interp())
-        .regs(RB_DEPTHCONTROL, &[2 | 4 | (7 << 4)])
-        .vertex_fetch(0, VERTS + 48, 24)
-        .draw_auto(PRIM_RECT_LIST, 3)
-        .regs(RB_DEPTHCONTROL, &[0])
-        .regs(RB_COLOR_MASK, &[0xF]);
-    resolve_words(&mut s, &mut mem, true, DEST2);
+    let s = restore_then_draw_depth(&mut mem);
     let colour = RenderTargetKey {
         base_tiles: 0,
         pitch: W,
@@ -671,6 +655,48 @@ fn restore_target_is_dropped_after_the_depth_draw() {
         frames.push(detiled(&mem, DEST2, W, H, W, 4));
     }
     assert!(frames[0] == frames[1]);
+}
+
+/// A target dropped at the end of every replay and recreated in the next
+/// leaves nothing behind in wgpu: its allocations and live textures, views,
+/// bind groups and buffers stay flat replay after replay.
+#[test]
+fn dropped_and_recreated_targets_do_not_leak() {
+    let Some(mut d) = drawer() else { return };
+    let mut mem = memory();
+    let s = restore_then_draw_depth(&mut mem);
+    run(&mut d, &s, &mut mem);
+    let live = d.gpu_live();
+    for frame in 1..30 {
+        run(&mut d, &s, &mut mem);
+        assert_eq!(d.gpu_live(), live, "replay {frame}");
+    }
+    let m = d.memory_line();
+    assert!(m.contains("targets 1 MB in 1, 30 dropped,"), "{m}");
+}
+
+/// A colour restore of the depth words at tile 0, a depth-only draw over
+/// its left half and a raw depth resolve to DEST2: the colour target is
+/// dropped at the end of the replay and recreated by the next.
+fn restore_then_draw_depth(mem: &mut SliceMemory) -> Stream {
+    let c = [0; 4];
+    mem.write_words(
+        VERTS + 48,
+        &color_verts(&[(0.0, 0.0, 0.3, c), (32.0, 0.0, 0.3, c), (0.0, 64.0, 0.3, c)]),
+    );
+    let mut s = Stream::default();
+    s.setup().regs(RB_DEPTH_INFO, &[D24S8_AT_0]);
+    draw_word(&mut s, mem, 64.0, 0x4000_0078);
+    // Depth only (colour mask 0): z ALWAYS with z write.
+    s.regs(RB_COLOR_MASK, &[0])
+        .shader(true, &ps_interp())
+        .regs(RB_DEPTHCONTROL, &[2 | 4 | (7 << 4)])
+        .vertex_fetch(0, VERTS + 48, 24)
+        .draw_auto(PRIM_RECT_LIST, 3)
+        .regs(RB_DEPTHCONTROL, &[0])
+        .regs(RB_COLOR_MASK, &[0xF]);
+    resolve_words(&mut s, mem, true, DEST2);
+    s
 }
 
 /// Two tiles across: a pitch of 160 pixels at 1x.
@@ -760,5 +786,51 @@ fn depth_to_colour_swaps_tile_halves() {
     for (x, &w) in (0..).zip(&row) {
         let want = if swapped_below(x, 96) { 0x1234_5678 } else { 0 };
         assert_eq!(w, want, "colour column {x}: {row:08X?}");
+    }
+}
+
+/// A pitch of 120 at 1x is a tile and a half: depth columns 80..120 would
+/// read colour 120..160, past the colour row, and keep their own depth and
+/// stencil, while 0..80 take the swapped colour.
+#[test]
+fn swapped_samples_past_the_row_keep_the_destination() {
+    let Some(mut d) = drawer() else { return };
+    let mut mem = memory();
+    let pitch = 120;
+    let mut s = Stream::default();
+    s.setup()
+        .regs(RB_SURFACE_INFO, &[pitch, 0, D24S8_AT_0])
+        .regs(PA_SC_WINDOW_SCISSOR_TL, &[1 << 31, pitch | (H << 16)]);
+    s.resolve_with(
+        &mut mem,
+        (pitch, H),
+        COPY_NULL | CLEAR_DEPTH,
+        (DEST, pitch | (H << 16), 0),
+        [0x2000_0033, 0, 0],
+    );
+    let report = run(&mut d, &s, &mut mem);
+    assert_eq!(report.resolves, 1, "{report:?}");
+    let mut s = Stream::default();
+    s.setup()
+        .regs(RB_SURFACE_INFO, &[pitch, 0, D24S8_AT_0])
+        .regs(PA_SC_WINDOW_SCISSOR_TL, &[1 << 31, pitch | (H << 16)]);
+    draw_word(&mut s, &mut mem, pitch as f32, 0x4000_0078);
+    s.resolve_with(
+        &mut mem,
+        (pitch, H),
+        4 | COPY_RAW,
+        (DEST2, pitch | (H << 16), dest_info(6, 0, false)),
+        [0; 3],
+    );
+    let report = run(&mut d, &s, &mut mem);
+    assert_eq!((report.draws, report.resolves), (1, 1), "{report:?}");
+    assert!(report.warnings.is_empty(), "{report:?}");
+    let img = detiled(&mem, DEST2, pitch, H, pitch, 4);
+    let row: Vec<u32> = (0..pitch)
+        .map(|x| u32::from_le_bytes(px(&img, pitch, x, 9)))
+        .collect();
+    for (x, &w) in (0..).zip(&row) {
+        let want = if x < 80 { 0x4000_0078 } else { 0x2000_0033 };
+        assert_eq!(w, want, "depth column {x}: {row:08X?}");
     }
 }

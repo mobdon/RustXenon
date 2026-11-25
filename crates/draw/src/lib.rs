@@ -777,6 +777,7 @@ const TARGET_CAP: u64 = 256 << 20;
 
 /// Replays recorded command lists on a headless wgpu device.
 pub struct Drawer {
+    instance: wgpu::Instance,
     device: wgpu::Device,
     queue: wgpu::Queue,
     /// Adapter name and backend, for logs.
@@ -1253,6 +1254,7 @@ impl Drawer {
             })
             .create_view(&Default::default());
         Ok(Drawer {
+            instance,
             device,
             queue,
             adapter: format!("{} ({:?})", info.name, info.backend),
@@ -1328,8 +1330,9 @@ impl Drawer {
     /// targets (bytes estimated from their size and format), the draw upload
     /// arena and its host staging copy, pipeline counts (with the distinct
     /// vertex and pixel shader pairs of the draw pipelines and how many were
-    /// dropped), shader module counts and the translated shaders with the
-    /// bytes of their WGSL.
+    /// dropped), shader module counts, the translated shaders with the
+    /// bytes of their WGSL, and what wgpu's allocator holds (to tell host
+    /// memory growth inside wgpu from growth outside it).
     pub fn memory_line(&self) -> String {
         let rt: u64 = self.targets.values().map(texture_bytes).sum();
         let kept: u64 = self.mirrors.iter().map(|m| m.buf.size()).sum::<u64>()
@@ -1348,7 +1351,7 @@ impl Drawer {
             .map(|t| t.wgsl.len())
             .collect();
         format!(
-            "draw: textures {} MB in {}, targets {} MB in {}, {} dropped, kept resolves {} MB in {}, arena {} MB, staged {} MB, pipelines {} ({} vs/ps pairs, {} dropped), shaders {}, translated {} ({} KB WGSL)",
+            "draw: textures {} MB in {}, targets {} MB in {}, {} dropped, kept resolves {} MB in {}, arena {} MB, staged {} MB, pipelines {} ({} vs/ps pairs, {} dropped), shaders {}, translated {} ({} KB WGSL), wgpu {} MB allocated",
             self.texture_cache_bytes >> 20,
             self.texture_cache.len(),
             rt >> 20,
@@ -1364,7 +1367,24 @@ impl Drawer {
             self.modules.len(),
             wgsl.len(),
             wgsl.iter().sum::<usize>().div_ceil(1024),
+            self.gpu_live().0.map_or("?".into(), |b| (b >> 20).to_string()),
         )
+    }
+
+    /// What wgpu itself holds, beside what [`Drawer::memory_line`] counts:
+    /// bytes in live allocations (where the backend reports them) and live
+    /// textures, texture views, bind groups and buffers. For tests.
+    #[doc(hidden)]
+    pub fn gpu_live(&self) -> (Option<u64>, [usize; 4]) {
+        let bytes = self
+            .device
+            .generate_allocator_report()
+            .map(|r| r.total_allocated_bytes);
+        let hub = self.instance.generate_report().map(|r| r.hub);
+        let n = hub.map_or([0; 4], |h| {
+            [h.textures, h.texture_views, h.bind_groups, h.buffers].map(|r| r.num_kept_from_user)
+        });
+        (bytes, n)
     }
 
     /// Sets how many draw pipelines are kept (least recently used ones
