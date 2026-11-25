@@ -85,6 +85,82 @@ pub struct Gpu {
     /// The newest frame the drawer produced, and how many it produced.
     pub last_frame: Option<xenon_draw::Frame>,
     pub frames_drawn: u32,
+    stats: DrawStats,
+}
+
+/// Drawer replays summed over a window, logged every [`DrawStats::EVERY`].
+#[derive(Default)]
+struct DrawStats {
+    since: Option<std::time::Instant>,
+    replays: u32,
+    frames: u32,
+    draws: u32,
+    resolves: u32,
+    /// Wall time inside the drawer.
+    busy: std::time::Duration,
+    t: xenon_draw::Timings,
+}
+
+impl DrawStats {
+    const EVERY: std::time::Duration = std::time::Duration::from_secs(5);
+
+    fn add(&mut self, r: &xenon_draw::Report, busy: std::time::Duration) {
+        let since = *self.since.get_or_insert_with(std::time::Instant::now);
+        self.replays += 1;
+        self.frames += r.frames.len() as u32;
+        self.draws += r.draws;
+        self.resolves += r.resolves;
+        self.busy += busy;
+        self.t += &r.timings;
+        let window = since.elapsed();
+        if window >= Self::EVERY {
+            crate::log(&self.line(window));
+            *self = DrawStats::default();
+        }
+    }
+
+    /// Per frame (or per window when no frame was swapped): milliseconds by
+    /// phase, then counts.
+    fn line(&self, window: std::time::Duration) -> String {
+        let (n, per) = match self.frames {
+            0 => (1, "window"),
+            f => (f, "frame"),
+        };
+        let ms = |d: std::time::Duration| d.as_secs_f64() * 1e3 / f64::from(n);
+        let mb = |b: u64| b as f64 / 1e6 / f64::from(n);
+        let t = &self.t;
+        format!(
+            "[draw] {:.1} s: {} frames, {} replays; ms per {per}: drawer {:.0} = shaders {:.0}, \
+             guest data {:.0}, textures {:.0}, submit {:.0}, gpu wait {:.0}, readback {:.0}, \
+             resolve cpu {:.0}, clears {:.0}, swap {:.0} (transfers {:.0}); per {per}: {} draws, \
+             {} resolves, {} submits, {} transfers ({} passes), readback {:.1} MB, \
+             hashed {:.1} MB, {} textures uploaded ({:.1} MB), {} pipelines created",
+            window.as_secs_f64(),
+            self.frames,
+            self.replays,
+            ms(self.busy),
+            ms(t.shaders),
+            ms(t.guest_data),
+            ms(t.textures),
+            ms(t.submit),
+            ms(t.gpu_wait),
+            ms(t.readback),
+            ms(t.resolve_cpu),
+            ms(t.clears),
+            ms(t.swap),
+            ms(t.transfer),
+            self.draws / n,
+            self.resolves / n,
+            t.submits / n,
+            t.transfers / n,
+            t.transfer_passes / n,
+            mb(t.readback_bytes),
+            mb(t.hashed_bytes),
+            t.textures_uploaded / n,
+            mb(t.texture_bytes),
+            t.pipelines_created / n,
+        )
+    }
 }
 
 impl Gpu {
@@ -137,8 +213,10 @@ impl Gpu {
             self.apply(rt, c, idle);
         }
         if let Some(d) = self.drawer.as_mut() {
+            let start = std::time::Instant::now();
             match d.replay(&cmds, &mut Physical(rt)) {
                 Ok(r) => {
+                    self.stats.add(&r, start.elapsed());
                     for u in r.unsupported.iter().chain(&r.warnings) {
                         capture::note(u);
                     }
@@ -522,6 +600,41 @@ pub mod capture {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The stats line divides by the frames of the window, or by one window
+    /// when none was swapped.
+    #[test]
+    fn draw_stats_line_is_per_frame() {
+        let ms = std::time::Duration::from_millis;
+        let mut s = DrawStats {
+            frames: 2,
+            replays: 7,
+            draws: 2760,
+            resolves: 84,
+            busy: ms(2000),
+            ..Default::default()
+        };
+        s.t.readback = ms(300);
+        s.t.transfers = 12;
+        s.t.transfer_passes = 60;
+        s.t.readback_bytes = 80_000_000;
+        let line = s.line(ms(5000));
+        assert!(
+            line.starts_with("[draw] 5.0 s: 2 frames, 7 replays; ms per frame: drawer 1000 ="),
+            "{line}"
+        );
+        for part in [
+            "readback 150,",
+            "1380 draws",
+            "42 resolves",
+            "6 transfers (30 passes)",
+            "readback 40.0 MB",
+        ] {
+            assert!(line.contains(part), "{part}: {line}");
+        }
+        s.frames = 0;
+        assert!(s.line(ms(5000)).contains("ms per window: drawer 2000 ="));
+    }
 
     #[test]
     fn swap_packets_are_what_the_recorder_reads() {
