@@ -249,3 +249,91 @@ fn a_full_upload_arena_submits_and_continues() {
     let img = d.read_render_target(COLOR_KEY, 0, 0, W, H).unwrap();
     assert_eq!(px(&img, W, 40, 40), RED);
 }
+
+/// Draws whose vertex window lies in one staged in the same batch bind
+/// that one (from its base) instead of staging the bytes again.
+#[test]
+fn vertex_window_in_a_staged_one_is_reused() {
+    let Some(mut d) = drawer() else { return };
+    let mut mem = memory();
+    let wf = W as f32;
+    rect(&mut mem, VERTS, wf, wf, RED);
+    rect(&mut mem, VERTS + 48, 32.0, 32.0, GREEN);
+    let mut s = Stream::default();
+    s.setup()
+        .shader(false, &vs_color())
+        .shader(true, &ps_interp())
+        .vertex_fetch(0, VERTS, 24)
+        .draw_auto(PRIM_RECT_LIST, 3)
+        .vertex_fetch(0, VERTS + 48, 12)
+        .draw_auto(PRIM_RECT_LIST, 3)
+        .draw_auto(PRIM_RECT_LIST, 3);
+    let report = run(&mut d, &s, &mut mem);
+    assert_eq!(report.draws, 3, "{report:?}");
+    assert_eq!(report.timings.windows_reused, 2, "{report:?}");
+    assert_eq!(report.timings.reused_bytes, 96, "{report:?}");
+    let img = d.read_render_target(COLOR_KEY, 0, 0, W, H).unwrap();
+    assert_eq!(px(&img, W, 8, 8), GREEN);
+    assert_eq!(px(&img, W, 40, 40), RED);
+}
+
+/// A MEM_WRITE into a staged window between two draws makes the second
+/// read the new vertices.
+#[test]
+fn mem_write_into_a_staged_window_reads_it_again() {
+    let Some(mut d) = drawer() else { return };
+    let mut mem = memory();
+    rect(&mut mem, VERTS, W as f32, H as f32, RED);
+    let green = color_verts(&[
+        (0.0, 0.0, 0.0, GREEN),
+        (32.0, 0.0, 0.0, GREEN),
+        (0.0, 32.0, 0.0, GREEN),
+    ]);
+    let mut write = vec![VERTS | 2]; // k8in32
+    write.extend(green);
+    let mut s = Stream::default();
+    s.setup()
+        .shader(false, &vs_color())
+        .shader(true, &ps_interp())
+        .vertex_fetch(0, VERTS, 12)
+        .draw_auto(PRIM_RECT_LIST, 3);
+    s.0.extend(xenon_gpu::pm4::build::type3(
+        xenon_gpu::pm4::PM4_MEM_WRITE,
+        &write,
+    ));
+    s.draw_auto(PRIM_RECT_LIST, 3);
+    let report = run(&mut d, &s, &mut mem);
+    assert_eq!(report.draws, 2, "{report:?}");
+    assert_eq!(report.timings.windows_reused, 0, "{report:?}");
+    let img = d.read_render_target(COLOR_KEY, 0, 0, W, H).unwrap();
+    assert_eq!(px(&img, W, 8, 8), GREEN);
+    assert_eq!(px(&img, W, 40, 40), RED);
+}
+
+/// A resolve between two draws submits the batch, so the second draw stages
+/// its window again and reads the resolved bytes: all its vertices are the
+/// clear colour's word, so it draws nothing over the cleared target.
+#[test]
+fn resolve_into_a_staged_window_reads_it_again() {
+    let Some(mut d) = drawer() else { return };
+    let mut mem = memory();
+    rect(&mut mem, DEST, W as f32, H as f32, RED);
+    let clear = [10, 20, 30, 255];
+    let mut s = Stream::default();
+    s.setup()
+        .shader(false, &vs_color())
+        .shader(true, &ps_interp())
+        .vertex_fetch(0, DEST, 12)
+        .draw_auto(PRIM_RECT_LIST, 3)
+        .resolve(&mut mem, W, H, false, Some((rgba(clear), 0)))
+        .resolve(&mut mem, W, H, true, None)
+        .vertex_fetch(0, DEST, 12)
+        .draw_auto(PRIM_RECT_LIST, 3);
+    let report = run(&mut d, &s, &mut mem);
+    assert_eq!(report.draws, 2, "{report:?}");
+    assert_eq!(report.timings.windows_reused, 0, "{report:?}");
+    assert!(report.timings.submits >= 2, "{report:?}");
+    let img = d.read_render_target(COLOR_KEY, 0, 0, W, H).unwrap();
+    assert_eq!(px(&img, W, 8, 8), clear);
+    assert_eq!(px(&img, W, 40, 40), clear);
+}
