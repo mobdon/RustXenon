@@ -471,7 +471,19 @@ pub fn x_notify_get_next(rt: &Runtime, c: &mut Context) {
     ret(c, got.is_some() as u32);
 }
 
+/// (app, message, buffer, size). The media player's "who controls
+/// playback" (app 0xFA, 0x7001B: client, controller out, locked out) says
+/// the title does and nothing is locked; other messages are refused.
 pub fn x_msg_in_process_call(rt: &Runtime, c: &mut Context) {
+    let buf = arg(rt, c, 2);
+    if arg(rt, c, 0) == 0xFA && arg(rt, c, 1) == 0x7_001B && buf != 0 {
+        for p in [rt.mem.read_u32(buf + 4), rt.mem.read_u32(buf + 8)] {
+            if p != 0 {
+                rt.mem.write_u32(p, 0);
+            }
+        }
+        return ret(c, 0);
+    }
     crate::log(&format!(
         "[xam] message {:#x} to app {:#x} refused",
         arg(rt, c, 1),

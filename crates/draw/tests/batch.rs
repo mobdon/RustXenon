@@ -431,6 +431,93 @@ fn equal_constants_are_staged_once_per_batch() {
     assert_eq!(px(&img, W, 40, 40), GREEN);
 }
 
+/// Draws in one batch that sample the same texture share one texture bind
+/// group; one that samples another texture gets its own.
+#[test]
+fn texture_bind_groups_follow_the_textures() {
+    let Some(mut d) = drawer() else { return };
+    let mut mem = memory();
+    let green = green_texture_quad(&mut mem);
+    // The same texture in red, one texture further on.
+    let red_base = TEXTURE + W * H * 4;
+    let linear: Vec<u8> = (0..W * H).flat_map(|_| RED).collect();
+    let mut tiled = tile::tile_2d(&linear, W, H, W, 4).unwrap();
+    endian::swap_in_place(&mut tiled, xenon_texture::Endian::K8in32);
+    mem.data[red_base as usize..][..tiled.len()].copy_from_slice(&tiled);
+    let mut red = green;
+    red[1] = 6 | (2 << 6) | red_base;
+    // Quads (0,0)-(32,32) and (0,32)-(32,64), after the one at (32,32).
+    for (i, y) in [0.0, 32.0].into_iter().enumerate() {
+        let quad: Vec<u32> = [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)]
+            .iter()
+            .flat_map(|&(u, v): &(f32, f32)| {
+                [f(u * 32.0), f(y + v * 32.0), f(0.0), f(u / 2.0), f(v / 2.0)]
+            })
+            .collect();
+        mem.write_words(VERTS + 0x200 + 0x100 * i as u32, &quad);
+    }
+    let mut s = Stream::default();
+    s.setup()
+        .shader(false, &vs_uv())
+        .shader(true, &ps_texture(1))
+        .regs(SHADER_CONSTANT_FETCH + 6, &green)
+        .vertex_fetch(0, VERTS + 0x100, 20)
+        .draw_auto(PRIM_QUAD_LIST, 4)
+        .regs(SHADER_CONSTANT_FETCH + 6, &red)
+        .vertex_fetch(0, VERTS + 0x200, 20)
+        .draw_auto(PRIM_QUAD_LIST, 4)
+        .regs(SHADER_CONSTANT_FETCH + 6, &green)
+        .vertex_fetch(0, VERTS + 0x300, 20)
+        .draw_auto(PRIM_QUAD_LIST, 4);
+    let report = run(&mut d, &s, &mut mem);
+    assert_eq!(report.draws, 3, "{report:?}");
+    assert!(report.unsupported.is_empty(), "{report:?}");
+    assert_eq!(report.timings.texture_groups_reused, 1, "{report:?}");
+    let img = d.read_render_target(COLOR_KEY, 0, 0, W, H).unwrap();
+    assert_eq!(px(&img, W, 40, 40), GREEN);
+    assert_eq!(px(&img, W, 8, 8), RED);
+    assert_eq!(px(&img, W, 8, 40), GREEN);
+}
+
+/// Draws whose arena slices have the same sizes share one group 0 bind
+/// group at their own offsets, and none outlives the arena: after a draw
+/// grows it, a draw of the old sizes binds the new one.
+#[test]
+fn arena_bind_groups_bind_each_draws_data() {
+    let Some(mut d) = drawer() else { return };
+    let mut mem = xenon_gpu::SliceMemory {
+        base: 0,
+        data: vec![0; 20 << 20],
+    };
+    let wf = W as f32;
+    rect(&mut mem, VERTS, wf, wf, RED);
+    rect(&mut mem, VERTS + 48, 32.0, 32.0, GREEN);
+    rect(&mut mem, VERTS + 96, 8.0, 8.0, RED);
+    rect(&mut mem, VERTS + 144, 16.0, 16.0, BLUE);
+    let mut s = Stream::default();
+    s.setup()
+        .shader(false, &vs_color())
+        .shader(true, &ps_interp())
+        .vertex_fetch(0, VERTS, 12)
+        .draw_auto(PRIM_RECT_LIST, 3)
+        .vertex_fetch(0, VERTS + 48, 12)
+        .draw_auto(PRIM_RECT_LIST, 3)
+        // A 17 MiB window: more than the 16 MiB arena, which is replaced.
+        .vertex_fetch(0, VERTS + 144, (17 << 20) / 4)
+        .draw_auto(PRIM_RECT_LIST, 3)
+        // Not in the large window, so not bound from it.
+        .vertex_fetch(0, VERTS + 96, 12)
+        .draw_auto(PRIM_RECT_LIST, 3);
+    let report = run(&mut d, &s, &mut mem);
+    assert_eq!(report.draws, 4, "{report:?}");
+    assert!(report.unsupported.is_empty(), "{report:?}");
+    let img = d.read_render_target(COLOR_KEY, 0, 0, W, H).unwrap();
+    assert_eq!(px(&img, W, 4, 4), RED);
+    assert_eq!(px(&img, W, 12, 12), BLUE);
+    assert_eq!(px(&img, W, 24, 24), GREEN);
+    assert_eq!(px(&img, W, 40, 40), RED);
+}
+
 /// A draw whose vertex window is not in guest memory is skipped, with the
 /// window in the report, and the draws staged around it still land.
 #[test]
