@@ -367,6 +367,9 @@ pub struct Timings {
     pub queue: Duration,
     /// Of `queue`: copying the staged draw buffers into upload memory.
     pub upload: Duration,
+    /// Finishing and submitting batches on the submit thread, alongside
+    /// the drawer's own phases (not part of them).
+    pub submit_thread: Duration,
     /// Waiting for queued GPU work before a resolve readback: where the
     /// rendering itself shows up.
     pub gpu_wait: Duration,
@@ -483,11 +486,103 @@ impl std::ops::AddAssign<&Timings> for Timings {
         self.texture_groups_reused += t.texture_groups_reused;
         self.queue += t.queue;
         self.upload += t.upload;
+        self.submit_thread += t.submit_thread;
         self.render_passes += t.render_passes;
         for (a, b) in self.gpu_passes.iter_mut().zip(t.gpu_passes) {
             *a += b;
         }
         self.passes_timed += t.passes_timed;
+    }
+}
+
+/// Finishes and submits flushed batches on a thread of its own, one at a
+/// time in order, so the drawer records the next batch meanwhile: wgpu
+/// encodes the recorded passes for the driver at `finish`, and the driver
+/// takes them at `submit`, which together cost tens of microseconds a draw
+/// on some drivers.
+struct Submitter {
+    tx: Option<std::sync::mpsc::Sender<Vec<wgpu::CommandEncoder>>>,
+    rx: Mutex<std::sync::mpsc::Receiver<SubmitDone>>,
+    /// Batches sent and not yet received back, and what came back: time
+    /// spent, the first validation error and the last submission.
+    state: Mutex<SubmitState>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+type SubmitDone = (Duration, Option<String>, wgpu::SubmissionIndex);
+
+#[derive(Default)]
+struct SubmitState {
+    pending: usize,
+    queue: Duration,
+    error: Option<String>,
+    last: Option<wgpu::SubmissionIndex>,
+}
+
+impl Submitter {
+    fn new(device: wgpu::Device, queue: wgpu::Queue) -> Submitter {
+        let (tx, jobs) = std::sync::mpsc::channel::<Vec<wgpu::CommandEncoder>>();
+        let (done, rx) = std::sync::mpsc::channel();
+        let thread = std::thread::Builder::new()
+            .name("xenon-draw submit".into())
+            .spawn(move || {
+                for encs in jobs {
+                    let t = Instant::now();
+                    // Error scopes are per thread.
+                    let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
+                    let index = queue.submit(encs.into_iter().map(|e| e.finish()));
+                    let error = block_on(scope.pop()).map(|e| e.to_string());
+                    if done.send((t.elapsed(), error, index)).is_err() {
+                        break;
+                    }
+                }
+            })
+            .expect("spawn submit thread");
+        Submitter {
+            tx: Some(tx),
+            rx: Mutex::new(rx),
+            state: Mutex::new(SubmitState::default()),
+            thread: Some(thread),
+        }
+    }
+
+    fn send(&self, encs: Vec<wgpu::CommandEncoder>) {
+        self.state.lock().expect("submit state").pending += 1;
+        self.tx
+            .as_ref()
+            .expect("submit thread")
+            .send(encs)
+            .expect("submit thread alive");
+    }
+
+    /// Waits until every batch sent is submitted.
+    fn drain(&self) {
+        let mut st = self.state.lock().expect("submit state");
+        let rx = self.rx.lock().expect("submit results");
+        while st.pending > 0 {
+            let (e, error, index) = rx.recv().expect("submit thread alive");
+            st.pending -= 1;
+            st.queue += e;
+            if st.error.is_none() {
+                st.error = error;
+            }
+            st.last = Some(index);
+        }
+    }
+
+    /// The submit time and first error since the last call.
+    fn take(&self) -> (Duration, Option<String>) {
+        let mut st = self.state.lock().expect("submit state");
+        (std::mem::take(&mut st.queue), st.error.take())
+    }
+}
+
+impl Drop for Submitter {
+    fn drop(&mut self) {
+        drop(self.tx.take());
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
     }
 }
 
@@ -1002,6 +1097,7 @@ pub struct Drawer {
     /// `queue.write_buffer` took a fresh staging buffer per flush, whose
     /// pages the copy faulted in every time.
     belt: wgpu::util::StagingBelt,
+    submitter: Submitter,
     arena: Option<wgpu::Buffer>,
     arena_align: u64,
     /// Vertex windows staged in the arena since it last wrapped: guest
@@ -1611,6 +1707,7 @@ impl Drawer {
             })
             .create_view(&Default::default());
         let device_for_belt = device.clone();
+        let submitter = Submitter::new(device.clone(), queue.clone());
         let mut d = Drawer {
             instance,
             device,
@@ -1669,6 +1766,7 @@ impl Drawer {
             staged_consts: None,
             staged_base: 0,
             belt: wgpu::util::StagingBelt::new(device_for_belt, 4 << 20),
+            submitter,
             pre: None,
             resolve_pending: false,
             arena_align: u64::from(
@@ -2256,7 +2354,7 @@ impl Drawer {
         let mut t = Instant::now();
         self.wait_idle()?;
         self.timings.gpu_wait += lap(&mut t);
-        let index = self.queue.submit([enc.finish()]);
+        let index = self.submit_now([enc.finish()]);
         self.submitted(Site::Other);
         for (m_lo, dirty, spans, buf) in copies {
             let data = self.map_read(&buf, index.clone())?;
@@ -2376,6 +2474,11 @@ impl Drawer {
     fn flush(&mut self) -> Result<(), Skip> {
         // The arena upload counts as submit time too.
         let t = Instant::now();
+        // One batch in flight at most: the previous one's upload chunks are
+        // submitted before the belt maps them again.
+        self.submitter.drain();
+        let _ = self.device.poll(wgpu::PollType::Poll);
+        self.belt.recall();
         let mut upload = None;
         if let (Some(arena), Some(size)) =
             (&self.arena, wgpu::BufferSize::new(self.staged.len() as u64))
@@ -2398,9 +2501,8 @@ impl Drawer {
             let e = t.elapsed();
             self.timings.submit += e;
             self.timings.queue += e;
-            return Ok(());
+            return self.take_submitted();
         }
-        let scope = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
         let site = if pre.is_some() && batch.is_none() {
             Site::Decode
         } else {
@@ -2409,10 +2511,9 @@ impl Drawer {
         // Decodes first: the draws sample what they write, and they read
         // kept resolves written by work submitted before.
         let clock = &self.gpu_clock;
-        let bufs = upload
+        let encs = upload
             .into_iter()
             .chain(pre)
-            .map(|e| e.finish())
             .chain(batch.map(|mut b| {
                 drop(b.pass.take());
                 if let Some(c) = clock.as_ref().filter(|c| !c.kinds.is_empty()) {
@@ -2422,20 +2523,45 @@ impl Drawer {
                     b.enc
                         .copy_buffer_to_buffer(&c.resolve, 0, &c.read, 0, 16 * n);
                 }
-                b.enc.finish()
-            }));
-        let index = self.queue.submit(bufs);
+                b.enc
+            }))
+            .collect();
+        self.submitter.send(encs);
         self.submitted(site);
-        // Chunks whose copies the GPU finished map again for reuse.
-        let _ = self.device.poll(wgpu::PollType::Poll);
-        self.belt.recall();
         // One reading for both, so `queue` never exceeds `submit`.
         let e = t.elapsed();
         self.timings.submit += e;
         self.timings.queue += e;
-        self.read_gpu_clock(index)?;
-        match block_on(scope.pop()) {
-            Some(e) => Err(Skip::Fatal(Error::Gpu(e.to_string()))),
+        if self.gpu_clock.as_ref().is_some_and(|c| !c.kinds.is_empty()) {
+            self.submitter.drain();
+            let index = self
+                .submitter
+                .state
+                .lock()
+                .expect("submit state")
+                .last
+                .clone();
+            self.read_gpu_clock(index.expect("submitted"))?;
+        }
+        self.take_submitted()
+    }
+
+    /// Submits now, after the batches the submit thread holds.
+    fn submit_now(
+        &self,
+        bufs: impl IntoIterator<Item = wgpu::CommandBuffer>,
+    ) -> wgpu::SubmissionIndex {
+        self.submitter.drain();
+        self.queue.submit(bufs)
+    }
+
+    /// Adds the submit thread's time so far to the timings, and fails on
+    /// the first validation error it met.
+    fn take_submitted(&mut self) -> Result<(), Skip> {
+        let (busy, error) = self.submitter.take();
+        self.timings.submit_thread += busy;
+        match error {
+            Some(e) => Err(Skip::Fatal(Error::Gpu(e))),
             None => Ok(()),
         }
     }
@@ -2656,6 +2782,7 @@ impl Drawer {
 
     /// Waits for all submitted GPU work, bounded by the drawer's timeout.
     fn wait_idle(&self) -> Result<(), Error> {
+        self.submitter.drain();
         match self.device.poll(wgpu::PollType::Wait {
             submission_index: None,
             timeout: Some(self.timeout),
@@ -2715,7 +2842,7 @@ impl Drawer {
                 depth_or_array_layers: 1,
             },
         );
-        let index = self.queue.submit([enc.finish()]);
+        let index = self.submit_now([enc.finish()]);
         let data = self.map_read(&buf, index)?;
         let mut out = Vec::with_capacity((row * h) as usize);
         for r in 0..h as usize {
@@ -2726,6 +2853,7 @@ impl Drawer {
 
     /// Waits for submission `index` and copies out the mapped `buf`.
     fn map_read(&self, buf: &wgpu::Buffer, index: wgpu::SubmissionIndex) -> Result<Vec<u8>, Error> {
+        self.submitter.drain();
         let slot = Arc::new(Mutex::new(None));
         let sink = slot.clone();
         buf.slice(..).map_async(wgpu::MapMode::Read, move |r| {
@@ -3177,7 +3305,7 @@ impl Drawer {
                 pass.draw(0..3, 0..1);
             }
         }
-        self.queue.submit([enc.finish()]);
+        self.submit_now([enc.finish()]);
         self.submitted(Site::Transfer);
         self.timings.transfers += 1;
         self.timings.transfer_passes += pipelines.len() as u32;

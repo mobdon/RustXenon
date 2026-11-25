@@ -658,7 +658,7 @@ fn texture_bind_group_is_reused_across_a_resolve() {
 #[test]
 fn gpu_timestamps_time_each_batch_pass() {
     // Not requested unless asked for.
-    {
+    if std::env::var_os("XENON_GPU_TIMESTAMPS").is_none() {
         let Some(mut plain) = drawer() else { return };
         assert!(!plain.enable_gpu_timestamps());
     }
