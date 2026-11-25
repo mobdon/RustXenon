@@ -423,7 +423,9 @@ pub struct Timings {
     /// Counts: pipelines and shader modules created, textures uploaded.
     pub pipelines_created: u32,
     pub textures_uploaded: u32,
-    /// Command buffer submissions made during the replay.
+    /// Submissions made during the replay. Batch flushes count one each,
+    /// though the submit thread may merge queued ones into one
+    /// `queue.submit`.
     pub submits: u32,
     /// `submits` by where they come from: resolve copies (GPU copies and
     /// CPU resolve readbacks), EDRAM transfers, kept resolve texture
