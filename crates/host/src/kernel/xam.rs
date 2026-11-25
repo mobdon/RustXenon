@@ -100,54 +100,162 @@ pub fn xam_create_enumerator_handle(_: &Runtime, c: &mut Context) {
 pub fn xam_get_private_enum_structure_from_handle(_: &Runtime, c: &mut Context) {
     ret(c, STATUS_INVALID_HANDLE);
 }
-/// (handle, flags, buffer, size, items out, request block). Every list is
-/// empty. Asked synchronously the answer is "no more files"; with a request
-/// block it completes with success and zero items, which is what a title
-/// that scans saves waits for (with "no more files" there it never ends the
-/// scan).
+/// (handle, flags, buffer, size, items out, request block). Gives the next
+/// records of a content list; every other list is empty. Asked
+/// synchronously, an empty answer is "no more files"; with a request block
+/// it completes with success and the record count (zero at the end), which
+/// is what a title that scans saves waits for (with "no more files" there
+/// it never ends the scan).
 pub fn xam_enumerate(rt: &Runtime, c: &mut Context) {
-    let (items, ov) = (arg(rt, c, 4), arg(rt, c, 5));
-    if items != 0 {
-        rt.mem.write_u32(items, 0);
-    }
-    finish(
-        rt,
-        c,
-        ov,
-        if ov != 0 {
-            ERROR_SUCCESS
-        } else {
-            ERROR_NO_MORE_FILES
-        },
+    let (h, buf, size, items, ov) = (
+        arg(rt, c, 0),
+        arg(rt, c, 2),
+        arg(rt, c, 3),
+        arg(rt, c, 4),
+        arg(rt, c, 5),
     );
+    let mut n = 0;
+    if let Some(Handle::Items(l)) = k().handle(h) {
+        let mut l = l.lock().unwrap();
+        let room = l.1.min(size / CONTENT_DATA);
+        while n < room {
+            let Some(r) = l.0.pop_front() else { break };
+            rt.mem.write_bytes(buf + n * CONTENT_DATA, &r);
+            n += 1;
+        }
+    }
+    if items != 0 {
+        rt.mem.write_u32(items, n);
+    }
+    if ov != 0 {
+        complete(rt, c, ov, ERROR_SUCCESS, n);
+        ret(c, ERROR_IO_PENDING);
+    } else {
+        ret(
+            c,
+            if n > 0 {
+                ERROR_SUCCESS
+            } else {
+                ERROR_NO_MORE_FILES
+            },
+        );
+    }
 }
 
 // ---- content -----------------------------------------------------------------
 
-/// Content data: device id, content type, display name (128 UTF-16
-/// characters), file name (42 bytes) at +0x108.
-fn content_dir(rt: &Runtime, data: u32) -> PathBuf {
+/// Content data (XCONTENT_DATA, 0x134 bytes): device id, content type,
+/// display name (128 UTF-16 characters) at +8, file name (42 bytes) at
+/// +0x108. Each package is a folder `content/<file name>` in the data
+/// folder, with its type and display name in `content/<file name>.meta`
+/// so an enumeration can list it again on a later run.
+pub const CONTENT_DATA: u32 = 0x134;
+/// Saved games: the content type a package without a `.meta` file (one
+/// made before they were kept) is listed as.
+const SAVED_GAME: u32 = 1;
+
+fn content_name(rt: &Runtime, data: u32) -> String {
     let mut name = cstr(rt, data + 0x108);
     name.retain(|ch| ch.is_ascii_alphanumeric() || "._-".contains(ch));
     if name.is_empty() {
         name = "content".into();
     }
-    k().data_dir.join("content").join(name)
+    name
 }
 
+fn content_root() -> PathBuf {
+    k().data_dir.join("content")
+}
+
+/// One content record as the guest reads it (on the hard disk, device 1).
+pub fn content_record(ty: u32, display: &str, file: &str) -> Vec<u8> {
+    let mut r = vec![0; CONTENT_DATA as usize];
+    r[..4].copy_from_slice(&1u32.to_be_bytes());
+    r[4..8].copy_from_slice(&ty.to_be_bytes());
+    for (i, ch) in display.encode_utf16().take(127).enumerate() {
+        r[8 + 2 * i..10 + 2 * i].copy_from_slice(&ch.to_be_bytes());
+    }
+    let f = &file.as_bytes()[..file.len().min(41)];
+    r[0x108..0x108 + f.len()].copy_from_slice(f);
+    r
+}
+
+/// What a create flag (low four bits: 1 create new, 2 create always, 3
+/// open existing, 4 open always, 5 truncate existing) does to a package
+/// that does or does not exist: Ok(empty it first) or the error.
+pub fn content_open(flag: u32, existed: bool) -> Result<bool, u32> {
+    match (flag & 0xF, existed) {
+        (1, true) => Err(ERROR_ALREADY_EXISTS),
+        (3 | 5, false) => Err(ERROR_PATH_NOT_FOUND),
+        (2 | 5, true) => Ok(true),
+        _ => Ok(false),
+    }
+}
+
+/// (type, display name) of the packages in `root`.
+pub fn content_list(root: &std::path::Path) -> Vec<(String, u32, String)> {
+    let mut out: Vec<_> = std::fs::read_dir(root)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| e.path().is_dir())
+        .map(|e| {
+            let file = e.file_name().to_string_lossy().into_owned();
+            let meta = std::fs::read_to_string(root.join(format!("{file}.meta"))).ok();
+            let (ty, display) = meta
+                .as_deref()
+                .and_then(|m| m.split_once('\n'))
+                .and_then(|(t, d)| Some((u32::from_str_radix(t.trim(), 16).ok()?, d.trim_end())))
+                .map_or((SAVED_GAME, file.clone()), |(t, d)| (t, d.to_string()));
+            (file, ty, display)
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+/// (user, root name, content data, flags, disposition out, licence out,
+/// cache size, content size, request block).
 pub fn xam_content_create_ex(rt: &Runtime, c: &mut Context) {
-    let (root, data, disp, lic, ov) = (
+    let (root, data, flags, disp, lic, ov) = (
         arg(rt, c, 1),
         arg(rt, c, 2),
+        arg(rt, c, 3),
         arg(rt, c, 4),
         arg(rt, c, 5),
         arg(rt, c, 8),
     );
-    let dir = content_dir(rt, data);
-    let existed = dir.exists();
-    super::files::link_root(&cstr(rt, root), dir);
+    let name = content_name(rt, data);
+    let dir = content_root().join(&name);
+    let existed = dir.is_dir();
+    let root_name = cstr(rt, root);
+    crate::log(&format!(
+        "[xam] content {name:?} as {root_name}: flags {flags:#x}, type {:#x}, {}",
+        rt.mem.read_u32(data + 4),
+        if existed { "exists" } else { "new" }
+    ));
+    let empty = match content_open(flags, existed) {
+        Ok(e) => e,
+        Err(e) => return finish(rt, c, ov, e),
+    };
+    if empty {
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    if !existed || empty {
+        let meta = format!(
+            "{:x}\n{}",
+            rt.mem.read_u32(data + 4),
+            super::rtl::wstr(rt, data + 8)
+        );
+        let _ = std::fs::create_dir_all(content_root());
+        if let Err(e) = std::fs::write(content_root().join(format!("{name}.meta")), meta) {
+            crate::log(&format!("[xam] cannot store content {name:?} details: {e}"));
+        }
+    }
+    super::files::link_root(&root_name, dir);
     if disp != 0 {
-        rt.mem.write_u32(disp, if existed { 2 } else { 1 });
+        rt.mem
+            .write_u32(disp, if existed && !empty { 2 } else { 1 });
     }
     if lic != 0 {
         rt.mem.write_u32(lic, 0);
@@ -161,17 +269,38 @@ pub fn xam_content_close(rt: &Runtime, c: &mut Context) {
     finish(rt, c, ov, ERROR_SUCCESS);
 }
 
+/// (user, device, type, flags, records per call, buffer size out, handle
+/// out): the packages of that type on the hard disk (device 0 is any).
 pub fn xam_content_create_enumerator(rt: &Runtime, c: &mut Context) {
-    let (size, out) = (arg(rt, c, 5), arg(rt, c, 6));
+    let (dev, ty, per, size, out) = (
+        arg(rt, c, 1),
+        arg(rt, c, 2),
+        arg(rt, c, 4),
+        arg(rt, c, 5),
+        arg(rt, c, 6),
+    );
+    let per = per.max(1);
     if size != 0 {
-        rt.mem.write_u32(size, 0x134);
+        rt.mem.write_u32(size, CONTENT_DATA * per);
     }
-    let h = k().add_handle(Handle::Other(0));
+    let items: std::collections::VecDeque<_> = if matches!(dev, 0 | 1) {
+        content_list(&content_root())
+            .into_iter()
+            .filter(|x| x.1 == ty)
+            .map(|(f, t, d)| content_record(t, &d, &f))
+            .collect()
+    } else {
+        Default::default()
+    };
+    crate::log(&format!(
+        "[xam] content list of type {ty:#x} on device {dev}: {} found",
+        items.len()
+    ));
+    let h = k().add_handle(Handle::Items(std::sync::Arc::new(Mutex::new((items, per)))));
     rt.mem.write_u32(out, h);
     ret(c, ERROR_SUCCESS);
 }
 
-/// One hard disk: id, type, total and free bytes, name.
 pub fn xam_content_get_device_data(rt: &Runtime, c: &mut Context) {
     let (id, p) = (arg(rt, c, 0), arg(rt, c, 1));
     if id != 1 {
@@ -199,7 +328,7 @@ pub fn xam_content_get_creator(rt: &Runtime, c: &mut Context) {
         rt.mem.write_u32(is, 1);
     }
     if xuid != 0 {
-        rt.mem.write_u64(xuid, 0);
+        rt.mem.write_u64(xuid, super::profile::XUID);
     }
     finish(rt, c, ov, ERROR_SUCCESS);
 }
@@ -350,13 +479,18 @@ pub fn x_msg_in_process_call(rt: &Runtime, c: &mut Context) {
     ));
     ret(c, 0x8007_0490); // ERROR_NOT_FOUND as HRESULT
 }
+/// Presence context and property writes (app 0xFB, 0xB0006 and 0xB0007)
+/// are accepted and dropped; other requests are refused.
 pub fn x_msg_start_io_request(rt: &Runtime, c: &mut Context) {
+    let ov = arg(rt, c, 2);
+    if arg(rt, c, 0) == 0xFB && matches!(arg(rt, c, 1), 0xB_0006 | 0xB_0007) {
+        return finish(rt, c, ov, ERROR_SUCCESS);
+    }
     crate::log(&format!(
         "[xam] request {:#x} to app {:#x} refused",
         arg(rt, c, 1),
         arg(rt, c, 0)
     ));
-    let ov = arg(rt, c, 2);
     finish(rt, c, ov, ERROR_FUNCTION_FAILED);
 }
 pub fn x_msg_start_io_request_ex(rt: &Runtime, c: &mut Context) {

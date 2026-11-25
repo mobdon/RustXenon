@@ -547,6 +547,8 @@ pub fn nt_set_information_file(rt: &Runtime, c: &mut Context) {
             Some(Ok(())) => STATUS_SUCCESS,
             _ => STATUS_ACCESS_DENIED,
         },
+        // FileBasicInformation: times and attributes. Host files keep their own.
+        4 => STATUS_SUCCESS,
         // FileDispositionInformation: delete on close.
         13 => {
             if rt.mem.read_u8(info) != 0 && f.path.starts_with(&k().data_dir) {
