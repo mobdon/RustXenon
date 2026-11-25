@@ -18,6 +18,13 @@
 //! lavapipe GPU memory is host memory, so RSS includes it.
 //!
 //! cargo run --release -p xenon-draw --example churn -- [frames] [every] [textures] [draws] [resolves] [cache MB]
+//!
+//! The defaults are small. Textures average about 0.33 MB, so the cache
+//! only thrashes while `cache MB` is below that total: a capture's shape
+//! (a few hundred textures evicted every frame, thousands of draws, about
+//! 44 resolves) is roughly `churn 300 30 400 5000 44 100`.
+//! "Evicted before" stays 0: the bytes change every frame, so no upload is
+//! of a texture the cache once held.
 
 #[path = "../tests/common/mod.rs"]
 mod common;
@@ -38,10 +45,11 @@ fn tex(i: u32) -> u32 {
     64 << (i % 4)
 }
 
-// Past the command stream, which grows with `draws`.
-const FULL: u32 = 0x90_0000;
-const QUADS: u32 = 0xA0_0000;
+// Each tiled 1280x720 32bpp resolve touches 0x39_8000 bytes: FRONT must end
+// before SCRATCH, and SCRATCH before FULL (main asserts it).
 const SCRATCH: u32 = 0x60_0000;
+const FULL: u32 = 0xA0_0000;
+const QUADS: u32 = 0xA1_0000;
 
 fn rss_mb() -> u64 {
     let statm = std::fs::read_to_string("/proc/self/statm").unwrap_or_default();
@@ -67,6 +75,17 @@ fn main() {
     };
     println!("adapter: {}", d.adapter);
     d.texture_cache_limit = u64::from(cache_mb) << 20;
+    let resolved = xenon_texture::tile::tiled_extent_2d(FW, FH, FW, 4).unwrap();
+    assert!(FRONT + resolved <= SCRATCH && SCRATCH + resolved <= FULL);
+    assert!(
+        QUADS + 80 * textures.max(draws) <= TEXTURES,
+        "too many draws"
+    );
+    // Guest addresses are 512 MB physical.
+    assert!(
+        TEXTURES + textures * SLOT <= 0x2000_0000,
+        "too many textures"
+    );
     let mut mem = xenon_gpu::SliceMemory {
         base: 0,
         data: vec![0; (TEXTURES + textures * SLOT) as usize],
@@ -79,6 +98,7 @@ fn main() {
         ])
     };
     mem.write_words(FULL, &full(0.5));
+    let full_bytes = mem.data[FULL as usize..][..4 * 12].to_vec();
     let quads: Vec<u32> = (0..textures.max(draws))
         .flat_map(|i| {
             let x = (i * 128 % FW) as f32;
@@ -111,8 +131,11 @@ fn main() {
         .regs(RB_COLOR_MASK, &[0xF])
         .shader(false, &vs_uv())
         .shader(true, &ps_texture(1));
+    // The front buffer resolve and the scratch ones.
+    let mut built = 1;
     for i in 0..textures + draws {
         if draws > 0 && i > textures && (i - textures) % draws.div_ceil(resolves).max(1) == 0 {
+            built += 1;
             s.resolve_with(
                 &mut mem,
                 (FW, FH),
@@ -142,6 +165,11 @@ fn main() {
         [0; 3],
     )
     .swap_at(FRONT, FW, FH);
+    // Not common::run: it writes the stream at CMD, where thousands of draws
+    // run over RECT.
+    let mut rec = xenon_gpu::Recorder::new();
+    rec.record_words(&mem, &s.0);
+    assert!(rec.warnings.is_empty(), "{:?}", rec.warnings);
 
     let start = rss_mb();
     println!("frame 0: rss {start} MB");
@@ -151,13 +179,22 @@ fn main() {
             let at = (TEXTURES + i * SLOT) as usize;
             mem.data[at..at + 4].copy_from_slice(&frame.to_le_bytes());
         }
-        let r = run(&mut d, &s, &mut mem);
+        let r = d.replay(&rec.commands, &mut mem).unwrap();
         assert_eq!(r.frames.len(), 1, "{r:?}");
+        // No resolve may land on the vertices it draws with.
+        assert_eq!(mem.data[FULL as usize..][..4 * 12], full_bytes[..]);
+        assert_eq!(r.draws, 2 + textures + draws, "{:?}", r.unsupported);
+        assert_eq!(r.resolves, built, "{:?}", r.unsupported);
+        assert!(r.timings.textures_uploaded >= textures, "{:?}", r.timings);
         if frame % every == 0 {
             println!(
-                "frame {frame}: rss {} MB (+{}), {}",
+                "frame {frame}: rss {} MB (+{}), {} draws, {} resolves, {} textures uploaded ({} evicted before), {}",
                 rss_mb(),
                 rss_mb().saturating_sub(start),
+                r.draws,
+                r.resolves,
+                r.timings.textures_uploaded,
+                r.timings.textures_reuploaded,
                 d.memory_line()
             );
         }
