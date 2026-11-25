@@ -919,6 +919,13 @@ pub struct Drawer {
     /// (default: whether the adapter has BC textures). Turning it on
     /// without them makes those uploads fail.
     pub bc_textures: bool,
+    /// Diagnostic: report a warning line per distinct texture a draw
+    /// samples (see [`texture_log_line`]): for every pixel shader when
+    /// `Some(None)`, for the pixel shader of that program hash when
+    /// `Some(Some(hash))`. Default from `XENON_TEXTURE_LOG` (`all`, or the
+    /// hash in hex); off without it. Draws whose shaders fail translation
+    /// (such as a cube or 3D fetch) do not log.
+    pub texture_log: Option<Option<u64>>,
     timings: Timings,
     uncaptured: Arc<Mutex<Vec<String>>>,
     max_dim: u32,
@@ -1354,6 +1361,19 @@ impl Drawer {
             skip_resolve_writeback: false,
             texture_cache_limit: TEXTURE_CACHE_LIMIT,
             bc_textures: required_features.contains(wgpu::Features::TEXTURE_COMPRESSION_BC),
+            texture_log: std::env::var("XENON_TEXTURE_LOG")
+                .ok()
+                .and_then(|v| match v.trim() {
+                    "all" => Some(None),
+                    h => {
+                        let hex = h.trim_start_matches("0x").trim_start_matches("0X");
+                        let r = u64::from_str_radix(hex, 16).ok().map(Some);
+                        if r.is_none() {
+                            eprintln!("XENON_TEXTURE_LOG={v:?} is not `all` or a hex hash; texture log off");
+                        }
+                        r
+                    }
+                }),
             timings: Timings::default(),
             uncaptured,
             max_dim: limits.max_texture_dimension_2d,
@@ -3520,6 +3540,18 @@ impl Drawer {
         let consts = self.consts(window_base);
         let epi = to_bytes(&state::epilogue(&self.regs, w, h));
         self.timings.guest_data += lap(&mut t);
+        if self
+            .texture_log
+            .is_some_and(|h| h.is_none_or(|h| h == ps.hash))
+        {
+            let lod = vs_t.info.texture_explicit_lod | ps_t.info.texture_explicit_lod;
+            let bias = vs_t.info.texture_lod_bias | ps_t.info.texture_lod_bias;
+            for n in (0..32).filter(|n| tex_mask & (1 << n) != 0) {
+                let c = self.regs.fetch_constant(n);
+                let (lod, bias) = (lod & (1 << n) != 0, bias & (1 << n) != 0);
+                report.warn(texture_log_line(ps.hash, n, c, lod, bias));
+            }
+        }
         let mut textures = Vec::new();
         for n in (0..32).filter(|n| tex_mask & (1 << n) != 0) {
             textures.push((n, self.texture(n, mem, report)?));
@@ -4277,6 +4309,52 @@ fn bc_blocks(
             .collect()
     };
     Ok(Some((format, blocks)))
+}
+
+/// The [`Drawer::texture_log`] line of fetch constant `c` in slot `n` of a
+/// draw with pixel shader `ps`: the fields that change sampled values
+/// (format, size, swizzle as source per output channel, X Y Z W signs
+/// 0 unsigned / 1 signed / 2 biased / 3 gamma, exp_adjust, endian), the mip
+/// fields (the drawer uploads the base level only), the fetch constant's
+/// LOD bias (1/32 steps), whether a fetch of the slot adds its own non-zero
+/// LOD bias (`instr_bias 1`), whether one picks its own LOD (`explicit`)
+/// and the raw dwords.
+pub fn texture_log_line(
+    ps: u64,
+    n: u32,
+    c: [u32; 6],
+    explicit_lod: bool,
+    instr_bias: bool,
+) -> String {
+    let f = xenon_texture::TextureFetch::decode(c);
+    let swizzle: String = (0..4)
+        .map(|i| b"xyzw0101"[usize::from((f.swizzle >> (3 * i)) & 7)] as char)
+        .collect();
+    let sign: String = f.sign.iter().map(|s| char::from(b'0' + s)).collect();
+    format!(
+        "texture log: ps {ps:016x} t{n} type {} {:?} {}x{} at {:08x} swizzle {swizzle} sign {sign} exp_adjust {} endian {:?} num_format {} mips {}-{}{} at {:08x} lod_bias {} instr_bias {} {} lod | {:08x} {:08x} {:08x} {:08x} {:08x} {:08x}",
+        f.fetch_type,
+        f.format,
+        f.width(),
+        f.height(),
+        f.base_address,
+        f.exp_adjust,
+        f.endian,
+        f.num_format,
+        f.mip_min_level,
+        f.mip_max_level,
+        if f.packed_mips { " packed" } else { "" },
+        f.mip_address,
+        f.lod_bias,
+        u8::from(instr_bias),
+        if explicit_lod { "explicit" } else { "computed" },
+        c[0],
+        c[1],
+        c[2],
+        c[3],
+        c[4],
+        c[5],
+    )
 }
 
 /// Host format of a guest texture: `Rgba16Float` for half floats,

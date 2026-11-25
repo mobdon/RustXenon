@@ -403,13 +403,18 @@ pub mod capture {
         }
     }
 
-    /// Logs each drawer note once.
+    /// Logs each drawer note once (again after 4096 distinct notes, when
+    /// the set is cleared so that per-texture log lines stay bounded).
     pub fn note(s: &str) {
-        static SEEN: Mutex<Vec<String>> = Mutex::new(Vec::new());
+        static SEEN: std::sync::LazyLock<Mutex<std::collections::HashSet<String>>> =
+            std::sync::LazyLock::new(Default::default);
         let mut v = SEEN.lock().unwrap();
-        if !v.iter().any(|x| x == s) {
+        if !v.contains(s) {
+            if v.len() >= 4096 {
+                v.clear();
+            }
             crate::log(&format!("[draw] {s}"));
-            v.push(s.to_string());
+            v.insert(s.to_string());
         }
     }
 

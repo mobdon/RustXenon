@@ -195,6 +195,13 @@ fn pixel_shader_texture_fetch() {
     let t = ok(&words, Pixel);
     assert_eq!(t.info.textures_used, 1 << 5);
     assert_eq!(t.info.texture_filter_overrides, 1 << 5);
+    assert_eq!(t.info.texture_explicit_lod, 0);
+    assert_eq!(t.info.texture_lod_bias, 1 << 5);
+    // A fixed LOD (no computed LOD) counts as explicit.
+    let mut fixed = tf;
+    fixed.use_computed_lod = false;
+    let w = assemble(&[exec(0, 2, true)], &[tfetch(fixed), alu(export(1, r(1)))]);
+    assert_eq!(ok(&w, Pixel).info.texture_explicit_lod, 1 << 5);
     assert_eq!(t.info.colour_targets_written, 0b10);
     has(&t, "@group(1) @binding(10) var tex5: texture_2d<f32>;");
     has(&t, "@group(1) @binding(11) var samp5: sampler;");
