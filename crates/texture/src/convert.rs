@@ -70,33 +70,66 @@ fn read_le(data: &[u8]) -> u64 {
     data.iter().rev().fold(0, |acc, &b| (acc << 8) | b as u64)
 }
 
-/// One uncompressed texel to XYZW.
-fn texel(format: TextureFormat, d: &[u8]) -> [f32; 4] {
+/// Bit position and width of each XYZW component of a fixed-point format,
+/// with missing components repeating the last one; `None` for depth and
+/// float formats.
+fn fixed_point_fields(format: TextureFormat) -> Option<[(u32, u32); 4]> {
+    Some(match format {
+        F::K8 => [(0, 8); 4],
+        F::K8_8 => [(0, 8), (8, 8), (8, 8), (8, 8)],
+        F::K8_8_8_8 => [(0, 8), (8, 8), (16, 8), (24, 8)],
+        F::K5_6_5 => [(0, 5), (5, 6), (11, 5), (11, 5)],
+        // Named 6_5_5 but laid out 5:5:6 from the low bits (Xenia).
+        F::K6_5_5 => [(0, 5), (5, 5), (10, 6), (10, 6)],
+        F::K1_5_5_5 => [(0, 5), (5, 5), (10, 5), (15, 1)],
+        F::K4_4_4_4 => [(0, 4), (4, 4), (8, 4), (12, 4)],
+        F::K2_10_10_10 => [(0, 10), (10, 10), (20, 10), (30, 2)],
+        // Xenia loads k_10_11_11 as R11G11B10 and k_11_11_10 as R10G11B11.
+        F::K10_11_11 => [(0, 11), (11, 11), (22, 10), (22, 10)],
+        F::K11_11_10 => [(0, 10), (10, 11), (21, 11), (21, 11)],
+        F::K16 => [(0, 16); 4],
+        F::K16_16 => [(0, 16), (16, 16), (16, 16), (16, 16)],
+        F::K16_16_16_16 => [(0, 16), (16, 16), (32, 16), (48, 16)],
+        _ => return None,
+    })
+}
+
+/// An n-bit field read as two's complement and scaled so that the largest
+/// positive value is 1; the most negative value (one step past -1) clamps
+/// to -1. A 1-bit field holds only 0 and -1.
+fn snorm(v: u64, bits: u32) -> f32 {
+    if bits == 1 {
+        return -(v as f32);
+    }
+    let half = 1i64 << (bits - 1);
+    let s = v as i64 - if v as i64 >= half { 2 * half } else { 0 };
+    (s as f32 / (half - 1) as f32).max(-1.0)
+}
+
+/// One uncompressed texel to XYZW. `signed` components of fixed-point
+/// formats read as two's complement ([`snorm`]); depth and float formats
+/// ignore it, as they have no unsigned encoding to reinterpret.
+fn texel(format: TextureFormat, d: &[u8], signed: [bool; 4]) -> [f32; 4] {
     let v = read_le(&d[..d.len().min(8)]);
+    if let Some(fields) = fixed_point_fields(format) {
+        return std::array::from_fn(|i| {
+            let (shift, bits) = fields[i];
+            let raw = field(v, shift, bits);
+            if signed[i] {
+                snorm(raw, bits)
+            } else {
+                unorm(raw, bits)
+            }
+        });
+    }
     let f16 = |i: usize| half_to_f32(u16::from_le_bytes([d[2 * i], d[2 * i + 1]]));
     let f32_at =
         |i: usize| f32::from_le_bytes([d[4 * i], d[4 * i + 1], d[4 * i + 2], d[4 * i + 3]]);
-    let u = |shift, bits| unorm(field(v, shift, bits), bits);
     match format {
-        F::K8 => [u(0, 8); 4],
-        F::K8_8 => [u(0, 8), u(8, 8), u(8, 8), u(8, 8)],
-        F::K8_8_8_8 => [u(0, 8), u(8, 8), u(16, 8), u(24, 8)],
-        F::K5_6_5 => [u(0, 5), u(5, 6), u(11, 5), u(11, 5)],
-        // Named 6_5_5 but laid out 5:5:6 from the low bits (Xenia).
-        F::K6_5_5 => [u(0, 5), u(5, 5), u(10, 6), u(10, 6)],
-        F::K1_5_5_5 => [u(0, 5), u(5, 5), u(10, 5), u(15, 1)],
-        F::K4_4_4_4 => [u(0, 4), u(4, 4), u(8, 4), u(12, 4)],
-        F::K2_10_10_10 => [u(0, 10), u(10, 10), u(20, 10), u(30, 2)],
-        // Xenia loads k_10_11_11 as R11G11B10 and k_11_11_10 as R10G11B11.
-        F::K10_11_11 => [u(0, 11), u(11, 11), u(22, 10), u(22, 10)],
-        F::K11_11_10 => [u(0, 10), u(10, 11), u(21, 11), u(21, 11)],
         // Depth in the high 24 bits, stencil in the low 8 (Xenia's
         // texture_load_depth_* shaders); the host swizzle is RRRR.
         F::K24_8 => [unorm24_to_f32((v >> 8) as u32); 4],
         F::K24_8Float => [float20e4_to_f32((v >> 8) as u32); 4],
-        F::K16 => [u(0, 16); 4],
-        F::K16_16 => [u(0, 16), u(16, 16), u(16, 16), u(16, 16)],
-        F::K16_16_16_16 => [u(0, 16), u(16, 16), u(32, 16), u(48, 16)],
         F::K16Float => [f16(0); 4],
         F::K16_16Float => [f16(0), f16(1), f16(1), f16(1)],
         F::K16_16_16_16Float => [f16(0), f16(1), f16(2), f16(3)],
@@ -223,6 +256,7 @@ fn decode(
     data: &[u8],
     width: u32,
     height: u32,
+    signed: [bool; 4],
     mut put: impl FnMut(usize, Texel),
 ) -> Result<(), Error> {
     check_len(format, data, width, height)?;
@@ -232,7 +266,7 @@ fn decode(
     let (w, h) = (width as usize, height as usize);
     if info.block_width == 1 {
         for (i, d) in data.chunks_exact(bpb).take(w * h).enumerate() {
-            put(i, Texel::F32(texel(format, d)));
+            put(i, Texel::F32(texel(format, d, signed)));
         }
         return Ok(());
     }
@@ -261,10 +295,38 @@ pub fn to_rgba_f32(
     width: u32,
     height: u32,
 ) -> Result<Vec<f32>, Error> {
+    to_rgba_f32_signed(format, data, width, height, [false; 4])
+}
+
+/// [`to_rgba_f32`] with the X Y Z W components marked in `signed` (fetch
+/// sign 1, before the swizzle) decoded as signed normalized: the unsigned
+/// n-bit field is read as two's complement and divided by 2^(n-1) - 1, with
+/// the most negative value clamped to -1, so the result is in -1..1.
+///
+/// Fixed-point formats convert from the raw field, exactly. Depth and float
+/// formats are unaffected. Block-compressed formats convert their decoded
+/// 8-bit values.
+pub fn to_rgba_f32_signed(
+    format: TextureFormat,
+    data: &[u8],
+    width: u32,
+    height: u32,
+    signed: [bool; 4],
+) -> Result<Vec<f32>, Error> {
     let mut out = vec![0.0; check_len(format, data, width, height)? * 4];
-    decode(format, data, width, height, |i, t| {
+    decode(format, data, width, height, signed, |i, t| {
         let t = match t {
-            Texel::U8(t) => t.map(|c| c as f32 / 255.0),
+            // shortcut: signed block formats reinterpret the byte after
+            // unsigned palette interpolation, not interpolating signed
+            // endpoints; exact for endpoint texels only. Upgrade if signed
+            // DXT/DXN content shows up.
+            Texel::U8(t) => std::array::from_fn(|c| {
+                if signed[c] {
+                    snorm(t[c] as u64, 8)
+                } else {
+                    t[c] as f32 / 255.0
+                }
+            }),
             Texel::F32(t) => t,
         };
         out[i * 4..i * 4 + 4].copy_from_slice(&t);
@@ -282,7 +344,7 @@ pub fn to_rgba8(
     height: u32,
 ) -> Result<Vec<u8>, Error> {
     let mut out = vec![0; check_len(format, data, width, height)? * 4];
-    decode(format, data, width, height, |i, t| {
+    decode(format, data, width, height, [false; 4], |i, t| {
         let t = match t {
             Texel::U8(t) => t,
             Texel::F32(t) => t.map(|c| (c.clamp(0.0, 1.0) * 255.0).round() as u8),
@@ -472,6 +534,29 @@ mod tests {
         // Exponent 15 (bias 15), mantissa 0: 1.0.
         assert_eq!(float20e4_to_f32(15 << 20), 1.0);
         assert_eq!(float20e4_to_f32((15 << 20) | (1 << 19)), 1.5);
+    }
+
+    #[test]
+    fn snorm_fields() {
+        assert_eq!(snorm(0x7F, 8), 1.0);
+        assert_eq!(snorm(0x80, 8), -1.0);
+        assert_eq!(snorm(0x81, 8), -1.0);
+        assert_eq!(snorm(0xFF, 8), -1.0 / 127.0);
+        assert_eq!(snorm(0x8001, 16), -1.0);
+        assert_eq!(snorm(0x200, 10), -1.0);
+        assert_eq!(snorm(0x3FF, 11), 1.0);
+        assert_eq!([snorm(0, 1), snorm(1, 1)], [0.0, -1.0]);
+        assert_eq!([snorm(1, 2), snorm(2, 2), snorm(3, 2)], [1.0, -1.0, -1.0]);
+        // k_2_10_10_10 with only W signed: X stays unorm.
+        let v = 0x3FFu32 | (3 << 30);
+        let t = to_rgba_f32_signed(
+            F::K2_10_10_10,
+            &v.to_le_bytes(),
+            1,
+            1,
+            [false, false, false, true],
+        );
+        assert_eq!(t.unwrap(), [1.0, 0.0, 0.0, -1.0]);
     }
 
     #[test]

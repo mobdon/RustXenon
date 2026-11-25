@@ -1339,7 +1339,10 @@ impl Drawer {
     }
 
     /// Host texture of fetch constant slot `n`, from the cache or decoded.
-    /// Formats whose values do not fit 8-bit unorm upload as floats.
+    /// Formats whose values do not fit 8-bit unorm, and fetches with a signed
+    /// component, upload as floats. The cache key holds the whole fetch
+    /// constant (sign bits included), so signed and unsigned views of the
+    /// same bytes are separate textures.
     fn guest_texture(
         &mut self,
         n: u32,
@@ -1361,7 +1364,8 @@ impl Drawer {
         if let Some(view) = self.texture_cache.get(&key) {
             return Ok(view.clone());
         }
-        let host = host_texture_format(fetch.format, self.float32_filterable);
+        let signed = fetch.sign.contains(&1);
+        let host = host_texture_format(fetch.format, signed, self.float32_filterable);
         let (width, height, data) = if host == wgpu::TextureFormat::Rgba8Unorm {
             let img = xenon_texture::decode_base_level(fetch, &bytes).map_err(|e| e.to_string())?;
             (img.width, img.height, img.rgba8)
@@ -2345,8 +2349,22 @@ impl Drawer {
 /// depth but not their precision. 32-bit floats also lose range: values with
 /// a magnitude of 65520 or more become infinity and values below about 2^-25
 /// flush to zero.
-fn host_texture_format(format: xenon_texture::TextureFormat, float32: bool) -> wgpu::TextureFormat {
+///
+/// `signed` (a fetch sign of 1 on any component) moves the 8-bit formats to
+/// the wide float format too: the decoder writes signed values in -1..1,
+/// which the host then filters directly, and the texture's unsigned
+/// components keep their 8-bit values exactly (a half would not).
+fn host_texture_format(
+    format: xenon_texture::TextureFormat,
+    signed: bool,
+    float32: bool,
+) -> wgpu::TextureFormat {
     use xenon_texture::TextureFormat as F;
+    let wide = if float32 {
+        wgpu::TextureFormat::Rgba32Float
+    } else {
+        wgpu::TextureFormat::Rgba16Float
+    };
     match format.data_format() {
         F::K16Float | F::K16_16Float | F::K16_16_16_16Float => wgpu::TextureFormat::Rgba16Float,
         F::K24_8
@@ -2357,13 +2375,8 @@ fn host_texture_format(format: xenon_texture::TextureFormat, float32: bool) -> w
         | F::K32Float
         | F::K32_32Float
         | F::K32_32_32Float
-        | F::K32_32_32_32Float => {
-            if float32 {
-                wgpu::TextureFormat::Rgba32Float
-            } else {
-                wgpu::TextureFormat::Rgba16Float
-            }
-        }
+        | F::K32_32_32_32Float => wide,
+        _ if signed => wide,
         _ => wgpu::TextureFormat::Rgba8Unorm,
     }
 }
@@ -2388,12 +2401,24 @@ mod tests {
     fn host_texture_formats() {
         use wgpu::TextureFormat as H;
         use xenon_texture::TextureFormat as F;
-        assert_eq!(host_texture_format(F::K8_8_8_8, true), H::Rgba8Unorm);
-        assert_eq!(host_texture_format(F::Dxt1, true), H::Rgba8Unorm);
-        assert_eq!(host_texture_format(F::K16Expand, true), H::Rgba16Float);
-        assert_eq!(host_texture_format(F::K24_8Float, true), H::Rgba32Float);
-        assert_eq!(host_texture_format(F::K24_8Float, false), H::Rgba16Float);
-        assert_eq!(host_texture_format(F::K16_16, true), H::Rgba32Float);
+        assert_eq!(host_texture_format(F::K8_8_8_8, false, true), H::Rgba8Unorm);
+        assert_eq!(host_texture_format(F::K8_8_8_8, true, true), H::Rgba32Float);
+        assert_eq!(host_texture_format(F::Dxt1, true, false), H::Rgba16Float);
+        assert_eq!(host_texture_format(F::Dxt1, false, true), H::Rgba8Unorm);
+        assert_eq!(
+            host_texture_format(F::K16Expand, false, true),
+            H::Rgba16Float
+        );
+        assert_eq!(
+            host_texture_format(F::K24_8Float, false, true),
+            H::Rgba32Float
+        );
+        assert_eq!(
+            host_texture_format(F::K24_8Float, false, false),
+            H::Rgba16Float
+        );
+        assert_eq!(host_texture_format(F::K16_16, false, true), H::Rgba32Float);
+        assert_eq!(host_texture_format(F::K16_16, true, true), H::Rgba32Float);
     }
 
     #[test]

@@ -24,7 +24,7 @@ pub mod tile;
 
 use std::fmt;
 
-pub use convert::{apply_swizzle, apply_swizzle_f32, to_rgba8, to_rgba_f32};
+pub use convert::{apply_swizzle, apply_swizzle_f32, to_rgba8, to_rgba_f32, to_rgba_f32_signed};
 pub use endian::Endian;
 pub use fetch::{Dimension, TextureFetch};
 pub use format::{FormatInfo, TextureFormat};
@@ -139,8 +139,9 @@ pub fn bytes_needed(fetch: &TextureFetch) -> Result<usize, Error> {
 /// base address; only slice 0's extent must be present.
 ///
 /// Signedness, `exp_adjust` and gamma are not applied here: texels decode as
-/// unsigned normalized (or float) values, and the translated shader applies
-/// them to the sampled value (see `xenon-shader`).
+/// unsigned normalized (or float) values. Signed components need
+/// [`decode_base_level_f32`]; the translated shader applies the biased sign,
+/// gamma and `exp_adjust` to the sampled value (see `xenon-shader`).
 pub fn decode_base_level(fetch: &TextureFetch, guest_bytes: &[u8]) -> Result<Image, Error> {
     let linear = linear_base_level(fetch, guest_bytes)?;
     let (width, height) = (fetch.width(), fetch.height());
@@ -153,12 +154,18 @@ pub fn decode_base_level(fetch: &TextureFetch, guest_bytes: &[u8]) -> Result<Ima
     })
 }
 
-/// [`decode_base_level`] to floats ([`to_rgba_f32`]), for formats whose
-/// values do not fit 8-bit unorm (depth, 16- and 32-bit, float).
+/// [`decode_base_level`] to floats, for formats whose values do not fit 8-bit
+/// unorm (depth, 16- and 32-bit, float) and for fetches with signed
+/// components. Components whose fetch sign is 1 decode as signed normalized
+/// ([`to_rgba_f32_signed`]) before the swizzle, so each output component
+/// takes the sign of the source component it selects and constant 0 / 1
+/// selects stay unsigned. Decoding before sampling lets the host filter the
+/// signed values.
 pub fn decode_base_level_f32(fetch: &TextureFetch, guest_bytes: &[u8]) -> Result<ImageF32, Error> {
     let linear = linear_base_level(fetch, guest_bytes)?;
     let (width, height) = (fetch.width(), fetch.height());
-    let mut rgba = to_rgba_f32(fetch.format, &linear, width, height)?;
+    let signed = fetch.sign.map(|s| s == 1);
+    let mut rgba = to_rgba_f32_signed(fetch.format, &linear, width, height, signed)?;
     apply_swizzle_f32(&mut rgba, fetch.swizzle);
     Ok(ImageF32 {
         width,
@@ -428,6 +435,50 @@ mod tests {
             .collect();
         let img = decode_base_level_f32(&fetch, &guest).unwrap();
         assert_eq!(img.rgba, [1.0, 0.5, -2.0, 4.0]);
+    }
+
+    #[test]
+    fn f32_decode_signs_components_before_swizzle() {
+        // 1x1 k_8_8_8_8, bytes X Y Z W = 0x80 0x7F 0x01 0xFF. X and Y are
+        // signed, Z and W unsigned. Swizzle (Y, X, 1, Z): outputs 0 and 1
+        // take the signs of sources Y and X, the constant stays 1, output 3
+        // is the unsigned Z.
+        let mut w = fetch_words(
+            TextureFormat::K8_8_8_8,
+            Endian::None,
+            false,
+            1,
+            1,
+            32,
+            1 | (5 << 6) | (2 << 9),
+        );
+        w[0] |= (1 << 2) | (1 << 4);
+        let fetch = TextureFetch::decode(w);
+        let img = decode_base_level_f32(&fetch, &[0x80, 0x7F, 0x01, 0xFF]).unwrap();
+        assert_eq!(img.rgba, [1.0, -1.0, 1.0, 1.0 / 255.0]);
+
+        // Constant 0 with a signed source keeps 0; signed 0xFF is -1/127.
+        let mut w = fetch_words(
+            TextureFormat::K8_8_8_8,
+            Endian::None,
+            false,
+            1,
+            1,
+            32,
+            4 | (3 << 3) | (4 << 6) | (4 << 9),
+        );
+        w[0] |= 0x55 << 2;
+        let img = decode_base_level_f32(&TextureFetch::decode(w), &[0, 0, 0, 0xFF]).unwrap();
+        assert_eq!(img.rgba, [0.0, -1.0 / 127.0, 0.0, 0.0]);
+
+        // k_16_16 signed reads the 16-bit fields exactly; Y repeats into Z, W.
+        let mut w = fetch_words(TextureFormat::K16_16, Endian::None, false, 1, 1, 32, RGBA);
+        w[0] |= 0x55 << 2;
+        let mut guest = 0x8001u16.to_le_bytes().to_vec();
+        guest.extend_from_slice(&0x4000u16.to_le_bytes());
+        let img = decode_base_level_f32(&TextureFetch::decode(w), &guest).unwrap();
+        let y = 16384.0 / 32767.0;
+        assert_eq!(img.rgba, [-1.0, y, y, y]);
     }
 
     #[test]

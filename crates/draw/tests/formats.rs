@@ -552,14 +552,6 @@ fn sample_into(
     format: u32,
     texel_bytes: &[u8],
 ) -> Vec<u8> {
-    let mut mem = memory();
-    mem.data[TEXTURE as usize..][..texel_bytes.len()].copy_from_slice(texel_bytes);
-    let q = W as f32;
-    let verts: Vec<u32> = [(0.0, 0.0), (q, 0.0), (q, q), (0.0, q)]
-        .iter()
-        .flat_map(|&(x, y)| [f(x), f(y), f(0.0), f(0.5), f(0.5)])
-        .collect();
-    mem.write_words(VERTS, &verts);
     let swizzle_rgba = (1 << 3) | (2 << 6) | (3 << 9);
     let fetch = [
         2 | (2 << 10) | (2 << 13) | (1 << 22), // clamp, pitch 32, linear
@@ -569,6 +561,26 @@ fn sample_into(
         0,
         1 << 9, // 2D
     ];
+    sample_fetch(d, rt_format, fetch, texel_bytes)
+}
+
+/// Draws a quad sampling `fetch` (whose base address is TEXTURE) at uv
+/// (0.5, 0.5) into a target of `rt_format`, returning the raw texel at
+/// (8, 8).
+fn sample_fetch(
+    d: &mut xenon_draw::Drawer,
+    rt_format: u32,
+    fetch: [u32; 6],
+    texel_bytes: &[u8],
+) -> Vec<u8> {
+    let mut mem = memory();
+    mem.data[TEXTURE as usize..][..texel_bytes.len()].copy_from_slice(texel_bytes);
+    let q = W as f32;
+    let verts: Vec<u32> = [(0.0, 0.0), (q, 0.0), (q, q), (0.0, q)]
+        .iter()
+        .flat_map(|&(x, y)| [f(x), f(y), f(0.0), f(0.5), f(0.5)])
+        .collect();
+    mem.write_words(VERTS, &verts);
     let mut s = Stream::default();
     s.setup()
         .regs(RB_COLOR_INFO, &[rt_format << 16])
@@ -909,4 +921,53 @@ fn texture_fetch_sign_gamma_and_exp_adjust() {
         halves(&texel(&raw, W, 8, 4, 4)),
         [0xBF3F, 0xC000, 0x3C89, 0x4000]
     );
+}
+
+/// Signed components convert before filtering: a 2x1 signed 8_8_8_8 texture
+/// of 0x7F (1.0) next to 0x80 (-1.0), sampled with linear filtering exactly
+/// between the two texel centres, reads 0 in every component. Converting the
+/// filtered unsigned value instead would read 127.5/255 as about -1 or +1.
+#[test]
+fn signed_texels_filter_after_conversion() {
+    let Some(mut d) = drawer() else { return };
+    let swizzle_rgba = (1 << 3) | (2 << 6) | (3 << 9);
+    let fetch = [
+        2 | (0x55 << 2) | (2 << 10) | (2 << 13) | (1 << 22), // all signed
+        6 | TEXTURE,                                         // 8_8_8_8
+        1,                                                   // 2x1
+        (swizzle_rgba << 1) | (1 << 19) | (1 << 21),         // linear mag/min
+        0,
+        1 << 9,
+    ];
+    let bytes = [[0x7F; 4], [0x80; 4]].concat();
+    let raw = sample_fetch(&mut d, RT_16_16_16_16_FLOAT, fetch, &bytes);
+    // Every component within 2^-8 of 0 (either sign).
+    let h = halves(&raw);
+    assert!(h.iter().all(|&h| h & 0x7FFF <= 0x1C00), "{h:x?}");
+}
+
+/// A signed 16_16 texel reads its fields exactly as two's complement:
+/// 0x8001 is -1 and 0x4000 is 16384/32767, both exact in a 32-bit float
+/// target.
+#[test]
+fn signed_16_16_texel_is_exact() {
+    let Some(mut d) = drawer() else { return };
+    let swizzle_rgba = (1 << 3) | (2 << 6) | (3 << 9);
+    let fetch = [
+        2 | (0x55 << 2) | (2 << 10) | (2 << 13) | (1 << 22),
+        25 | TEXTURE, // 16_16
+        0,
+        swizzle_rgba << 1,
+        0,
+        1 << 9,
+    ];
+    let mut bytes = 0x8001u16.to_le_bytes().to_vec();
+    bytes.extend_from_slice(&0x4000u16.to_le_bytes());
+    let red = |raw: Vec<u8>| f32::from_le_bytes(raw.try_into().unwrap());
+    assert_eq!(red(sample_fetch(&mut d, RT_32_FLOAT, fetch, &bytes)), -1.0);
+    // Swizzle YXZW puts Y in red.
+    let mut fetch = fetch;
+    fetch[3] = (1 | (2 << 6) | (3 << 9)) << 1;
+    let y = red(sample_fetch(&mut d, RT_32_FLOAT, fetch, &bytes));
+    assert_eq!(y, 16384.0 / 32767.0);
 }
