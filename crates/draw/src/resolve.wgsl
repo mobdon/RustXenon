@@ -279,7 +279,9 @@ struct DecodeParams {
     // First row decoded; `h` rows from it.
     y0: u32,
     // decode_float only: 0 k_32_FLOAT to Rgba32Float, 1 k_32_FLOAT to
-    // Rgba16Float, 2 k_16_16_16_16_FLOAT to Rgba16Float.
+    // Rgba16Float, 2 k_16_16_16_16_FLOAT to Rgba16Float, 3 k_24_8 and 5
+    // k_24_8_FLOAT to Rgba32Float, 4 k_24_8 and 6 k_24_8_FLOAT to
+    // Rgba16Float.
     mode: u32,
     pad0: u32,
     pad1: u32,
@@ -311,11 +313,34 @@ fn decode_8888(@builtin(global_invocation_id) id: vec3<u32>) {
     texels[id.y * dp.row_words + id.x] = out;
 }
 
-// A tiled k_32_FLOAT or k_16_16_16_16_FLOAT texture decoded from guest bytes
-// kept on the GPU, as xenon_texture::decode_base_level_f32 and the host
-// conversion in Drawer::guest_texture do on the CPU: the fetch endian, the
-// tiling, the texel as RRRR (k_32_FLOAT) or four halves, the fetch swizzle,
-// then f32 bits or halves (formats::f32_to_half) per host texel.
+// xenon_texture::convert::unorm24_to_f32 (Xenia UNorm24To32): exact, as
+// n + (n >> 23) <= 2^24. Not transfer.wgsl's from_unorm24 (n / 0xFFFFFF).
+fn unorm24_texel(n: u32) -> f32 {
+    return f32(n + (n >> 23u)) * (1.0 / 16777216.0);
+}
+
+// xenon_texture float20e4_to_f32 (Xenia Float20e4To32): exact in f32.
+fn from_20e4(f24: u32) -> f32 {
+    if f24 == 0u {
+        return 0.0;
+    }
+    var m = f24 & 0xFFFFFu;
+    var e = f24 >> 20u;
+    if e == 0u {
+        let lz = countLeadingZeros(m) - 11u;
+        e = 1u - lz;
+        m = (m << lz) & 0xFFFFFu;
+    }
+    return bitcast<f32>(((e + 112u) << 23u) | (m << 3u));
+}
+
+// A tiled k_32_FLOAT, k_16_16_16_16_FLOAT, k_24_8 or k_24_8_FLOAT texture
+// decoded from guest bytes kept on the GPU, as
+// xenon_texture::decode_base_level_f32 and the host conversion in
+// Drawer::guest_texture do on the CPU: the fetch endian, the tiling, the
+// texel as RRRR (k_32_FLOAT; the depth of k_24_8 and k_24_8_FLOAT, bits
+// 8..31, as unorm24 or 20e4) or four halves, the fetch swizzle, then f32
+// bits or halves (formats::f32_to_half) per host texel.
 @compute @workgroup_size(8, 8)
 fn decode_float(@builtin(global_invocation_id) id: vec3<u32>) {
     if id.x >= dp.w || id.y >= dp.h {
@@ -339,7 +364,12 @@ fn decode_float(@builtin(global_invocation_id) id: vec3<u32>) {
         }
         one = 0x3C00u;
     } else {
-        let w = swap_endian(guest[dp.offset + (tiled(id.x, y, dp.pitch) >> 2u)], dp.endian);
+        var w = swap_endian(guest[dp.offset + (tiled(id.x, y, dp.pitch) >> 2u)], dp.endian);
+        if dp.mode == 3u || dp.mode == 4u {
+            w = bitcast<u32>(unorm24_texel(w >> 8u));
+        } else if dp.mode >= 5u {
+            w = bitcast<u32>(from_20e4(w >> 8u));
+        }
         v = array<u32, 4>(w, w, w, w);
     }
     var out: array<u32, 4>;
@@ -353,13 +383,13 @@ fn decode_float(@builtin(global_invocation_id) id: vec3<u32>) {
             out[i] = 0u;
         }
     }
-    if dp.mode == 0u {
+    if dp.mode == 0u || dp.mode == 3u || dp.mode == 5u {
         for (var i = 0u; i < 4u; i++) {
             texels[id.y * dp.row_words + id.x * 4u + i] = out[i];
         }
         return;
     }
-    if dp.mode == 1u {
+    if dp.mode != 2u {
         for (var i = 0u; i < 4u; i++) {
             out[i] = half_bits(out[i]);
         }

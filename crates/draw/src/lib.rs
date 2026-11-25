@@ -2938,9 +2938,10 @@ impl Drawer {
     /// The texture of `fetch` decoded on the GPU from a kept resolve holding
     /// all of its guest bytes `[addr, end)`, as [`Self::guest_texture`]
     /// would decode them; `None` for the guest path. Only tiled 2D
-    /// k_8_8_8_8 layouts that host as `Rgba8Unorm`, k_32_FLOAT and
-    /// k_16_16_16_16_FLOAT (any endian, swizzle and resolve format, as the
-    /// bytes are the guest's) are decoded here.
+    /// k_8_8_8_8 layouts that host as `Rgba8Unorm`, k_32_FLOAT,
+    /// k_16_16_16_16_FLOAT and the depth formats k_24_8 and k_24_8_FLOAT
+    /// (any endian, swizzle and resolve format, as the bytes are the
+    /// guest's) are decoded here.
     fn kept_texture(
         &mut self,
         fetch: &xenon_texture::TextureFetch,
@@ -2968,6 +2969,10 @@ impl Drawer {
             (F::K32Float, H::Rgba32Float) => (Some(0), 4, 16),
             (F::K32Float, H::Rgba16Float) => (Some(1), 4, 8),
             (F::K16_16_16_16Float, H::Rgba16Float) => (Some(2), 8, 8),
+            (F::K24_8, H::Rgba32Float) => (Some(3), 4, 16),
+            (F::K24_8, H::Rgba16Float) => (Some(4), 4, 8),
+            (F::K24_8Float, H::Rgba32Float) => (Some(5), 4, 16),
+            (F::K24_8Float, H::Rgba16Float) => (Some(6), 4, 8),
             _ => return Ok(None),
         };
         if !fetch.tiled
