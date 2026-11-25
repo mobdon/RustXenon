@@ -278,6 +278,9 @@ pub mod capture {
 
     /// Writes the drawer's frame number `n` when it was asked for.
     pub fn frame_done(n: u32, f: &xenon_draw::Frame) {
+        if let Some(w) = super::super::input::WINDOW.get() {
+            w.show(f.width, f.height, f.rgba8.clone());
+        }
         let Some((dir, want)) = FRAMES.get() else {
             return;
         };

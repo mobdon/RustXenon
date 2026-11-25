@@ -1,0 +1,13 @@
+[package]
+name = "xenon-window"
+description = "The game window: shows the drawer's frames and reads an XInput controller and the keyboard. Thin glue over xenon-input."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[dependencies]
+softbuffer = "0.4"
+winit = "0.30"
+xenon-input = { path = "../input" }

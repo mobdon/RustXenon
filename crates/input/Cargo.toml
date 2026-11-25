@@ -1,0 +1,8 @@
+[package]
+name = "xenon-input"
+description = "Controller state for the host: keyboard to pad mapping, stick dead zones, merging pad and keyboard. No window, sound or GPU."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
