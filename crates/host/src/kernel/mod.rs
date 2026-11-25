@@ -28,6 +28,7 @@ pub mod net;
 pub mod objects;
 pub mod profile;
 pub mod rtl;
+pub mod sound;
 pub mod table;
 pub mod threads;
 pub mod video;

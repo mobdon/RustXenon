@@ -8,7 +8,7 @@
 use xenon_audio::compare::correlation;
 use xenon_audio::ffmpeg::{Decoder, Ffmpeg};
 use xenon_audio::wav::{self, WavWriter};
-use xenon_audio::xma::{PacketHeader, PACKET_BYTES};
+use xenon_audio::xma;
 use xenon_audio::{Mixer, FRAME_SAMPLES, GUEST_CHANNELS, SAMPLE_RATE};
 
 fn ffmpeg() -> Option<Ffmpeg> {
@@ -107,58 +107,13 @@ fn ffmpeg_pcm_stream_through_mixer_to_wav() {
     assert!(c > 0.9999, "correlation {c}");
 }
 
-/// MSB-first bit writer for hand-building XMA packets.
-struct Bits(Vec<u8>, usize);
-impl Bits {
-    fn put(&mut self, v: u32, n: usize) {
-        for i in (0..n).rev() {
-            if self.1 / 8 == self.0.len() {
-                self.0.push(0);
-            }
-            if v >> i & 1 != 0 {
-                self.0[self.1 / 8] |= 0x80 >> (self.1 % 8);
-            }
-            self.1 += 1;
-        }
-    }
-}
-
-/// One mono XMA2 packet holding one frame whose single subframe sends no
-/// coefficients (silence). Bits per FFmpeg's wmaprodec.c with the XMA
-/// flags 0x10d6: length prefix, 4 subframes max, range compression on.
-fn silent_packet() -> Vec<u8> {
-    let mut b = Bits(
-        PacketHeader {
-            frame_count: 1,
-            frame_offset_bits: 0,
-            metadata: 0,
-            skip_count: 0,
-        }
-        .to_bytes()
-        .to_vec(),
-        32,
-    );
-    b.put(31, 15); // frame length in bits, trailer included
-    b.put(1, 1); // every channel uses the same tiling
-    b.put(0, 1); // one subframe of full length
-    b.put(0, 8); // range compression gain
-    b.put(0, 1); // no trim
-    b.put(0, 1); // no extended subframe header
-    b.put(0, 1); // reserved
-    b.put(0, 1); // channel 0 sends no coefficients
-    b.put(0, 1); // pad up to the length
-    b.put(0, 1); // no more frames in this packet
-    b.0.resize(PACKET_BYTES, 0);
-    b.0
-}
-
 #[test]
 fn ffmpeg_xma2_hand_built_silence() {
     let Some(ff) = ffmpeg() else { return };
     let mut d = Decoder::xma2(&ff, SAMPLE_RATE, 1).unwrap();
     let mut pcm = Vec::new();
     for _ in 0..8 {
-        d.decode(&silent_packet(), &mut pcm).unwrap();
+        d.decode(&xma::silent_packet(), &mut pcm).unwrap();
     }
     d.finish(&mut pcm).unwrap();
     // 8 frames of 512, less the decoder's 64-sample start delay, plus at
@@ -172,7 +127,7 @@ fn ffmpeg_xma2_hand_built_silence() {
     assert!(pcm.iter().all(|&v| v == 0.0));
     // Junk must give an error or nothing, never a crash.
     let mut d = Decoder::xma2(&ff, SAMPLE_RATE, 2).unwrap();
-    let junk: Vec<u8> = (0..PACKET_BYTES as u32)
+    let junk: Vec<u8> = (0..xma::PACKET_BYTES as u32)
         .map(|i| (i.wrapping_mul(2654435761) >> 13) as u8)
         .collect();
     let _ = d.decode(&junk, &mut Vec::new());
@@ -187,7 +142,7 @@ fn ffmpeg_channel_mismatch_is_an_error() {
     let mut d = Decoder::open(&ff, "xma2", SAMPLE_RATE, 2, &mono).unwrap();
     let mut pcm = Vec::new();
     let r = (0..8)
-        .try_for_each(|_| d.decode(&silent_packet(), &mut pcm))
+        .try_for_each(|_| d.decode(&xma::silent_packet(), &mut pcm))
         .and_then(|_| d.finish(&mut pcm));
     assert!(r.is_err() && pcm.is_empty(), "{r:?} {}", pcm.len());
     assert!(Decoder::open(&ff, "pcm_s16be", SAMPLE_RATE, 9, &[]).is_err());
