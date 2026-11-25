@@ -325,8 +325,10 @@ fn partial_resolve_updates_the_kept_texture() {
     assert_ne!(px(&img, W, 40, 5), [10, 20, 230, 255]);
 }
 
-/// Kept-texture decodes are recorded in the batch after the resolves they
-/// read, not flushed: the same pixels as the guest path, in one batch.
+/// Kept-texture decodes are submitted with the draws that sample them, not
+/// on their own: the same pixels as the guest path, with a submit fewer per
+/// decode. (`XENON_DECODE_IN_BATCH=1` records them in the batch after the
+/// resolve instead; off by default.)
 #[test]
 fn decodes_join_the_batch() {
     let f = fetch(6, 2, IDENTITY);
@@ -343,10 +345,10 @@ fn decodes_join_the_batch() {
     let r = run(&mut d, &s, &mut mem);
     let t = &r.timings;
     assert_eq!((t.textures_kept, t.textures_uploaded), (2, 0), "{r:?}");
-    // The copies and the decodes after them are recorded in one batch:
-    // that batch and the end-of-replay write-back.
-    assert_eq!(t.submits_by_site, [0, 0, 0, 2], "{t:?}");
-    assert_eq!(t.submits, 2, "{t:?}");
+    // The copies are recorded in the batches; a decode after one flushes
+    // it first. Three batches and the end-of-replay write-back.
+    assert_eq!(t.submits_by_site, [0, 0, 0, 4], "{t:?}");
+    assert_eq!(t.submits, 4, "{t:?}");
     let img = d.read_render_target(OUT, 0, 0, W, H).unwrap();
     drop(d);
     assert_eq!(img, guest_path(&mem, f));
