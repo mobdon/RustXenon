@@ -170,7 +170,10 @@ pub fn write(img: &Image, a: &Analysis, out: &Path, o: &Options) -> io::Result<S
             "[workspace]\nresolver = \"2\"\nmembers = [\"game\", {}]\n\n\
              # Generated code: no debug info or overflow checks, no incremental\n\
              # state (it costs more memory than it saves on crates this size).\n\
-             [profile.dev]\nopt-level = 1\ndebug = false\noverflow-checks = false\ndebug-assertions = false\nincremental = false\n",
+             [profile.dev]\nopt-level = 1\ndebug = false\noverflow-checks = false\ndebug-assertions = false\nincremental = false\n\n\
+             # The runtime, host, drawer and wgpu are not generated: fully\n\
+             # optimised (guest memory copies run about 3x faster than at 1).\n\
+             [profile.dev.package.\"*\"]\nopt-level = 3\n",
             list.join(", ")
         ),
         &mut st,
