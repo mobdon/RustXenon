@@ -365,6 +365,8 @@ pub struct Timings {
     /// finishes the encoders and calls `queue.submit`; the rest is
     /// recording draws.
     pub queue: Duration,
+    /// Of `queue`: copying the staged draw buffers into upload memory.
+    pub upload: Duration,
     /// Waiting for queued GPU work before a resolve readback: where the
     /// rendering itself shows up.
     pub gpu_wait: Duration,
@@ -480,6 +482,7 @@ impl std::ops::AddAssign<&Timings> for Timings {
         self.consts_reused += t.consts_reused;
         self.texture_groups_reused += t.texture_groups_reused;
         self.queue += t.queue;
+        self.upload += t.upload;
         self.render_passes += t.render_passes;
         for (a, b) in self.gpu_passes.iter_mut().zip(t.gpu_passes) {
             *a += b;
@@ -995,6 +998,10 @@ pub struct Drawer {
     /// append, and staging starts again at 0 only when it is full.
     staged: Vec<u8>,
     staged_base: u64,
+    /// Mapped upload chunks for `staged`, kept and reused across flushes:
+    /// `queue.write_buffer` took a fresh staging buffer per flush, whose
+    /// pages the copy faulted in every time.
+    belt: wgpu::util::StagingBelt,
     arena: Option<wgpu::Buffer>,
     arena_align: u64,
     /// Vertex windows staged in the arena since it last wrapped: guest
@@ -1596,6 +1603,7 @@ impl Drawer {
                 view_formats: &[],
             })
             .create_view(&Default::default());
+        let device_for_belt = device.clone();
         let mut d = Drawer {
             instance,
             device,
@@ -1653,6 +1661,7 @@ impl Drawer {
             window_memo: BTreeMap::new(),
             staged_consts: None,
             staged_base: 0,
+            belt: wgpu::util::StagingBelt::new(device_for_belt, 4 << 20),
             pre: None,
             resolve_pending: false,
             arena_align: u64::from(
@@ -2360,34 +2369,43 @@ impl Drawer {
     fn flush(&mut self) -> Result<(), Skip> {
         // The arena upload counts as submit time too.
         let t = Instant::now();
-        if let (Some(arena), false) = (&self.arena, self.staged.is_empty()) {
-            // Ordered on the queue after the work already submitted, which
-            // reads only bytes before `staged_base` (or before a wrap).
-            self.queue
-                .write_buffer(arena, self.staged_base, &self.staged);
+        let mut upload = None;
+        if let (Some(arena), Some(size)) =
+            (&self.arena, wgpu::BufferSize::new(self.staged.len() as u64))
+        {
+            // Submitted first, so ordered after the work already submitted,
+            // which reads only bytes before `staged_base` (or before a wrap).
+            let mut enc = self.device.create_command_encoder(&Default::default());
+            self.belt
+                .write_buffer(&mut enc, arena, self.staged_base, size)
+                .copy_from_slice(&self.staged);
+            self.belt.finish();
+            upload = Some(enc);
             self.staged_base += self.staged.len() as u64;
             self.staged.clear();
         }
+        self.timings.upload += t.elapsed();
         self.resolve_pending = false;
         let (pre, batch) = (self.pre.take(), self.batch.take());
-        if pre.is_none() && batch.is_none() {
+        if pre.is_none() && batch.is_none() && upload.is_none() {
             let e = t.elapsed();
             self.timings.submit += e;
             self.timings.queue += e;
             return Ok(());
         }
         let scope = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
-        let site = if batch.is_some() {
-            Site::Other
-        } else {
+        let site = if pre.is_some() && batch.is_none() {
             Site::Decode
+        } else {
+            Site::Other
         };
         // Decodes first: the draws sample what they write, and they read
         // kept resolves written by work submitted before.
         let clock = &self.gpu_clock;
-        let bufs = pre
-            .map(|e| e.finish())
+        let bufs = upload
             .into_iter()
+            .chain(pre)
+            .map(|e| e.finish())
             .chain(batch.map(|mut b| {
                 drop(b.pass.take());
                 if let Some(c) = clock.as_ref().filter(|c| !c.kinds.is_empty()) {
@@ -2401,6 +2419,9 @@ impl Drawer {
             }));
         let index = self.queue.submit(bufs);
         self.submitted(site);
+        // Chunks whose copies the GPU finished map again for reuse.
+        let _ = self.device.poll(wgpu::PollType::Poll);
+        self.belt.recall();
         // One reading for both, so `queue` never exceeds `submit`.
         let e = t.elapsed();
         self.timings.submit += e;
