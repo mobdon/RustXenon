@@ -1125,3 +1125,32 @@ fn saves_are_created_listed_and_reopened() {
         .join("data/content/SLOT1/data.bin")
         .exists());
 }
+
+#[test]
+fn media_player_says_the_title_controls_playback() {
+    use xenon_host::kernel::xam;
+    let e = env();
+    let rt = &e.rt;
+    let mut c = ctx(0x2_9000);
+    rt.mem.write_u32(0xFC00, 0x2003);
+    rt.mem.write_u32(0xFC04, 0xFC10);
+    rt.mem.write_u32(0xFC08, 0xFC14);
+    rt.mem.write_u32(0xFC10, 7);
+    rt.mem.write_u32(0xFC14, 7);
+    let r = call(
+        rt,
+        &mut c,
+        xam::x_msg_in_process_call,
+        &[0xFA, 0x7_001B, 0xFC00, 12],
+    );
+    assert_eq!(r, 0);
+    assert_eq!((rt.mem.read_u32(0xFC10), rt.mem.read_u32(0xFC14)), (0, 0));
+    // Anything else is still refused.
+    let r = call(
+        rt,
+        &mut c,
+        xam::x_msg_in_process_call,
+        &[0xFA, 0x7_0001, 0xFC00, 12],
+    );
+    assert_eq!(r as u32, 0x8007_0490);
+}
