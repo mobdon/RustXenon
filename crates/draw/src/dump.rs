@@ -72,18 +72,23 @@ impl ShaderDump {
         if !new_vs && !new_ps {
             return Ok(());
         }
+        // Marked before writing: a failed write warns once, not every draw.
+        if new_vs {
+            self.done.insert((vs.0, false));
+        }
+        if new_ps {
+            self.done.insert((ps.0, true));
+        }
         std::fs::create_dir_all(&self.dir)?;
         let vs_d = disassemble(vs.1, ShaderStage::Vertex);
         if new_vs {
             self.program("vs", vs, &vs_d, vs_wgsl)?;
-            self.done.insert((vs.0, false));
         }
         if new_ps {
             let ps_d = disassemble(ps.1, ShaderStage::Pixel);
             self.program("ps", ps, &ps_d, ps_wgsl)?;
             let text = draw_state(regs, vs.0, &vs_d, ps.0, &ps_d, draw);
             std::fs::write(self.dir.join(format!("{:016x}.ps.draw.txt", ps.0)), text)?;
-            self.done.insert((ps.0, true));
         }
         Ok(())
     }

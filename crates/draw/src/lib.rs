@@ -3436,7 +3436,11 @@ impl Drawer {
             );
         let param_gen = self.param_gen(topology, polygonal);
         let mut t = Instant::now();
-        let vs_t = self.translate(&vs, ShaderStage::Vertex, None);
+        // Without the dump a failed vertex shader skips the draw at once.
+        let vs_t = match self.translate(&vs, ShaderStage::Vertex, None) {
+            Err(e) if self.shader_dump.is_none() => return Err(e),
+            t => t,
+        };
         let ps_t = self.translate(&ps, ShaderStage::Pixel, param_gen);
         if let Some(dump) = &mut self.shader_dump {
             fn wgsl(t: &Result<Translated, Skip>) -> Result<&str, String> {
