@@ -61,6 +61,9 @@
 //! All four render targets (`RB_COLOR_INFO_RT[0..4]`) are drawn, each with
 //! its own `RB_COLOR_MASK` bits, `RB_BLENDCONTROL_RT` blend and output
 //! clamp; a target is skipped when the pixel shader does not export it.
+//! The pixel shader's colour is scaled by `2^color_exp_bias`
+//! (`RB_COLOR_INFO` bits 20..25, signed) before the output clamp, as Xenia
+//! does.
 //! MSAA surfaces are drawn and resolved with one sample per pixel (a
 //! warning).
 //! Resolve clears decode the 64-bit value `RB_COLOR_CLEAR |
@@ -403,10 +406,10 @@ enum Variant {
     Plain,
     /// Vertex shader wrapped to make rectangle list corners.
     RectList,
-    /// Pixel shader colour i clamped to [0, rgb] and [0, alpha], then
-    /// scaled (f32 bits; an infinite bound does not clamp) where entry i is
-    /// set.
-    Clamp([Option<(u32, u32, u32)>; 4]),
+    /// Pixel shader colour i scaled by 2^bias, clamped to [0, rgb] and
+    /// [0, alpha], then multiplied by scale (f32 bits; an infinite bound
+    /// does not clamp) where entry i is set.
+    Output([Option<(u32, u32, i8, u32)>; 4]),
 }
 
 #[derive(Clone, PartialEq, Eq, Hash)]
@@ -469,7 +472,7 @@ pub struct Drawer {
     ps: Option<Program>,
     translated: HashMap<(u64, bool), Result<Translated, String>>,
     /// Keyed by program hash, stage, extra vertex outputs and variant (the
-    /// rectangle list wrapper or the pixel output clamp).
+    /// rectangle list wrapper or the pixel output bias and clamp).
     modules: HashMap<(u64, bool, u16, Variant), wgpu::ShaderModule>,
     pipelines: HashMap<PipelineKey, wgpu::RenderPipeline>,
     texture_layouts: HashMap<u32, (wgpu::BindGroupLayout, wgpu::PipelineLayout)>,
@@ -657,10 +660,14 @@ fn vs_main(@builtin(vertex_index) host_index: u32) -> VsOut {{
         ))
 }
 
-/// Clamps colour 0 of a translated pixel shader to [0, rgb] / [0, alpha].
-fn clamp_pixel_wgsl(
+/// Scales colour `rt` of a translated pixel shader by 2^`bias`
+/// (RB_COLOR_INFO's colour exponent bias, all four components, before the
+/// EDRAM format clamp), clamps it to [0, rgb] / [0, alpha], and multiplies
+/// it by `scale` (the host storage scale of the target format).
+fn output_pixel_wgsl(
     ps: &str,
     rt: usize,
+    bias: i8,
     rgb: f32,
     alpha: f32,
     scale: f32,
@@ -669,21 +676,31 @@ fn clamp_pixel_wgsl(
     if !ps.contains(&store) {
         return Err(format!("pixel shader colour output {rt} not recognised"));
     }
-    // An infinite bound leaves the colour as it is (blending a 7e3 target
-    // takes the source colour unclamped, as a float).
-    let rgb = if rgb.is_finite() {
-        format!("clamp(o_col[{rt}].xyz, vec3<f32>(0.0), vec3<f32>({rgb:?}))")
+    let c = if bias == 0 {
+        format!("o_col[{rt}]")
     } else {
-        format!("o_col[{rt}].xyz")
+        format!("(o_col[{rt}] * {:?})", 2f32.powi(bias.into()))
     };
-    let alpha = if alpha.is_finite() {
-        format!("clamp(o_col[{rt}].w, 0.0, {alpha:?})")
+    // An infinite bound leaves the component as it is (blending a 7e3
+    // target takes the source colour unclamped, as a float).
+    let rgb = if rgb.is_finite() {
+        format!("clamp({c}.xyz, vec3<f32>(0.0), vec3<f32>({rgb:?}))")
     } else {
-        format!("o_col[{rt}].w")
+        format!("{c}.xyz")
+    };
+    let a = if alpha.is_finite() {
+        format!("clamp({c}.w, 0.0, {alpha:?})")
+    } else {
+        format!("{c}.w")
+    };
+    let scaled = if scale == 1.0 {
+        String::new()
+    } else {
+        format!(" * {scale:?}")
     };
     Ok(ps.replacen(
         &store,
-        &format!("    out.c{rt} = vec4<f32>({rgb}, {alpha}) * {scale:?};\n"),
+        &format!("    out.c{rt} = vec4<f32>({rgb}, {a}){scaled};\n"),
         1,
     ))
 }
@@ -1239,13 +1256,14 @@ impl Drawer {
             (true, Variant::RectList) => patch_vertex_wgsl(&t.wgsl, extra)
                 .and_then(|vs| rect_list_wgsl(&vs, t.info.interpolators_written | extra)),
             (true, _) => patch_vertex_wgsl(&t.wgsl, extra),
-            (false, Variant::Clamp(c)) => {
+            (false, Variant::Output(c)) => {
                 c.iter()
                     .enumerate()
                     .try_fold(t.wgsl.clone(), |ps, (rt, c)| match c {
-                        Some((rgb, a, k)) => clamp_pixel_wgsl(
+                        Some((rgb, a, bias, k)) => output_pixel_wgsl(
                             &ps,
                             rt,
+                            *bias,
                             f32::from_bits(*rgb),
                             f32::from_bits(*a),
                             f32::from_bits(*k),
@@ -1615,13 +1633,19 @@ impl Drawer {
                 blends[rt] = None;
             }
         }
-        let clamps: [Option<(u32, u32, u32)>; 4] = std::array::from_fn(|rt| {
-            color[rt]
-                .and_then(|k| formats::output_clamp(k.format, blends[rt].is_some()))
-                .map(|(rgb, a, k)| (rgb.to_bits(), a.to_bits(), k.to_bits()))
+        let outputs: [Option<(u32, u32, i8, u32)>; 4] = std::array::from_fn(|rt| {
+            let k = color[rt]?;
+            // RB_COLOR_INFO bits 20..25: signed colour exponent bias.
+            let bias = ((self.regs.get(regs::RB_COLOR_INFO_RT[rt]) << 6) as i32 >> 26) as i8;
+            let clamp = formats::output_clamp(k.format, blends[rt].is_some());
+            if bias == 0 && clamp.is_none() {
+                return None;
+            }
+            let (rgb, a, scale) = clamp.unwrap_or((f32::INFINITY, f32::INFINITY, 1.0));
+            Some((rgb.to_bits(), a.to_bits(), bias, scale.to_bits()))
         });
-        let ps_variant = if clamps.iter().any(Option::is_some) {
-            Variant::Clamp(clamps)
+        let ps_variant = if outputs.iter().any(Option::is_some) {
+            Variant::Output(outputs)
         } else {
             Variant::Plain
         };
@@ -2501,13 +2525,18 @@ mod tests {
         assert!(w.contains("o.o0 = (b.o0 - a.o0) + c.o0;\n    o.o2 = (b.o2 - a.o2) + c.o2;"));
         assert!(!w.contains("o.o1 ="));
         assert!(rect_list_wgsl("var<private> x: i32 = 1;\n", 0).is_err());
-        let ps = clamp_pixel_wgsl("    out.c0 = o_col[0];\n", 0, 31.875, 1.0, 1.0).unwrap();
-        assert!(ps.contains("vec3<f32>(31.875)), clamp(o_col[0].w, 0.0, 1.0)) * 1.0;"));
-        assert!(clamp_pixel_wgsl("", 0, 1.0, 1.0, 1.0).is_err());
-        let ps = clamp_pixel_wgsl("    out.c2 = o_col[2];\n", 2, f32::INFINITY, 1.0, 1.0).unwrap();
-        assert!(ps.contains("out.c2 = vec4<f32>(o_col[2].xyz, clamp(o_col[2].w, 0.0, 1.0)) * 1.0;"));
+        let ps = output_pixel_wgsl("    out.c0 = o_col[0];\n", 0, 0, 31.875, 1.0, 1.0).unwrap();
+        assert!(ps.contains("vec3<f32>(31.875)), clamp(o_col[0].w, 0.0, 1.0));"));
+        assert!(output_pixel_wgsl("", 0, 0, 1.0, 1.0, 1.0).is_err());
+        let ps =
+            output_pixel_wgsl("    out.c2 = o_col[2];\n", 2, 0, f32::INFINITY, 1.0, 1.0).unwrap();
+        assert!(ps.contains("out.c2 = vec4<f32>(o_col[2].xyz, clamp(o_col[2].w, 0.0, 1.0));"));
         let inf = f32::INFINITY;
-        let ps = clamp_pixel_wgsl("    out.c1 = o_col[1];\n", 1, inf, inf, 0.03125).unwrap();
-        assert!(ps.contains("out.c1 = vec4<f32>(o_col[1].xyz, o_col[1].w) * 0.03125;"));
+        let ps = output_pixel_wgsl("    out.c1 = o_col[1];\n", 1, -2, inf, inf, 1.0).unwrap();
+        assert!(ps.contains("out.c1 = vec4<f32>((o_col[1] * 0.25).xyz, (o_col[1] * 0.25).w);"));
+        let ps = output_pixel_wgsl("    out.c3 = o_col[3];\n", 3, 1, inf, inf, 0.03125).unwrap();
+        assert!(
+            ps.contains("out.c3 = vec4<f32>((o_col[3] * 2.0).xyz, (o_col[3] * 2.0).w) * 0.03125;")
+        );
     }
 }
