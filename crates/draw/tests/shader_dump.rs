@@ -111,7 +111,7 @@ fn dumps_each_shader_once_with_draw_state() {
     let state = read(format!("{pc:016x}.ps.draw.txt"));
     for want in [
         &format!("vs {vs:016x} ps {pc:016x}"),
-        "vfetch_mini r2.xyzw, r0.x, vf0 format 8_8_8_8(6)",
+        "vfetch_mini r2.xyzw format 8_8_8_8(6)",
         "vf0 VertexFetch {",
         "RB_COLOR_INFO[0]",
         "ps c0 [0.25, 0.5, 1.0, 2.0] | 3e800000 3f000000 3f800000 40000000",

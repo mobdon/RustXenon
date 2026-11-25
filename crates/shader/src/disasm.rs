@@ -261,25 +261,53 @@ fn format_name(f: VertexFormat) -> String {
 /// One fetch instruction with all its fields.
 pub fn fetch_text(f: &FetchInstr) -> String {
     match f {
-        FetchInstr::Vertex(v) => format!(
-            "{}vfetch{} {}.{}, {}.{}, vf{} format {} {} {}{}{} exp_adjust {} stride {} offset {} prefetch {}",
-            pred(v.predicate),
-            if v.mini { "_mini" } else { "_full" },
-            reg(v.dest, v.dest_relative),
-            fetch_swizzle(v.dest_swizzle),
-            reg(v.src, v.src_relative),
-            COMP[v.src_swizzle as usize & 3],
-            v.fetch_const,
-            format_name(v.format),
-            if v.signed { "signed" } else { "unsigned" },
-            if v.normalized { "normalized" } else { "integer" },
-            if v.signed_rf_no_zero { " rf_no_zero" } else { "" },
-            if v.index_rounded { " index_rounded" } else { "" },
-            v.exp_adjust,
-            v.stride,
-            v.offset,
-            v.prefetch_count,
-        ),
+        FetchInstr::Vertex(v) => {
+            // A mini fetch takes its index register, fetch constant, stride
+            // and index rounding from the previous full fetch; its own bits
+            // for them are not used.
+            let full = if v.mini {
+                String::new()
+            } else {
+                format!(
+                    ", {}.{}, vf{}",
+                    reg(v.src, v.src_relative),
+                    COMP[v.src_swizzle as usize & 3],
+                    v.fetch_const
+                )
+            };
+            format!(
+                "{}vfetch{} {}.{}{full} format {} {} {}{}{} exp_adjust {}{} offset {} prefetch {}",
+                pred(v.predicate),
+                if v.mini { "_mini" } else { "_full" },
+                reg(v.dest, v.dest_relative),
+                fetch_swizzle(v.dest_swizzle),
+                format_name(v.format),
+                if v.signed { "signed" } else { "unsigned" },
+                if v.normalized {
+                    "normalized"
+                } else {
+                    "integer"
+                },
+                if v.signed_rf_no_zero {
+                    " rf_no_zero"
+                } else {
+                    ""
+                },
+                if v.index_rounded && !v.mini {
+                    " index_rounded"
+                } else {
+                    ""
+                },
+                v.exp_adjust,
+                if v.mini {
+                    String::new()
+                } else {
+                    format!(" stride {}", v.stride)
+                },
+                v.offset,
+                v.prefetch_count,
+            )
+        }
         FetchInstr::Texture(t) => {
             let (dim, n) = match t.dim {
                 TextureDim::D1 => ("1d", 1),

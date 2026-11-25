@@ -128,7 +128,8 @@ fn draw_state(
             let k = v.fetch_const;
             let base = regs::SHADER_CONSTANT_FETCH + 2 * k;
             let _ = writeln!(s, "{}", xenon_shader::disasm::fetch_text(f));
-            if seen & (1 << k) != 0 {
+            // A mini fetch reads the constant of its full fetch, listed there.
+            if v.mini || seen & (1 << k) != 0 {
                 continue;
             }
             seen |= 1 << k;

@@ -146,3 +146,32 @@ fn abs_constants_applies_to_both_scalar_constant_op_operands() {
     let want = format!("mulsc0 r1.___w, |c5|.w, |r{temp}|.x");
     assert!(d.text.contains(&want), "missing {want:?} in\n{}", d.text);
 }
+
+#[test]
+fn mini_fetch_omits_fields_it_takes_from_the_full_fetch() {
+    let full = VertexFetch::full(1, 0, 4, VertexFormat::F32_32_FLOAT, 3, 0);
+    // Encoded index register, constant, stride and rounding that differ
+    // from the full fetch's: hardware ignores them.
+    let mini = VertexFetch {
+        mini: true,
+        index_rounded: true,
+        ..VertexFetch::full(2, 5, 7, VertexFormat::F32_FLOAT, 9, 2)
+    };
+    let words = assemble(
+        &[CfInstr::Exec(Exec::new(0, 2, true))],
+        &[
+            Instr::Fetch(FetchInstr::Vertex(full)),
+            Instr::Fetch(FetchInstr::Vertex(mini)),
+        ],
+    );
+    let t = disassemble(&words, ShaderStage::Vertex).text;
+    assert!(
+        t.contains(
+            "vfetch_mini r2.xyzw format 32_FLOAT(36) unsigned normalized exp_adjust 0 offset 2"
+        ),
+        "{t}"
+    );
+    for absent in ["r5", "vf7", "stride 9", "index_rounded"] {
+        assert!(!t.contains(absent), "{absent:?} in\n{t}");
+    }
+}
