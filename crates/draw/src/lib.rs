@@ -235,8 +235,9 @@ struct Mirror {
     /// Physical range written by resolves and not yet written back to guest
     /// memory.
     dirty: Option<(u64, u64)>,
-    /// Hash of guest memory over `[lo, hi)` as the last replay left it, to
-    /// notice CPU writes between replays; `None` until computed.
+    /// Hash of the bytes over `[lo, hi)` that guest memory held when the
+    /// buffer was made from it or last written back (the buffer's bytes
+    /// then), to notice CPU writes since; `None` until computed.
     hash: Option<u64>,
     /// Checked against guest memory (or made from it) this replay.
     verified: bool,
@@ -1405,17 +1406,21 @@ impl Drawer {
             if !self.verify(i, mem) {
                 continue;
             }
+            // The whole buffer comes back, not only the dirty range: its
+            // hash must be of what the buffer holds, as guest memory may
+            // have changed under it since it was made (a CPU write during
+            // the replay), and then the next replay's check drops it.
             let m = &self.mirrors[i];
             let (a, b) = m.dirty.expect("dirty");
             let buf = self.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("resolve write-back"),
-                size: b - a,
+                size: m.hi - m.lo,
                 usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
                 mapped_at_creation: false,
             });
             enc.get_or_insert_with(|| self.device.create_command_encoder(&Default::default()))
-                .copy_buffer_to_buffer(&m.buf, a - m.lo, &buf, 0, b - a);
-            copies.push((m.lo, a, buf));
+                .copy_buffer_to_buffer(&m.buf, 0, &buf, 0, m.hi - m.lo);
+            copies.push((m.lo, a, b, buf));
             i += 1;
         }
         let Some(enc) = enc else {
@@ -1426,25 +1431,22 @@ impl Drawer {
         self.timings.gpu_wait += lap(&mut t);
         let index = self.queue.submit([enc.finish()]);
         self.timings.submits += 1;
-        for (m_lo, a, buf) in copies {
+        for (m_lo, a, b, buf) in copies {
             let data = self.map_read(&buf, index.clone())?;
             self.timings.readback += lap(&mut t);
             self.timings.readback_bytes += data.len() as u64;
-            let ok = mem.write_back(a as u32, &data);
+            let ok = mem.write_back(a as u32, &data[(a - m_lo) as usize..(b - m_lo) as usize]);
             let Some(i) = self.mirrors.iter().position(|m| m.lo == m_lo) else {
                 continue;
             };
             let m = &mut self.mirrors[i];
             m.dirty = None;
-            if !ok {
-                // Readable when made, so not expected; the pixels are lost.
-                self.mirrors.remove(i);
-            } else if (m.lo, m.hi) == (a, a + data.len() as u64) {
+            if ok {
                 m.hash = Some(hash_bytes(&data));
                 self.timings.kept_hashed_bytes += data.len() as u64;
             } else {
-                let (lo, hi) = (m.lo, m.hi);
-                self.mirrors[i].hash = self.guest_hash(mem, lo, hi);
+                // Readable when made, so not expected; the pixels are lost.
+                self.mirrors.remove(i);
             }
             self.timings.resolve_cpu += lap(&mut t);
         }
@@ -1452,18 +1454,15 @@ impl Drawer {
     }
 
     /// End of a replay: writes back every kept resolve (unless
-    /// `skip_resolve_writeback`), and hashes guest memory under the ones
-    /// made this replay for the next replay's check.
+    /// `skip_resolve_writeback`). Every kept buffer then has the hash of
+    /// its bytes for the next replay's check, except one made for a resolve
+    /// that failed before writing to it, which is dropped: hashing guest
+    /// memory now could miss a CPU write made after the buffer was filled.
     fn finish_mirrors(&mut self, mem: &mut Tracked) -> Result<(), Error> {
         if !self.skip_resolve_writeback {
             self.sync(mem, 0, u64::MAX)?;
         }
-        for i in 0..self.mirrors.len() {
-            if self.mirrors[i].hash.is_none() {
-                let (lo, hi) = (self.mirrors[i].lo, self.mirrors[i].hi);
-                self.mirrors[i].hash = self.guest_hash(mem, lo, hi);
-            }
-        }
+        self.mirrors.retain(|m| m.hash.is_some());
         Ok(())
     }
 
@@ -2870,7 +2869,7 @@ impl Drawer {
                 address, format, ..
             } = &d.source
             {
-                let a = u64::from(*address);
+                let a = u64::from(*address & PHYSICAL_MASK);
                 let len = u64::from(d.index_count) * format.bytes() as u64;
                 self.sync(mem, a, a + len)?;
             }

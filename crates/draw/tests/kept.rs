@@ -379,3 +379,72 @@ fn skipped_write_back_happens_when_the_drawer_reads() {
     assert_eq!(r.frames[0].rgba8, detiled(&mem, DEST, W, H, W, 4));
     assert_ne!(r.frames[0].rgba8[..4], [0; 4]);
 }
+
+/// Guest memory whose CPU writes `fill` over `at` while the drawer reads
+/// the gradient's vertices (as a guest CPU thread running beside the
+/// replay may).
+struct Racing {
+    mem: std::cell::RefCell<SliceMemory>,
+    at: std::ops::Range<usize>,
+    armed: std::cell::Cell<bool>,
+}
+
+impl xenon_gpu::GuestRead for Racing {
+    fn read_u32(&self, addr: u32) -> Option<u32> {
+        self.mem.borrow().read_u32(addr)
+    }
+    fn read_bytes(&self, addr: u32, len: usize) -> Option<Vec<u8>> {
+        if addr == PAINT && self.armed.replace(false) {
+            self.mem.borrow_mut().data[self.at.clone()].fill(0x55);
+        }
+        self.mem.borrow().read_bytes(addr, len)
+    }
+}
+
+impl xenon_draw::GuestMemory for Racing {
+    fn write_bytes(&mut self, addr: u32, bytes: &[u8]) -> bool {
+        self.mem.get_mut().write_bytes(addr, bytes)
+    }
+}
+
+/// A CPU write during a replay to the part of a kept buffer that the
+/// replay did not resolve: the next replay sees it in guest memory and
+/// takes the guest path, instead of decoding the buffer's older bytes.
+#[test]
+fn cpu_write_during_a_replay_takes_the_guest_path() {
+    let f = fetch(6, 2, IDENTITY);
+    let Some(mut d) = drawer() else { return };
+    let mut mem = memory();
+    vertices(&mut mem);
+    let bottom = DEST + W * 32 * 4;
+    // Two halves of one surface, kept in one buffer.
+    let mut s = Stream::default();
+    paint(s.setup());
+    resolve_to(&mut s, &mut mem, W, 32, DEST);
+    resolve_to(&mut s, &mut mem, W, 32, bottom);
+    run(&mut d, &s, &mut mem);
+    // The top half again; the CPU writes the bottom half meanwhile.
+    let mut s = Stream::default();
+    paint_small(s.setup());
+    resolve_to(&mut s, &mut mem, W, 32, DEST);
+    paint(&mut s);
+    mem.write_words(CMD, &s.0);
+    let mut rec = xenon_gpu::Recorder::new();
+    rec.record_buffer(&mem, CMD, s.0.len() as u32).unwrap();
+    let mut racing = Racing {
+        mem: std::cell::RefCell::new(mem),
+        at: bottom as usize..(bottom + 256) as usize,
+        armed: std::cell::Cell::new(true),
+    };
+    d.replay(&rec.commands, &mut racing).unwrap();
+    assert!(!racing.armed.get());
+    let mut mem = racing.mem.into_inner();
+    let mut s = Stream::default();
+    sample(s.setup(), f);
+    let r = run(&mut d, &s, &mut mem);
+    assert_eq!(r.timings.textures_kept, 0, "{r:?}");
+    let img = d.read_render_target(OUT, 0, 0, W, H).unwrap();
+    drop(d);
+    assert_eq!(img, guest_path(&mem, f));
+    assert!(img.chunks(4).any(|p| p == [0x55; 4]));
+}
