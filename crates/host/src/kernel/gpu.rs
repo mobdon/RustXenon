@@ -61,6 +61,23 @@ impl xenon_draw::GuestMemory for Physical<'_> {
         self.0.mem.write_bytes(a, bytes);
         true
     }
+
+    fn take_written(&mut self) -> Option<Vec<(u64, u64)>> {
+        Some(physical_ranges(&self.0.mem.take_written()?))
+    }
+}
+
+/// Written guest memory ranges ([`xenon_rt::mem::GuestMemory::take_written`]
+/// offsets) as the physical ranges the GPU reads them at: the
+/// `0xA000_0000` view, which every physical view aliases to.
+fn physical_ranges(written: &[(u64, u64)]) -> Vec<(u64, u64)> {
+    const LO: u64 = 0xA000_0000;
+    const HI: u64 = 0xC000_0000;
+    written
+        .iter()
+        .filter(|&&(a, b)| a < HI && LO < b)
+        .map(|&(a, b)| (a.max(LO) - LO, b.min(HI) - LO))
+        .collect()
 }
 
 /// A GPU write of `v` at physical `addr` in byte order `e`.
@@ -748,6 +765,23 @@ pub mod capture {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn written_ranges_map_to_physical() {
+        assert_eq!(
+            physical_ranges(&[
+                (0x4000_0000, 0x4000_1000),
+                (0x9FFF_F000, 0xA000_2000),
+                (0xA100_0000, 0xA100_3000),
+                (0xBFFF_F000, 0xC000_1000),
+            ]),
+            [
+                (0, 0x2000),
+                (0x100_0000, 0x100_3000),
+                (0x1FFF_F000, 0x2000_0000)
+            ]
+        );
+    }
 
     /// The stats line divides by the frames of the window, or by one window
     /// when none was swapped.

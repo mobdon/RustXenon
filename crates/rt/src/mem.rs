@@ -22,6 +22,8 @@ pub struct GuestMemory {
     len: usize,
     /// Reserved with no access ([`crate::guard`]) instead of allocated.
     guarded: bool,
+    /// Allocated with the OS recording writes ([`crate::watch`]).
+    watched: bool,
 }
 
 // SAFETY: every access through `&self` is atomic (see the module notes);
@@ -128,7 +130,40 @@ impl GuestMemory {
             base,
             len: size,
             guarded: false,
+            watched: false,
         }
+    }
+
+    /// Like [`Self::new`], with the OS recording the pages written (see
+    /// [`Self::take_written`]); plain [`Self::new`] memory where the OS
+    /// cannot.
+    pub fn new_watched(size: usize) -> Self {
+        match NonNull::new(crate::watch::allocate(size.max(1))) {
+            Some(base) => Self {
+                base,
+                len: size,
+                guarded: false,
+                watched: true,
+            },
+            None => Self::new(size),
+        }
+    }
+
+    /// Whether [`Self::take_written`] can list writes.
+    pub fn watched(&self) -> bool {
+        self.watched
+    }
+
+    /// The `[start, end)` offsets (the addresses [`alias`] maps to) of the
+    /// pages written since the last call, merged and sorted, with the
+    /// record reset; `None` when writes are not recorded or were too many
+    /// to list: then any byte may have changed.
+    pub fn take_written(&self) -> Option<Vec<(u64, u64)>> {
+        if !self.watched {
+            return None;
+        }
+        let (pages, size) = crate::watch::take_written(self.base.as_ptr(), self.len)?;
+        Some(merge_pages(&pages, size))
     }
 
     /// Reserves `size` bytes with no access: only ranges passed to
@@ -141,6 +176,7 @@ impl GuestMemory {
             base,
             len: size,
             guarded: true,
+            watched: false,
         }
     }
 
@@ -301,10 +337,27 @@ impl Drop for GuestMemory {
             crate::guard::release(self.base.as_ptr(), self.len.max(1));
             return;
         }
+        if self.watched {
+            crate::watch::release(self.base.as_ptr());
+            return;
+        }
         let layout = Layout::from_size_align(self.len.max(1), ALIGN).unwrap();
         // SAFETY: allocated in `new` with this layout.
         unsafe { dealloc(self.base.as_ptr(), layout) }
     }
+}
+
+/// Sorted page offsets of `size` bytes each as merged `[start, end)` ranges.
+fn merge_pages(pages: &[usize], size: usize) -> Vec<(u64, u64)> {
+    let mut out: Vec<(u64, u64)> = Vec::new();
+    for &p in pages {
+        let (a, b) = (p as u64, (p + size) as u64);
+        match out.last_mut() {
+            Some(last) if last.1 == a => last.1 = b,
+            _ => out.push((a, b)),
+        }
+    }
+    out
 }
 
 #[cold]
@@ -316,6 +369,35 @@ fn out_of_range(addr: u32, n: usize, len: usize) -> ! {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn written_pages_merge_into_ranges() {
+        assert_eq!(
+            merge_pages(&[0, 4096, 12288, 16384, 32768], 4096),
+            [(0, 8192), (12288, 20480), (32768, 36864)]
+        );
+        assert!(merge_pages(&[], 4096).is_empty());
+    }
+
+    /// Watched memory reads and writes like any other; where the OS cannot
+    /// watch, `take_written` says so (`None`) rather than listing nothing.
+    #[test]
+    fn watched_memory_lists_writes_or_says_it_cannot() {
+        let m = GuestMemory::new_watched(1 << 20);
+        let _ = m.take_written();
+        m.write_u32(0x1_2344, 7);
+        assert_eq!(m.read_u32(0x1_2344), 7);
+        match m.take_written() {
+            Some(w) => {
+                assert!(
+                    w.iter().any(|&(a, b)| a <= 0x1_2344 && 0x1_2348 <= b),
+                    "{w:?}"
+                );
+                assert_eq!(m.take_written(), Some(vec![]));
+            }
+            None => assert!(!m.watched()),
+        }
+    }
 
     #[test]
     fn big_endian_round_trip() {

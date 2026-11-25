@@ -1407,3 +1407,101 @@ fn pipeline_cache_persists_across_drawers() {
     drop(d);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Guest memory that lists the ranges written to it, as watched memory
+/// does: `None` until set, then whatever the test says was written.
+struct Watched {
+    mem: xenon_gpu::SliceMemory,
+    written: Option<Vec<(u64, u64)>>,
+}
+
+impl xenon_gpu::GuestRead for Watched {
+    fn read_u32(&self, addr: u32) -> Option<u32> {
+        self.mem.read_u32(addr)
+    }
+    fn read_bytes(&self, addr: u32, len: usize) -> Option<Vec<u8>> {
+        self.mem.read_bytes(addr, len)
+    }
+}
+
+impl xenon_draw::GuestMemory for Watched {
+    fn write_bytes(&mut self, addr: u32, bytes: &[u8]) -> bool {
+        self.mem.write_bytes(addr, bytes)
+    }
+    fn take_written(&mut self) -> Option<Vec<(u64, u64)>> {
+        self.written.replace(Vec::new())
+    }
+}
+
+/// With guest memory listing its writes, a texture looked up in one replay
+/// is used in the next without reading its bytes again, until its bytes
+/// are written.
+#[test]
+fn listed_writes_keep_textures_across_replays() {
+    let Some(mut d) = drawer() else { return };
+    let n = 32u32;
+    let put_texture = |mem: &mut xenon_gpu::SliceMemory, shade: u8| {
+        let linear: Vec<u8> = (0..n * n).flat_map(|_| [shade, 0, 0, 255]).collect();
+        let mut tiled = tile::tile_2d(&linear, n, n, n, 4).unwrap();
+        endian::swap_in_place(&mut tiled, xenon_texture::Endian::K8in32);
+        mem.data[TEXTURE as usize..][..tiled.len()].copy_from_slice(&tiled);
+        tiled.len() as u64
+    };
+    let mut mem = memory();
+    let len = put_texture(&mut mem, 200);
+    let q = n as f32;
+    let verts: Vec<u32> = [
+        (0.0, 0.0, 0.0, 0.0),
+        (q, 0.0, 1.0, 0.0),
+        (q, q, 1.0, 1.0),
+        (0.0, q, 0.0, 1.0),
+    ]
+    .iter()
+    .flat_map(|&(x, y, u, v)| [f(x), f(y), f(0.0), f(u), f(v)])
+    .collect();
+    mem.write_words(VERTS, &verts);
+    let fetch = [
+        2 | (2 << 10) | (2 << 13) | ((n >> 5) << 22) | (1 << 31),
+        6 | (2 << 6) | TEXTURE,
+        (n - 1) | ((n - 1) << 13),
+        ((1 << 3) | (2 << 6) | (3 << 9)) << 1,
+        0,
+        1 << 9,
+    ];
+    let mut s = Stream::default();
+    s.setup()
+        .resolve(&mut mem, W, H, false, Some((rgba(CLEAR), 0)))
+        .shader(false, &vs_uv())
+        .shader(true, &ps_texture(1))
+        .vertex_fetch(0, VERTS, 20)
+        .regs(SHADER_CONSTANT_FETCH + 6, &fetch)
+        .draw_auto(PRIM_QUAD_LIST, 4);
+    mem.write_words(CMD, &s.0);
+    let mut rec = xenon_gpu::Recorder::new();
+    rec.record_buffer(&mem, CMD, s.0.len() as u32).unwrap();
+    let cmds = rec.commands;
+    let mut w = Watched { mem, written: None };
+    let replay = |d: &mut xenon_draw::Drawer, w: &mut Watched| {
+        let r = d
+            .replay(&cmds, w as &mut dyn xenon_draw::GuestMemory)
+            .unwrap();
+        let img = d.read_render_target(COLOR_KEY, 0, 0, W, H).unwrap();
+        (r.timings.hashed_bytes, px(&img, W, 3, 3)[0])
+    };
+    assert_eq!(replay(&mut d, &mut w), (len, 200));
+    // Nothing written: no guest bytes read.
+    assert_eq!(replay(&mut d, &mut w), (0, 200));
+    // Writes elsewhere change nothing.
+    w.written = Some(vec![(0, u64::from(TEXTURE))]);
+    assert_eq!(replay(&mut d, &mut w), (0, 200));
+    // A write to the texture: read and drawn again.
+    put_texture(&mut w.mem, 90);
+    w.written = Some(vec![(
+        u64::from(TEXTURE) + len - 1,
+        u64::from(TEXTURE) + len + 4096,
+    )]);
+    assert_eq!(replay(&mut d, &mut w), (len, 90));
+    // Writes not listed: everything is read again.
+    w.written = None;
+    assert_eq!(replay(&mut d, &mut w), (len, 90));
+}

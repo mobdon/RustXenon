@@ -511,6 +511,15 @@ pub fn run(sha256: &str, regs: &[fn(&mut Runtime)]) -> ExitCode {
     let mem = if guarded {
         log("guarded guest memory: a never-allocated address stops the run");
         GuestMemory::new_guarded(GUEST_MEMORY)
+    } else if std::env::var_os("XENON_WRITE_WATCH").is_some_and(|v| v != "0") {
+        let mem = GuestMemory::new_watched(GUEST_MEMORY);
+        if mem.watched() {
+            log("watched guest memory: the drawer re-reads only what the CPU wrote");
+        } else {
+            log("XENON_WRITE_WATCH: not available on this OS, ignored");
+            GUEST_IN_HEAP.store(GUEST_MEMORY, Ordering::Relaxed);
+        }
+        mem
     } else {
         GUEST_IN_HEAP.store(GUEST_MEMORY, Ordering::Relaxed);
         GuestMemory::new(GUEST_MEMORY)
