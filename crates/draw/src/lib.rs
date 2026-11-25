@@ -50,7 +50,8 @@
 //! 8 | b << 16 | a << 24`; depth `depth24 << 8 | stencil`, converted like
 //! the depth clear and the depth resolve) by the fullscreen passes of
 //! `transfer.wgsl`, each destination pixel reading the source pixel of its
-//! first sample. Depth destinations take `frag_depth`, then, without
+//! first sample, in the other 40-sample half of its tile between colour and
+//! depth (Xenos stores depth tiles with their halves swapped). Depth destinations take `frag_depth`, then, without
 //! shader stencil export, the stencil one bit per pass as Xenia does.
 //! Other aliasing is not modelled: each key keeps its own pixels. A newer
 //! target on the same tiles that cannot be transferred (a colour format
@@ -2272,7 +2273,8 @@ impl Drawer {
     /// word: colour `r | g << 8 | b << 16 | a << 24`, depth `depth24 << 8
     /// | stencil` (24-bit unorm for kD24S8, 20e4 for kD24FS8, converted as
     /// the depth clear and resolve do). A `dst` pixel takes the `src`
-    /// pixel holding its first sample.
+    /// pixel holding its first sample, the tile's halves swapped between
+    /// colour and depth.
     fn transfer(
         &mut self,
         (src, src_msaa): (RenderTargetKey, u32),
@@ -2302,10 +2304,12 @@ impl Drawer {
             pipelines.push(self.transfer_pipeline(sf, df, bit)?);
         }
         // transfer.wgsl reads the samples per pixel from x0, y0 (`dst`) and
-        // w, h (`src`); resolve.wgsl's depth_word reads `src_format`.
+        // w, h (`src`), `src`'s pitch from pitch; resolve.wgsl's depth_word
+        // reads `src_format`.
         let mut params = [0u32; 12];
         (params[0], params[1]) = samples(dst_msaa);
         (params[2], params[3]) = samples(src_msaa);
+        params[4] = src.pitch;
         params[5] = if src.format == TargetFormat::D24FS8 {
             6
         } else {
