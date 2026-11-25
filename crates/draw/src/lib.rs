@@ -766,7 +766,15 @@ fn texture_bytes(t: &wgpu::Texture) -> u64 {
         u64::from,
     );
     let e = t.size();
-    texel * u64::from(e.width * e.height * e.depth_or_array_layers * t.sample_count())
+    // Block-compressed formats count bytes per block, not per texel.
+    let (bw, bh) = f.block_dimensions();
+    texel
+        * u64::from(
+            e.width.div_ceil(bw)
+                * e.height.div_ceil(bh)
+                * e.depth_or_array_layers
+                * t.sample_count(),
+        )
 }
 
 /// Bound on the host memory of render targets (EDRAM is 10 MB; host
@@ -881,6 +889,10 @@ pub struct Drawer {
     /// Bytes of decoded guest textures the texture cache keeps before
     /// evicting the least recently used ones (default 256 MiB).
     pub texture_cache_limit: u64,
+    /// Upload unsigned DXT textures as BC blocks for the host to decode
+    /// (default: whether the adapter has BC textures). Turning it on
+    /// without them makes those uploads fail.
+    pub bc_textures: bool,
     timings: Timings,
     uncaptured: Arc<Mutex<Vec<String>>>,
     max_dim: u32,
@@ -1182,7 +1194,8 @@ impl Drawer {
         });
         let snorm16_blend = snorm16
             && snorm16_all(&|f| f.flags.contains(wgpu::TextureFormatFeatureFlags::BLENDABLE));
-        let mut required_features = adapter.features() & wgpu::Features::FLOAT32_FILTERABLE;
+        let mut required_features = adapter.features()
+            & (wgpu::Features::FLOAT32_FILTERABLE | wgpu::Features::TEXTURE_COMPRESSION_BC);
         required_features.set(wgpu::Features::DEPTH32FLOAT_STENCIL8, float_stencil);
         required_features.set(snorm16_features, snorm16);
         let (device, queue) = block_on(adapter.request_device(&wgpu::DeviceDescriptor {
@@ -1305,6 +1318,7 @@ impl Drawer {
             decode_pipeline: None,
             skip_resolve_writeback: false,
             texture_cache_limit: TEXTURE_CACHE_LIMIT,
+            bc_textures: required_features.contains(wgpu::Features::TEXTURE_COMPRESSION_BC),
             timings: Timings::default(),
             uncaptured,
             max_dim: limits.max_texture_dimension_2d,
@@ -2826,7 +2840,8 @@ impl Drawer {
 
     /// Host texture of fetch constant slot `n`, from the cache or decoded.
     /// Formats whose values do not fit 8-bit unorm, and fetches with a signed
-    /// component, upload as floats. The cache key holds the whole fetch
+    /// component, upload as floats; unsigned DXT1..5 as BC blocks where
+    /// [`bc_blocks`] takes them. The cache key holds the whole fetch
     /// constant (sign bits included), so signed and unsigned views of the
     /// same bytes are separate textures.
     fn guest_texture(
@@ -2858,8 +2873,16 @@ impl Drawer {
             return Ok(view);
         }
         let signed = fetch.sign.contains(&1);
-        let host = host_texture_format(fetch.format, signed, self.float32_filterable);
-        let (width, height, data) = if host == wgpu::TextureFormat::Rgba8Unorm {
+        let mut host = host_texture_format(fetch.format, signed, self.float32_filterable);
+        let bc = if self.bc_textures && !signed {
+            bc_blocks(fetch, &bytes).map_err(|e| e.to_string())?
+        } else {
+            None
+        };
+        let (width, height, data) = if let Some((format, blocks)) = bc {
+            host = format;
+            (fetch.width(), fetch.height(), blocks)
+        } else if host == wgpu::TextureFormat::Rgba8Unorm {
             let img = xenon_texture::decode_base_level(fetch, &bytes).map_err(|e| e.to_string())?;
             (img.width, img.height, img.rgba8)
         } else {
@@ -2885,6 +2908,8 @@ impl Drawer {
         };
         report.timings.textures_uploaded += 1;
         report.timings.texture_bytes += data.len() as u64;
+        // Rows of blocks: a BC row holds four rows of texels.
+        let rows = height / host.block_dimensions().1;
         let tex = self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("guest texture"),
             size,
@@ -2905,8 +2930,8 @@ impl Drawer {
             &data,
             wgpu::TexelCopyBufferLayout {
                 offset: 0,
-                bytes_per_row: Some(data.len() as u32 / height),
-                rows_per_image: Some(height),
+                bytes_per_row: Some(data.len() as u32 / rows),
+                rows_per_image: Some(rows),
             },
             size,
         );
@@ -3965,6 +3990,57 @@ impl Drawer {
             rgba8,
         })
     }
+}
+
+/// The base level of an unsigned DXT1, DXT2/3 or DXT4/5 `fetch` as linear
+/// BC1, BC2 or BC3 blocks (endian swapped and detiled, as the CPU decoder
+/// reads them), which the host decodes to the CPU decoder's texels (up to
+/// its rounding of interpolated ones); `None` for the CPU path. Only the
+/// identity swizzle passes (a wgpu view cannot swizzle), and only whole
+/// blocks: a padded host texture would move normalised coordinates and
+/// clamping. DXN stays on the CPU path, which repeats Y into Z and W where
+/// BC5 gives 0 and 1.
+fn bc_blocks(
+    fetch: &xenon_texture::TextureFetch,
+    bytes: &[u8],
+) -> Result<Option<(wgpu::TextureFormat, Vec<u8>)>, xenon_texture::Error> {
+    use xenon_texture::{tile, TextureFormat as F};
+    let (format, bpb) = match fetch.format.data_format() {
+        F::Dxt1 => (wgpu::TextureFormat::Bc1RgbaUnorm, 8),
+        F::Dxt2_3 => (wgpu::TextureFormat::Bc2RgbaUnorm, 16),
+        F::Dxt4_5 => (wgpu::TextureFormat::Bc3RgbaUnorm, 16),
+        _ => return Ok(None),
+    };
+    const IDENTITY: u16 = (1 << 3) | (2 << 6) | (3 << 9);
+    let (w, h) = (fetch.width(), fetch.height());
+    if fetch.swizzle & 0xFFF != IDENTITY || w % 4 != 0 || h % 4 != 0 {
+        return Ok(None);
+    }
+    let (wb, hb) = (w / 4, h / 4);
+    let pitch = tile::align_to_tile(fetch.pitch_texels().div_ceil(4));
+    let extent = if fetch.tiled {
+        tile::tiled_extent_2d(wb, hb, pitch, bpb)? as usize
+    } else {
+        ((pitch * (hb - 1) + wb) * bpb) as usize
+    };
+    let Some(raw) = bytes.get(..extent) else {
+        return Err(xenon_texture::Error::TooShort {
+            needed: extent,
+            got: bytes.len(),
+        });
+    };
+    let mut raw = raw.to_vec();
+    xenon_texture::endian::swap_in_place(&mut raw, fetch.endian);
+    let blocks = if fetch.tiled {
+        tile::detile_2d(&raw, wb, hb, pitch, bpb)?
+    } else {
+        let row = (wb * bpb) as usize;
+        raw.chunks(pitch as usize * bpb as usize)
+            .flat_map(|r| &r[..row])
+            .copied()
+            .collect()
+    };
+    Ok(Some((format, blocks)))
 }
 
 /// Host format of a guest texture: `Rgba16Float` for half floats,
