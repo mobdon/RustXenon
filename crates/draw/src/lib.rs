@@ -189,6 +189,31 @@ pub trait GuestMemory: GuestRead {
     fn write_bytes(&mut self, addr: u32, bytes: &[u8]) -> bool;
 }
 
+/// Guest memory that remembers the ranges written through it, so the
+/// textures read from them are looked up again.
+struct Tracked<'a> {
+    mem: &'a mut dyn GuestMemory,
+    /// Physical `[start, end)` ranges written since the last drain.
+    written: Vec<(u64, u64)>,
+}
+
+impl GuestRead for Tracked<'_> {
+    fn read_u32(&self, addr: u32) -> Option<u32> {
+        self.mem.read_u32(addr)
+    }
+    fn read_bytes(&self, addr: u32, len: usize) -> Option<Vec<u8>> {
+        self.mem.read_bytes(addr, len)
+    }
+}
+
+impl GuestMemory for Tracked<'_> {
+    fn write_bytes(&mut self, addr: u32, bytes: &[u8]) -> bool {
+        let start = u64::from(addr & PHYSICAL_MASK);
+        self.written.push((start, start + bytes.len() as u64));
+        self.mem.write_bytes(addr, bytes)
+    }
+}
+
 impl GuestMemory for SliceMemory {
     fn write_bytes(&mut self, addr: u32, bytes: &[u8]) -> bool {
         let Some(start) = addr.checked_sub(self.base).map(|s| s as usize) else {
@@ -285,6 +310,9 @@ pub struct Timings {
     pub clears: Duration,
     /// Reading, swapping and detiling the front buffer at each swap.
     pub swap: Duration,
+    /// EDRAM ownership transfers between colour and depth targets (also
+    /// counted in the phase that needed the target).
+    pub transfer: Duration,
     /// Counts: pipelines and shader modules created, textures uploaded.
     pub pipelines_created: u32,
     pub textures_uploaded: u32,
@@ -293,6 +321,38 @@ pub struct Timings {
     pub submits: u32,
     pub texture_bytes: u64,
     pub guest_bytes: u64,
+    /// EDRAM transfers and their render passes.
+    pub transfers: u32,
+    pub transfer_passes: u32,
+    /// Bytes read back from the GPU for resolves.
+    pub readback_bytes: u64,
+    /// Guest texture bytes read and hashed to look up the texture cache.
+    pub hashed_bytes: u64,
+}
+
+impl std::ops::AddAssign<&Timings> for Timings {
+    /// Sums the phases and counts of several replays.
+    fn add_assign(&mut self, t: &Timings) {
+        self.shaders += t.shaders;
+        self.guest_data += t.guest_data;
+        self.textures += t.textures;
+        self.submit += t.submit;
+        self.gpu_wait += t.gpu_wait;
+        self.readback += t.readback;
+        self.resolve_cpu += t.resolve_cpu;
+        self.clears += t.clears;
+        self.swap += t.swap;
+        self.transfer += t.transfer;
+        self.pipelines_created += t.pipelines_created;
+        self.textures_uploaded += t.textures_uploaded;
+        self.submits += t.submits;
+        self.texture_bytes += t.texture_bytes;
+        self.guest_bytes += t.guest_bytes;
+        self.transfers += t.transfers;
+        self.transfer_passes += t.transfer_passes;
+        self.readback_bytes += t.readback_bytes;
+        self.hashed_bytes += t.hashed_bytes;
+    }
 }
 
 impl Report {
@@ -591,10 +651,12 @@ pub struct Drawer {
     /// guest bytes they read, so an unchanged texture is not decoded again.
     texture_cache: HashMap<([u32; 6], u64), wgpu::TextureView>,
     texture_cache_bytes: u64,
-    /// Textures already looked up this replay by fetch constant. Guest
+    /// Textures already looked up this replay by fetch constant, with the
+    /// physical `[start, end)` guest range they were read from. Guest
     /// memory only changes at a resolve or MEM_WRITE during a replay, which
-    /// clear it, so later draws skip reading and hashing the guest bytes.
-    texture_memo: HashMap<[u32; 6], wgpu::TextureView>,
+    /// drop the entries whose range they write, so later draws skip reading
+    /// and hashing the guest bytes of the others.
+    texture_memo: HashMap<[u32; 6], (wgpu::TextureView, u64, u64)>,
     samplers: HashMap<([u8; 3], u8, u8), wgpu::Sampler>,
     /// Draws recorded but not yet submitted (see [`Batch`]).
     batch: Option<Batch>,
@@ -620,6 +682,9 @@ pub struct Drawer {
     snorm16: bool,
     /// The snorm16 targets blend (else their blending is dropped).
     snorm16_blend: bool,
+    /// [`formats::half_lut`] tables by source format and exponent bias, for
+    /// CPU resolves to 16-bit float destinations.
+    half_luts: HashMap<(TargetFormat, i32), Option<Vec<[u16; 2]>>>,
     timings: Timings,
     uncaptured: Arc<Mutex<Vec<String>>>,
     max_dim: u32,
@@ -1016,6 +1081,7 @@ impl Drawer {
             float_stencil,
             snorm16,
             snorm16_blend,
+            half_luts: HashMap::new(),
             timings: Timings::default(),
             uncaptured,
             max_dim: limits.max_texture_dimension_2d,
@@ -1078,7 +1144,11 @@ impl Drawer {
         let mut report = Report::default();
         self.timings = Timings::default();
         self.texture_memo.clear();
-        let done = self.replay_commands(commands, mem, &mut report);
+        let mut mem = Tracked {
+            mem,
+            written: Vec::new(),
+        };
+        let done = self.replay_commands(commands, &mut mem, &mut report);
         // On an error the batch is dropped unsubmitted.
         let done = done.and_then(|()| {
             self.flush().map_err(|e| match e {
@@ -1091,12 +1161,17 @@ impl Drawer {
         done?;
         // Counts made where only the report is mutable.
         let t = &report.timings;
-        let (uploaded, tex_bytes, guest_bytes) =
-            (t.textures_uploaded, t.texture_bytes, t.guest_bytes);
+        let (uploaded, tex_bytes, guest_bytes, hashed_bytes) = (
+            t.textures_uploaded,
+            t.texture_bytes,
+            t.guest_bytes,
+            t.hashed_bytes,
+        );
         report.timings = Timings {
             textures_uploaded: uploaded,
             texture_bytes: tex_bytes,
             guest_bytes,
+            hashed_bytes,
             ..std::mem::take(&mut self.timings)
         };
         Ok(report)
@@ -1105,10 +1180,11 @@ impl Drawer {
     fn replay_commands(
         &mut self,
         commands: &[Command],
-        mem: &mut dyn GuestMemory,
+        tracked: &mut Tracked,
         report: &mut Report,
     ) -> Result<(), Error> {
         for c in commands {
+            let mem: &mut dyn GuestMemory = tracked;
             let done = match c {
                 Command::WriteRegisters { base, values } => {
                     for (i, &v) in values.iter().enumerate() {
@@ -1140,13 +1216,9 @@ impl Drawer {
                 Command::Draw(d) => self.draw(d, mem, report).map(|drawn| {
                     report.draws += u32::from(drawn);
                 }),
-                Command::Resolve(r) => {
-                    let done = self.resolve(r, mem, report).map(|done| {
-                        report.resolves += u32::from(done);
-                    });
-                    self.texture_memo.clear();
-                    done
-                }
+                Command::Resolve(r) => self.resolve(r, mem, report).map(|done| {
+                    report.resolves += u32::from(done);
+                }),
                 Command::Swap {
                     signature_ok,
                     frontbuffer,
@@ -1170,7 +1242,6 @@ impl Drawer {
                     endian,
                     values,
                 } => {
-                    self.texture_memo.clear();
                     for (i, &v) in values.iter().enumerate() {
                         let a = addr.wrapping_add(4 * i as u32);
                         if !mem.write_bytes(a, &endian.to_guest_bytes(v)) {
@@ -1181,6 +1252,10 @@ impl Drawer {
                 }
                 _ => Ok(()),
             };
+            for (lo, hi) in tracked.written.drain(..) {
+                self.texture_memo
+                    .retain(|_, &mut (_, a, b)| b <= lo || hi <= a);
+            }
             match done {
                 Ok(()) => {}
                 Err(Skip::Unsupported(why)) => report.unsupported(why),
@@ -1553,7 +1628,9 @@ impl Drawer {
                 let (src_down, dst_down) = (samples(w.msaa).1, samples(msaa).1);
                 let height = RENDER_TARGET_HEIGHT.min(self.max_dim);
                 let rows = (w.rows * src_down).div_ceil(dst_down).min(height);
+                let t = Instant::now();
                 self.transfer((src, w.msaa), (key, msaa), &tex, rows)?;
+                self.timings.transfer += t.elapsed();
                 // Both now hold the same words: the source's stamp, so
                 // using the source again does not transfer them back.
                 let own = self.written.entry(key).or_default();
@@ -1806,6 +1883,8 @@ impl Drawer {
         }
         self.queue.submit([enc.finish()]);
         self.timings.submits += 1;
+        self.timings.transfers += 1;
+        self.timings.transfer_passes += pipelines.len() as u32;
         match block_on(scope.pop()) {
             Some(e) => Err(Skip::Fatal(Error::Gpu(e.to_string()))),
             None => Ok(()),
@@ -2037,7 +2116,7 @@ impl Drawer {
             return Ok((self.zero_texture.clone(), self.zero_sampler.clone()));
         }
         let sampler = self.sampler(&fetch, report);
-        if let Some(view) = self.texture_memo.get(&self.regs.fetch_constant(n)) {
+        if let Some((view, ..)) = self.texture_memo.get(&self.regs.fetch_constant(n)) {
             return Ok((view.clone(), sampler));
         }
         let view = self
@@ -2071,9 +2150,12 @@ impl Drawer {
                     })
             })
             .map_err(|e| e.to_string())?;
+        report.timings.hashed_bytes += bytes.len() as u64;
         let key = (self.regs.fetch_constant(n), hash_bytes(&bytes));
+        let range = (u64::from(addr), u64::from(addr) + bytes.len() as u64);
         if let Some(view) = self.texture_cache.get(&key) {
-            self.texture_memo.insert(key.0, view.clone());
+            self.texture_memo
+                .insert(key.0, (view.clone(), range.0, range.1));
             return Ok(view.clone());
         }
         let signed = fetch.sign.contains(&1);
@@ -2137,7 +2219,8 @@ impl Drawer {
         }
         self.texture_cache_bytes += len;
         self.texture_cache.insert(key, view.clone());
-        self.texture_memo.insert(key.0, view.clone());
+        self.texture_memo
+            .insert(key.0, (view.clone(), range.0, range.1));
         Ok(view)
     }
 
@@ -2862,14 +2945,32 @@ impl Drawer {
         self.timings.gpu_wait += lap(&mut t);
         let px = self.read_texture(&tex, rect.x0, rect.y0, rect.width(), rect.height())?;
         self.timings.readback += lap(&mut t);
+        self.timings.readback_bytes += px.len() as u64;
         let src_bytes = px.len() / (rect.width() * rect.height()) as usize;
         let mut out = vec![0; px.len() / src_bytes * dest_bytes];
+        let half_dest = matches!(
+            r.dest_format,
+            formats::DEST_16_16_FLOAT | formats::DEST_16_16_16_16_FLOAT
+        );
+        let lut = if half_dest {
+            self.half_luts
+                .entry((format, r.dest_exp_bias))
+                .or_insert_with(|| formats::half_lut(format, r.dest_exp_bias))
+                .as_ref()
+        } else {
+            None
+        };
         for (src, dst) in px
             .chunks_exact(src_bytes)
             .zip(out.chunks_exact_mut(dest_bytes))
         {
-            let rgba = formats::edram_rgba(format, src);
-            formats::resolve_pixel(rgba, r.dest_exp_bias, r.dest_swap, r.dest_format, dst);
+            match lut {
+                Some(lut) => formats::resolve_half_pixel(lut, src, r.dest_swap, dst),
+                None => {
+                    let rgba = formats::edram_rgba(format, src);
+                    formats::resolve_pixel(rgba, r.dest_exp_bias, r.dest_swap, r.dest_format, dst);
+                }
+            }
         }
         let done = resolve::write_tiled_texels(
             mem,
@@ -3049,6 +3150,7 @@ impl Drawer {
         }
         let mut out = self.map_read(&readback, index)?;
         self.timings.readback += lap(&mut t);
+        self.timings.readback_bytes += out.len() as u64;
         out.truncate(extent as usize);
         if !mem.write_bytes(base, &out) {
             return unsupported(format!("resolve destination 0x{base:08X} is not writable"));

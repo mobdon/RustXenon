@@ -343,7 +343,13 @@ pub fn to_rgba8(
     width: u32,
     height: u32,
 ) -> Result<Vec<u8>, Error> {
-    let mut out = vec![0; check_len(format, data, width, height)? * 4];
+    let texels = check_len(format, data, width, height)?;
+    // k_8_8_8_8 bytes are already XYZW unorm8: the float round trip below
+    // gives each byte back unchanged, so copy them.
+    if format.data_format() == F::K8_8_8_8 {
+        return Ok(data[..texels * 4].to_vec());
+    }
+    let mut out = vec![0; texels * 4];
     decode(format, data, width, height, [false; 4], |i, t| {
         let t = match t {
             Texel::U8(t) => t,
@@ -410,6 +416,19 @@ mod tests {
         assert_eq!(one(F::K8_8_8_8, &px), px);
         assert_eq!(one(F::K8_8_8_8A, &px), px);
         assert_eq!(one(F::K8_8_8_8As16_16_16_16, &px), px);
+    }
+
+    /// The k_8_8_8_8 copy path gives what the float conversion gives, for
+    /// every byte value in every channel.
+    #[test]
+    fn k8_8_8_8_copy_matches_the_float_conversion() {
+        let bytes: Vec<u8> = (0..=255u8)
+            .flat_map(|b| [b, 255 - b, b ^ 0x5A, b / 3])
+            .collect();
+        let floats = to_rgba_f32(F::K8_8_8_8, &bytes, 16, 16).unwrap();
+        let rounded: Vec<u8> = floats.iter().map(|c| (c * 255.0).round() as u8).collect();
+        assert_eq!(to_rgba8(F::K8_8_8_8, &bytes, 16, 16).unwrap(), rounded);
+        assert_eq!(rounded, bytes);
     }
 
     #[test]

@@ -146,11 +146,17 @@ pub fn detile_2d(
     }
     let log2 = bytes_per_block.trailing_zeros();
     let bpb = bytes_per_block as usize;
-    let mut out = Vec::with_capacity(width as usize * height as usize * bpb);
+    let mut out = vec![0; width as usize * height as usize * bpb];
+    // The low 4 address bits are x's low bits times the block size (within
+    // x & 7), so a run of `run` blocks from an aligned x is contiguous.
+    let run = (16 >> log2.min(4)).clamp(1, 8);
+    let row = width as usize * bpb;
     for y in 0..height {
-        for x in 0..width {
+        let line = &mut out[y as usize * row..][..row];
+        for x in (0..width).step_by(run as usize) {
             let at = tiled_offset_2d(x, y, pitch, log2) as usize;
-            out.extend_from_slice(&src[at..at + bpb]);
+            let n = run.min(width - x) as usize * bpb;
+            line[x as usize * bpb..][..n].copy_from_slice(&src[at..at + n]);
         }
     }
     Ok(out)
@@ -219,6 +225,32 @@ pub fn tile_2d(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The run-copying detile gives what reading every block at its
+    /// tiled offset gives, for each block size and widths that end mid-run.
+    #[test]
+    fn detile_matches_per_block_offsets() {
+        for log2 in 0..=4u32 {
+            let bpb = 1usize << log2;
+            for (w, h) in [(37, 5), (64, 33), (3, 2), (96, 1)] {
+                let pitch = align_to_tile(w);
+                let len = tiled_extent_2d(w, h, pitch, bpb as u32).unwrap() as usize;
+                let src: Vec<u8> = (0..len).map(|i| (i * 7 + i / 251) as u8).collect();
+                let mut want = Vec::new();
+                for y in 0..h {
+                    for x in 0..w {
+                        let at = tiled_offset_2d(x, y, pitch, log2) as usize;
+                        want.extend_from_slice(&src[at..at + bpb]);
+                    }
+                }
+                assert_eq!(
+                    detile_2d(&src, w, h, pitch, bpb as u32).unwrap(),
+                    want,
+                    "{bpb} {w}x{h}"
+                );
+            }
+        }
+    }
 
     /// Hand-computed with Tiled2D/TiledCombine from texture_address.h:
     ///   outer = ((y >> 5) * (pitch >> 5) + (x >> 5)) << 6
