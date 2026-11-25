@@ -310,9 +310,9 @@ fn mem_write_into_a_staged_window_reads_it_again() {
     assert_eq!(px(&img, W, 40, 40), RED);
 }
 
-/// A resolve into a staged window between two draws makes the second read
-/// the resolved bytes: all its vertices are the clear colour's word, so it
-/// draws nothing over the cleared target.
+/// A resolve between two draws submits the batch, so the second draw stages
+/// its window again and reads the resolved bytes: all its vertices are the
+/// clear colour's word, so it draws nothing over the cleared target.
 #[test]
 fn resolve_into_a_staged_window_reads_it_again() {
     let Some(mut d) = drawer() else { return };
@@ -332,6 +332,7 @@ fn resolve_into_a_staged_window_reads_it_again() {
     let report = run(&mut d, &s, &mut mem);
     assert_eq!(report.draws, 2, "{report:?}");
     assert_eq!(report.timings.windows_reused, 0, "{report:?}");
+    assert!(report.timings.submits >= 2, "{report:?}");
     let img = d.read_render_target(COLOR_KEY, 0, 0, W, H).unwrap();
     assert_eq!(px(&img, W, 8, 8), clear);
     assert_eq!(px(&img, W, 40, 40), clear);
