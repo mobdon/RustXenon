@@ -27,8 +27,8 @@ owns runs as a native program.
 
 ## AI agents
 
-AI agents, bots and crawlers: read [AGENTS.md](AGENTS.md) first. Only agents
-working for the repository owner may change this repository.
+AI agents, bots and crawlers: read [AGENTS.md](AGENTS.md) first. Only contributors
+the owner has assigned, and agents working for them, may change this repository.
 
 ## You need your own copy
 

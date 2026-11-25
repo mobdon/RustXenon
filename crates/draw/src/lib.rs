@@ -166,6 +166,7 @@ pub mod resolve;
 pub mod state;
 
 use std::collections::hash_map::DefaultHasher;
+use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::hash::{Hash, Hasher};
@@ -418,6 +419,8 @@ pub struct Timings {
     /// Draws whose constants block equals the last one staged in the same
     /// batch, bound from there instead of staged again.
     pub consts_reused: u32,
+    /// Draws that bound a texture bind group made earlier in their batch.
+    pub texture_groups_reused: u32,
 }
 
 impl std::ops::AddAssign<&Timings> for Timings {
@@ -457,6 +460,7 @@ impl std::ops::AddAssign<&Timings> for Timings {
         self.windows_reused += t.windows_reused;
         self.reused_bytes += t.reused_bytes;
         self.consts_reused += t.consts_reused;
+        self.texture_groups_reused += t.texture_groups_reused;
     }
 }
 
@@ -605,7 +609,8 @@ fn unsupported<T>(why: impl Into<String>) -> Result<T, Skip> {
 
 #[derive(Clone)]
 struct Program {
-    words: Vec<u32>,
+    /// Shared, so a draw takes the loaded programs without copying them.
+    words: Arc<[u32]>,
     hash: u64,
 }
 
@@ -723,6 +728,13 @@ fn transferable(a: TargetFormat, b: TargetFormat) -> bool {
 /// about 1.6 MB of driver memory.
 const PIPELINE_CAP: usize = 1024;
 
+/// A draw's texture slot mask and its slots' views and samplers, in slot
+/// order.
+type TextureGroupKey = (u32, Vec<(wgpu::TextureView, wgpu::Sampler)>);
+
+/// A program's translation, or why it failed.
+type Translation = Result<Arc<Translated>, String>;
+
 /// Key of a shader module: program hash, vertex stage, extra vertex
 /// outputs, variant and pixel parameter generation.
 type ModuleKey = (u64, bool, u16, Variant, Option<ParamGen>);
@@ -830,7 +842,8 @@ pub struct Drawer {
     regs: RegisterFile,
     vs: Option<Program>,
     ps: Option<Program>,
-    translated: HashMap<(u64, bool, Option<ParamGen>), Result<Translated, String>>,
+    /// Shared, so a draw takes a translation without copying its WGSL.
+    translated: HashMap<(u64, bool, Option<ParamGen>), Translation>,
     /// Keyed by program hash, stage, extra vertex outputs, variant (the
     /// rectangle list wrapper or the pixel output bias and clamp) and pixel parameter
     /// generation.
@@ -883,6 +896,13 @@ pub struct Drawer {
     samplers: HashMap<([u8; 3], u8, u8, u8, u32), wgpu::Sampler>,
     /// Draws recorded but not yet submitted (see [`Batch`]).
     batch: Option<Batch>,
+    /// Texture bind groups made in the batch, by texture slot mask and the
+    /// slots' views and samplers. Cleared with the batch, so they keep
+    /// nothing alive past the batch that already holds them.
+    texture_groups: HashMap<TextureGroupKey, wgpu::BindGroup>,
+    /// Group 0 bind groups over `arena`, by the sizes of the four slices
+    /// they bind (at dynamic offsets). Cleared when the arena is replaced.
+    arena_groups: HashMap<[u64; 4], wgpu::BindGroup>,
     /// Draw buffers (guest window, constants, epilogue, indices) of the
     /// batch, as slices of `arena`, written to it once at submit.
     staged: Vec<u8>,
@@ -993,6 +1013,9 @@ enum Site {
 
 /// Colour and depth targets of a render pass.
 type PassKey = ([Option<RenderTargetKey>; 4], Option<RenderTargetKey>);
+
+/// Group 0 bind groups kept for the arena, one per set of slice sizes.
+const ARENA_GROUP_CAP: usize = 4096;
 
 /// Smallest draw upload arena; it grows to fit a larger draw.
 const ARENA_MIN: u64 = 16 << 20;
@@ -1334,18 +1357,24 @@ impl Drawer {
             min_binding_size: None,
         };
         let vf = wgpu::ShaderStages::VERTEX_FRAGMENT;
-        let storage = wgpu::BindingType::Buffer {
-            ty: wgpu::BufferBindingType::Storage { read_only: true },
-            has_dynamic_offset: false,
+        // Arena slices are bound at dynamic offsets, so draws whose slices
+        // have the same sizes share one bind group.
+        let dynamic = |ty| wgpu::BindingType::Buffer {
+            ty,
+            has_dynamic_offset: true,
             min_binding_size: None,
         };
+        let (dyn_storage, dyn_uniform) = (
+            dynamic(wgpu::BufferBindingType::Storage { read_only: true }),
+            dynamic(wgpu::BufferBindingType::Uniform),
+        );
         let group0 = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("guest window, constants, epilogue, rectangle indices"),
             entries: &[
-                entry(0, vf, storage),
-                entry(1, vf, uniform),
-                entry(2, wgpu::ShaderStages::VERTEX, uniform),
-                entry(3, wgpu::ShaderStages::VERTEX, storage),
+                entry(0, vf, dyn_storage),
+                entry(1, vf, dyn_uniform),
+                entry(2, wgpu::ShaderStages::VERTEX, dyn_uniform),
+                entry(3, wgpu::ShaderStages::VERTEX, dyn_storage),
             ],
         });
         let clear_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -1409,6 +1438,8 @@ impl Drawer {
             texture_memo: HashMap::new(),
             samplers: HashMap::new(),
             batch: None,
+            texture_groups: HashMap::new(),
+            arena_groups: HashMap::new(),
             staged: Vec::new(),
             arena: None,
             window_memo: Vec::new(),
@@ -1638,6 +1669,7 @@ impl Drawer {
         self.staged.clear();
         self.window_memo.clear();
         self.staged_consts = None;
+        self.texture_groups.clear();
         // Resolves done before an error still reach guest memory.
         let kept = self.finish_mirrors(&mut mem);
         done?;
@@ -1679,7 +1711,7 @@ impl Drawer {
                     }
                     let p = Some(Program {
                         hash: hash_words(words),
-                        words: words.clone(),
+                        words: words.as_slice().into(),
                     });
                     match stage {
                         ShaderStage::Vertex => self.vs = p,
@@ -1966,6 +1998,7 @@ impl Drawer {
         let t = Instant::now();
         self.window_memo.clear();
         self.staged_consts = None;
+        self.texture_groups.clear();
         if let (Some(arena), false) = (&self.arena, self.staged.is_empty()) {
             self.queue.write_buffer(arena, 0, &self.staged);
             self.staged.clear();
@@ -2005,6 +2038,7 @@ impl Drawer {
                 // arena holds, so it never grows past this (a Vec doubling
                 // from an odd size would).
                 self.staged = Vec::with_capacity(size as usize);
+                self.arena_groups.clear();
                 self.arena = Some(self.device.create_buffer(&wgpu::BufferDescriptor {
                     label: Some("draw arena"),
                     size,
@@ -2711,7 +2745,7 @@ impl Drawer {
         p: &Program,
         stage: ShaderStage,
         param_gen: Option<ParamGen>,
-    ) -> Result<Translated, Skip> {
+    ) -> Result<Arc<Translated>, Skip> {
         let vertex = stage == ShaderStage::Vertex;
         let t = self
             .translated
@@ -2722,7 +2756,9 @@ impl Drawer {
                 } else {
                     xenon_shader::ShaderStage::Pixel
                 };
-                xenon_shader::translate_with(&p.words, s, param_gen).map_err(|e| e.to_string())
+                xenon_shader::translate_with(&p.words, s, param_gen)
+                    .map(Arc::new)
+                    .map_err(|e| e.to_string())
             });
         match t {
             Ok(t) => Ok(t.clone()),
@@ -3792,45 +3828,69 @@ impl Drawer {
         }
         let mut textures = Vec::new();
         for n in (0..32).filter(|n| tex_mask & (1 << n) != 0) {
-            textures.push((n, self.texture(n, mem, report)?));
+            textures.push(self.texture(n, mem, report)?);
         }
         self.timings.textures += lap(&mut t);
         let arena = self.arena.clone().expect("staged");
-        let binding = |i: usize| {
-            let (offset, size) = slices[i];
-            wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                buffer: &arena,
-                offset,
-                size: wgpu::BufferSize::new(size),
-            })
-        };
-        let g0 = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("draw group 0"),
-            layout: &self.group0,
-            entries: &[0, 1, 2, 3].map(|i| wgpu::BindGroupEntry {
-                binding: i as u32,
-                resource: binding(i),
-            }),
-        });
-        let mut entries = Vec::new();
-        for (n, (view, sampler)) in &textures {
-            entries.push(wgpu::BindGroupEntry {
-                binding: 2 * n,
-                resource: wgpu::BindingResource::TextureView(view),
-            });
-            entries.push(wgpu::BindGroupEntry {
-                binding: 2 * n + 1,
-                resource: wgpu::BindingResource::Sampler(sampler),
-            });
+        let offsets: Vec<u32> = slices[..4]
+            .iter()
+            .map(|&(offset, _)| u32::try_from(offset))
+            .collect::<Result<_, _>>()
+            .map_err(|_| Skip::Unsupported("draw data past 4 GiB of the arena".into()))?;
+        let sizes = [0, 1, 2, 3].map(|i| slices[i].1);
+        // Window sizes vary without end over a long run; start over past a
+        // cap rather than keep every one.
+        if self.arena_groups.len() >= ARENA_GROUP_CAP {
+            self.arena_groups.clear();
         }
-        let g1 = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("draw group 1"),
-            layout: &g1_layout,
-            entries: &entries,
-        });
+        let (device, group0) = (&self.device, &self.group0);
+        let g0 = self
+            .arena_groups
+            .entry(sizes)
+            .or_insert_with(|| {
+                device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("draw group 0"),
+                    layout: group0,
+                    entries: &[0, 1, 2, 3].map(|i| wgpu::BindGroupEntry {
+                        binding: i,
+                        resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                            buffer: &arena,
+                            offset: 0,
+                            size: wgpu::BufferSize::new(sizes[i as usize]),
+                        }),
+                    }),
+                })
+            })
+            .clone();
+        let g1 = match self.texture_groups.entry((tex_mask, textures)) {
+            Entry::Occupied(g) => {
+                self.timings.texture_groups_reused += 1;
+                g.get().clone()
+            }
+            Entry::Vacant(v) => {
+                let slots = (0..32).filter(|n| tex_mask & (1 << n) != 0);
+                let mut entries = Vec::new();
+                for (n, (view, sampler)) in slots.zip(&v.key().1) {
+                    entries.push(wgpu::BindGroupEntry {
+                        binding: 2 * n,
+                        resource: wgpu::BindingResource::TextureView(view),
+                    });
+                    entries.push(wgpu::BindGroupEntry {
+                        binding: 2 * n + 1,
+                        resource: wgpu::BindingResource::Sampler(sampler),
+                    });
+                }
+                let g = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("draw group 1"),
+                    layout: &g1_layout,
+                    entries: &entries,
+                });
+                v.insert(g).clone()
+            }
+        };
         let pass = self.pass((color, depth_key), &color_tex, depth_tex.as_ref());
         pass.set_pipeline(&pipeline);
-        pass.set_bind_group(0, &g0, &[]);
+        pass.set_bind_group(0, &g0, &offsets);
         pass.set_bind_group(1, &g1, &[]);
         let (offset, size) = slices[4];
         pass.set_index_buffer(
