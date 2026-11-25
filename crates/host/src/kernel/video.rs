@@ -168,7 +168,7 @@ pub fn start(rt: std::sync::Arc<Runtime>) {
                     c.r[4] = user as u64;
                     let prev = super::gpu::STATE.swap(3, Ordering::Relaxed);
                     super::gpu::RAISED.fetch_add(1, Ordering::Relaxed);
-                    rt.call(&mut c, f);
+                    crate::cpu_profile::interrupt(|| rt.call(&mut c, f));
                     super::gpu::STATE.store(prev, Ordering::Relaxed);
                 }
             };
