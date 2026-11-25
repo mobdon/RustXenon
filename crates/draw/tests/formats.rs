@@ -817,3 +817,96 @@ fn float32_target_clear_draw_and_resolve() {
     );
     assert_eq!(out, 3.25f32.to_le_bytes());
 }
+
+/// RB_COLOR_INFO's colour exponent bias (bits 20..25, signed) scales every
+/// component of the pixel shader's colour by 2^bias before it is written:
+/// -2 for the first draw, +1 for the second.
+#[test]
+fn color_exp_bias_scales_pixel_output() {
+    let Some(mut d) = drawer() else { return };
+    let mut mem = memory();
+    mem.write_words(
+        VERTS,
+        &[corner_triangle(128.0), corner_triangle(16.0)].concat(),
+    );
+    let info = |bias: i32| (RT_16_16_16_16_FLOAT << 16) | (((bias as u32) & 0x3F) << 20);
+    let mut s = Stream::default();
+    s.setup()
+        .regs(RB_COLOR_INFO, &[info(-2)])
+        .shader(false, &vs_color())
+        .shader(true, &ps_const())
+        .vertex_fetch(0, VERTS, 24);
+    c0(&mut s, [1.0, -0.5, 3.0, 0.25]).draw_auto(PRIM_TRI_LIST, 3);
+    s.regs(RB_COLOR_INFO, &[info(1)])
+        .vertex_fetch(0, VERTS + 48, 12);
+    c0(&mut s, [0.25, -0.5, 3.0, 0.125]).draw_auto(PRIM_TRI_LIST, 3);
+    let report = run(&mut d, &s, &mut mem);
+    assert_eq!(report.draws, 2, "{report:?}");
+    assert!(report.unsupported.is_empty(), "{report:?}");
+    let raw = d
+        .read_render_target_raw(key(TargetFormat::Rgba16Float), 0, 0, W, H)
+        .unwrap();
+    // 0.25, -0.125, 0.75, 0.0625.
+    assert_eq!(
+        halves(&texel(&raw, W, 8, 40, 4)),
+        [0x3400, 0xB000, 0x3A00, 0x2C00]
+    );
+    // 0.5, -1.0, 6.0, 0.25.
+    assert_eq!(
+        halves(&texel(&raw, W, 8, 2, 2)),
+        [0x3800, 0xBC00, 0x4600, 0x3400]
+    );
+}
+
+/// A texture fetch applies the fetch constant's sign per component and its
+/// exponent adjust: an 8_8_8_8 texel (0x80, 12, 200, 255) with signs
+/// signed, unsigned biased, gamma, signed, swizzle YXZ1 and exp_adjust 1
+/// reads as 2 * (12/255 * 2 - 1, -1 (clamped from -128/127), PWL gamma
+/// 580/1023, 1): each sign follows its source component through the
+/// swizzle, and the constant 1 takes no sign.
+#[test]
+fn texture_fetch_sign_gamma_and_exp_adjust() {
+    use xenon_texture::{endian, tile};
+    let Some(mut d) = drawer() else { return };
+    let mut mem = memory();
+    let n = 32u32;
+    let linear: Vec<u8> = (0..n * n).flat_map(|_| [0x80, 12, 200, 255]).collect();
+    let mut tiled = tile::tile_2d(&linear, n, n, n, 4).unwrap();
+    endian::swap_in_place(&mut tiled, xenon_texture::Endian::K8in32);
+    mem.data[TEXTURE as usize..][..tiled.len()].copy_from_slice(&tiled);
+    let q = n as f32;
+    let verts: Vec<u32> = [(0.0, 0.0, 0.0, 0.0), (q, 0.0, 1.0, 0.0), (0.0, q, 0.0, 1.0)]
+        .iter()
+        .flat_map(|&(x, y, u, v)| [f(x), f(y), f(0.0), f(u), f(v)])
+        .collect();
+    mem.write_words(VERTS, &verts);
+    let swizzle_yxz1 = 1 | (2 << 6) | (5 << 9);
+    let signs = (1 << 2) | (2 << 4) | (3 << 6) | (1 << 8);
+    let fetch = [
+        2 | signs | (2 << 10) | (2 << 13) | ((n >> 5) << 22) | (1 << 31),
+        6 | (2 << 6) | TEXTURE, // 8_8_8_8, k8in32
+        (n - 1) | ((n - 1) << 13),
+        (swizzle_yxz1 << 1) | (1 << 13), // exp_adjust 1, point filters
+        0,
+        1 << 9, // 2D
+    ];
+    let mut s = Stream::default();
+    s.setup()
+        .regs(RB_COLOR_INFO, &[RT_16_16_16_16_FLOAT << 16])
+        .shader(false, &vs_uv())
+        .shader(true, &ps_texture(1))
+        .vertex_fetch(0, VERTS, 15)
+        .regs(SHADER_CONSTANT_FETCH + 6, &fetch)
+        .draw_auto(PRIM_TRI_LIST, 3);
+    let report = run(&mut d, &s, &mut mem);
+    assert_eq!(report.draws, 1, "{report:?}");
+    assert!(report.unsupported.is_empty(), "{report:?}");
+    let raw = d
+        .read_render_target_raw(key(TargetFormat::Rgba16Float), 0, 0, W, H)
+        .unwrap();
+    // -1.8115 (rounded down), -2.0, 1.1338, 2.0.
+    assert_eq!(
+        halves(&texel(&raw, W, 8, 4, 4)),
+        [0xBF3F, 0xC000, 0x3C89, 0x4000]
+    );
+}
