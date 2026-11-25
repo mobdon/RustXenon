@@ -8,7 +8,8 @@
 //! cargo run --release -p xenon-draw --example bench -- [frames] [draws] [points] [resolves]
 //!
 //! A world frame is about `4 3000 384 40`. `XENON_PIPELINE_CACHE=<dir>`
-//! keeps the pipeline cache there (frame 0 shows the pipeline time).
+//! keeps the pipeline cache there (frame 0 shows the pipeline time);
+//! `XENON_GPU_TIMESTAMPS=1` prints GPU time per pass kind.
 
 #[path = "../tests/common/mod.rs"]
 mod common;
@@ -186,6 +187,10 @@ fn main() {
         total.textures_uploaded += t.textures_uploaded;
         total.submits += t.submits;
         total.pipelines_created += t.pipelines_created;
+        for (a, b) in total.gpu_passes.iter_mut().zip(t.gpu_passes) {
+            *a += b;
+        }
+        total.passes_timed += t.passes_timed;
     }
     let n = frames - 1;
     println!(
@@ -213,5 +218,14 @@ fn main() {
         t.pipelines_created / n,
         t.submits / n
     );
+    if t.passes_timed > 0 {
+        println!(
+            "  GPU (timestamps, {} passes): draw {:.2?}, clear {:.2?}, resolve {:.2?} per frame",
+            t.passes_timed / n,
+            t.gpu_passes[0] / n,
+            t.gpu_passes[1] / n,
+            t.gpu_passes[2] / n
+        );
+    }
     println!("  {}", d.memory_line());
 }

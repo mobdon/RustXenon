@@ -432,6 +432,12 @@ pub struct Timings {
     pub texture_groups_reused: u32,
     /// Render passes begun for draws: each target change or flush ends one.
     pub render_passes: u32,
+    /// GPU time measured by timestamps around the batch's draw passes,
+    /// clear passes and resolve copies, with
+    /// [`Drawer::enable_gpu_timestamps`] on (zero otherwise); and the
+    /// passes measured.
+    pub gpu_passes: [Duration; 3],
+    pub passes_timed: u32,
 }
 
 impl std::ops::AddAssign<&Timings> for Timings {
@@ -475,6 +481,59 @@ impl std::ops::AddAssign<&Timings> for Timings {
         self.texture_groups_reused += t.texture_groups_reused;
         self.queue += t.queue;
         self.render_passes += t.render_passes;
+        for (a, b) in self.gpu_passes.iter_mut().zip(t.gpu_passes) {
+            *a += b;
+        }
+        self.passes_timed += t.passes_timed;
+    }
+}
+
+/// Batch passes timed per flush; later ones in the same batch go untimed.
+const GPU_CLOCK_PASSES: u64 = 1024;
+
+/// Timestamp queries around the batch's passes, read back at each flush.
+struct GpuClock {
+    set: wgpu::QuerySet,
+    resolve: wgpu::Buffer,
+    read: wgpu::Buffer,
+    /// Kind of each timed pass in the batch: 0 draw, 1 clear, 2 resolve.
+    kinds: Vec<u8>,
+    /// Nanoseconds per tick.
+    period: f32,
+}
+
+impl GpuClock {
+    /// The query set and the begin and end indices for the next `kind`
+    /// pass, or `None` when the batch has timed as many as fit.
+    fn next(clock: &mut Option<GpuClock>, kind: u8) -> Option<(&wgpu::QuerySet, u32)> {
+        let c = clock.as_mut()?;
+        if c.kinds.len() as u64 >= GPU_CLOCK_PASSES {
+            return None;
+        }
+        c.kinds.push(kind);
+        Some((&c.set, 2 * (c.kinds.len() as u32 - 1)))
+    }
+
+    fn render(
+        clock: &mut Option<GpuClock>,
+        kind: u8,
+    ) -> Option<wgpu::RenderPassTimestampWrites<'_>> {
+        Self::next(clock, kind).map(|(query_set, i)| wgpu::RenderPassTimestampWrites {
+            query_set,
+            beginning_of_pass_write_index: Some(i),
+            end_of_pass_write_index: Some(i + 1),
+        })
+    }
+
+    fn compute(
+        clock: &mut Option<GpuClock>,
+        kind: u8,
+    ) -> Option<wgpu::ComputePassTimestampWrites<'_>> {
+        Self::next(clock, kind).map(|(query_set, i)| wgpu::ComputePassTimestampWrites {
+            query_set,
+            beginning_of_pass_write_index: Some(i),
+            end_of_pass_write_index: Some(i + 1),
+        })
     }
 }
 
@@ -1006,6 +1065,8 @@ pub struct Drawer {
     /// (such as a cube or 3D fetch) do not log.
     pub texture_log: Option<Option<u64>>,
     timings: Timings,
+    /// GPU timestamps around the batch's passes, when enabled.
+    gpu_clock: Option<GpuClock>,
     /// File name for the pipeline cache of this adapter, when the device
     /// has `PIPELINE_CACHE` (Vulkan only).
     cache_key: Option<String>,
@@ -1452,7 +1513,8 @@ impl Drawer {
             & (wgpu::Features::FLOAT32_FILTERABLE | wgpu::Features::TEXTURE_COMPRESSION_BC);
         required_features.set(wgpu::Features::DEPTH32FLOAT_STENCIL8, float_stencil);
         required_features.set(snorm16_features, snorm16);
-        required_features |= adapter.features() & wgpu::Features::PIPELINE_CACHE;
+        required_features |=
+            adapter.features() & (wgpu::Features::PIPELINE_CACHE | wgpu::Features::TIMESTAMP_QUERY);
         let (device, queue) = block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("xenon-draw"),
             required_limits: limits.clone(),
@@ -1529,7 +1591,7 @@ impl Drawer {
                 view_formats: &[],
             })
             .create_view(&Default::default());
-        Ok(Drawer {
+        let mut d = Drawer {
             instance,
             device,
             queue,
@@ -1606,6 +1668,7 @@ impl Drawer {
                     }
                 }),
             timings: Timings::default(),
+            gpu_clock: None,
             cache_key: required_features
                 .contains(wgpu::Features::PIPELINE_CACHE)
                 .then(|| wgpu::util::pipeline_cache_key(&info))
@@ -1614,7 +1677,48 @@ impl Drawer {
             uncaptured,
             max_dim: limits.max_texture_dimension_2d,
             max_storage: limits.max_storage_buffer_binding_size,
-        })
+        };
+        if std::env::var_os("XENON_GPU_TIMESTAMPS").is_some_and(|v| v != "0") {
+            d.enable_gpu_timestamps();
+        }
+        Ok(d)
+    }
+
+    /// Times the batch's draw, clear and resolve passes on the GPU with
+    /// timestamp queries, into [`Timings::gpu_passes`]. Each flush then
+    /// waits for its batch, so frames run slower and `submit` no longer
+    /// includes time queued behind the GPU. Returns false where the device
+    /// has no timestamp queries. `XENON_GPU_TIMESTAMPS=1` turns it on at
+    /// [`Drawer::new`].
+    pub fn enable_gpu_timestamps(&mut self) -> bool {
+        if !self
+            .device
+            .features()
+            .contains(wgpu::Features::TIMESTAMP_QUERY)
+        {
+            return false;
+        }
+        let size = 16 * GPU_CLOCK_PASSES;
+        let buffer = |usage| {
+            self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("gpu clock"),
+                size,
+                usage,
+                mapped_at_creation: false,
+            })
+        };
+        self.gpu_clock = Some(GpuClock {
+            set: self.device.create_query_set(&wgpu::QuerySetDescriptor {
+                label: Some("gpu clock"),
+                ty: wgpu::QueryType::Timestamp,
+                count: 2 * GPU_CLOCK_PASSES as u32,
+            }),
+            resolve: buffer(wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC),
+            read: buffer(wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST),
+            kinds: Vec::new(),
+            period: self.queue.get_timestamp_period(),
+        });
+        true
     }
 
     /// Keeps compiled pipelines in a file under `dir` (made if missing),
@@ -2260,23 +2364,58 @@ impl Drawer {
         };
         // Decodes first: the draws sample what they write, and they read
         // kept resolves written by work submitted before.
+        let clock = &self.gpu_clock;
         let bufs = pre
             .map(|e| e.finish())
             .into_iter()
             .chain(batch.map(|mut b| {
                 drop(b.pass.take());
+                if let Some(c) = clock.as_ref().filter(|c| !c.kinds.is_empty()) {
+                    let n = c.kinds.len() as u64;
+                    b.enc
+                        .resolve_query_set(&c.set, 0..2 * n as u32, &c.resolve, 0);
+                    b.enc
+                        .copy_buffer_to_buffer(&c.resolve, 0, &c.read, 0, 16 * n);
+                }
                 b.enc.finish()
             }));
-        self.queue.submit(bufs);
+        let index = self.queue.submit(bufs);
         self.submitted(site);
         // One reading for both, so `queue` never exceeds `submit`.
         let e = t.elapsed();
         self.timings.submit += e;
         self.timings.queue += e;
+        self.read_gpu_clock(index)?;
         match block_on(scope.pop()) {
             Some(e) => Err(Skip::Fatal(Error::Gpu(e.to_string()))),
             None => Ok(()),
         }
+    }
+
+    /// Waits for the timestamps of the batch just submitted (`index`) and
+    /// adds its passes' GPU time to the timings. The wait counts as GPU
+    /// wait; it also stops submits from queueing up behind the GPU.
+    fn read_gpu_clock(&mut self, index: wgpu::SubmissionIndex) -> Result<(), Skip> {
+        let Some(kinds) = self
+            .gpu_clock
+            .as_mut()
+            .filter(|c| !c.kinds.is_empty())
+            .map(|c| std::mem::take(&mut c.kinds))
+        else {
+            return Ok(());
+        };
+        let t = Instant::now();
+        let c = self.gpu_clock.as_ref().expect("clock");
+        let data = self.map_read(&c.read, index).map_err(Skip::Fatal)?;
+        let period = f64::from(c.period);
+        for (i, &kind) in kinds.iter().enumerate() {
+            let tick = |j: usize| u64::from_le_bytes(data[8 * j..][..8].try_into().unwrap());
+            let ns = tick(2 * i + 1).saturating_sub(tick(2 * i)) as f64 * period;
+            self.timings.gpu_passes[kind as usize] += Duration::from_nanos(ns as u64);
+        }
+        self.timings.passes_timed += kinds.len() as u32;
+        self.timings.gpu_wait += t.elapsed();
+        Ok(())
     }
 
     /// Forgets what the arena holds, to stage from its start again: the
@@ -2384,10 +2523,12 @@ impl Drawer {
                 .map(|t| t.as_ref().map(|t| t.create_view(&Default::default())));
             let depth_view = depth.map(|t| (t.format(), t.create_view(&Default::default())));
             self.timings.render_passes += 1;
+            let timestamp_writes = GpuClock::render(&mut self.gpu_clock, 0);
             let pass = batch
                 .enc
                 .begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("draw"),
+                    timestamp_writes,
                     color_attachments: &color_views.each_ref().map(|v| {
                         v.as_ref().map(|view| wgpu::RenderPassColorAttachment {
                             view,
@@ -4459,6 +4600,7 @@ impl Drawer {
         {
             let mut pass = batch.enc.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("clear"),
+                timestamp_writes: GpuClock::render(&mut self.gpu_clock, 1),
                 color_attachments: if is_depth { &[] } else { &color_attachment },
                 depth_stencil_attachment: is_depth.then(|| {
                     wgpu::RenderPassDepthStencilAttachment {
@@ -4860,7 +5002,10 @@ impl Drawer {
         });
         batch.pass = None;
         {
-            let mut pass = batch.enc.begin_compute_pass(&Default::default());
+            let mut pass = batch.enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("resolve"),
+                timestamp_writes: GpuClock::compute(&mut self.gpu_clock, 2),
+            });
             pass.set_pipeline(pipeline);
             pass.set_bind_group(0, &bg, &[]);
             pass.dispatch_workgroups(rect.width().div_ceil(8), rect.height().div_ceil(8), 1);

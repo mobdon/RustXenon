@@ -654,3 +654,40 @@ fn texture_bind_group_is_reused_across_a_resolve() {
     let img = d.read_render_target(COLOR_KEY, 0, 0, W, H).unwrap();
     assert_eq!(px(&img, W, 40, 40), GREEN);
 }
+
+#[test]
+fn gpu_timestamps_time_each_batch_pass() {
+    let Some(mut d) = drawer() else { return };
+    if !d.enable_gpu_timestamps() {
+        eprintln!("skipped: no timestamp queries on this device");
+        return;
+    }
+    let mut mem = memory();
+    let wf = W as f32;
+    rect(&mut mem, VERTS, wf, wf, RED);
+    rect(&mut mem, VERTS + 48, 32.0, 32.0, BLUE);
+    let mut s = Stream::default();
+    s.setup()
+        .shader(false, &vs_color())
+        .shader(true, &ps_interp())
+        .vertex_fetch(0, VERTS, 12)
+        .draw_auto(PRIM_RECT_LIST, 3)
+        .resolve(&mut mem, W, H, true, Some((rgba(GREEN), 0)))
+        .vertex_fetch(0, VERTS + 48, 12)
+        .draw_auto(PRIM_RECT_LIST, 3);
+    let report = run(&mut d, &s, &mut mem);
+    let t = &report.timings;
+    eprintln!("{:?} over {} passes", t.gpu_passes, t.passes_timed);
+    // Two draw passes, the resolve copy and its clear at least.
+    assert!(t.passes_timed >= 4, "{t:?}");
+    assert!(t.gpu_passes[0] > std::time::Duration::ZERO, "{t:?}");
+    // Timing changes nothing drawn.
+    let copy = detiled(&mem, DEST, W, H, W, 4);
+    assert_eq!(px(&copy, W, 40, 40), RED);
+    let img = d.read_render_target(COLOR_KEY, 0, 0, W, H).unwrap();
+    assert_eq!(px(&img, W, 10, 10), BLUE);
+    assert_eq!(px(&img, W, 40, 40), GREEN);
+    // A second replay reads only its own passes.
+    let again = run(&mut d, &s, &mut mem).timings;
+    assert_eq!(again.passes_timed, t.passes_timed, "{again:?}");
+}
