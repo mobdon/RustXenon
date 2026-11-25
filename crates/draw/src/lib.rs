@@ -91,6 +91,13 @@
 //! wrapper around the translated vertex shader that makes the fourth corner
 //! from the three guest vertices after the vertex shader, as Xenia's
 //! geometry shader does (`rect_list_wgsl`); they are never face culled.
+//! Point lists draw one-pixel host points: `PA_SU_POINT_SIZE` is not
+//! applied.
+//!
+//! Draws are recorded into one command buffer, in one render pass while
+//! their render targets stay the same, with their buffers as slices of one
+//! upload arena; the batch is submitted before each resolve and at the end
+//! of [`Drawer::replay`].
 //!
 //! Draws while RB_SURFACE_INFO's pitch is 0 rasterize nothing, as in Xenia
 //! (`IsRasterizationPotentiallyDone`): Direct3D draws before its first
@@ -231,6 +238,8 @@ pub struct Timings {
     /// Counts: pipelines and shader modules created, textures uploaded.
     pub pipelines_created: u32,
     pub textures_uploaded: u32,
+    /// Command buffer submissions for draws, clears and 32bpp resolves.
+    pub submits: u32,
     pub texture_bytes: u64,
     pub guest_bytes: u64,
 }
@@ -448,6 +457,19 @@ pub struct Drawer {
     /// guest bytes they read, so an unchanged texture is not decoded again.
     texture_cache: HashMap<([u32; 6], u64), wgpu::TextureView>,
     texture_cache_bytes: u64,
+    /// Textures already looked up this replay by fetch constant. Guest
+    /// memory only changes at a resolve or MEM_WRITE during a replay, which
+    /// clear it, so later draws skip reading and hashing the guest bytes.
+    texture_memo: HashMap<[u32; 6], wgpu::TextureView>,
+    samplers: HashMap<([u8; 3], u8, u8), wgpu::Sampler>,
+    /// Draws recorded but not yet submitted (see [`Batch`]).
+    batch: Option<Batch>,
+    /// Draw buffers (guest window, constants, epilogue, indices) of the
+    /// batch, as slices of `arena`, written to it once at submit.
+    staged: Vec<u8>,
+    arena: Option<wgpu::Buffer>,
+    arena_align: u64,
+    max_buffer: u64,
     /// Compute pipeline of resolve.wgsl, made on the first 32bpp resolve.
     /// Colour, depth and depth + stencil entry points of resolve.wgsl.
     resolve_pipelines: [Option<wgpu::ComputePipeline>; 3],
@@ -458,6 +480,22 @@ pub struct Drawer {
     max_dim: u32,
     max_storage: u64,
 }
+
+/// Draws recorded into one command encoder, in one render pass while the
+/// render targets stay the same. Submitted by [`Drawer::flush`] before
+/// anything that reads or writes the targets outside the batch (resolves
+/// and clears) and at the end of a replay.
+struct Batch {
+    /// Dropped (ended) before `enc` is finished.
+    pass: Option<(PassKey, wgpu::RenderPass<'static>)>,
+    enc: wgpu::CommandEncoder,
+}
+
+/// Colour and depth targets of a render pass.
+type PassKey = ([Option<RenderTargetKey>; 4], Option<RenderTargetKey>);
+
+/// Smallest draw upload arena; it grows to fit a larger draw.
+const ARENA_MIN: u64 = 16 << 20;
 
 /// Time since `t`, restarting `t`.
 fn lap(t: &mut Instant) -> Duration {
@@ -750,6 +788,17 @@ impl Drawer {
             resolved_endian: HashMap::new(),
             texture_cache: HashMap::new(),
             texture_cache_bytes: 0,
+            texture_memo: HashMap::new(),
+            samplers: HashMap::new(),
+            batch: None,
+            staged: Vec::new(),
+            arena: None,
+            arena_align: u64::from(
+                limits
+                    .min_uniform_buffer_offset_alignment
+                    .max(limits.min_storage_buffer_offset_alignment),
+            ),
+            max_buffer: limits.max_buffer_size,
             resolve_pipelines: [None, None, None],
             float_stencil,
             timings: Timings::default(),
@@ -779,6 +828,37 @@ impl Drawer {
     ) -> Result<Report, Error> {
         let mut report = Report::default();
         self.timings = Timings::default();
+        self.texture_memo.clear();
+        let done = self.replay_commands(commands, mem, &mut report);
+        // On an error the batch is dropped unsubmitted.
+        let done = done.and_then(|()| {
+            self.flush().map_err(|e| match e {
+                Skip::Fatal(e) => e,
+                Skip::Unsupported(why) => Error::Gpu(why),
+            })
+        });
+        self.batch = None;
+        self.staged.clear();
+        done?;
+        // Counts made where only the report is mutable.
+        let t = &report.timings;
+        let (uploaded, tex_bytes, guest_bytes) =
+            (t.textures_uploaded, t.texture_bytes, t.guest_bytes);
+        report.timings = Timings {
+            textures_uploaded: uploaded,
+            texture_bytes: tex_bytes,
+            guest_bytes,
+            ..std::mem::take(&mut self.timings)
+        };
+        Ok(report)
+    }
+
+    fn replay_commands(
+        &mut self,
+        commands: &[Command],
+        mem: &mut dyn GuestMemory,
+        report: &mut Report,
+    ) -> Result<(), Error> {
         for c in commands {
             let done = match c {
                 Command::WriteRegisters { base, values } => {
@@ -808,12 +888,16 @@ impl Drawer {
                     }
                     Ok(())
                 }
-                Command::Draw(d) => self.draw(d, mem, &mut report).map(|drawn| {
+                Command::Draw(d) => self.draw(d, mem, report).map(|drawn| {
                     report.draws += u32::from(drawn);
                 }),
-                Command::Resolve(r) => self.resolve(r, mem, &mut report).map(|done| {
-                    report.resolves += u32::from(done);
-                }),
+                Command::Resolve(r) => {
+                    let done = self.resolve(r, mem, report).map(|done| {
+                        report.resolves += u32::from(done);
+                    });
+                    self.texture_memo.clear();
+                    done
+                }
                 Command::Swap {
                     signature_ok,
                     frontbuffer,
@@ -837,6 +921,7 @@ impl Drawer {
                     endian,
                     values,
                 } => {
+                    self.texture_memo.clear();
                     for (i, &v) in values.iter().enumerate() {
                         let a = addr.wrapping_add(4 * i as u32);
                         if !mem.write_bytes(a, &endian.to_guest_bytes(v)) {
@@ -854,17 +939,118 @@ impl Drawer {
             }
             self.check_uncaptured()?;
         }
-        // Counts made where only the report is mutable.
-        let t = &report.timings;
-        let (uploaded, tex_bytes, guest_bytes) =
-            (t.textures_uploaded, t.texture_bytes, t.guest_bytes);
-        report.timings = Timings {
-            textures_uploaded: uploaded,
-            texture_bytes: tex_bytes,
-            guest_bytes,
-            ..std::mem::take(&mut self.timings)
+        Ok(())
+    }
+
+    /// Submits the batched draws, with their staged buffers.
+    fn flush(&mut self) -> Result<(), Skip> {
+        if let (Some(arena), false) = (&self.arena, self.staged.is_empty()) {
+            self.queue.write_buffer(arena, 0, &self.staged);
+            self.staged.clear();
+        }
+        let Some(mut batch) = self.batch.take() else {
+            return Ok(());
         };
-        Ok(report)
+        let t = Instant::now();
+        let scope = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
+        drop(batch.pass.take());
+        self.queue.submit([batch.enc.finish()]);
+        self.timings.submits += 1;
+        self.timings.submit += t.elapsed();
+        match block_on(scope.pop()) {
+            Some(e) => Err(Skip::Fatal(Error::Gpu(e.to_string()))),
+            None => Ok(()),
+        }
+    }
+
+    /// Copies `parts` into the batch's staging area, each at an offset
+    /// aligned for uniform and storage bindings, and returns their
+    /// (offset, size) in the arena. Submits the batch first when the arena
+    /// is full, and grows the arena when one draw does not fit.
+    fn stage(&mut self, parts: &[&[u8]]) -> Result<Vec<(u64, u64)>, Skip> {
+        let size = |p: &[u8]| (p.len() as u64).max(4).next_multiple_of(4);
+        let align = self.arena_align;
+        let need: u64 = parts.iter().map(|p| size(p).next_multiple_of(align)).sum();
+        let have = self.arena.as_ref().map_or(0, |b| b.size());
+        if self.staged.len() as u64 + need > have {
+            self.flush()?;
+            if need > have {
+                if need > self.max_buffer {
+                    return unsupported(format!("{need} bytes of draw data"));
+                }
+                self.arena = Some(self.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("draw arena"),
+                    size: need.max(ARENA_MIN).next_power_of_two().min(self.max_buffer),
+                    usage: wgpu::BufferUsages::STORAGE
+                        | wgpu::BufferUsages::UNIFORM
+                        | wgpu::BufferUsages::INDEX
+                        | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                }));
+            }
+        }
+        let mut out = Vec::with_capacity(parts.len());
+        for p in parts {
+            let off = self.staged.len() as u64;
+            self.staged.extend_from_slice(p);
+            self.staged.resize((off + size(p)) as usize, 0);
+            out.push((off, size(p)));
+            let end = self.staged.len() as u64;
+            self.staged.resize(end.next_multiple_of(align) as usize, 0);
+        }
+        Ok(out)
+    }
+
+    /// The batch's render pass, begun on `key`'s targets unless the current
+    /// pass already draws to them.
+    fn pass(
+        &mut self,
+        key: PassKey,
+        color: &[Option<wgpu::Texture>; 4],
+        depth: Option<&wgpu::Texture>,
+    ) -> &mut wgpu::RenderPass<'static> {
+        let device = &self.device;
+        let batch = self.batch.get_or_insert_with(|| Batch {
+            pass: None,
+            enc: device.create_command_encoder(&Default::default()),
+        });
+        if batch.pass.as_ref().map(|p| &p.0) != Some(&key) {
+            batch.pass = None;
+            fn keep<V>() -> wgpu::Operations<V> {
+                wgpu::Operations {
+                    load: wgpu::LoadOp::Load,
+                    store: wgpu::StoreOp::Store,
+                }
+            }
+            let color_views = color
+                .each_ref()
+                .map(|t| t.as_ref().map(|t| t.create_view(&Default::default())));
+            let depth_view = depth.map(|t| (t.format(), t.create_view(&Default::default())));
+            let pass = batch
+                .enc
+                .begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("draw"),
+                    color_attachments: &color_views.each_ref().map(|v| {
+                        v.as_ref().map(|view| wgpu::RenderPassColorAttachment {
+                            view,
+                            depth_slice: None,
+                            resolve_target: None,
+                            ops: keep(),
+                        })
+                    }),
+                    depth_stencil_attachment: depth_view.as_ref().map(|(format, view)| {
+                        wgpu::RenderPassDepthStencilAttachment {
+                            view,
+                            depth_ops: Some(keep()),
+                            stencil_ops: format.has_stencil_aspect().then(keep),
+                        }
+                    }),
+                    ..Default::default()
+                })
+                .forget_lifetime();
+            batch.pass = Some((key, pass));
+        }
+        &mut batch.pass.as_mut().expect("pass begun").1
     }
 
     fn check_uncaptured(&self) -> Result<(), Error> {
@@ -1188,7 +1374,7 @@ impl Drawer {
         mask: u128,
         mem: &dyn GuestMemory,
         report: &mut Report,
-    ) -> Result<(wgpu::Buffer, u32), Skip> {
+    ) -> Result<(Vec<u8>, u32), Skip> {
         let (mut lo, mut hi) = (u64::MAX, 0u64);
         for k in (0..96).filter(|k| mask & (1u128 << k) != 0) {
             let vf = self.regs.vertex_fetch(k);
@@ -1217,10 +1403,7 @@ impl Drawer {
             };
             (lo as u32, b)
         };
-        Ok((
-            self.buffer("guest window", &bytes, wgpu::BufferUsages::STORAGE),
-            base,
-        ))
+        Ok((bytes, base))
     }
 
     fn buffer(&self, label: &str, bytes: &[u8], usage: wgpu::BufferUsages) -> wgpu::Buffer {
@@ -1261,6 +1444,10 @@ impl Drawer {
         if fetch.fetch_type != 2 {
             return unsupported(format!("texture slot {n} has no texture fetch constant"));
         }
+        let sampler = self.sampler(&fetch, report);
+        if let Some(view) = self.texture_memo.get(&self.regs.fetch_constant(n)) {
+            return Ok((view.clone(), sampler));
+        }
         let addr = fetch.base_address & PHYSICAL_MASK;
         let bytes = xenon_texture::bytes_needed(&fetch)
             .and_then(|len| {
@@ -1272,8 +1459,8 @@ impl Drawer {
             })
             .map_err(|e| Skip::Unsupported(format!("texture slot {n}: {e}")))?;
         let key = (self.regs.fetch_constant(n), hash_bytes(&bytes));
-        let sampler = self.sampler(&fetch, report);
         if let Some(view) = self.texture_cache.get(&key) {
+            self.texture_memo.insert(key.0, view.clone());
             return Ok((view.clone(), sampler));
         }
         let img = xenon_texture::decode_base_level(&fetch, &bytes)
@@ -1321,10 +1508,15 @@ impl Drawer {
         }
         self.texture_cache_bytes += len;
         self.texture_cache.insert(key, view.clone());
+        self.texture_memo.insert(key.0, view.clone());
         Ok((view, sampler))
     }
 
-    fn sampler(&self, fetch: &xenon_texture::TextureFetch, report: &mut Report) -> wgpu::Sampler {
+    fn sampler(
+        &mut self,
+        fetch: &xenon_texture::TextureFetch,
+        report: &mut Report,
+    ) -> wgpu::Sampler {
         let mut addr_mode = |c: u8| {
             let (m, exact) = sampler_address(c);
             if !exact {
@@ -1332,15 +1524,22 @@ impl Drawer {
             }
             m
         };
-        self.device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("guest sampler"),
-            address_mode_u: addr_mode(fetch.clamp[0]),
-            address_mode_v: addr_mode(fetch.clamp[1]),
-            address_mode_w: addr_mode(fetch.clamp[2]),
-            mag_filter: filter(fetch.mag_filter),
-            min_filter: filter(fetch.min_filter),
-            ..Default::default()
-        })
+        let modes = fetch.clamp.map(&mut addr_mode);
+        let device = &self.device;
+        self.samplers
+            .entry((fetch.clamp, fetch.mag_filter, fetch.min_filter))
+            .or_insert_with(|| {
+                device.create_sampler(&wgpu::SamplerDescriptor {
+                    label: Some("guest sampler"),
+                    address_mode_u: modes[0],
+                    address_mode_v: modes[1],
+                    address_mode_w: modes[2],
+                    mag_filter: filter(fetch.mag_filter),
+                    min_filter: filter(fetch.min_filter),
+                    ..Default::default()
+                })
+            })
+            .clone()
     }
 
     /// Draws `d`; Ok(false) when the state makes it draw nothing.
@@ -1595,16 +1794,8 @@ impl Drawer {
         self.timings.shaders += lap(&mut t);
 
         let (window, window_base) = self.guest_window(vf_mask, mem, report)?;
-        let consts = self.buffer(
-            "consts",
-            &self.consts(window_base),
-            wgpu::BufferUsages::UNIFORM,
-        );
-        let epi = self.buffer(
-            "epilogue",
-            &to_bytes(&state::epilogue(&self.regs, w, h)),
-            wgpu::BufferUsages::UNIFORM,
-        );
+        let consts = self.consts(window_base);
+        let epi = to_bytes(&state::epilogue(&self.regs, w, h));
         self.timings.guest_data += lap(&mut t);
         let mut textures = Vec::new();
         for n in (0..32).filter(|n| tex_mask & (1 << n) != 0) {
@@ -1613,39 +1804,25 @@ impl Drawer {
         self.timings.textures += lap(&mut t);
         // Rectangle lists read their guest indices in the vertex shader and
         // draw 6 host vertices per rectangle without an index buffer.
-        let index_buf = self.buffer("indices", &to_bytes(&idx), wgpu::BufferUsages::INDEX);
-        let rect_indices = self.buffer(
-            "rectangle indices",
-            &if rect_list {
-                to_bytes(&idx)
-            } else {
-                Vec::new()
-            },
-            wgpu::BufferUsages::STORAGE,
-        );
-
-        let scope = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let idx_bytes = to_bytes(&idx);
+        let rect_indices: &[u8] = if rect_list { &idx_bytes } else { &[] };
+        let slices = self.stage(&[&window, &consts, &epi, rect_indices, &idx_bytes])?;
+        let arena = self.arena.clone().expect("staged");
+        let binding = |i: usize| {
+            let (offset, size) = slices[i];
+            wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                buffer: &arena,
+                offset,
+                size: wgpu::BufferSize::new(size),
+            })
+        };
         let g0 = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("draw group 0"),
             layout: &self.group0,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: window.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: consts.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: epi.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: rect_indices.as_entire_binding(),
-                },
-            ],
+            entries: &[0, 1, 2, 3].map(|i| wgpu::BindGroupEntry {
+                binding: i as u32,
+                resource: binding(i),
+            }),
         });
         let mut entries = Vec::new();
         for (n, (view, sampler)) in &textures {
@@ -1663,70 +1840,32 @@ impl Drawer {
             layout: &g1_layout,
             entries: &entries,
         });
-        let color_views = color_tex
-            .each_ref()
-            .map(|t| t.as_ref().map(|t| t.create_view(&Default::default())));
-        let depth_view = depth_tex
-            .as_ref()
-            .map(|t| t.create_view(&Default::default()));
-        let mut enc = self.device.create_command_encoder(&Default::default());
-        {
-            let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("draw"),
-                color_attachments: &color_views.each_ref().map(|v| {
-                    v.as_ref().map(|view| wgpu::RenderPassColorAttachment {
-                        view,
-                        depth_slice: None,
-                        resolve_target: None,
-                        ops: wgpu::Operations {
-                            load: wgpu::LoadOp::Load,
-                            store: wgpu::StoreOp::Store,
-                        },
-                    })
-                }),
-                depth_stencil_attachment: depth_view.as_ref().map(|view| {
-                    wgpu::RenderPassDepthStencilAttachment {
-                        view,
-                        depth_ops: Some(wgpu::Operations {
-                            load: wgpu::LoadOp::Load,
-                            store: wgpu::StoreOp::Store,
-                        }),
-                        stencil_ops: depth_format
-                            .is_some_and(|f| f.has_stencil_aspect())
-                            .then_some(wgpu::Operations {
-                                load: wgpu::LoadOp::Load,
-                                store: wgpu::StoreOp::Store,
-                            }),
-                    }
-                }),
-                ..Default::default()
-            });
-            pass.set_pipeline(&pipeline);
-            pass.set_bind_group(0, &g0, &[]);
-            pass.set_bind_group(1, &g1, &[]);
-            pass.set_index_buffer(index_buf.slice(..), wgpu::IndexFormat::Uint32);
-            pass.set_viewport(0.0, 0.0, w as f32, h as f32, 0.0, 1.0);
-            pass.set_scissor_rect(sx, sy, sw, sh);
-            if let Some((_, reference)) = &stencil {
-                pass.set_stencil_reference(*reference);
-            }
-            pass.set_blend_constant(wgpu::Color {
-                r: f64::from(blend_rgba[0]),
-                g: f64::from(blend_rgba[1]),
-                b: f64::from(blend_rgba[2]),
-                a: f64::from(blend_rgba[3]),
-            });
-            if rect_list {
-                pass.draw(0..idx.len() as u32 * 2, 0..1);
-            } else {
-                pass.draw_indexed(0..idx.len() as u32, 0, 0..1);
-            }
+        let pass = self.pass((color, depth_key), &color_tex, depth_tex.as_ref());
+        pass.set_pipeline(&pipeline);
+        pass.set_bind_group(0, &g0, &[]);
+        pass.set_bind_group(1, &g1, &[]);
+        let (offset, size) = slices[4];
+        pass.set_index_buffer(
+            arena.slice(offset..offset + size),
+            wgpu::IndexFormat::Uint32,
+        );
+        pass.set_viewport(0.0, 0.0, w as f32, h as f32, 0.0, 1.0);
+        pass.set_scissor_rect(sx, sy, sw, sh);
+        if let Some((_, reference)) = &stencil {
+            pass.set_stencil_reference(*reference);
         }
-        self.queue.submit([enc.finish()]);
+        pass.set_blend_constant(wgpu::Color {
+            r: f64::from(blend_rgba[0]),
+            g: f64::from(blend_rgba[1]),
+            b: f64::from(blend_rgba[2]),
+            a: f64::from(blend_rgba[3]),
+        });
+        if rect_list {
+            pass.draw(0..idx.len() as u32 * 2, 0..1);
+        } else {
+            pass.draw_indexed(0..idx.len() as u32, 0, 0..1);
+        }
         self.timings.submit += lap(&mut t);
-        if let Some(e) = block_on(scope.pop()) {
-            return Err(Skip::Fatal(Error::Gpu(e.to_string())));
-        }
         Ok(true)
     }
 
@@ -1874,6 +2013,7 @@ impl Drawer {
             pass.draw(0..3, 0..1);
         }
         self.queue.submit([enc.finish()]);
+        self.timings.submits += 1;
         match block_on(scope.pop()) {
             Some(e) => Err(Skip::Fatal(Error::Gpu(e.to_string()))),
             None => Ok(()),
@@ -1896,6 +2036,8 @@ impl Drawer {
         mem: &mut dyn GuestMemory,
         report: &mut Report,
     ) -> Result<bool, Skip> {
+        // The copy and clears see every draw before them.
+        self.flush()?;
         if r.msaa_samples != 0 {
             report.warn("MSAA surfaces drawn and resolved single-sampled");
         }
@@ -2059,7 +2201,11 @@ impl Drawer {
             ))
             .into());
         }
+        // Waiting here only splits the rendering from the resolve in the
+        // timings: the readback waits for it anyway.
         let mut t = Instant::now();
+        self.wait_idle()?;
+        self.timings.gpu_wait += lap(&mut t);
         let base = r.dest_base & PHYSICAL_MASK;
         let pitch = xenon_texture::tile::align_to_tile(r.dest_pitch);
         let extent = xenon_texture::tile::tiled_extent_2d(rect.x1, rect.y1, pitch, 4)
@@ -2179,6 +2325,7 @@ impl Drawer {
         }
         enc.copy_buffer_to_buffer(&dest, 0, &readback, 0, dest.size());
         let index = self.queue.submit([enc.finish()]);
+        self.timings.submits += 1;
         if let Some(e) = block_on(scope.pop()) {
             return Err(Skip::Fatal(Error::Gpu(e.to_string())));
         }
