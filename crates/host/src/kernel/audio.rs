@@ -7,7 +7,8 @@ use super::*;
 /// (callback record, driver out). The record holds the callback and its
 /// argument. The callback asks the title for the next 256-sample frame;
 /// it runs on a thread of its own at the console's rate (48 kHz / 256, one
-/// call every 5.33 ms). The first client's thread also ticks the mixer.
+/// call every 5.33 ms). The first client with a callback also ticks the
+/// mixer.
 pub fn x_audio_register_render_driver_client(rt: &Runtime, c: &mut Context) {
     let (rec, out) = (arg(rt, c, 0), arg(rt, c, 1));
     let (f, user) = (rt.mem.read_u32(rec), rt.mem.read_u32(rec + 4));
@@ -15,7 +16,9 @@ pub fn x_audio_register_render_driver_client(rt: &Runtime, c: &mut Context) {
     if out != 0 {
         rt.mem.write_u32(out, 0x4155_0000 | n);
     }
+    // Only the first client with a callback ticks the mixer.
     if f != 0 {
+        let ticks = !TICKING.swap(true, Ordering::Relaxed);
         let rt = crate::runtime();
         std::thread::Builder::new()
             .name(format!("audio-{n}"))
@@ -29,7 +32,7 @@ pub fn x_audio_register_render_driver_client(rt: &Runtime, c: &mut Context) {
                     let mut c = base.clone();
                     c.r[3] = user as u64;
                     rt.call(&mut c, f);
-                    if n == 0 {
+                    if ticks {
                         super::sound::tick();
                     }
                 }
@@ -40,6 +43,7 @@ pub fn x_audio_register_render_driver_client(rt: &Runtime, c: &mut Context) {
 }
 
 static CLIENTS: AtomicU32 = AtomicU32::new(0);
+static TICKING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 pub fn x_audio_unregister_render_driver_client(_: &Runtime, c: &mut Context) {
     ret(c, STATUS_SUCCESS);
