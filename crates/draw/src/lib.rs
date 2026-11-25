@@ -11,9 +11,12 @@
 // shader in src/xenia/gpu/vulkan/vulkan_pipeline_cache.cc, no face culling
 // for rectangle lists follows IsPrimitivePolygonal in draw_util.h, and the
 // surface pitch 0 skip follows IsRasterizationPotentiallyDone in
-// draw_util.cc, and pixel parameter generation setup follows
+// draw_util.cc; pixel parameter generation setup follows
 // Shader::GetInterpolatorInputMask in shader_translator.cc and the pixel
-// shader modification in vulkan/vulkan_pipeline_cache.cc (BSD 3-Clause, see
+// shader modification in vulkan/vulkan_pipeline_cache.cc; EDRAM ownership
+// transfers between colour and depth (and the per-bit stencil passes without
+// stencil export) follow src/xenia/gpu/render_target_cache.cc and the
+// transfer shaders of d3d12/d3d12_render_target_cache.cc (BSD 3-Clause, see
 // CREDITS.md).
 
 //! `xenon-draw`: a headless wgpu drawer for recorded Xenos command lists.
@@ -28,11 +31,27 @@
 //! # EDRAM model
 //!
 //! Every render target is its own wgpu texture keyed by
-//! [`RenderTargetKey`]: EDRAM base tile, surface pitch and format. Aliasing
-//! between targets that share EDRAM tiles (another format, another pitch,
-//! another base inside the same range) is not modelled: each key has its
-//! own pixels. A target is `pitch` pixels wide and [`RENDER_TARGET_HEIGHT`]
-//! pixels high (the EDRAM holds 2048 rows of 1280 32-bit pixels).
+//! [`RenderTargetKey`]: EDRAM base tile, surface pitch and format. A target
+//! is `pitch` pixels wide and [`RENDER_TARGET_HEIGHT`] pixels high (the
+//! EDRAM holds 2048 rows of 1280 32-bit pixels).
+//!
+//! Each target records when it was last written (draw or clear; a transfer
+//! gives the target its source's stamp, so neither is transferred back).
+//! When a draw, clear or resolve uses a target and a `k_8_8_8_8` colour
+//! and a depth target at the same base and pitch were written later by
+//! the other one, that one's pixels are first transferred into it, as
+//! Xenia's render target cache transfers EDRAM ownership: they are drawn
+//! as the shared 32-bit EDRAM word (colour `r | g << 8 | b << 16 | a <<
+//! 24`; depth `depth24 << 8 | stencil`, converted like the depth clear and
+//! the depth resolve) by the fullscreen passes of `transfer.wgsl`. Colour
+//! to depth writes `frag_depth`, then, without shader stencil export, sets
+//! the stencil one bit per pass as Xenia does. Other aliasing is not
+//! modelled: each key keeps its own pixels. A newer target at the same
+//! base and pitch that cannot be transferred (depth to depth, or depth and
+//! a colour format other than `k_8_8_8_8`), or a newer target at another
+//! base or pitch whose tiles overlap (estimated from the rows written, one
+//! sample per pixel), is only reported in [`Report::warnings`]; colour
+//! targets of different formats at one base are not reported.
 //!
 //! Colour targets ([`TargetFormat`]; formats with one bit layout share a
 //! key):
@@ -118,8 +137,8 @@
 //!
 //! Draws are recorded into one command buffer, in one render pass while
 //! their render targets stay the same, with their buffers as slices of one
-//! upload arena; the batch is submitted before each resolve and at the end
-//! of [`Drawer::replay`].
+//! upload arena; the batch is submitted before each resolve, before each
+//! EDRAM ownership transfer and at the end of [`Drawer::replay`].
 //!
 //! Draws while RB_SURFACE_INFO's pitch is 0 rasterize nothing, as in Xenia
 //! (`IsRasterizationPotentiallyDone`): Direct3D draws before its first
@@ -261,7 +280,8 @@ pub struct Timings {
     /// Counts: pipelines and shader modules created, textures uploaded.
     pub pipelines_created: u32,
     pub textures_uploaded: u32,
-    /// Command buffer submissions for draws, clears and 32bpp resolves.
+    /// Command buffer submissions for draws, clears, EDRAM transfers and
+    /// 32bpp resolves.
     pub submits: u32,
     pub texture_bytes: u64,
     pub guest_bytes: u64,
@@ -475,6 +495,37 @@ fn ps_depth() {
 }
 ";
 
+/// The last write to a render target.
+#[derive(Clone, Copy, Default)]
+struct Written {
+    stamp: u64,
+    /// Rows written so far, at least (scissor or rectangle bottom).
+    rows: u32,
+}
+
+/// EDRAM tiles `[start, end)` that `k` covers down to row `rows`.
+// shortcut: one sample per pixel and no wrap past tile 2048; count MSAA
+// samples and wrap if a capture's overlap report needs to be exact.
+fn edram_range(k: RenderTargetKey, rows: u32) -> (u32, u32) {
+    let tile_width = if k.format == TargetFormat::Rgba16Float {
+        40
+    } else {
+        80
+    };
+    let len = k.pitch.div_ceil(tile_width) * rows.div_ceil(16);
+    (k.base_tiles, k.base_tiles + len)
+}
+
+/// Whether the EDRAM word of a target of format `a` can be transferred to
+/// one of format `b`: k_8_8_8_8 colour to or from depth.
+// shortcut: depth <-> depth (D24S8 / D24FS8) and depth <-> colour formats
+// other than k_8_8_8_8 (k_32_FLOAT, 2_10_10_10, ...) are not transferred,
+// only reported; add their word conversions to transfer.wgsl when a capture
+// aliases them.
+fn transferable(a: TargetFormat, b: TargetFormat) -> bool {
+    (a == TargetFormat::Rgba8 && b.is_depth()) || (a.is_depth() && b == TargetFormat::Rgba8)
+}
+
 /// Replays recorded command lists on a headless wgpu device.
 pub struct Drawer {
     device: wgpu::Device,
@@ -498,6 +549,16 @@ pub struct Drawer {
     clear_module: wgpu::ShaderModule,
     clear_pipelines: HashMap<wgpu::TextureFormat, wgpu::RenderPipeline>,
     targets: HashMap<RenderTargetKey, wgpu::Texture>,
+    /// When each render target was last written (draw or clear; a transfer
+    /// copies its source's stamp) and how many rows down, for EDRAM
+    /// ownership transfers.
+    written: HashMap<RenderTargetKey, Written>,
+    clock: u64,
+    transfer_module: Option<wgpu::ShaderModule>,
+    /// Keyed by source and destination host format and pass (stencil bit
+    /// 0..8, or 8 for the depth or colour pass).
+    transfer_pipelines:
+        HashMap<(wgpu::TextureFormat, wgpu::TextureFormat, u32), wgpu::RenderPipeline>,
     /// Destination endian of the last 32bpp resolve to each guest address,
     /// so a swap reads its front buffer in the byte order it was written.
     resolved_endian: HashMap<u32, u32>,
@@ -542,8 +603,8 @@ pub struct Drawer {
 
 /// Draws recorded into one command encoder, in one render pass while the
 /// render targets stay the same. Submitted by [`Drawer::flush`] before
-/// anything that reads or writes the targets outside the batch (resolves
-/// and clears) and at the end of a replay.
+/// anything that reads or writes the targets outside the batch (resolves,
+/// clears and EDRAM transfers) and at the end of a replay.
 struct Batch {
     /// Dropped (ended) before `enc` is finished.
     pass: Option<(PassKey, wgpu::RenderPass<'static>)>,
@@ -905,6 +966,10 @@ impl Drawer {
             clear_module,
             clear_pipelines: HashMap::new(),
             targets: HashMap::new(),
+            written: HashMap::new(),
+            clock: 0,
+            transfer_module: None,
+            transfer_pipelines: HashMap::new(),
             resolved_endian: HashMap::new(),
             texture_cache: HashMap::new(),
             texture_cache_bytes: 0,
@@ -1346,7 +1411,17 @@ impl Drawer {
         Ok(out)
     }
 
-    fn target(&mut self, key: RenderTargetKey) -> Result<wgpu::Texture, Skip> {
+    /// The texture of render target `key`, made current first: when another
+    /// target at the same EDRAM base and pitch was written after it, that
+    /// target's pixels are transferred into it (the EDRAM holds one set of
+    /// bytes for both). `rows` is how far down this use reaches, for the
+    /// overlap report.
+    fn target(
+        &mut self,
+        key: RenderTargetKey,
+        rows: u32,
+        report: &mut Report,
+    ) -> Result<wgpu::Texture, Skip> {
         if key.pitch == 0 || key.pitch > self.max_dim {
             return unsupported(format!("surface pitch {}", key.pitch));
         }
@@ -1358,7 +1433,7 @@ impl Drawer {
         }
         let host_format = self.host_format(key.format);
         let (device, height) = (&self.device, RENDER_TARGET_HEIGHT.min(self.max_dim));
-        Ok(self
+        let tex = self
             .targets
             .entry(key)
             .or_insert_with(|| {
@@ -1380,7 +1455,277 @@ impl Drawer {
                     view_formats: &[],
                 })
             })
-            .clone())
+            .clone();
+        let own = self.written.get(&key).copied().unwrap_or_default();
+        let range = edram_range(key, rows.max(own.rows));
+        let mut newest: Option<(RenderTargetKey, Written)> = None;
+        for (&k, &w) in &self.written {
+            if w.stamp <= own.stamp || k == key {
+                continue;
+            }
+            if k.base_tiles == key.base_tiles && k.pitch == key.pitch {
+                // shortcut: colour targets of different formats at one base
+                // keep their own pixels, silently; transfer them too if a
+                // capture reinterprets colour in place.
+                let with_depth = k.format.is_depth() || key.format.is_depth();
+                if with_depth && newest.is_none_or(|(_, n)| w.stamp > n.stamp) {
+                    newest = Some((k, w));
+                }
+            } else {
+                let other = edram_range(k, w.rows);
+                // shortcut: partial overlaps (another base or pitch) are only
+                // reported; transfer the overlapping tiles if a capture
+                // needs them.
+                if range.0 < other.1 && other.0 < range.1 {
+                    report.warn(
+                        "render target overlaps a newer one at another EDRAM base or pitch; not transferred",
+                    );
+                }
+            }
+        }
+        if let Some((src, w)) = newest {
+            if transferable(src.format, key.format) {
+                self.transfer(src, key, &tex, w.rows)?;
+                // Both now hold the same words: the source's stamp, so
+                // using the source again does not transfer them back.
+                let own = self.written.entry(key).or_default();
+                own.stamp = w.stamp;
+                own.rows = own.rows.max(w.rows);
+            } else {
+                report.warn(format!(
+                    "{:?} render target aliases a newer {:?} one at its EDRAM base; not transferred",
+                    key.format, src.format
+                ));
+            }
+        }
+        Ok(tex)
+    }
+
+    /// Records a write to `key` down to row `rows`.
+    fn mark_written(&mut self, key: RenderTargetKey, rows: u32) {
+        self.clock += 1;
+        let w = self.written.entry(key).or_default();
+        w.stamp = self.clock;
+        w.rows = w.rows.max(rows);
+    }
+
+    /// The transfer pipeline from host format `src` to `dst`; `bit` 0..8 is
+    /// a stencil bit pass, 8 the depth (or colour) pass.
+    fn transfer_pipeline(
+        &mut self,
+        src: wgpu::TextureFormat,
+        dst: wgpu::TextureFormat,
+        bit: u32,
+    ) -> Result<wgpu::RenderPipeline, Skip> {
+        if let Some(p) = self.transfer_pipelines.get(&(src, dst, bit)) {
+            return Ok(p.clone());
+        }
+        let device = &self.device;
+        let module = &self
+            .transfer_module
+            .get_or_insert_with(|| {
+                let wgsl = [include_str!("resolve.wgsl"), include_str!("transfer.wgsl")].concat();
+                device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                    label: Some("transfer"),
+                    source: wgpu::ShaderSource::Wgsl(wgsl.into()),
+                })
+            })
+            .clone();
+        let to_depth = dst.is_depth_stencil_format();
+        let entry = match (to_depth, bit) {
+            (true, 8) => "color_to_depth",
+            (true, _) => "color_to_stencil",
+            (false, _) if src.has_stencil_aspect() => "depth_stencil_to_color",
+            (false, _) => "depth_to_color",
+        };
+        let float20e4 = dst != wgpu::TextureFormat::Depth24PlusStencil8;
+        let constants = [
+            ("transfer_20e4", if float20e4 { 1.0 } else { 0.0 }),
+            ("transfer_bit", f64::from(bit)),
+        ];
+        // The depth pass replaces the whole stencil with the reference 0;
+        // bit pass i replaces only bit i, with the reference 0xFF.
+        let face = wgpu::StencilFaceState {
+            compare: wgpu::CompareFunction::Always,
+            fail_op: wgpu::StencilOperation::Keep,
+            depth_fail_op: wgpu::StencilOperation::Keep,
+            pass_op: wgpu::StencilOperation::Replace,
+        };
+        let stencil = wgpu::StencilState {
+            front: face,
+            back: face,
+            read_mask: 0xFF,
+            write_mask: if bit == 8 { 0xFF } else { 1 << bit },
+        };
+        let color_target = [Some(wgpu::ColorTargetState {
+            format: dst,
+            blend: None,
+            write_mask: wgpu::ColorWrites::ALL,
+        })];
+        let p = self.validated("transfer pipeline", |dev| {
+            dev.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("transfer"),
+                layout: None,
+                vertex: wgpu::VertexState {
+                    module,
+                    entry_point: Some("transfer_vs"),
+                    compilation_options: Default::default(),
+                    buffers: &[],
+                },
+                primitive: Default::default(),
+                depth_stencil: to_depth.then(|| wgpu::DepthStencilState {
+                    format: dst,
+                    depth_write_enabled: Some(bit == 8),
+                    depth_compare: Some(wgpu::CompareFunction::Always),
+                    stencil: if dst.has_stencil_aspect() {
+                        stencil.clone()
+                    } else {
+                        Default::default()
+                    },
+                    bias: Default::default(),
+                }),
+                multisample: Default::default(),
+                fragment: Some(wgpu::FragmentState {
+                    module,
+                    entry_point: Some(entry),
+                    compilation_options: wgpu::PipelineCompilationOptions {
+                        constants: if to_depth { &constants } else { &[] },
+                        ..Default::default()
+                    },
+                    targets: if to_depth { &[] } else { &color_target },
+                }),
+                multiview_mask: None,
+                cache: None,
+            })
+        })?;
+        self.transfer_pipelines.insert((src, dst, bit), p.clone());
+        Ok(p)
+    }
+
+    /// EDRAM ownership transfer: draws the first `rows` rows of target
+    /// `src` into `dst` (same base and pitch, one k_8_8_8_8 and one depth)
+    /// as their shared 32-bit EDRAM word: colour `r | g << 8 | b << 16 |
+    /// a << 24`, depth `depth24 << 8 | stencil` (24-bit unorm for kD24S8,
+    /// 20e4 for kD24FS8, converted as the depth clear and resolve do).
+    fn transfer(
+        &mut self,
+        src: RenderTargetKey,
+        dst: RenderTargetKey,
+        dst_tex: &wgpu::Texture,
+        rows: u32,
+    ) -> Result<(), Skip> {
+        let src_tex = self.targets[&src].clone();
+        let rows = rows.min(dst_tex.height());
+        if rows == 0 {
+            return Ok(());
+        }
+        // The source's batched draws (and any reads of `dst` in the batch)
+        // come before the transfer, which is submitted on its own.
+        self.flush()?;
+        let (sf, df) = (self.host_format(src.format), self.host_format(dst.format));
+        let to_depth = df.is_depth_stencil_format();
+        let bits = if df.has_stencil_aspect() { 0..8 } else { 0..0 };
+        let mut pipelines = vec![self.transfer_pipeline(sf, df, 8)?];
+        for bit in bits {
+            pipelines.push(self.transfer_pipeline(sf, df, bit)?);
+        }
+        // resolve.wgsl's depth_word reads only `src_format` of its params.
+        let mut params = [0u32; 12];
+        params[5] = if src.format == TargetFormat::D24FS8 {
+            6
+        } else {
+            5
+        };
+        let uniform = self.buffer(
+            "transfer params",
+            &to_bytes(&params),
+            wgpu::BufferUsages::UNIFORM,
+        );
+        let aspect = |aspect| {
+            src_tex.create_view(&wgpu::TextureViewDescriptor {
+                aspect,
+                ..Default::default()
+            })
+        };
+        let views = if to_depth {
+            vec![(0, aspect(wgpu::TextureAspect::All))]
+        } else if sf.has_stencil_aspect() {
+            vec![
+                (3, aspect(wgpu::TextureAspect::DepthOnly)),
+                (4, aspect(wgpu::TextureAspect::StencilOnly)),
+            ]
+        } else {
+            vec![(3, aspect(wgpu::TextureAspect::DepthOnly))]
+        };
+        let scope = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let groups: Vec<_> = pipelines
+            .iter()
+            .map(|p| {
+                let mut entries: Vec<_> = views
+                    .iter()
+                    .map(|(binding, view)| wgpu::BindGroupEntry {
+                        binding: *binding,
+                        resource: wgpu::BindingResource::TextureView(view),
+                    })
+                    .collect();
+                if !to_depth {
+                    entries.push(wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: uniform.as_entire_binding(),
+                    });
+                }
+                self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("transfer"),
+                    layout: &p.get_bind_group_layout(0),
+                    entries: &entries,
+                })
+            })
+            .collect();
+        let view = dst_tex.create_view(&Default::default());
+        let color_attachment = [Some(wgpu::RenderPassColorAttachment {
+            view: &view,
+            depth_slice: None,
+            resolve_target: None,
+            ops: wgpu::Operations {
+                load: wgpu::LoadOp::Load,
+                store: wgpu::StoreOp::Store,
+            },
+        })];
+        let keep = wgpu::Operations {
+            load: wgpu::LoadOp::Load,
+            store: wgpu::StoreOp::Store,
+        };
+        let mut enc = self.device.create_command_encoder(&Default::default());
+        {
+            let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("transfer"),
+                color_attachments: if to_depth { &[] } else { &color_attachment },
+                depth_stencil_attachment: to_depth.then(|| {
+                    wgpu::RenderPassDepthStencilAttachment {
+                        view: &view,
+                        depth_ops: Some(keep),
+                        stencil_ops: df.has_stencil_aspect().then_some(wgpu::Operations {
+                            load: wgpu::LoadOp::Load,
+                            store: wgpu::StoreOp::Store,
+                        }),
+                    }
+                }),
+                ..Default::default()
+            });
+            pass.set_scissor_rect(0, 0, dst_tex.width(), rows);
+            for (i, (p, g)) in pipelines.iter().zip(&groups).enumerate() {
+                pass.set_pipeline(p);
+                pass.set_bind_group(0, g, &[]);
+                pass.set_stencil_reference(if i == 0 { 0 } else { 0xFF });
+                pass.draw(0..3, 0..1);
+            }
+        }
+        self.queue.submit([enc.finish()]);
+        self.timings.submits += 1;
+        match block_on(scope.pop()) {
+            Some(e) => Err(Skip::Fatal(Error::Gpu(e.to_string()))),
+            None => Ok(()),
+        }
     }
 
     /// Whether `kD24FS8` keeps its stencil (the host has
@@ -1934,19 +2279,19 @@ impl Drawer {
             return Ok(false);
         }
 
+        // Every target of a draw has the surface pitch and the same height.
+        let (w, h) = (surface & 0x3FFF, RENDER_TARGET_HEIGHT.min(self.max_dim));
+        let (sx, sy, sw, sh) = state::scissor(&self.regs, w, h);
+        let rows = sy + sh;
         let mut color_tex: [Option<wgpu::Texture>; 4] = Default::default();
         for rt in 0..4 {
-            color_tex[rt] = color[rt].map(|k| self.target(k)).transpose()?;
+            color_tex[rt] = color[rt]
+                .map(|k| self.target(k, rows, report))
+                .transpose()?;
         }
-        let depth_tex = depth_key.map(|k| self.target(k)).transpose()?;
-        let any = color_tex
-            .iter()
-            .flatten()
-            .next()
-            .or(depth_tex.as_ref())
-            .expect("one target");
-        let (w, h) = (any.width(), any.height());
-        let (sx, sy, sw, sh) = state::scissor(&self.regs, w, h);
+        let depth_tex = depth_key
+            .map(|k| self.target(k, rows, report))
+            .transpose()?;
         if sw == 0 || sh == 0 {
             return Ok(false);
         }
@@ -2112,6 +2457,14 @@ impl Drawer {
             pass.draw_indexed(0..idx.len() as u32, 0, 0..1);
         }
         self.timings.submit += lap(&mut t);
+        // Recorded, not yet submitted: everything else that touches the
+        // targets flushes the batch first, so stamps follow submit order.
+        for k in color.into_iter().flatten() {
+            self.mark_written(k, rows);
+        }
+        if let Some(k) = depth_key.filter(|_| depth.write || stencil.is_some()) {
+            self.mark_written(k, rows);
+        }
         Ok(true)
     }
 
@@ -2194,8 +2547,9 @@ impl Drawer {
         color: [f32; 4],
         depth: f32,
         stencil: u32,
+        report: &mut Report,
     ) -> Result<(), Skip> {
-        let tex = self.target(key)?;
+        let tex = self.target(key, rect.y1, report)?;
         let rect = resolve::Rect {
             x0: rect.x0.min(tex.width()),
             y0: rect.y0.min(tex.height()),
@@ -2260,10 +2614,11 @@ impl Drawer {
         }
         self.queue.submit([enc.finish()]);
         self.timings.submits += 1;
-        match block_on(scope.pop()) {
-            Some(e) => Err(Skip::Fatal(Error::Gpu(e.to_string()))),
-            None => Ok(()),
+        if let Some(e) = block_on(scope.pop()) {
+            return Err(Skip::Fatal(Error::Gpu(e.to_string())));
         }
+        self.mark_written(key, rect.y1);
+        Ok(())
     }
 
     /// Performs a resolve: copy, then the colour and depth clears (also when
@@ -2296,7 +2651,7 @@ impl Drawer {
             return Ok(false);
         }
         let copied = match r.copy_command {
-            CopyCommand::Raw | CopyCommand::Convert => self.resolve_copy(r, rect, mem),
+            CopyCommand::Raw | CopyCommand::Convert => self.resolve_copy(r, rect, mem, report),
             CopyCommand::Null => Ok(()),
             CopyCommand::ConstantOne => return unsupported("resolve copy command ConstantOne"),
         };
@@ -2312,7 +2667,14 @@ impl Drawer {
                 .map_err(|e| Skip::Unsupported(format!("resolve clear of {e}")))?;
             let value = formats::clear_value(r.color_clear, r.color_clear_lo);
             let t = Instant::now();
-            self.clear(key, rect, formats::clear_color(key.format, value), 0.0, 0)?;
+            self.clear(
+                key,
+                rect,
+                formats::clear_color(key.format, value),
+                0.0,
+                0,
+                report,
+            )?;
             self.timings.clears += t.elapsed();
         }
         if r.depth_clear_enable {
@@ -2326,7 +2688,7 @@ impl Drawer {
                 _ => (f64::from(d) / f64::from(0xFF_FFFFu32)) as f32,
             };
             let t = Instant::now();
-            self.clear(key, rect, [0.0; 4], depth, r.depth_clear & 0xFF)?;
+            self.clear(key, rect, [0.0; 4], depth, r.depth_clear & 0xFF, report)?;
             self.timings.clears += t.elapsed();
         }
         copied.map(|()| true)
@@ -2342,6 +2704,7 @@ impl Drawer {
         r: &Resolve,
         rect: resolve::Rect,
         mem: &mut dyn GuestMemory,
+        report: &mut Report,
     ) -> Result<(), Skip> {
         let format = if r.is_depth {
             if r.src_format & 1 != 0 {
@@ -2384,7 +2747,7 @@ impl Drawer {
             pitch: r.surface_pitch,
             format,
         };
-        let tex = self.target(key)?;
+        let tex = self.target(key, rect.y1, report)?;
         let pitch = xenon_texture::tile::align_to_tile(r.dest_pitch);
         let rect = resolve::Rect {
             x1: rect.x1.min(pitch).min(tex.width()),
@@ -2680,6 +3043,87 @@ fn host_texture_format(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// transfer.wgsl's `word_depth` makes exactly the depth the depth clear
+    /// makes: n / 0xFFFFFF rounded to the nearest f32 for kD24S8 (a host
+    /// that keeps Depth24PlusStencil8 as 32-bit float stores it as is;
+    /// lavapipe's 24-bit store would hide a mismatch), float20e4 for kD24FS8.
+    #[test]
+    fn transfer_word_depth_matches_the_clear() {
+        let d = match Drawer::new() {
+            Ok(d) => d,
+            Err(Error::NoAdapter) if std::env::var("XENON_REQUIRE_GPU").as_deref() != Ok("1") => {
+                return
+            }
+            Err(e) => panic!("{e}"),
+        };
+        // Odd n (the ones a reciprocal multiply gets wrong) across 24 bits.
+        const N: u32 = 1 << 20;
+        let n = |i: u32| (i << 4) | 15;
+        let wgsl = [
+            include_str!("resolve.wgsl"),
+            include_str!("transfer.wgsl"),
+            "@compute @workgroup_size(64)\n\
+             fn word_depth_test(@builtin(global_invocation_id) id: vec3<u32>) {\n\
+             \x20   dest[id.x] = bitcast<u32>(word_depth((id.x << 4u) | 15u));\n}\n",
+        ]
+        .concat();
+        let module = d.device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: None,
+            source: wgpu::ShaderSource::Wgsl(wgsl.into()),
+        });
+        for float in [false, true] {
+            let pipeline = d
+                .device
+                .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                    label: None,
+                    layout: None,
+                    module: &module,
+                    entry_point: Some("word_depth_test"),
+                    compilation_options: wgpu::PipelineCompilationOptions {
+                        constants: &[("transfer_20e4", if float { 1.0 } else { 0.0 })],
+                        ..Default::default()
+                    },
+                    cache: None,
+                });
+            let buffer = |usage| {
+                d.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: None,
+                    size: u64::from(N) * 4,
+                    usage,
+                    mapped_at_creation: false,
+                })
+            };
+            let out = buffer(wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC);
+            let read = buffer(wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST);
+            let group = d.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None,
+                layout: &pipeline.get_bind_group_layout(0),
+                entries: &[wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: out.as_entire_binding(),
+                }],
+            });
+            let mut enc = d.device.create_command_encoder(&Default::default());
+            {
+                let mut pass = enc.begin_compute_pass(&Default::default());
+                pass.set_pipeline(&pipeline);
+                pass.set_bind_group(0, &group, &[]);
+                pass.dispatch_workgroups(N / 64, 1, 1);
+            }
+            enc.copy_buffer_to_buffer(&out, 0, &read, 0, None);
+            let data = d.map_read(&read, d.queue.submit([enc.finish()])).unwrap();
+            for i in 0..N {
+                let got = u32::from_le_bytes(data[i as usize * 4..][..4].try_into().unwrap());
+                let want = if float {
+                    float20e4(n(i))
+                } else {
+                    (f64::from(n(i)) / f64::from(0xFF_FFFFu32)) as f32
+                };
+                assert_eq!(got, want.to_bits(), "{float} {:06X}", n(i));
+            }
+        }
+    }
 
     #[test]
     fn slice_memory_writes_inside_only() {
