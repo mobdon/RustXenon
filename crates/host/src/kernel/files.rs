@@ -131,6 +131,14 @@ fn filetime(t: std::io::Result<std::time::SystemTime>) -> u64 {
     116_444_736_000_000_000 + unix.as_nanos() as u64 / 100
 }
 
+/// Host time of a FILETIME; `None` for 0 (not set) and times before 1970.
+fn system_time(ft: u64) -> Option<std::time::SystemTime> {
+    let since_unix = ft
+        .checked_sub(116_444_736_000_000_000)
+        .filter(|_| ft != 0)?;
+    Some(std::time::UNIX_EPOCH + std::time::Duration::from_nanos(since_unix * 100))
+}
+
 /// Attributes: 0x10 directory, 0x80 normal, 0x01 read only.
 fn attributes(m: &fs::Metadata, writable: bool) -> u32 {
     if m.is_dir() {
@@ -547,8 +555,16 @@ pub fn nt_set_information_file(rt: &Runtime, c: &mut Context) {
             Some(Ok(())) => STATUS_SUCCESS,
             _ => STATUS_ACCESS_DENIED,
         },
-        // FileBasicInformation: times and attributes. Host files keep their own.
-        4 => STATUS_SUCCESS,
+        // FileBasicInformation: the last write time (+16) is kept on the host
+        // file, since titles compare it to decide whether a copy is current
+        // (all four times read back as that one). Zero means "leave it";
+        // attributes are not kept.
+        4 => {
+            if let (Some(h), Some(t)) = (f.file.as_ref(), system_time(rt.mem.read_u64(info + 16))) {
+                let _ = h.set_modified(t);
+            }
+            STATUS_SUCCESS
+        }
         // FileDispositionInformation: delete on close.
         13 => {
             if rt.mem.read_u8(info) != 0 && f.path.starts_with(&k().data_dir) {
@@ -790,5 +806,13 @@ mod tests {
         assert!(super::matches(b"a?c", b"abc"));
         assert!(!super::matches(b"a?c", b"ac"));
         assert!(super::matches(b"*", b""));
+    }
+
+    #[test]
+    fn filetimes_round_trip() {
+        let ft = 133_000_000_000_000_123;
+        assert_eq!(super::filetime(Ok(super::system_time(ft).unwrap())), ft);
+        assert_eq!(super::system_time(0), None);
+        assert_eq!(super::system_time(1), None);
     }
 }
