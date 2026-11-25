@@ -115,9 +115,20 @@ impl DrawSide {
             crate::log(&self.drawer.memory_line());
         }
         let start = std::time::Instant::now();
-        match self.drawer.replay(cmds, &mut Physical(rt)) {
+        let replayed = self.drawer.replay(cmds, &mut Physical(rt));
+        let busy = start.elapsed();
+        // The drawer is never dropped at exit (its thread is left running),
+        // so new pipelines reach the cache file here at most 5 s late.
+        static SAVE: AtomicU32 = AtomicU32::new(0);
+        if crate::ms() >= SAVE.load(Ordering::Relaxed) {
+            SAVE.store(crate::ms() + 5_000, Ordering::Relaxed);
+            if let Err(e) = self.drawer.save_pipeline_cache() {
+                crate::log(&format!("[draw] pipeline cache not saved: {e}"));
+            }
+        }
+        match replayed {
             Ok(r) => {
-                self.stats.add(&r, start.elapsed());
+                self.stats.add(&r, busy);
                 for u in r.unsupported.iter().chain(&r.warnings) {
                     capture::note(u);
                 }

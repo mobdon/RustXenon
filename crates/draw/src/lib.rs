@@ -1518,11 +1518,12 @@ impl Drawer {
     }
 
     /// Keeps compiled pipelines in a file under `dir` (made if missing),
-    /// loaded now and written every few new pipelines and when the drawer
-    /// drops, so pipelines compiled in earlier runs are not compiled
-    /// again. Returns the file, or `None` where the device has no pipeline
-    /// cache (GL). A file from another driver version, or unreadable, is
-    /// replaced. Pipelines made before this call are not in the cache.
+    /// loaded now and written every few new pipelines, when the drawer
+    /// drops and on [`Drawer::save_pipeline_cache`] (an owner that never
+    /// drops the drawer calls it now and then), so pipelines compiled in
+    /// earlier runs are not compiled again. Returns the file, or `None`
+    /// where the device has no pipeline cache (GL). A file from another
+    /// driver version, or unreadable, is replaced once a pipeline is made. Pipelines made before this call are not in the cache.
     pub fn set_pipeline_cache_dir(
         &mut self,
         dir: &std::path::Path,
@@ -1566,7 +1567,9 @@ impl Drawer {
     }
 
     /// Writes the pipeline cache file, if there is one (see
-    /// [`Drawer::set_pipeline_cache_dir`]), through a temporary file of its
+    /// [`Drawer::set_pipeline_cache_dir`]) and pipelines were created since
+    /// it was last written, so it is cheap to call often; through a
+    /// temporary file of its
     /// own so a crash, or another process saving to the same directory,
     /// leaves a whole file (the last one renamed wins).
     pub fn save_pipeline_cache(&mut self) -> std::io::Result<()> {
@@ -1574,6 +1577,9 @@ impl Drawer {
         let Some(c) = &mut self.disk_cache else {
             return Ok(());
         };
+        if c.unsaved == 0 {
+            return Ok(());
+        }
         c.unsaved = 0;
         let Some(data) = c.cache.get_data() else {
             return Ok(());

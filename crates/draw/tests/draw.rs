@@ -1340,7 +1340,8 @@ fn draw_triangle(d: &mut xenon_draw::Drawer) -> (xenon_draw::Report, Vec<u8>) {
     (report, img)
 }
 
-/// The pipeline cache file is written when the drawer drops, read by the
+/// The pipeline cache file is written when the drawer drops (or on a save
+/// after new pipelines), read by the
 /// next drawer, and replaced when it is garbage or from another adapter;
 /// the drawer draws the same with and without it.
 #[test]
@@ -1391,5 +1392,18 @@ fn pipeline_cache_persists_across_drawers() {
         }
         assert_eq!(std::fs::read(&file).unwrap()[..32], saved[..32]);
     }
+    // A save writes only when pipelines were made since the last one.
+    std::fs::remove_file(&file).unwrap();
+    let mut d = drawer().unwrap();
+    d.set_pipeline_cache_dir(&dir).unwrap();
+    d.save_pipeline_cache().unwrap();
+    assert!(!file.exists());
+    draw_triangle(&mut d);
+    d.save_pipeline_cache().unwrap();
+    assert!(file.exists());
+    std::fs::remove_file(&file).unwrap();
+    d.save_pipeline_cache().unwrap();
+    assert!(!file.exists());
+    drop(d);
     let _ = std::fs::remove_dir_all(&dir);
 }
