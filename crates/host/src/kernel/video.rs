@@ -191,6 +191,9 @@ pub fn start(rt: std::sync::Arc<Runtime>) {
                 match xenon_draw::Drawer::new() {
                     Ok(mut d) => {
                         crate::log(&format!("[draw] adapter: {}", d.adapter));
+                        if d.skip_resolve_writeback {
+                            crate::log("[draw] resolve write-back: skipped (the CPU never sees resolve output)");
+                        }
                         if d.late_writeback {
                             crate::log("[draw] resolve write-back: late (the CPU sees resolves a frame later)");
                         }
