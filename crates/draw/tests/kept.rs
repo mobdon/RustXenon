@@ -1157,3 +1157,80 @@ fn late_write_back_keeps_a_cpu_write() {
         "{r:?}"
     );
 }
+
+/// Guest memory that lists the writes the test says were made.
+struct Watched {
+    mem: SliceMemory,
+    written: Option<Vec<(u64, u64)>>,
+}
+
+impl xenon_gpu::GuestRead for Watched {
+    fn read_u32(&self, addr: u32) -> Option<u32> {
+        self.mem.read_u32(addr)
+    }
+    fn read_bytes(&self, addr: u32, len: usize) -> Option<Vec<u8>> {
+        self.mem.read_bytes(addr, len)
+    }
+}
+
+impl xenon_draw::GuestMemory for Watched {
+    fn write_bytes(&mut self, addr: u32, bytes: &[u8]) -> bool {
+        self.mem.write_bytes(addr, bytes)
+    }
+    fn take_written(&mut self) -> Option<Vec<(u64, u64)>> {
+        self.written.replace(Vec::new())
+    }
+}
+
+/// With guest writes listed, a kept resolve checked against guest memory
+/// is not hashed again until a listed write covers it: the write-back's
+/// own write, then nothing, then a CPU write, which takes the guest path.
+#[test]
+fn listed_writes_skip_hashing_unwritten_kept_resolves() {
+    let f = fetch(6, 2, IDENTITY);
+    let Some(mut d) = drawer() else { return };
+    let mut mem = memory();
+    vertices(&mut mem);
+    let mut s = Stream::default();
+    paint(s.setup());
+    resolve(&mut s, &mut mem, W, H);
+    let mut sampler = Stream::default();
+    sample(sampler.setup(), f);
+    // Another fetch constant over the same bytes: not in the texture memo.
+    let mut other = Stream::default();
+    sample(other.setup(), fetch(6, 2, BGR1));
+    let commands = |mem: &mut SliceMemory, s: &Stream| {
+        mem.write_words(CMD, &s.0);
+        let mut rec = xenon_gpu::Recorder::new();
+        rec.record_buffer(&*mem, CMD, s.0.len() as u32).unwrap();
+        rec.commands
+    };
+    let paint_cmds = commands(&mut mem, &s);
+    let sample_cmds = commands(&mut mem, &sampler);
+    let other_cmds = commands(&mut mem, &other);
+    let mut w = Watched {
+        mem,
+        written: Some(vec![]),
+    };
+    let replay = |d: &mut xenon_draw::Drawer, w: &mut Watched, cmds| {
+        let r = d
+            .replay(cmds, w as &mut dyn xenon_draw::GuestMemory)
+            .unwrap();
+        let t = &r.timings;
+        (t.textures_kept, t.kept_hashed_bytes)
+    };
+    replay(&mut d, &mut w, &paint_cmds);
+    // The write-back wrote the destination: hashed again.
+    let dest = u64::from(DEST);
+    let all = u64::from(W * H * 4);
+    w.written = Some(vec![(dest, dest + all)]);
+    assert_eq!(replay(&mut d, &mut w, &sample_cmds), (1, all));
+    // Nothing written since: kept, not hashed.
+    assert_eq!(replay(&mut d, &mut w, &other_cmds), (1, 0));
+    // A CPU write: hashed, does not match, guest path.
+    w.mem.data[DEST as usize..][..256].fill(0x55);
+    w.written = Some(vec![(dest, dest + 256)]);
+    assert_eq!(replay(&mut d, &mut w, &sample_cmds).0, 0);
+    let img = d.read_render_target(OUT, 0, 0, W, H).unwrap();
+    assert!(img.chunks(4).any(|p| p == [0x55; 4]));
+}

@@ -2241,11 +2241,22 @@ impl Drawer {
     ) -> Result<Report, Error> {
         let mut report = Report::default();
         self.timings = Timings::default();
+        let was_watching = self.watching;
         match mem.take_written() {
             Some(written) if self.texture_memo.len() < TEXTURE_MEMO_CAP => {
                 self.watching = true;
+                if was_watching {
+                    // Kept resolve blocks hashed against guest memory stay
+                    // checked while nothing writes them: no hash again.
+                    for m in &mut self.mirrors {
+                        for (k, c) in m.checked.iter_mut().enumerate() {
+                            *c &= m.hashes[k].is_some();
+                        }
+                    }
+                }
                 for (lo, hi) in written {
                     self.forget_guest(lo, hi);
+                    self.uncheck(lo, hi);
                 }
             }
             _ => {
@@ -2259,8 +2270,10 @@ impl Drawer {
             }
         }
         self.replays += 1;
-        for m in &mut self.mirrors {
-            m.checked.fill(false);
+        if !(was_watching && self.watching) {
+            for m in &mut self.mirrors {
+                m.checked.fill(false);
+            }
         }
         let mut mem = Tracked {
             mem,
@@ -2402,6 +2415,16 @@ impl Drawer {
             .retain(|&a, &mut (b, _)| b <= lo || hi <= a);
         self.index_memo
             .retain(|_, &mut (a, b, _)| b <= lo || hi <= a);
+    }
+
+    /// Marks the kept resolve blocks over `[lo, hi)` unchecked: guest
+    /// memory there changed, so the next use hashes it again.
+    fn uncheck(&mut self, lo: u64, hi: u64) {
+        for m in self.mirrors.iter_mut().filter(|m| lo < m.hi && m.lo < hi) {
+            let k0 = (lo.max(m.lo) - m.lo) / KEPT_BLOCK;
+            let k1 = (hi.min(m.hi) - m.lo).div_ceil(KEPT_BLOCK);
+            m.checked[k0 as usize..k1 as usize].fill(false);
+        }
     }
 
     /// Hash of one [`KEPT_BLOCK`] of a kept resolve.
