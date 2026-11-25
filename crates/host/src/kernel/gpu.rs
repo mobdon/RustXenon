@@ -197,7 +197,7 @@ impl DrawStats {
              guest data {:.0}, textures {:.0}, submit {:.0} (queue {:.0}, upload {:.0}; submit thread {:.0} alongside), gpu wait {:.0}, readback {:.0}, \
              resolve cpu {:.0}, clears {:.0}, swap {:.0} (transfers {:.0}); of those, creating \
              pipelines {:.0}; per {per}: {} draws, \
-             {} resolves, {} submits ({} resolve, {} transfer, {} decode, {} flush/other), {} transfers ({} passes), {} render passes, readback {:.1} MB, \
+             {} resolves, {} submits ({} resolve, {} transfer, {} decode, {} flush/other), {} transfers ({} passes), {} render passes, {} write-backs, readback {:.1} MB, \
              hashed {:.1} MB (kept resolves {:.1} MB), {} textures uploaded ({:.1} MB, {} evicted before), \
              {} evicted, {} from kept resolves, {} pipelines created; guest data {:.1} MB ({} windows reused, {:.1} MB); \
              uploads by format: rgba8 {}, bc {}, f16 {}, f32 {}, other {}",
@@ -229,6 +229,7 @@ impl DrawStats {
             t.transfers / n,
             t.transfer_passes / n,
             t.render_passes / n,
+            t.writebacks / n,
             mb(t.readback_bytes),
             mb(t.hashed_bytes),
             mb(t.kept_hashed_bytes),
@@ -766,6 +767,7 @@ mod tests {
         s.t.queue = ms(60);
         s.t.upload = ms(20);
         s.t.submit_thread = ms(50);
+        s.t.writebacks = 14;
         s.t.render_passes = 500;
         s.t.transfers = 12;
         s.t.transfer_passes = 60;
@@ -786,7 +788,7 @@ mod tests {
             "1380 draws",
             "42 resolves",
             "submit 80 (queue 30, upload 10; submit thread 25 alongside),",
-            "6 transfers (30 passes), 250 render passes,",
+            "6 transfers (30 passes), 250 render passes, 7 write-backs,",
             "readback 40.0 MB",
             "140 submits (44 resolve, 19 transfer, 17 decode, 60 flush/other)",
             "guest data 4.5 MB (450 windows reused, 1.5 MB)",
