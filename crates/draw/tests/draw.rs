@@ -30,6 +30,9 @@ fn resolve_clear_fills_render_target() {
     assert!(img.chunks_exact(4).all(|p| p == CLEAR));
     let m = d.memory_line();
     assert!(m.contains("targets 1 MB in 2,"), "{m}");
+    // wgpu's own counters are live: the targets above are counted.
+    assert!(m.contains("; wgpu live: textures 1 MB,"), "{m}");
+    assert!(m.contains(" MB reserved in "), "{m}");
 }
 
 /// Clears, then draws a triangle with per-vertex colours through the
@@ -159,6 +162,8 @@ fn textured_quad_samples_tiled_texture() {
     }
     assert_eq!(px(&img, W, n, n), CLEAR);
     assert_eq!(report.timings.textures_uploaded, 1);
+    let rgba8 = (1, report.timings.texture_bytes);
+    assert_eq!(report.timings.uploads_by_format[0], rgba8, "{report:?}");
 
     // Unchanged guest bytes come from the texture cache.
     let report = run(&mut d, &s, &mut mem);
@@ -189,6 +194,118 @@ fn textured_quad_samples_tiled_texture() {
     for y in 0..n {
         for x in 0..n {
             assert_eq!(px(&img, W, x, y), texel2(x, y), "({x}, {y})");
+        }
+    }
+}
+
+/// Draws a `w`x`h` DXT `format` (k8in16, nearest sampling, tiled or linear
+/// with a pitch field of `pitch`) of pseudo-random blocks of `bpb` bytes over
+/// the target's corner, at most `W` wide, with BC passthrough on or off;
+/// returns the quad's pixels and the bytes uploaded.
+fn draw_dxt(
+    bc: bool,
+    format: u32,
+    bpb: u32,
+    tiled: bool,
+    (w, h, pitch): (u32, u32, u32),
+) -> Option<(Vec<[u8; 4]>, u64)> {
+    let mut d = drawer()?;
+    if bc && !d.bc_textures {
+        println!("skip: the adapter has no BC textures");
+        return None;
+    }
+    d.bc_textures = bc;
+    let mut mem = memory();
+    let mut seed = 0x1234_5678u32;
+    let linear: Vec<u8> = (0..w * h / 16 * bpb)
+        .map(|_| {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (seed >> 24) as u8
+        })
+        .collect();
+    let mut guest = if tiled {
+        tile::tile_2d(&linear, w / 4, h / 4, w / 4, bpb).unwrap()
+    } else {
+        let row = (w / 4 * bpb) as usize;
+        let stride = (tile::align_to_tile(pitch * 8) * bpb) as usize;
+        linear
+            .chunks(row)
+            .flat_map(|r| [r, &vec![0; stride.saturating_sub(row)]].concat())
+            .collect()
+    };
+    endian::swap_in_place(&mut guest, xenon_texture::Endian::K8in16);
+    mem.data[TEXTURE as usize..][..guest.len()].copy_from_slice(&guest);
+    let (qw, qh) = (w.min(W), h);
+    let (x, y) = (qw as f32, qh as f32);
+    let verts: Vec<u32> = [
+        (0.0, 0.0, 0.0, 0.0),
+        (x, 0.0, 1.0, 0.0),
+        (x, y, 1.0, 1.0),
+        (0.0, y, 0.0, 1.0),
+    ]
+    .iter()
+    .flat_map(|&(x, y, u, v)| [f(x), f(y), f(0.0), f(u), f(v)])
+    .collect();
+    mem.write_words(VERTS, &verts);
+    let fetch = [
+        2 | (2 << 10) | (2 << 13) | (pitch << 22) | (u32::from(tiled) << 31), // clamp
+        format | (1 << 6) | TEXTURE,                                          // k8in16
+        (w - 1) | ((h - 1) << 13),
+        ((1 << 3) | (2 << 6) | (3 << 9)) << 1, // swizzle RGBA, point filters
+        0,
+        1 << 9, // 2D
+    ];
+    let mut s = Stream::default();
+    s.setup()
+        .resolve(&mut mem, W, H, false, Some((rgba(CLEAR), 0)))
+        .shader(false, &vs_uv())
+        .shader(true, &ps_texture(1))
+        .vertex_fetch(0, VERTS, 20)
+        .regs(SHADER_CONSTANT_FETCH + 6, &fetch)
+        .draw_auto(PRIM_QUAD_LIST, 4);
+    let report = run(&mut d, &s, &mut mem);
+    assert_eq!(report.draws, 1, "{report:?}");
+    assert!(report.warnings.is_empty(), "{report:?}");
+    assert_eq!(report.timings.textures_uploaded, 1, "{report:?}");
+    // Bucket 1 is BC blocks, bucket 0 the CPU decode's Rgba8Unorm.
+    let by = report.timings.uploads_by_format[usize::from(bc)];
+    assert_eq!(by, (1, report.timings.texture_bytes), "{report:?}");
+    let img = d.read_render_target(COLOR_KEY, 0, 0, W, H).unwrap();
+    let pixels = (0..qw * qh).map(|i| px(&img, W, i % qw, i / qw)).collect();
+    Some((pixels, report.timings.texture_bytes))
+}
+
+/// DXT1 and DXT5 uploaded as BC blocks sample the texels the CPU decoder
+/// makes, in an eighth or a quarter of the bytes. Interpolated texels may
+/// be 1 off: the host rounds the 1/3, 2/3 and 1/7.. mixes its own way
+/// (lavapipe rounds where the CPU decoder truncates), as the BC spec allows.
+#[test]
+fn dxt_passthrough_matches_cpu_decode() {
+    let square = (32, 32, 1);
+    // One linear block row may have a pitch below its width.
+    let strip = (256, 4, 0);
+    for (format, bpb, tiled, size) in [
+        (18, 8, true, square),
+        (19, 16, true, square),
+        (20, 16, true, square),
+        (18, 8, false, square),
+        (20, 16, false, strip),
+    ] {
+        let Some((bc, bc_bytes)) = draw_dxt(true, format, bpb, tiled, size) else {
+            return;
+        };
+        let (cpu, cpu_bytes) = draw_dxt(false, format, bpb, tiled, size).unwrap();
+        let texels = u64::from(size.0 * size.1);
+        assert_eq!(cpu_bytes, texels * 4);
+        assert_eq!(bc_bytes, texels / 16 * u64::from(bpb), "format {format}");
+        for (i, (b, c)) in bc.iter().zip(&cpu).enumerate() {
+            let near = b.iter().zip(c).all(|(&b, &c)| b.abs_diff(c) <= 1);
+            assert!(
+                near,
+                "format {format} ({}, {}): {b:?} {c:?}",
+                i as u32 % size.0.min(W),
+                i as u32 / size.0.min(W)
+            );
         }
     }
 }

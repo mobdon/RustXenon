@@ -189,7 +189,10 @@ pub fn start(rt: std::sync::Arc<Runtime>) {
             let mut gpu = Gpu::default();
             if super::gpu::capture::RENDER.load(Ordering::Relaxed) {
                 match xenon_draw::Drawer::new() {
-                    Ok(d) => gpu.drawer = Some(d),
+                    Ok(d) => {
+                        crate::log(&format!("[draw] adapter: {}", d.adapter));
+                        gpu.drawer = Some(d);
+                    }
                     Err(e) => crate::log(&format!("[draw] no drawer: {e}")),
                 }
             }
