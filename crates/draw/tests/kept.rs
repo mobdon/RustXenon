@@ -344,10 +344,10 @@ fn decodes_join_the_batch() {
     let r = run(&mut d, &s, &mut mem);
     let t = &r.timings;
     assert_eq!((t.textures_kept, t.textures_uploaded), (2, 0), "{r:?}");
-    // Two resolve copies; three batches (the last two with a decode each)
-    // and the end-of-replay write-back.
-    assert_eq!(t.submits_by_site, [2, 0, 0, 4], "{t:?}");
-    assert_eq!(t.submits, 6, "{t:?}");
+    // The copies are recorded in the batches; a decode after one flushes
+    // it first. Three batches and the end-of-replay write-back.
+    assert_eq!(t.submits_by_site, [0, 0, 0, 4], "{t:?}");
+    assert_eq!(t.submits, 4, "{t:?}");
     let img = d.read_render_target(OUT, 0, 0, W, H).unwrap();
     drop(d);
     assert_eq!(img, guest_path(&mem, f));
