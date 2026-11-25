@@ -55,6 +55,19 @@ fn draw_xy(
     raw: &[u8],
     endian: u32,
 ) -> [f32; 2] {
+    draw_buf(d, fetches, &raw.repeat(4), endian, [0.0; 4])
+}
+
+/// `draw_xy` with `vals` (guest memory bytes) at VALS as is, and r3 set to
+/// `r3` before `fetches` run, for fetches that take their index from r3
+/// instead of the vertex index in r0.
+fn draw_buf(
+    d: &mut xenon_draw::Drawer,
+    fetches: &[VertexFetch],
+    vals: &[u8],
+    endian: u32,
+    r3: [f32; 4],
+) -> [f32; 2] {
     let mut mem = memory();
     let q = W as f32;
     let verts: Vec<u32> = [(0.0, 0.0), (q, 0.0), (q, q), (0.0, q)]
@@ -62,12 +75,14 @@ fn draw_xy(
         .flat_map(|&(x, y)| [f(x), f(y), f(0.0)])
         .collect();
     mem.write_words(VERTS, &verts);
-    for v in 0..4 {
-        mem.data[VALS as usize + v * raw.len()..][..raw.len()].copy_from_slice(raw);
-    }
+    mem.data[VALS as usize..][..vals.len()].copy_from_slice(vals);
     let mut pos = VertexFetch::full(1, 0, 0, VertexFormat::F32_32_32_FLOAT, 3, 0);
     pos.dest_swizzle = fetch_dest_swz("xyz1");
-    let mut instrs = vec![Instr::Fetch(FetchInstr::Vertex(pos))];
+    let c0 = AluSrc::constant(0, SWZ_XYZW);
+    let mut instrs = vec![
+        Instr::Fetch(FetchInstr::Vertex(pos)),
+        Instr::Alu(AluInstr::vector(VectorOp::Max, 3, mask("xyzw"), &[c0, c0])),
+    ];
     instrs.extend(fetches.iter().map(|&v| Instr::Fetch(FetchInstr::Vertex(v))));
     let r = |n| AluSrc::temp(n, SWZ_XYZW);
     instrs.push(export(62, r(1)));
@@ -81,8 +96,9 @@ fn draw_xy(
         .vertex_fetch(0, VERTS, 12)
         .regs(
             SHADER_CONSTANT_FETCH + 2,
-            &[VALS | 3, ((raw.len() as u32) << 2) | endian],
+            &[VALS | 3, ((vals.len() as u32) << 2) | endian],
         )
+        .regs(SHADER_CONSTANT_FLOAT, &r3.map(f))
         .draw_auto(PRIM_QUAD_LIST, 4);
     let report = run(d, &s, &mut mem);
     assert_eq!(report.draws, 1, "{report:?}");
@@ -425,35 +441,75 @@ fn vfetch_endian_modes_on_16_bit_data() {
     }
 }
 
+/// Guest bytes (8in32 swapped) of vertices laid out as one garbage word
+/// then the vertex's words, one after another.
+fn vertices(words: &[&[u32]]) -> Vec<u8> {
+    words
+        .iter()
+        .flat_map(|v| std::iter::once(&GARBAGE).chain(v.iter()))
+        .flat_map(|w| w.to_be_bytes())
+        .collect()
+}
+
+/// The full fetch address is the fetch constant's base plus the index
+/// from the source register's selected component, rounded down or (index
+/// rounding) to nearest, times the stride, plus the offset.
+#[test]
+fn vfetch_index_stride_and_rounding() {
+    let Some(mut d) = drawer() else { return };
+    // Stride 3 words: garbage, value 10 + i, padding 99.
+    let verts: Vec<[u32; 2]> = (0..5).map(|i| [f(10.0 + i as f32), f(99.0)]).collect();
+    let vals = vertices(&verts.iter().map(|v| &v[..]).collect::<Vec<_>>());
+    let mut v = VertexFetch::full(2, 3, 1, VertexFormat::F32_FLOAT, 3, 1);
+    v.src_swizzle = 1;
+    v.dest_swizzle = fetch_dest_swz("x0__");
+    for (index, rounded, want) in [
+        (2.0, false, 12.0),
+        (2.75, false, 12.0),
+        (2.75, true, 13.0),
+        (2.25, true, 12.0),
+        (3.5, true, 14.0),
+    ] {
+        v.index_rounded = rounded;
+        let got = draw_buf(&mut d, &[v], &vals, E_8IN32, [0.0, index, 0.0, 0.0]);
+        check_xy(got, [want, 0.0]);
+    }
+}
+
 /// vfetch_mini reuses the preceding full fetch's constant, index and
 /// stride, ignoring its own, and applies its own format, offset and
 /// conversion; constant 0 and 1 selects work in the destination swizzle.
 #[test]
 fn vfetch_mini_reuses_full_fetch_address() {
     let Some(mut d) = drawer() else { return };
+    // The full fetch reads vertex 2 (index from r3.x), stride 4 words; the
+    // other vertices hold zeros, so a mini fetch that used its own index
+    // register (r0.x, the vertex index), stride or constant reads wrong data.
     let words = [f(1.5), 0x7FFF_8000, 0xC000_3C00];
-    let raw: Vec<u8> = std::iter::once(GARBAGE)
-        .chain(words)
-        .flat_map(|w| w.to_be_bytes())
-        .collect();
+    let zero = [0; 3];
+    let vals = vertices(&[&zero, &zero, &words, &zero]);
+    let r3 = [2.0, 0.0, 0.0, 0.0];
     // The full fetch writes nothing (every component kept).
     let mut full = vf(VertexFormat::F32_FLOAT, false, true, 3);
+    full.src = 3;
     full.dest = 3;
     full.dest_swizzle = fetch_dest_swz("____");
     let mut mini = vf(VertexFormat::F16_16, true, true, 3);
     mini.mini = true;
+    mini.src = 0;
     mini.fetch_const = 0;
     mini.stride = 0;
     mini.offset = 2;
     mini.dest_swizzle = fetch_dest_swz("yx01");
-    check_xy(draw_xy(&mut d, &[full, mini], &raw, E_8IN32), [1.0, -1.0]);
+    let draw = |d: &mut _, mini| draw_buf(d, &[full, mini], &vals, E_8IN32, r3);
+    check_xy(draw(&mut d, mini), [1.0, -1.0]);
     mini.dest_swizzle = fetch_dest_swz("01xy");
-    check_xy(draw_xy(&mut d, &[full, mini], &raw, E_8IN32), [0.0, 1.0]);
+    check_xy(draw(&mut d, mini), [0.0, 1.0]);
     let mut half = mini;
     half.format = VertexFormat::F16_16_FLOAT;
     half.offset = 3;
     half.dest_swizzle = fetch_dest_swz("xyzw");
-    check_xy(draw_xy(&mut d, &[full, half], &raw, E_8IN32), [1.0, -2.0]);
+    check_xy(draw(&mut d, half), [1.0, -2.0]);
 }
 
 #[track_caller]
