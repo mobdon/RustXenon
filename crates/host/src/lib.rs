@@ -167,13 +167,14 @@ fn backtrace(rt: &Runtime) -> Vec<u32> {
 }
 
 fn backtrace_from(rt: &Runtime, mut sp: u32) -> Vec<u32> {
+    use xenon_rt::guard::readable;
     let mut out = Vec::new();
     for _ in 0..24 {
-        if sp == 0 || sp % 4 != 0 || sp as usize + 4 > GUEST_MEMORY {
+        if sp == 0 || sp % 4 != 0 || sp as usize + 4 > GUEST_MEMORY || !readable(sp, 4) {
             break;
         }
         let prev = rt.mem.read_u32(sp);
-        if prev <= sp || prev < 8 {
+        if prev <= sp || prev < 8 || !readable(prev - 8, 4) {
             break;
         }
         out.push(rt.mem.read_u32(prev - 8));
@@ -368,6 +369,7 @@ USAGE: game --exe <patched executable> --game <unpacked game folder>
             [--seconds <n>] [--press <ms>:<button>[+<button>],...]
             [--no-controller] [--window] [--capture <dir> [--capture-at <s>,<s>...]] [--render]
             [--capture-frames <n>,<n>... --capture-dir <dir>] [--audio-wav <file>]
+            [--guard-memory]
 
 Runs the title headless for --seconds (default 30) and reports how far it
 got: frames presented, threads, imports called, memory in use. A
@@ -385,7 +387,10 @@ frames (counted from 1, one per swap) as <dir>/frame-<n>.png; it implies
 (or for --seconds when given). --audio-wav writes the game's sound (the
 render clients' frames mixed to 48 kHz stereo) to a .wav file; compressed
 sound is decoded through an LGPL FFmpeg found at run time (XENON_FFMPEG_DIR),
-silence without one. Nothing is ever played.";
+silence without one. Nothing is ever played. --guard-memory (or
+XENON_GUARD_MEMORY=1) reserves guest memory without access and commits only
+what the kernel hands out, so a wild pointer stops the run with its address
+and every thread's last calls instead of reading zeros.";
 
 fn opt(args: &[String], name: &str) -> Option<String> {
     args.iter()
@@ -478,7 +483,15 @@ pub fn run(sha256: &str, regs: &[fn(&mut Runtime)]) -> ExitCode {
         }
     };
 
-    let mut mem = GuestMemory::new(GUEST_MEMORY);
+    let guarded = args.iter().any(|a| a == "--guard-memory")
+        || std::env::var_os("XENON_GUARD_MEMORY").is_some();
+    let mut mem = if guarded {
+        log("guarded guest memory: a never-allocated address stops the run");
+        GuestMemory::new_guarded(GUEST_MEMORY)
+    } else {
+        GuestMemory::new(GUEST_MEMORY)
+    };
+    xenon_rt::guard::commit(image.base, image.data.len() as u32);
     let base = image.base as usize;
     mem.bytes_mut()[base..base + image.data.len()].copy_from_slice(&image.data);
     let mut rt = Runtime::new(mem);
@@ -500,20 +513,13 @@ pub fn run(sha256: &str, regs: &[fn(&mut Runtime)]) -> ExitCode {
     set_runtime(rt.clone());
     log(&format!("call table: {} MB", rt.table_bytes() >> 20));
 
-    std::panic::set_hook(Box::new(|info| {
-        let name = std::thread::current().name().unwrap_or("?").to_string();
-        log(&format!("STOP in {name}: {info}"));
-        log(&format!(
-            "recent calls: {}",
-            hex_list(&MINE.with(|m| m.recent()))
-        ));
-        if let Some(rt) = RT.get() {
-            let bt: Vec<String> = backtrace(rt).iter().map(|a| format!("{a:#010x}")).collect();
-            log(&format!("guest return addresses: {}", bt.join(" ")));
-        }
-        report();
-        std::process::exit(101);
-    }));
+    std::panic::set_hook(Box::new(|info| stop(&info.to_string())));
+    xenon_rt::guard::on_wild_access(|a| {
+        stop(&format!(
+            "wild guest access at {a:#010x}, never allocated{}",
+            xenon_rt::runtime::wild_hint(a)
+        ))
+    });
 
     if let Some(w) = opt(&args, "--audio-wav") {
         if let Err(e) = kernel::audio::start_wav(w.as_ref()) {
@@ -616,6 +622,25 @@ fn host_rss() -> Option<u64> {
 #[cfg(not(any(target_os = "linux", windows)))]
 fn host_rss() -> Option<u64> {
     None
+}
+
+/// Stops the run: the reason, this thread's last calls and guest return
+/// addresses, then the full report (every thread). Never returns.
+fn stop(why: &str) -> ! {
+    let name = std::thread::current().name().unwrap_or("?").to_string();
+    log(&format!("STOP in {name}: {why}"));
+    log(&format!(
+        "recent calls: {}",
+        hex_list(&MINE.with(|m| m.recent()))
+    ));
+    if let Some(rt) = RT.get() {
+        log(&format!(
+            "guest return addresses: {}",
+            hex_list(&backtrace(rt))
+        ));
+    }
+    report();
+    std::process::exit(101);
 }
 
 fn report() {

@@ -268,6 +268,9 @@ fn missing(_: &Runtime, _: &mut Context) {
 /// import. Call before [`Runtime::share`].
 pub fn install(rt: &mut Runtime, s: &Setup) {
     let h = xenon_recomp::xex::Header::parse(s.file).expect("executable header");
+    // Fixed ranges outside the heaps (no-ops without guarded memory).
+    xenon_rt::guard::commit(s.image.base, s.image.data.len() as u32);
+    xenon_rt::guard::commit(video::GPU_REGS, 0x8_0000);
     let mut pool = Heap::new("pool", POOL.0, POOL.1, 0x10);
     let mut alloc = |size: u32| pool.alloc(size, 16).unwrap().0;
 

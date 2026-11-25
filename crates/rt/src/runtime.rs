@@ -269,7 +269,7 @@ impl Runtime {
 
 /// A call target that is really a common instruction word means code bytes
 /// were read as a pointer: an overwritten function pointer or a stale object.
-fn wild_hint(addr: u32) -> String {
+pub fn wild_hint(addr: u32) -> String {
     let what = match addr {
         a if a >> 16 == 0x9421 => "stwu r1,-n(r1), a function's first instruction",
         0x7D88_02A6 => "mflr r12, a function's first instruction",

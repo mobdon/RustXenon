@@ -77,6 +77,8 @@ impl Heap {
     }
 
     fn take(&mut self, at: u32, size: u32) -> bool {
+        // Only does something with guarded guest memory (--guard-memory).
+        xenon_rt::guard::commit(at, size);
         self.map.insert(at, size);
         self.used += size as u64;
         self.peak = self.peak.max(self.used);
