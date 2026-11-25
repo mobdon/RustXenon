@@ -3220,14 +3220,15 @@ impl Drawer {
         let device = &self.device;
         let cache = self.disk_cache.as_ref().map(|c| &c.cache);
         let entry = ["decode_8888", "decode_float"][usize::from(mode.is_some())];
-        let fresh = self.decode_pipelines[usize::from(mode.is_some())].is_none();
-        let t0 = Instant::now();
+        // Set once the shader module is made, so it times the pipeline alone.
+        let mut t0 = None;
         let pipeline = self.decode_pipelines[usize::from(mode.is_some())]
             .get_or_insert_with(|| {
                 let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
                     label: Some("resolve"),
                     source: wgpu::ShaderSource::Wgsl(include_str!("resolve.wgsl").into()),
                 });
+                t0 = Some(Instant::now());
                 device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                     label: Some(entry),
                     layout: None,
@@ -3238,7 +3239,7 @@ impl Drawer {
                 })
             })
             .clone();
-        if fresh {
+        if let Some(t0) = t0 {
             self.pipeline_made(t0);
         }
         let pipeline = &pipeline;
@@ -4540,13 +4541,14 @@ impl Drawer {
         let scope = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
         let device = &self.device;
         let cache = self.disk_cache.as_ref().map(|c| &c.cache);
-        let fresh = self.resolve_pipelines[entry].is_none();
-        let t0 = Instant::now();
+        // Set once the shader module is made, so it times the pipeline alone.
+        let mut t0 = None;
         let pipeline = self.resolve_pipelines[entry].get_or_insert_with(|| {
             let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("resolve"),
                 source: wgpu::ShaderSource::Wgsl(include_str!("resolve.wgsl").into()),
             });
+            t0 = Some(Instant::now());
             device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                 label: Some("resolve"),
                 layout: None,
@@ -4557,7 +4559,7 @@ impl Drawer {
             })
         });
         let pipeline = &pipeline.clone();
-        if fresh {
+        if let Some(t0) = t0 {
             self.pipeline_made(t0);
         }
         let aspect = |aspect| {
