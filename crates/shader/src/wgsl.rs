@@ -350,7 +350,9 @@ pub fn translate_with(
         stage,
         info: ShaderInfo::default(),
         body: String::new(),
-        last_full_vfetch: None,
+        live_fulls: Vec::new(),
+        cond_exec: false,
+        forward_jump: false,
         r0x_written: false,
         nonlinear: false,
         has_mini: false,
@@ -530,10 +532,17 @@ struct Gen {
     stage: ShaderStage,
     info: ShaderInfo,
     body: String,
-    /// Fetch constant, stride and index kind of the last vfetch_full in
-    /// program order, which a following vfetch_mini reuses (as Xenia tracks
-    /// it).
-    last_full_vfetch: Option<(u32, u32, bool)>,
+    /// Fetch constant, stride and index kind of each vfetch_full whose
+    /// address a following vfetch_mini may read through, last in program
+    /// order last (its constant gives the mini's endianness, as Xenia tracks
+    /// it). A full that may be skipped (predicated, in a conditional exec,
+    /// or after a forward jump) leaves the earlier ones live.
+    live_fulls: Vec<(u32, u32, bool)>,
+    /// The exec being translated has a condition.
+    cond_exec: bool,
+    /// A forward jump came earlier in program order, so later instructions
+    /// may be skipped.
+    forward_jump: bool,
     /// Some instruction so far in program order may write r0.x.
     r0x_written: bool,
     has_mini: bool,
@@ -602,6 +611,7 @@ impl Gen {
             CfInstr::CondJmp { address, .. } => address <= k,
             _ => false,
         };
+        self.forward_jump |= matches!(*cf, CfInstr::CondJmp { address, .. } if address > k + 1);
         let _ = writeln!(self.body, "        case {k}u: {{");
         self.line(&format!("pc = {}u;", k + 1));
         match *cf {
@@ -615,6 +625,7 @@ impl Gen {
                     ExecCond::Predicate { value, .. } => format!("(p0 == {value})"),
                 };
                 self.line(&format!("if {cond} {{"));
+                self.cond_exec = !matches!(e.cond, ExecCond::Always { .. });
                 for j in 0..e.count {
                     let ins = prog.instrs[(e.address + j) as usize].expect("decoded in parse");
                     match ins {
@@ -1104,9 +1115,9 @@ impl Gen {
     }
 
     fn vfetch(&mut self, f: &VertexFetch) -> Result<(), Error> {
-        let (fc, stride, bounded) = if f.mini {
+        let (fc, _, _) = if f.mini {
             self.has_mini = true;
-            self.last_full_vfetch.ok_or_else(|| {
+            *self.live_fulls.last().ok_or_else(|| {
                 Error::Malformed("vfetch_mini without a preceding vfetch_full".into())
             })?
         } else {
@@ -1116,26 +1127,37 @@ impl Gen {
                 && f.src_swizzle == 0
                 && !self.r0x_written;
             let full = (f.fetch_const, f.stride, f.stride == 0 || vertex_index);
-            self.last_full_vfetch = Some(full);
+            if f.predicate.is_none() && !self.cond_exec && !self.forward_jump {
+                self.live_fulls.clear();
+            }
+            self.live_fulls.retain(|&l| l != full);
+            self.live_fulls.push(full);
             full
         };
         let (words, comps) = vertex_format_decode(f)?;
         self.info.uses_vertex_fetch = true;
-        self.info.vertex_fetch_consts |= 1u128 << fc;
         let (first, end) = (f.offset, f.offset + words as i32);
-        let reach = &mut self.info.vertex_fetch_reach;
-        match reach
-            .iter_mut()
-            .find(|r| (r.fetch_const, r.stride, r.bounded) == (fc, stride, bounded))
-        {
-            Some(r) => (r.first, r.end) = (r.first.min(first), r.end.max(end)),
-            None => reach.push(VertexFetchReach {
-                fetch_const: fc,
-                stride,
-                bounded,
-                first,
-                end,
-            }),
+        let sources = if f.mini {
+            self.live_fulls.clone()
+        } else {
+            vec![*self.live_fulls.last().expect("pushed above")]
+        };
+        for (fc, stride, bounded) in sources {
+            self.info.vertex_fetch_consts |= 1u128 << fc;
+            let reach = &mut self.info.vertex_fetch_reach;
+            match reach
+                .iter_mut()
+                .find(|r| (r.fetch_const, r.stride, r.bounded) == (fc, stride, bounded))
+            {
+                Some(r) => (r.first, r.end) = (r.first.min(first), r.end.max(end)),
+                None => reach.push(VertexFetchReach {
+                    fetch_const: fc,
+                    stride,
+                    bounded,
+                    first,
+                    end,
+                }),
+            }
         }
         if let Some(v) = f.predicate {
             self.line(&format!("if (p0 == {v}) {{"));

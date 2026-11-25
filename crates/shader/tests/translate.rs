@@ -1203,3 +1203,54 @@ fn vertex_fetch_reach_with_a_backward_jump() {
     );
     assert_eq!(t.info.vertex_fetch_reach, [reach(0, 2, true, 0, 1)]);
 }
+
+/// A vfetch_mini reads through whichever vfetch_full ran last. When the
+/// program-order one may be skipped (predicated, conditional exec or after a
+/// forward jump), the mini's words also reach the earlier full's constant.
+#[test]
+fn vertex_fetch_reach_mini_after_a_skippable_full() {
+    let a = VertexFetch::full(1, 0, 1, VertexFormat::F32_FLOAT, 4, 0);
+    let b = VertexFetch::full(1, 0, 2, VertexFormat::F32_FLOAT, 4, 0);
+    let mut mini = VertexFetch::full(2, 0, 0, VertexFormat::F32_FLOAT, 4, 3);
+    mini.mini = true;
+    let out = alu(export(62, r(1)));
+    let both = [reach(1, 4, true, 0, 4), reach(2, 4, true, 0, 4)];
+
+    // Predicated full.
+    let mut pb = b;
+    pb.predicate = Some(true);
+    let instrs = [vfetch(a), vfetch(pb), vfetch(mini), out];
+    let t = ok(&assemble(&[exec(0, 4, true)], &instrs), Vertex);
+    assert_eq!(t.info.vertex_fetch_reach, both);
+
+    // Full in a conditional exec.
+    let cond = CfInstr::Exec(Exec::new(1, 1, false).with_cond(ExecCond::Bool {
+        index: 0,
+        value: true,
+        predicate_clean: true,
+    }));
+    let instrs = [vfetch(a), vfetch(b), vfetch(mini), out];
+    let cf = [exec(0, 1, false), cond, exec(2, 2, true)];
+    let t = ok(&assemble(&cf, &instrs), Vertex);
+    assert_eq!(t.info.vertex_fetch_reach, both);
+
+    // Full after a forward jump that can pass over it.
+    let jump = CfInstr::CondJmp {
+        address: 3,
+        cond: BranchCond::Bool {
+            index: 0,
+            value: true,
+        },
+        direction: false,
+    };
+    let cf = [exec(0, 1, false), jump, exec(1, 1, false), exec(2, 2, true)];
+    let t = ok(&assemble(&cf, &instrs), Vertex);
+    assert_eq!(t.info.vertex_fetch_reach, both);
+
+    // An unconditional full replaces the earlier one.
+    let t = ok(&assemble(&[exec(0, 4, true)], &instrs), Vertex);
+    assert_eq!(
+        t.info.vertex_fetch_reach,
+        [reach(1, 4, true, 0, 1), reach(2, 4, true, 0, 4)]
+    );
+}
