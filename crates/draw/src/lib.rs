@@ -1467,6 +1467,11 @@ impl Drawer {
     pub fn new() -> Result<Drawer, Error> {
         let mut desc = wgpu::InstanceDescriptor::new_without_display_handle();
         desc.backends = wgpu::Backends::VULKAN | wgpu::Backends::GL;
+        // Not from the build: wgpu turns Vulkan validation on in builds
+        // with debug assertions, which costs microseconds a draw where the
+        // layer is installed. WGPU_VALIDATION=1 and WGPU_DEBUG=1 still do.
+        desc.flags = wgpu::InstanceFlags::empty().with_env();
+        let flags = desc.flags;
         let instance = wgpu::Instance::new(desc);
         let options = |force_fallback_adapter| wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::HighPerformance,
@@ -1595,7 +1600,22 @@ impl Drawer {
             instance,
             device,
             queue,
-            adapter: format!("{} ({:?}, {:?})", info.name, info.backend, info.device_type),
+            adapter: format!(
+                "{} ({:?}, {:?}){}{}",
+                info.name,
+                info.backend,
+                info.device_type,
+                if flags.contains(wgpu::InstanceFlags::VALIDATION) {
+                    ", validation on"
+                } else {
+                    ""
+                },
+                if cfg!(debug_assertions) {
+                    ", built with debug assertions"
+                } else {
+                    ""
+                }
+            ),
             timeout: DEFAULT_TIMEOUT,
             regs: RegisterFile::default(),
             vs: None,
