@@ -329,11 +329,12 @@ fn decode_float(@builtin(global_invocation_id) id: vec3<u32>) {
         let lo = swap_endian(guest[o], dp.endian);
         let hi = swap_endian(guest[o + 1u], dp.endian);
         v = array<u32, 4>(lo & 0xFFFFu, lo >> 16u, hi & 0xFFFFu, hi >> 16u);
-        // f32_to_half(half_to_f32(h)) keeps every half but NaNs, which
-        // become the quiet NaN of their sign.
+        // f32_to_half(half_to_f32(h)) keeps every half but NaNs: the
+        // texture crate's half_to_f32 drops their sign, so all of them
+        // become the positive quiet NaN 0x7E00.
         for (var i = 0u; i < 4u; i++) {
             if (v[i] & 0x7C00u) == 0x7C00u && (v[i] & 0x3FFu) != 0u {
-                v[i] = (v[i] & 0x8000u) | 0x7E00u;
+                v[i] = 0x7E00u;
             }
         }
         one = 0x3C00u;

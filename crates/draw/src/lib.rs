@@ -1368,6 +1368,15 @@ impl Drawer {
         self.float32_filterable
     }
 
+    /// Uploads those textures as `Rgba16Float` from now on, as on a host
+    /// without filterable 32-bit floats, so tests can reach that path on
+    /// any adapter. Call it before the first replay: cached textures keep
+    /// their format.
+    #[doc(hidden)]
+    pub fn disable_float32_textures(&mut self) {
+        self.float32_filterable = false;
+    }
+
     /// What the drawer holds, for the run log: cached textures, render
     /// targets (bytes estimated from their size and format), the draw upload
     /// arena and its host staging copy, pipeline counts (with the distinct

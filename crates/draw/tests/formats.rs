@@ -566,6 +566,12 @@ fn gpu_half4_resolve_matches_cpu_reference() {
         (w2, 0.0, 0.0, [255, 128, 3, 255]),
         (0.0, h2, 0.0, [7, 255, 255, 64]),
     ]);
+    const SPECIAL: u32 = VERTS + 0x100;
+    let corner = color_verts(&[
+        (0.0, 0.0, 0.0, [0; 4]),
+        (8.0, 0.0, 0.0, [0; 4]),
+        (0.0, 8.0, 0.0, [0; 4]),
+    ]);
     // (exponent bias, swap, endian)
     let cases = [
         (0, false, 0),
@@ -583,13 +589,23 @@ fn gpu_half4_resolve_matches_cpu_reference() {
     ] {
         let mut mem = memory();
         mem.write_words(VERTS, &verts);
+        mem.write_words(SPECIAL, &corner);
         let mut s = Stream::default();
         s.setup()
             .regs(RB_COLOR_INFO, &[rt << 16])
             .shader(false, &vs_color())
             .shader(true, &ps_interp())
             .vertex_fetch(0, VERTS, 12)
-            .draw_auto(PRIM_TRI_LIST, 3);
+            .draw_auto(PRIM_TRI_LIST, 3)
+            // A corner of a negative NaN, a negative, -inf and a negative
+            // denormal: the resolve keeps their signs (7e3 clamps them).
+            .shader(true, &ps_const())
+            .regs(
+                SHADER_CONSTANT_FLOAT + 256 * 4,
+                &[0xFFC0_0000, f(-1.5), 0xFF80_0000, f(-(2f32).powi(-24))],
+            )
+            .vertex_fetch(0, SPECIAL, 12)
+            .draw_auto(PRIM_RECT_LIST, 3);
         let dest = |i: usize| DEST + 0x1_0000 * i as u32;
         for (i, &(bias, swap, endian)) in cases.iter().enumerate() {
             s.resolve_with(
@@ -608,6 +624,10 @@ fn gpu_half4_resolve_matches_cpu_reference() {
         assert_eq!(report.resolves, cases.len() as u32, "{report:?}");
         assert!(report.unsupported.is_empty(), "{report:?}");
         let raw = d.read_render_target_raw(key(format), 0, 0, W, H).unwrap();
+        if format == TargetFormat::Rgba16Float {
+            let h = |i: usize| u16::from_le_bytes([raw[2 * i], raw[2 * i + 1]]);
+            assert!(h(0) > 0xFC00 && h(1) == 0xBE00, "{:x?}", &raw[..8]);
+        }
         let mut expected = memory();
         for (i, &(bias, swap, endian)) in cases.iter().enumerate() {
             let lut = formats::half_lut(format, bias).unwrap();
