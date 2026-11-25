@@ -455,9 +455,10 @@ pub fn run(sha256: &str, regs: &[fn(&mut Runtime)]) -> ExitCode {
         std::thread::sleep(Duration::from_secs(1));
         let swaps = kernel::k().swaps.load(Ordering::Relaxed);
         log(&format!(
-            "frames {swaps} (+{}), {}",
+            "frames {swaps} (+{}), {}, {}",
             swaps - last,
-            kernel::k().usage_line()
+            kernel::k().usage_line(),
+            growth_line()
         ));
         if swaps == last {
             stalled += 1;
@@ -482,6 +483,57 @@ pub fn run(sha256: &str, regs: &[fn(&mut Runtime)]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// Counts that grow if something is never released: open handles, live
+/// guest threads and host resident memory.
+fn growth_line() -> String {
+    let kx = kernel::k();
+    let started = kx.threads.lock().map(|t| t.len()).unwrap_or(0) as u32;
+    let ended = kernel::threads::ENDED.load(Ordering::Relaxed);
+    let rss = host_rss().map_or("?".into(), |b| (b >> 20).to_string());
+    format!(
+        "handles {}, threads {} live, host {rss} MB",
+        kx.handle_count(),
+        started.saturating_sub(ended)
+    )
+}
+
+/// Resident memory of this process in bytes.
+#[cfg(target_os = "linux")]
+fn host_rss() -> Option<u64> {
+    let s = std::fs::read_to_string("/proc/self/statm").ok()?;
+    Some(s.split_whitespace().nth(1)?.parse::<u64>().ok()? * 4096)
+}
+
+#[cfg(windows)]
+fn host_rss() -> Option<u64> {
+    // PROCESS_MEMORY_COUNTERS; kernel32 exports K32GetProcessMemoryInfo.
+    #[repr(C)]
+    #[derive(Default)]
+    struct Counters {
+        cb: u32,
+        page_faults: u32,
+        peak_working_set: usize,
+        working_set: usize,
+        rest: [usize; 6],
+    }
+    extern "system" {
+        fn GetCurrentProcess() -> isize;
+        fn K32GetProcessMemoryInfo(p: isize, c: *mut Counters, cb: u32) -> i32;
+    }
+    let mut c = Counters {
+        cb: std::mem::size_of::<Counters>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: c is a correctly sized PROCESS_MEMORY_COUNTERS.
+    let ok = unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut c, c.cb) };
+    (ok != 0).then_some(c.working_set as u64)
+}
+
+#[cfg(not(any(target_os = "linux", windows)))]
+fn host_rss() -> Option<u64> {
+    None
+}
+
 fn report() {
     let kx = kernel::k();
     log(&format!(
@@ -492,7 +544,7 @@ fn report() {
         "threads started: {}",
         kx.threads.lock().map(|t| t.len()).unwrap_or(0)
     ));
-    log(&format!("memory: {}", kx.usage_line()));
+    log(&format!("memory: {}, {}", kx.usage_line(), growth_line()));
     if let Some(p) = PROFILE.lock().unwrap().as_ref() {
         let mut v: Vec<_> = p.iter().collect();
         v.sort_by(|a, b| b.1.cmp(a.1));

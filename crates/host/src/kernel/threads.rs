@@ -136,9 +136,25 @@ pub fn create(
     (handle, kthread)
 }
 
+/// Ended threads, for the memory line of the run log.
+pub static ENDED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
 fn finished(rt: &Runtime, kthread: u32, code: u32) {
     rt.mem.write_u32(kthread + 0x140, code);
     rt.mem.write_u32(kthread + 4, 1);
+    // The stack and TLS block go back to their heaps: no guest code runs on
+    // them again. The thread object and control region stay, since handles
+    // and affinity calls can still reach them.
+    let kx = k();
+    kx.virt
+        .lock()
+        .unwrap()
+        .free(rt.mem.read_u32(kthread + 0x60));
+    kx.pool
+        .lock()
+        .unwrap()
+        .free(rt.mem.read_u32(kthread + 0x68));
+    ENDED.fetch_add(1, Ordering::Relaxed);
     if let KObj::Thread(e) = &*objects::get(rt, kthread) {
         e.set();
     }
