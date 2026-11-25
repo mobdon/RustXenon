@@ -654,6 +654,7 @@ fn late_front_buffer_is_one_swap_behind() {
     // The cleared copy (a resolve copies before it clears) shows two later.
     run(&mut d, &next, &mut mem);
     let r = run(&mut d, &next, &mut mem);
+    assert_eq!(r.frames.len(), 1, "{r:?}");
     assert!(r.frames[0].rgba8.chunks_exact(4).all(|p| p == CLEAR));
 }
 

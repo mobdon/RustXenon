@@ -248,12 +248,6 @@ impl Tracked<'_> {
     }
 }
 
-/// Guest bytes that GPU resolves wrote, kept in a GPU buffer so that
-/// textures fetched from them are decoded on the GPU instead of read back,
-/// hashed, decoded and uploaded. The buffer always holds what guest memory
-/// holds (or, for the `dirty` range, will hold once written back) over
-/// `[lo, hi)`: it starts as a copy of guest memory, resolves write into it,
-/// and any other write to the range drops it.
 /// A front buffer copy on its way back: the buffer, its submission, and
 /// how to read it (width, height, pitch, endian, swizzle).
 struct LateFront {
@@ -264,6 +258,12 @@ struct LateFront {
     swizzle: Option<u16>,
 }
 
+/// Guest bytes that GPU resolves wrote, kept in a GPU buffer so that
+/// textures fetched from them are decoded on the GPU instead of read back,
+/// hashed, decoded and uploaded. The buffer always holds what guest memory
+/// holds (or, for the `dirty` range, will hold once written back) over
+/// `[lo, hi)`: it starts as a copy of guest memory, resolves write into it,
+/// and any other write to the range drops it.
 struct Mirror {
     lo: u64,
     hi: u64,
@@ -5659,7 +5659,14 @@ impl Drawer {
         };
         let addr = addr & PHYSICAL_MASK;
         let (lo, hi) = (u64::from(addr), u64::from(addr) + u64::from(extent));
-        let kept = self.mirrors.iter().position(|m| m.lo <= lo && hi <= m.hi);
+        let mut kept = self.mirrors.iter().position(|m| m.lo <= lo && hi <= m.hi);
+        // A CPU write to the front buffer since the resolve drops the kept
+        // copy, as the synchronous path's check does.
+        if let Some(i) = kept.filter(|_| self.late_front_buffer) {
+            if !self.verify(i, mem, lo, hi) {
+                kept = None;
+            }
+        }
         if let (true, Some(i)) = (self.late_front_buffer, kept) {
             let buf = self.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("front buffer"),
