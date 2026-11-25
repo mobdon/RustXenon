@@ -395,9 +395,11 @@ pub struct Timings {
     pub queue: Duration,
     /// Of `queue`: copying the staged draw buffers into upload memory.
     pub upload: Duration,
-    /// Finishing and submitting batches on the submit thread, alongside
-    /// the drawer's own phases (not part of them).
+    /// Submitting batches on the submit thread, alongside the drawer's
+    /// own phases (not part of them).
     pub submit_thread: Duration,
+    /// Finishing batches' encoders on the finish thread, alongside too.
+    pub finish_thread: Duration,
     /// Kept resolve write-backs to guest memory: each waits for the GPU.
     pub writebacks: u32,
     /// Waiting for queued GPU work before a resolve readback: where the
@@ -524,6 +526,7 @@ impl std::ops::AddAssign<&Timings> for Timings {
         self.queue += t.queue;
         self.upload += t.upload;
         self.submit_thread += t.submit_thread;
+        self.finish_thread += t.finish_thread;
         self.writebacks += t.writebacks;
         self.render_passes += t.render_passes;
         for (a, b) in self.gpu_passes.iter_mut().zip(t.gpu_passes) {
@@ -555,7 +558,9 @@ struct Submitter {
     threads: Vec<std::thread::JoinHandle<()>>,
 }
 
-type SubmitDone = (Duration, Option<String>, wgpu::SubmissionIndex);
+/// Finish time, submit time, the first validation error and the
+/// submission of one batch.
+type SubmitDone = (Duration, Duration, Option<String>, wgpu::SubmissionIndex);
 
 /// Staged bytes to write to `arena` at an offset before the encoders run,
 /// and the encoders.
@@ -568,6 +573,7 @@ type SubmitJob = (
 struct SubmitState {
     pending: usize,
     queue: Duration,
+    finish: Duration,
     error: Option<String>,
     last: Option<wgpu::SubmissionIndex>,
 }
@@ -601,33 +607,54 @@ impl Submitter {
                 // Mapped upload chunks, kept and reused: recalled after each
                 // submit, so mapped again by the next upload.
                 let mut belt = wgpu::util::StagingBelt::new(device.clone(), BELT_CHUNK);
-                for (upload, bufs, finish, finish_error) in finished {
+                while let Ok(first) = finished.recv() {
                     let t = Instant::now();
+                    // Batches finished meanwhile go in the same submit: each
+                    // `queue.submit` has a fixed cost, and a run of resolves
+                    // flushes many small batches close together.
+                    let mut jobs = vec![first];
+                    jobs.extend(finished.try_iter().take(SUBMIT_MERGE_MAX - 1));
                     // Error scopes are per thread.
                     let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
                     // Maps the chunks recalled after earlier submits whose
                     // work the GPU finished.
                     let _ = device.poll(wgpu::PollType::Poll);
-                    let upload = upload.map(|(arena, base, bytes)| {
-                        let mut enc = device.create_command_encoder(&Default::default());
-                        // In chunk-sized pieces: the belt makes a chunk as
-                        // large as a write and never frees one, so batches
-                        // of growing sizes kept adding larger chunks.
-                        for (i, piece) in bytes.chunks(BELT_CHUNK as usize).enumerate() {
-                            let size =
-                                wgpu::BufferSize::new(piece.len() as u64).expect("non-empty");
-                            let at = base + i as u64 * BELT_CHUNK;
-                            belt.write_buffer(&mut enc, &arena, at, size)
-                                .copy_from_slice(piece);
+                    let mut cmds = Vec::new();
+                    let mut dones = Vec::with_capacity(jobs.len());
+                    for (upload, bufs, finish, finish_error) in jobs {
+                        if let Some((arena, base, bytes)) = upload {
+                            let mut enc = device.create_command_encoder(&Default::default());
+                            // In chunk-sized pieces: the belt makes a chunk
+                            // as large as a write and never frees one, so
+                            // batches of growing sizes kept adding larger
+                            // chunks.
+                            for (i, piece) in bytes.chunks(BELT_CHUNK as usize).enumerate() {
+                                let size =
+                                    wgpu::BufferSize::new(piece.len() as u64).expect("non-empty");
+                                let at = base + i as u64 * BELT_CHUNK;
+                                belt.write_buffer(&mut enc, &arena, at, size)
+                                    .copy_from_slice(piece);
+                            }
+                            // Each upload ahead of its own batch, after the
+                            // batches before it read the arena.
+                            cmds.push(enc.finish());
                         }
-                        belt.finish();
-                        enc
-                    });
-                    let index = queue.submit(upload.map(|e| e.finish()).into_iter().chain(bufs));
+                        cmds.extend(bufs);
+                        dones.push((finish, finish_error));
+                    }
+                    belt.finish();
+                    let index = queue.submit(cmds);
                     belt.recall();
-                    let error = finish_error.or(block_on(scope.pop()).map(|e| e.to_string()));
-                    if done.send((finish + t.elapsed(), error, index)).is_err() {
-                        break;
+                    let error = block_on(scope.pop()).map(|e| e.to_string());
+                    // The submit time goes to the first batch of the merge.
+                    let mut busy = t.elapsed();
+                    for (i, (finish, finish_error)) in dones.into_iter().enumerate() {
+                        let error = finish_error.or(if i == 0 { error.clone() } else { None });
+                        let sent =
+                            done.send((finish, std::mem::take(&mut busy), error, index.clone()));
+                        if sent.is_err() {
+                            return;
+                        }
                     }
                 }
             })
@@ -659,8 +686,9 @@ impl Submitter {
         let mut st = self.state.lock().expect("submit state");
         let rx = self.rx.lock().expect("submit results");
         while st.pending > n {
-            let (e, error, index) = rx.recv().expect("submit thread alive");
+            let (f, e, error, index) = rx.recv().expect("submit thread alive");
             st.pending -= 1;
+            st.finish += f;
             st.queue += e;
             if st.error.is_none() {
                 st.error = error;
@@ -669,10 +697,11 @@ impl Submitter {
         }
     }
 
-    /// The submit time and first error since the last call.
-    fn take(&self) -> (Duration, Option<String>) {
+    /// The finish and submit time and first error since the last call.
+    fn take(&self) -> (Duration, Duration, Option<String>) {
         let mut st = self.state.lock().expect("submit state");
-        (std::mem::take(&mut st.queue), st.error.take())
+        let finish = std::mem::take(&mut st.finish);
+        (finish, std::mem::take(&mut st.queue), st.error.take())
     }
 }
 
@@ -685,8 +714,12 @@ impl Drop for Submitter {
     }
 }
 
-/// Flushed batches the submit thread may hold before a flush waits.
+/// Flushed batches the submit thread may hold before a flush waits, by
+/// default; `XENON_SUBMITS_IN_FLIGHT` sets it.
 const SUBMITS_IN_FLIGHT: usize = 4;
+
+/// Most finished batches the submit thread merges into one submit.
+const SUBMIT_MERGE_MAX: usize = 16;
 
 /// Batch passes timed per flush; later ones in the same batch go untimed.
 const GPU_CLOCK_PASSES: u64 = 1024;
@@ -1206,6 +1239,8 @@ pub struct Drawer {
     /// `window_memo` are kept across replays and dropped only where written.
     watching: bool,
     submitter: Submitter,
+    /// Flushed batches the submit thread may hold (`SUBMITS_IN_FLIGHT`).
+    submits_in_flight: usize,
     arena: Option<wgpu::Buffer>,
     arena_align: u64,
     /// Vertex windows staged in the arena since it last wrapped: guest
@@ -1994,6 +2029,10 @@ impl Drawer {
             staged_base: 0,
             watching: false,
             submitter,
+            submits_in_flight: std::env::var("XENON_SUBMITS_IN_FLIGHT")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(SUBMITS_IN_FLIGHT),
             pre: None,
             resolve_pending: false,
             arena_align: u64::from(
@@ -2828,7 +2867,7 @@ impl Drawer {
         // A few batches in flight, so their staged copies stay few; the
         // drawer records on while the submit thread catches up. With one,
         // flushes close together waited on each other's submit.
-        self.submitter.drain_to(SUBMITS_IN_FLIGHT);
+        self.submitter.drain_to(self.submits_in_flight);
         let mut upload = None;
         if let (Some(arena), false) = (&self.arena, self.staged.is_empty()) {
             // A copy goes to the submit thread, which writes it to the arena
@@ -2900,7 +2939,8 @@ impl Drawer {
     /// Adds the submit thread's time so far to the timings, and fails on
     /// the first validation error it met.
     fn take_submitted(&mut self) -> Result<(), Skip> {
-        let (busy, error) = self.submitter.take();
+        let (finish, busy, error) = self.submitter.take();
+        self.timings.finish_thread += finish;
         self.timings.submit_thread += busy;
         match error {
             Some(e) => Err(Skip::Fatal(Error::Gpu(e))),

@@ -214,7 +214,7 @@ impl DrawStats {
         };
         format!(
             "[draw] {:.1} s: {} frames, {} replays; ms per {per}: drawer {:.0} = shaders {:.0} (state {:.0}, indices {:.0}, targets {:.0}, pipeline {:.0}), \
-             guest data {:.0}, textures {:.0}, submit {:.0} (queue {:.0}, upload {:.0}; submit thread {:.0} alongside), gpu wait {:.0}, readback {:.0}, \
+             guest data {:.0}, textures {:.0}, submit {:.0} (queue {:.0}, upload {:.0}; finish thread {:.0}, submit thread {:.0} alongside), gpu wait {:.0}, readback {:.0}, \
              resolve cpu {:.0}, clears {:.0}, swap {:.0} (transfers {:.0}); of those, creating \
              pipelines {:.0}; per {per}: {} draws, \
              {} resolves, {} submits ({} resolve, {} transfer, {} decode, {} flush/other), {} transfers ({} passes, {} set up), {} render passes, {} write-backs, readback {:.1} MB, \
@@ -235,6 +235,7 @@ impl DrawStats {
             ms(t.submit),
             ms(t.queue),
             ms(t.upload),
+            ms(t.finish_thread),
             ms(t.submit_thread),
             ms(t.gpu_wait),
             ms(t.readback),
@@ -861,6 +862,7 @@ mod tests {
         s.t.submit = ms(160);
         s.t.queue = ms(60);
         s.t.upload = ms(20);
+        s.t.finish_thread = ms(30);
         s.t.submit_thread = ms(50);
         s.t.writebacks = 14;
         s.t.render_passes = 500;
@@ -882,7 +884,7 @@ mod tests {
             "readback 150,",
             "1380 draws",
             "42 resolves",
-            "submit 80 (queue 30, upload 10; submit thread 25 alongside),",
+            "submit 80 (queue 30, upload 10; finish thread 15, submit thread 25 alongside),",
             "6 transfers (30 passes, 0 set up), 250 render passes, 7 write-backs,",
             "readback 40.0 MB",
             "140 submits (44 resolve, 19 transfer, 17 decode, 60 flush/other)",
