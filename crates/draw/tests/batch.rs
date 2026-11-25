@@ -421,6 +421,45 @@ fn texture_bind_groups_follow_the_textures() {
     assert_eq!(px(&img, W, 8, 40), GREEN);
 }
 
+/// Draws whose arena slices have the same sizes share one group 0 bind
+/// group at their own offsets, and none outlives the arena: after a draw
+/// grows it, a draw of the old sizes binds the new one.
+#[test]
+fn arena_bind_groups_bind_each_draws_data() {
+    let Some(mut d) = drawer() else { return };
+    let mut mem = xenon_gpu::SliceMemory {
+        base: 0,
+        data: vec![0; 20 << 20],
+    };
+    let wf = W as f32;
+    rect(&mut mem, VERTS, wf, wf, RED);
+    rect(&mut mem, VERTS + 48, 32.0, 32.0, GREEN);
+    rect(&mut mem, VERTS + 96, 8.0, 8.0, RED);
+    rect(&mut mem, VERTS + 144, 16.0, 16.0, BLUE);
+    let mut s = Stream::default();
+    s.setup()
+        .shader(false, &vs_color())
+        .shader(true, &ps_interp())
+        .vertex_fetch(0, VERTS, 12)
+        .draw_auto(PRIM_RECT_LIST, 3)
+        .vertex_fetch(0, VERTS + 48, 12)
+        .draw_auto(PRIM_RECT_LIST, 3)
+        // A 17 MiB window: more than the 16 MiB arena, which is replaced.
+        .vertex_fetch(0, VERTS + 144, (17 << 20) / 4)
+        .draw_auto(PRIM_RECT_LIST, 3)
+        // Not in the large window, so not bound from it.
+        .vertex_fetch(0, VERTS + 96, 12)
+        .draw_auto(PRIM_RECT_LIST, 3);
+    let report = run(&mut d, &s, &mut mem);
+    assert_eq!(report.draws, 4, "{report:?}");
+    assert!(report.unsupported.is_empty(), "{report:?}");
+    let img = d.read_render_target(COLOR_KEY, 0, 0, W, H).unwrap();
+    assert_eq!(px(&img, W, 4, 4), RED);
+    assert_eq!(px(&img, W, 12, 12), BLUE);
+    assert_eq!(px(&img, W, 24, 24), GREEN);
+    assert_eq!(px(&img, W, 40, 40), RED);
+}
+
 /// A draw whose vertex window is not in guest memory is skipped, with the
 /// window in the report, and the draws staged around it still land.
 #[test]
