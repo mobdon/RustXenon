@@ -2791,6 +2791,7 @@ version = "0.0.0"
 dependencies = [
  "png 0.18.1",
  "pollster",
+ "rustc-hash",
  "wgpu",
  "xenon-gpu",
  "xenon-shader",
