@@ -109,11 +109,29 @@ pub struct ShaderInfo {
     pub uses_vertex_fetch: bool,
     /// Bit n: vertex fetch constant n (0..=95) is read.
     pub vertex_fetch_consts: u128,
+    /// Where the vertex fetches read, one entry per fetch constant, stride
+    /// and index kind, so the drawer can upload only those words.
+    pub vertex_fetch_reach: Vec<VertexFetchReach>,
     /// The program writes the point size / edge flag / kill-vertex export,
     /// which is dropped.
     pub point_size_export_ignored: bool,
     /// The pixel program can discard.
     pub kills: bool,
+}
+
+/// The guest words some vertex fetches of one fetch constant read: words
+/// `[first, end)` past the constant's dword address plus `index * stride`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VertexFetchReach {
+    pub fetch_const: u32,
+    /// Words per index; 0 means every invocation reads the same words.
+    pub stride: u32,
+    /// The index is the vertex index the vertex shader starts with in r0.x
+    /// (so within the draw's index range), or unused (stride 0). False: the
+    /// fetches may read anywhere in the constant's buffer.
+    pub bounded: bool,
+    pub first: i32,
+    pub end: i32,
 }
 
 /// Output of [`translate`].
@@ -332,6 +350,9 @@ pub fn translate_with(
         info: ShaderInfo::default(),
         body: String::new(),
         last_full_vfetch: None,
+        r0x_written: false,
+        nonlinear: false,
+        has_mini: false,
         float_min_max: None,
         param_gen,
     };
@@ -343,6 +364,14 @@ pub fn translate_with(
         g.cf(k as u32, cf, &prog)?;
     }
     g.info.float_consts_used = g.float_min_max;
+    // shortcut: with loops, calls or backward jumps a fetch may run after a
+    // later r0 write, and a vfetch_mini after another vfetch_full than the
+    // program-order one; no index bound then. Track per path if it matters.
+    if g.nonlinear && (g.r0x_written || g.has_mini) {
+        for r in &mut g.info.vertex_fetch_reach {
+            r.bounded &= r.stride == 0 && !g.has_mini;
+        }
+    }
     Ok(Translated {
         wgsl: g.finish(prog.cf.len() as u32),
         info: g.info,
@@ -500,9 +529,16 @@ struct Gen {
     stage: ShaderStage,
     info: ShaderInfo,
     body: String,
-    /// Fetch constant of the last vfetch_full in program order, which a
-    /// following vfetch_mini reuses (as Xenia tracks it).
-    last_full_vfetch: Option<u32>,
+    /// Fetch constant, stride and index kind of the last vfetch_full in
+    /// program order, which a following vfetch_mini reuses (as Xenia tracks
+    /// it).
+    last_full_vfetch: Option<(u32, u32, bool)>,
+    /// Some instruction so far in program order may write r0.x.
+    r0x_written: bool,
+    has_mini: bool,
+    /// Control flow can run an instruction after one later in program order
+    /// (loops, calls, backward jumps).
+    nonlinear: bool,
     float_min_max: Option<(u32, u32)>,
     param_gen: Option<ParamGen>,
 }
@@ -560,6 +596,11 @@ impl Gen {
     }
 
     fn cf(&mut self, k: u32, cf: &CfInstr, prog: &Program) -> Result<(), Error> {
+        self.nonlinear |= match *cf {
+            CfInstr::LoopEnd { .. } | CfInstr::CondCall { .. } | CfInstr::Return => true,
+            CfInstr::CondJmp { address, .. } => address <= k,
+            _ => false,
+        };
         let _ = writeln!(self.body, "        case {k}u: {{");
         self.line(&format!("pc = {}u;", k + 1));
         match *cf {
@@ -650,6 +691,12 @@ impl Gen {
         }
         self.body.push_str("        }\n");
         Ok(())
+    }
+
+    /// Notes a write of temporary `reg` (relative or not) whose x component
+    /// is written when `x`.
+    fn note_write(&mut self, reg: u32, rel: bool, x: bool) {
+        self.r0x_written |= x && (rel || reg == 0);
     }
 
     fn note_float_const(&mut self, idx: u32) {
@@ -995,6 +1042,10 @@ impl Gen {
         }
 
         // Writes.
+        if export_target.is_none() {
+            self.note_write(a.vector_dest, a.vector_dest_relative, vmask & 1 != 0);
+            self.note_write(a.scalar_dest, a.scalar_dest_relative, smask & 1 != 0);
+        }
         let (vdst, sdst) = match &export_target {
             Some(None) => (None, None),
             Some(Some(t)) => (Some(t.clone()), Some(t.clone())),
@@ -1037,6 +1088,7 @@ impl Gen {
 
     /// Stores `v` (a vec4) into a fetch destination by its 3-bit swizzle.
     fn fetch_store(&mut self, dest: u32, rel: bool, swizzle: u32) {
+        self.note_write(dest, rel, swizzle & 7 != 7);
         let d = temp_ref(dest, rel);
         for c in 0..4 {
             let src = match (swizzle >> (3 * c)) & 7 {
@@ -1051,17 +1103,39 @@ impl Gen {
     }
 
     fn vfetch(&mut self, f: &VertexFetch) -> Result<(), Error> {
-        let fc = if f.mini {
+        let (fc, stride, bounded) = if f.mini {
+            self.has_mini = true;
             self.last_full_vfetch.ok_or_else(|| {
                 Error::Malformed("vfetch_mini without a preceding vfetch_full".into())
             })?
         } else {
-            self.last_full_vfetch = Some(f.fetch_const);
-            f.fetch_const
+            let vertex_index = self.stage == ShaderStage::Vertex
+                && f.src == 0
+                && !f.src_relative
+                && f.src_swizzle == 0
+                && !self.r0x_written;
+            let full = (f.fetch_const, f.stride, f.stride == 0 || vertex_index);
+            self.last_full_vfetch = Some(full);
+            full
         };
         let (words, comps) = vertex_format_decode(f)?;
         self.info.uses_vertex_fetch = true;
         self.info.vertex_fetch_consts |= 1u128 << fc;
+        let (first, end) = (f.offset, f.offset + words as i32);
+        let reach = &mut self.info.vertex_fetch_reach;
+        match reach
+            .iter_mut()
+            .find(|r| (r.fetch_const, r.stride, r.bounded) == (fc, stride, bounded))
+        {
+            Some(r) => (r.first, r.end) = (r.first.min(first), r.end.max(end)),
+            None => reach.push(VertexFetchReach {
+                fetch_const: fc,
+                stride,
+                bounded,
+                first,
+                end,
+            }),
+        }
         if let Some(v) = f.predicate {
             self.line(&format!("if (p0 == {v}) {{"));
         } else {

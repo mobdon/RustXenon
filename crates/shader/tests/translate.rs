@@ -7,7 +7,7 @@ use common::{has, ok, Lcg};
 use xenon_shader::asm::*;
 use xenon_shader::ucode::*;
 use xenon_shader::{
-    translate, translate_with, Error, ParamGen, ParamGenPrimitive, ShaderStage,
+    translate, translate_with, Error, ParamGen, ParamGenPrimitive, ShaderStage, VertexFetchReach,
     PIXEL_FLOAT_CONST_BASE,
 };
 
@@ -1088,4 +1088,117 @@ fn random_alu_programs_validate() {
         let words = assemble(&[exec(0, instrs.len() as u32, true)], &instrs);
         ok(&words, stage);
     }
+}
+
+fn reach(fetch_const: u32, stride: u32, bounded: bool, first: i32, end: i32) -> VertexFetchReach {
+    VertexFetchReach {
+        fetch_const,
+        stride,
+        bounded,
+        first,
+        end,
+    }
+}
+
+/// A vfetch_mini reads through its vfetch_full's constant and stride, so
+/// their words merge into one reach.
+#[test]
+fn vertex_fetch_reach_merges_full_and_mini() {
+    let pos = VertexFetch::full(1, 0, 3, VertexFormat::F32_32_32_FLOAT, 6, -1);
+    let mut col = VertexFetch::full(2, 0, 0, VertexFormat::F16_16_16_16, 1, 4);
+    col.mini = true;
+    let other = VertexFetch::full(3, 0, 9, VertexFormat::F32_FLOAT, 0, 2);
+    let words = assemble(
+        &[exec(0, 4, true)],
+        &[
+            vfetch(pos),
+            vfetch(col),
+            vfetch(other),
+            alu(export(62, r(1))),
+        ],
+    );
+    let t = ok(&words, Vertex);
+    assert_eq!(
+        t.info.vertex_fetch_reach,
+        [reach(3, 6, true, -1, 6), reach(9, 0, true, 2, 3)]
+    );
+}
+
+/// Only an index that is still the starting vertex index is bounded by the
+/// draw's indices; stride 0 needs no index.
+#[test]
+fn vertex_fetch_reach_bounds_only_the_vertex_index() {
+    let f = |src| VertexFetch::full(1, src, 0, VertexFormat::F32_FLOAT, 2, 0);
+    let bounded = |instrs: &[Instr], stage| {
+        let words = assemble(&[exec(0, instrs.len() as u32, true)], instrs);
+        let t = ok(&words, stage);
+        t.info
+            .vertex_fetch_reach
+            .iter()
+            .map(|r| r.bounded)
+            .collect::<Vec<_>>()
+    };
+    let out = alu(export(62, r(1)));
+    assert_eq!(bounded(&[vfetch(f(0)), out], Vertex), [true]);
+    // Another register, or r0 after a write to r0.x.
+    assert_eq!(bounded(&[vfetch(f(2)), out], Vertex), [false]);
+    let write_r0 = alu(mov(0, mask("x"), r(1)));
+    assert_eq!(bounded(&[write_r0, vfetch(f(0)), out], Vertex), [false]);
+    // A write to r0.y, or to r0 after the fetch, leaves r0.x alone.
+    let write_r0y = alu(mov(0, mask("y"), r(1)));
+    assert_eq!(bounded(&[write_r0y, vfetch(f(0)), out], Vertex), [true]);
+    assert_eq!(bounded(&[vfetch(f(0)), write_r0, out], Vertex), [true]);
+    // A fetch into r0.x before the next fetch.
+    let mut into_r0 = VertexFetch::full(0, 0, 1, VertexFormat::F32_FLOAT, 1, 0);
+    into_r0.dest_swizzle = fetch_dest_swz("xyzw");
+    assert_eq!(
+        bounded(&[vfetch(into_r0), vfetch(f(0)), out], Vertex),
+        [true, false]
+    );
+    // A relative index, or another component.
+    let mut rel = f(0);
+    rel.src_relative = true;
+    assert_eq!(bounded(&[vfetch(rel), out], Vertex), [false]);
+    let mut y = f(0);
+    y.src_swizzle = 1;
+    assert_eq!(bounded(&[vfetch(y), out], Vertex), [false]);
+    // Stride 0 reads the same words whatever the index.
+    let mut flat = f(2);
+    flat.stride = 0;
+    assert_eq!(bounded(&[vfetch(flat), out], Vertex), [true]);
+    // r0 of a pixel shader is an interpolator.
+    assert_eq!(
+        bounded(&[vfetch(f(0)), alu(export(0, r(1)))], Pixel),
+        [false]
+    );
+}
+
+/// A backward jump can run the fetch after the later r0 write.
+#[test]
+fn vertex_fetch_reach_with_a_backward_jump() {
+    let jump_back = CfInstr::CondJmp {
+        address: 0,
+        cond: BranchCond::Bool {
+            index: 0,
+            value: true,
+        },
+        direction: true,
+    };
+    let instrs = [
+        vfetch(VertexFetch::full(1, 0, 0, VertexFormat::F32_FLOAT, 2, 0)),
+        alu(mov(0, mask("x"), r(1))),
+        alu(export(62, r(1))),
+    ];
+    let t = ok(
+        &assemble(&[exec(0, 2, false), jump_back, exec(2, 1, true)], &instrs),
+        Vertex,
+    );
+    assert_eq!(t.info.vertex_fetch_reach, [reach(0, 2, false, 0, 1)]);
+    // Without the r0 write the jump changes nothing.
+    let instrs = [instrs[0], alu(mov(2, mask("x"), r(1))), instrs[2]];
+    let t = ok(
+        &assemble(&[exec(0, 2, false), jump_back, exec(2, 1, true)], &instrs),
+        Vertex,
+    );
+    assert_eq!(t.info.vertex_fetch_reach, [reach(0, 2, true, 0, 1)]);
 }

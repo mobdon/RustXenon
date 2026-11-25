@@ -93,5 +93,5 @@ mod wgsl;
 
 pub use wgsl::{
     translate, translate_with, Error, ParamGen, ParamGenPrimitive, ShaderInfo, ShaderStage,
-    Translated, PIXEL_FLOAT_CONST_BASE, TEMP_REGISTERS, WATCHDOG_STEPS,
+    Translated, VertexFetchReach, PIXEL_FLOAT_CONST_BASE, TEMP_REGISTERS, WATCHDOG_STEPS,
 };
