@@ -64,6 +64,11 @@ impl Event {
         was
     }
 
+    /// Whether the event is set now (for reports; it may change at once).
+    pub fn is_set(&self) -> bool {
+        *self.set.lock().unwrap()
+    }
+
     /// Clears the event; returns whether it was set.
     pub fn reset(&self) -> bool {
         std::mem::replace(&mut *self.set.lock().unwrap(), false)
@@ -115,6 +120,11 @@ impl Semaphore {
         Some(prev)
     }
 
+    /// The count now (for reports).
+    pub fn count(&self) -> u32 {
+        *self.count.lock().unwrap()
+    }
+
     pub fn wait(&self, timeout: Option<Duration>) -> bool {
         let g = self.count.lock().unwrap();
         wait_until(&self.cv, g, timeout, |c| {
@@ -153,6 +163,11 @@ impl CriticalSection {
             }
         })
         .1
+    }
+
+    /// The host thread holding the lock now, if any (for reports).
+    pub fn owner(&self) -> Option<ThreadId> {
+        self.state.lock().unwrap().0
     }
 
     pub fn try_enter(&self) -> bool {

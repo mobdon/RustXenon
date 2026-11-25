@@ -227,6 +227,12 @@ impl Runtime {
             .unwrap_or_else(|_| panic!("guest object at {addr:#010x} has another type"))
     }
 
+    /// The object at `addr` if one exists and has type `T`; creates nothing.
+    pub fn find_object<T: Any + Send + Sync>(&self, addr: u32) -> Option<Arc<T>> {
+        let obj = self.objects.lock().unwrap().get(&addr)?.clone();
+        obj.downcast().ok()
+    }
+
     /// Forgets the object at `addr` (the guest freed or reinitialised it).
     pub fn drop_object(&self, addr: u32) {
         self.objects.lock().unwrap().remove(&addr);
@@ -384,6 +390,20 @@ mod tests {
         let rt = Runtime::new(GuestMemory::new(16));
         rt.object(0x40, crate::sync::CriticalSection::new);
         rt.object(0x40, || crate::sync::Semaphore::new(0, 1));
+    }
+
+    #[test]
+    fn find_object_creates_nothing_and_reports_owner() {
+        let rt = Runtime::new(GuestMemory::new(16));
+        assert!(rt.find_object::<crate::sync::Event>(0x40).is_none());
+        let cs = rt.object(0x40, crate::sync::CriticalSection::new);
+        assert!(rt.find_object::<crate::sync::Event>(0x40).is_none());
+        assert_eq!(cs.owner(), None);
+        cs.enter(None);
+        let found = rt
+            .find_object::<crate::sync::CriticalSection>(0x40)
+            .unwrap();
+        assert_eq!(found.owner(), Some(std::thread::current().id()));
     }
 
     #[test]

@@ -873,3 +873,30 @@ fn decoder_context_plays_its_input_into_the_output_ring() {
     );
     kernel::sound::forget(ctx);
 }
+
+#[test]
+fn stall_report_names_the_lock_holder() {
+    let e = env();
+    let rt = &e.rt;
+    let cs = 0x3_2000u64;
+    let mut c = ctx(0x1_C000);
+    call(rt, &mut c, objects::rtl_initialize_critical_section, &[cs]);
+    assert_eq!(objects::describe(rt, cs as u32), "critical section, free");
+    let rt2 = rt.clone();
+    std::thread::Builder::new()
+        .name("holder".into())
+        .spawn(move || {
+            let mut c = ctx(0x1_D000);
+            // Register this thread's name with the activity list first.
+            xenon_host::last_call();
+            call(&rt2, &mut c, objects::rtl_enter_critical_section, &[cs]);
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+    assert_eq!(
+        objects::describe(rt, cs as u32),
+        "critical section, held by holder"
+    );
+    assert_eq!(objects::describe(rt, 0x3_2100), "no host object");
+}
