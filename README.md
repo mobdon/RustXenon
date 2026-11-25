@@ -248,7 +248,7 @@ and the NaN result of `max4` (both differ slightly from Xenia); resolves of
 depth, to destination formats other than those listed above, to 3D
 destinations, and MSAA sample selection; the `ConstantOne` copy command;
 MSAA; `16_16` and `16_16_16_16` targets on hosts without renderable 16-bit
-snorm; blending into `32_FLOAT` and `32_32_FLOAT`; clamping a 7e3 target's blend result to its range; render
+snorm, and blending into them on hosts that cannot blend it; blending into `32_FLOAT` and `32_32_FLOAT`; clamping a 7e3 target's blend result to its range; render
 targets 1 to 3; EDRAM aliasing between targets that overlap in EDRAM; the
 piecewise-linear gamma of `8_8_8_8_GAMMA`
 (drawn as plain 8_8_8_8); stencil, alpha test, alpha to coverage, polygon

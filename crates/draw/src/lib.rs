@@ -53,7 +53,8 @@
 //!   works on the value / 32, as in Xenia) and a resolve unpacks the 16
 //!   bits as `x * 32 / 32767`, floored at -1, like Xenia's resolve shader.
 //!   They need a host that renders into 16-bit snorm
-//!   ([`Drawer::snorm16`]) and are unsupported without one.
+//!   ([`Drawer::snorm16`]) and are unsupported without one; where the
+//!   host cannot blend snorm16 they are drawn without blending (a warning).
 //!
 //! All four render targets (`RB_COLOR_INFO_RT[0..4]`) are drawn, each with
 //! its own `RB_COLOR_MASK` bits, `RB_BLENDCONTROL_RT` blend and output
@@ -488,6 +489,8 @@ pub struct Drawer {
     /// `Rg16Snorm` and `Rgba16Snorm` can be render targets (k_16_16 and
     /// k_16_16_16_16 are refused without them).
     snorm16: bool,
+    /// The snorm16 targets blend (else their blending is dropped).
+    snorm16_blend: bool,
     timings: Timings,
     uncaptured: Arc<Mutex<Vec<String>>>,
     max_dim: u32,
@@ -728,18 +731,21 @@ impl Drawer {
         // only renders into with these features and the adapter's say-so.
         let snorm16_features = wgpu::Features::TEXTURE_FORMAT_16BIT_NORM
             | wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES;
-        let snorm16 = adapter.features().contains(snorm16_features)
-            && [
-                wgpu::TextureFormat::Rg16Snorm,
-                wgpu::TextureFormat::Rgba16Snorm,
-            ]
-            .iter()
-            .all(|&f| {
-                adapter
-                    .get_texture_format_features(f)
-                    .allowed_usages
-                    .contains(wgpu::TextureUsages::RENDER_ATTACHMENT)
-            });
+        let snorm16_all = |ok: &dyn Fn(wgpu::TextureFormatFeatures) -> bool| {
+            adapter.features().contains(snorm16_features)
+                && [
+                    wgpu::TextureFormat::Rg16Snorm,
+                    wgpu::TextureFormat::Rgba16Snorm,
+                ]
+                .iter()
+                .all(|&f| ok(adapter.get_texture_format_features(f)))
+        };
+        let snorm16 = snorm16_all(&|f| {
+            f.allowed_usages
+                .contains(wgpu::TextureUsages::RENDER_ATTACHMENT)
+        });
+        let snorm16_blend = snorm16
+            && snorm16_all(&|f| f.flags.contains(wgpu::TextureFormatFeatureFlags::BLENDABLE));
         let mut required_features = wgpu::Features::empty();
         required_features.set(wgpu::Features::DEPTH32FLOAT_STENCIL8, float_stencil);
         required_features.set(snorm16_features, snorm16);
@@ -814,6 +820,7 @@ impl Drawer {
             resolve_pipelines: [None, None, None],
             float_stencil,
             snorm16,
+            snorm16_blend,
             timings: Timings::default(),
             uncaptured,
             max_dim: limits.max_texture_dimension_2d,
@@ -1522,6 +1529,15 @@ impl Drawer {
                 )
             {
                 report.warn("blending into a 32-bit float render target drawn without blending");
+                blends[rt] = None;
+            }
+            // shortcut: no blending into snorm16 where the host cannot (e.g.
+            // lavapipe); emulate it in the shader if a game relies on it.
+            if blends[rt].is_some()
+                && !self.snorm16_blend
+                && color[rt].is_some_and(|k| k.format.is_snorm16())
+            {
+                report.warn("blending into a 16-bit snorm render target drawn without blending");
                 blends[rt] = None;
             }
         }

@@ -876,6 +876,38 @@ fn fixed16x4_target_clear_draw_and_resolve() {
     assert_eq!(px(&img, W, 40, 40), [255, 0, 8, 255]);
 }
 
+/// Blending into k_16_16_16_16 works on the value / 32 (ONE + ONE adds
+/// the snorm texels) where the host blends snorm16, and is dropped with a
+/// warning, not the whole draw, where it cannot (lavapipe).
+#[test]
+fn fixed16_target_blends_or_draws_without_blending() {
+    let Some(mut d) = drawer() else { return };
+    if !d.snorm16() {
+        eprintln!("SKIP: the host cannot render into 16-bit snorm");
+        return;
+    }
+    let (_, report) = clear_draw_resolve(
+        &mut d,
+        RT_16_16_16_16,
+        (0x0400_0400, 0x0400_0400),
+        [1.0, -1.0, 8.0, 0.5],
+        true,
+        &[],
+    );
+    assert_eq!(report.draws, 1, "{report:?}");
+    assert!(report.unsupported.is_empty(), "{report:?}");
+    let dropped = report.warnings.iter().any(|w| w.contains("16-bit snorm"));
+    let raw = d
+        .read_render_target_raw(key(TargetFormat::Rgba16Fixed), 0, 0, W, H)
+        .unwrap();
+    let expected = if dropped {
+        [0x0400, 0xFC00, 0x2000, 0x0200]
+    } else {
+        [0x0800, 0x0000, 0x2400, 0x0600]
+    };
+    assert_eq!(shorts(&texel(&raw, W, 8, 2, 2)), expected, "{report:?}");
+}
+
 /// k_16_16_FLOAT as Rg16Float: a clear writes the two halves of
 /// RB_COLOR_CLEAR, a resolve to 16_16_FLOAT copies them, one to 8_8_8_8
 /// (GPU) gets blue and alpha 0 (Xenia unpacks only red and green).
