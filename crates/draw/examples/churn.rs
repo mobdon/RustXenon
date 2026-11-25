@@ -196,13 +196,14 @@ fn main() {
         assert!(r.timings.textures_uploaded >= textures, "{:?}", r.timings);
         if frame % every == 0 {
             println!(
-                "frame {frame}: rss {} MB (+{}), {} draws, {} resolves, {} textures uploaded ({} evicted before), {}",
+                "frame {frame}: rss {} MB (+{}), {} draws, {} resolves, {} textures uploaded ({} evicted before), {} guest vertex bytes, {}",
                 rss_mb(),
                 rss_mb().saturating_sub(start),
                 r.draws,
                 r.resolves,
                 r.timings.textures_uploaded,
                 r.timings.textures_reuploaded,
+                r.timings.guest_bytes,
                 d.memory_line()
             );
         }

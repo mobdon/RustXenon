@@ -178,7 +178,7 @@ use xenon_gpu::{
     Command, CopyCommand, Draw, FetchConstantType, GuestRead, RegisterFile, Resolve, ShaderStage,
     SliceMemory, PHYSICAL_MASK,
 };
-use xenon_shader::{ParamGen, ParamGenPrimitive, ShaderInfo, Translated};
+use xenon_shader::{ParamGen, ParamGenPrimitive, ShaderInfo, Translated, VertexFetchReach};
 use xenon_texture::convert::float20e4_to_f32 as float20e4;
 
 pub use frame::Frame;
@@ -1107,6 +1107,57 @@ fn hash_bytes(bytes: &[u8]) -> u64 {
     h
 }
 
+/// The physical byte range `[lo, hi)` vertex fetch constant `k`, at
+/// physical byte address `a` with `size_dwords` words, has read by the
+/// fetches in `reach` when the vertex shader's starting indices (index plus
+/// VGT_INDX_OFFSET, 24 bits) lie in `indices`; `None` when they are not
+/// known. Clipped to the constant's buffer, which is all of it for a fetch
+/// with an unbounded index or a constant without a reach entry. The flag is
+/// set when some fetch's words were clipped: the draw reads past the buffer.
+fn fetch_range(
+    a: u64,
+    size_dwords: u32,
+    k: u32,
+    reach: &[VertexFetchReach],
+    indices: Option<(u32, u32)>,
+) -> (u64, u64, bool) {
+    let end = a + 4 * u64::from(size_dwords);
+    let mut entries = reach.iter().filter(|r| r.fetch_const == k).peekable();
+    if entries.peek().is_none() {
+        return (a, end, false);
+    }
+    let (mut lo, mut hi, mut clipped) = (end, a, false);
+    for r in entries {
+        let (i0, i1) = match (r.stride, indices) {
+            (0, _) => (0, 0),
+            (_, Some(i)) if r.bounded => i,
+            _ => return (a, end, false),
+        };
+        let stride = i64::from(r.stride);
+        let first = a as i64 + 4 * (i64::from(i0) * stride + i64::from(r.first));
+        let last = a as i64 + 4 * (i64::from(i1) * stride + i64::from(r.end));
+        clipped |= first < a as i64 || last > end as i64;
+        lo = lo.min(first.clamp(a as i64, end as i64) as u64);
+        hi = hi.max(last.clamp(a as i64, end as i64) as u64);
+    }
+    (lo, hi.max(lo), clipped)
+}
+
+/// The lowest and highest vertex index the vertex shader starts with for
+/// `indices` (reset markers skipped) and index offset `offset`, as the
+/// shader adds them in 32 bits and keeps 24; `None` when that wraps.
+fn index_range(indices: &[u32], offset: u32) -> Option<(u32, u32)> {
+    let mut used = indices.iter().filter(|&&i| i != u32::MAX);
+    let first = *used.next()?;
+    let (lo, hi) = used.fold((first, first), |(lo, hi), &i| (lo.min(i), hi.max(i)));
+    let (lo, hi) = (lo.wrapping_add(offset), hi.wrapping_add(offset));
+    (lo <= hi && lo >> 24 == hi >> 24).then_some((lo & 0xFF_FFFF, hi & 0xFF_FFFF))
+}
+
+/// Vertex data ranges closer than this share one window part; farther
+/// ranges are staged apart, so the gap between them is not uploaded.
+const WINDOW_GAP: u64 = 4096;
+
 /// Cached textures are dropped wholesale past this many bytes.
 const TEXTURE_CACHE_LIMIT: u64 = 256 << 20;
 
@@ -1115,18 +1166,21 @@ fn to_bytes(words: &[u32]) -> Vec<u8> {
 }
 
 /// The `Consts` uniform of the shader binding contract: float, fetch, bool
-/// and loop constants, then the window base and the index offset.
-fn consts(r: &regs::RegisterFile, window_base: u32) -> Vec<u8> {
+/// and loop constants, then the window base, the index offset and the 96
+/// vertex fetch constants' rebase words.
+fn consts(r: &regs::RegisterFile, window_base: u32, rebase: &[i32; 96]) -> Vec<u8> {
     // Float and fetch constants are adjacent, and so are bool and loop.
     const _: () = assert!(regs::SHADER_CONSTANT_FLOAT + 2048 == regs::SHADER_CONSTANT_FETCH);
     const _: () = assert!(regs::SHADER_CONSTANT_BOOL + 8 == regs::SHADER_CONSTANT_LOOP);
     let tail = [window_base, r.get(regs::VGT_INDX_OFFSET), 0, 0];
+    let rebase = rebase.map(|w| w as u32);
     let blocks = [
         r.slice(regs::SHADER_CONSTANT_FLOAT, 2048 + 192),
         r.slice(regs::SHADER_CONSTANT_BOOL, 8 + 32),
         &tail,
+        &rebase,
     ];
-    let mut b = vec![0; 4 * (2048 + 192 + 8 + 32 + 4)];
+    let mut b = vec![0; 4 * (2048 + 192 + 8 + 32 + 4 + 96)];
     let mut at = 0;
     for block in blocks {
         for (o, w) in b[at..][..4 * block.len()].chunks_exact_mut(4).zip(block) {
@@ -3043,25 +3097,35 @@ impl Drawer {
     }
 
     /// The guest memory the vertex fetch constants in `mask` point at, as
-    /// one window, made ready to read (kept resolves under it written
-    /// back). Returns its physical `[lo, hi)` (none for no window) and base
-    /// address; or, when a window staged in the arena holds it, none, that
-    /// window's base and its memo entry, with this window's size.
+    /// far as `reach` reads with vertex indices in `indices` (see
+    /// [`fetch_range`]), made ready to read (kept resolves under it written
+    /// back). Ranges less than [`WINDOW_GAP`] apart share one part (all of
+    /// them when some fetch reads past its buffer); the parts are staged
+    /// one after the other as one window. Returns the
+    /// parts' physical `[lo, hi)` (none for no window), the window base and
+    /// each constant's rebase words (see the shader binding contract); or,
+    /// when the window is one part and a window staged in the arena holds
+    /// it, no parts, that window's base and its memo entry, with this
+    /// window's size.
     #[allow(clippy::type_complexity)]
     fn guest_window(
         &mut self,
         mask: u128,
+        reach: &[VertexFetchReach],
+        indices: Option<(u32, u32)>,
         mem: &mut Tracked,
         report: &mut Report,
     ) -> Result<
         (
-            Option<(u64, u64)>,
+            Vec<(u64, u64)>,
             u32,
+            [i32; 96],
             Option<((u64, u64, (u64, u64)), u64)>,
         ),
         Skip,
     > {
-        let (mut lo, mut hi) = (u64::MAX, 0u64);
+        let mut ranges = Vec::new();
+        let mut clipped = false;
         for k in (0..96).filter(|k| mask & (1u128 << k) != 0) {
             let vf = self.regs.vertex_fetch(k);
             if vf.fetch_type != FetchConstantType::Vertex {
@@ -3069,24 +3133,61 @@ impl Drawer {
             }
             // Physical, as the translated shader masks fetch addresses.
             let a = u64::from(vf.address & PHYSICAL_MASK);
-            lo = lo.min(a);
-            hi = hi.max(a + 4 * u64::from(vf.size_dwords));
+            let (lo, hi, c) = fetch_range(a, vf.size_dwords, k, reach, indices);
+            clipped |= c;
+            if lo < hi {
+                ranges.push((lo, hi, k));
+            }
         }
-        if lo >= hi {
-            return Ok((None, 0, None));
+        ranges.sort_unstable();
+        let mut parts: Vec<(u64, u64)> = Vec::new();
+        let mut part_of = Vec::new();
+        // A read past its constant's buffer must find the guest's word or 0,
+        // not another part's, so such a draw stages one span with no rebase.
+        // shortcut: an unbounded index past the buffer is not seen and may
+        // still read another part; bound fetches in the shader if that shows.
+        let gap = if clipped { u64::MAX } else { WINDOW_GAP };
+        for &(lo, hi, k) in &ranges {
+            match parts.last_mut() {
+                Some(p) if lo <= p.1.saturating_add(gap) => p.1 = p.1.max(hi),
+                _ => parts.push((lo, hi)),
+            }
+            part_of.push((k, parts.len() - 1));
         }
-        let memo = self.window_memo.range(..=lo).next_back();
-        if let Some((&a, &(b, s))) = memo.filter(|(_, (b, _))| hi <= *b) {
-            return Ok((None, a as u32, Some(((a, b, s), hi - lo))));
+        let mut rebase = [0; 96];
+        let Some(&(lo, hi)) = parts.first() else {
+            return Ok((parts, 0, rebase, None));
+        };
+        if parts.len() == 1 {
+            let memo = self.window_memo.range(..=lo).next_back();
+            if let Some((&a, &(b, s))) = memo.filter(|(_, (b, _))| hi <= *b) {
+                return Ok((Vec::new(), a as u32, rebase, Some(((a, b, s), hi - lo))));
+            }
         }
-        if hi - lo > self.max_storage {
+        // Where each part lands in the window, as `stage` lays them out.
+        let mut at = Vec::with_capacity(parts.len());
+        let mut next = 0;
+        for &(lo, hi) in &parts {
+            at.push(next);
+            next += (hi - lo)
+                .max(4)
+                .next_multiple_of(4)
+                .next_multiple_of(self.arena_align);
+        }
+        let (last_lo, last_hi) = parts[parts.len() - 1];
+        let size = at[at.len() - 1] + last_hi - last_lo;
+        if size > self.max_storage {
             return unsupported(format!(
-                "vertex data window of {} bytes is larger than the storage buffer limit",
-                hi - lo
+                "vertex data window of {size} bytes is larger than the storage buffer limit"
             ));
         }
-        self.sync(mem, lo, hi)?;
-        Ok((Some((lo, hi)), lo as u32, None))
+        for (k, p) in part_of {
+            rebase[k as usize] = ((lo + at[p]) as i64 - parts[p].0 as i64) as i32 / 4;
+        }
+        for &(lo, hi) in &parts {
+            self.sync(mem, lo, hi)?;
+        }
+        Ok((parts, lo as u32, rebase, None))
     }
 
     fn buffer(&self, label: &str, bytes: &[u8], usage: wgpu::BufferUsages) -> wgpu::Buffer {
@@ -3104,8 +3205,8 @@ impl Drawer {
     }
 
     /// The `Consts` uniform of the shader binding contract.
-    fn consts(&self, window_base: u32) -> Vec<u8> {
-        consts(&self.regs, window_base)
+    fn consts(&self, window_base: u32, rebase: &[i32; 96]) -> Vec<u8> {
+        consts(&self.regs, window_base, rebase)
     }
 
     /// Texture and sampler for fetch constant slot `n`. A slot without a
@@ -3916,8 +4017,14 @@ impl Drawer {
         };
         self.timings.shaders += lap(&mut t);
 
-        let (mut read, window_base, staged) = self.guest_window(vf_mask, mem, report)?;
-        let consts = self.consts(window_base);
+        let reach: Vec<VertexFetchReach> = (vs_t.info.vertex_fetch_reach.iter())
+            .chain(&ps_t.info.vertex_fetch_reach)
+            .copied()
+            .collect();
+        let indices = index_range(&idx, self.regs.get(regs::VGT_INDX_OFFSET));
+        let (mut read, window_base, rebase, staged) =
+            self.guest_window(vf_mask, &reach, indices, mem, report)?;
+        let consts = self.consts(window_base, &rebase);
         let epi = to_bytes(&state::epilogue(&self.regs, w, h));
         // Rectangle lists read their guest indices in the vertex shader and
         // draw 6 host vertices per rectangle without an index buffer.
@@ -3933,20 +4040,27 @@ impl Drawer {
             .filter(|(b, _)| *b == consts)
             .map(|&(_, s)| s);
         fn parts<'a>(
-            w: Option<Part<'a>>,
+            w: Option<Vec<Part<'a>>>,
             c: Option<&'a [u8]>,
             rest: [Part<'a>; 3],
         ) -> Vec<Part<'a>> {
-            w.into_iter()
+            (w.into_iter().flatten())
                 .chain(c.map(Part::Bytes))
                 .chain(rest)
                 .collect()
         }
-        // The window's size is all `fits` needs of it.
-        let window_size = Part::Guest(0, read.map_or(0, |(lo, hi)| (hi - lo) as usize));
+        // The window's parts, or one empty part for no window.
+        let window = |read: &[(u64, u64)]| -> Vec<Part<'static>> {
+            if read.is_empty() {
+                return vec![Part::Bytes(&[])];
+            }
+            (read.iter())
+                .map(|&(lo, hi)| Part::Guest(lo as u32, (hi - lo) as usize))
+                .collect()
+        };
         if (kept_window.is_some() || kept_consts.is_some())
             && !self.fits(&parts(
-                kept_window.is_none().then_some(window_size),
+                kept_window.is_none().then(|| window(&read)),
                 kept_consts.is_none().then_some(&consts),
                 rest,
             ))
@@ -3957,21 +4071,17 @@ impl Drawer {
         }
         if let (Some(((lo, hi, _), _)), None) = (staged, kept_window) {
             self.sync(mem, lo, hi)?;
-            read = Some((lo, hi));
+            read = vec![(lo, hi)];
         }
-        let window = match read {
-            Some((lo, hi)) => {
-                report.timings.guest_bytes += hi - lo;
-                Part::Guest(lo as u32, (hi - lo) as usize)
-            }
-            None => Part::Bytes(&[]),
-        };
+        if kept_window.is_none() {
+            report.timings.guest_bytes += read.iter().map(|(lo, hi)| hi - lo).sum::<u64>();
+        }
         // A full arena submits the batch in `stage`: submit time, not guest data.
         let submit = self.timings.submit;
         let mut fresh = (self.stage(
             &*mem,
             &parts(
-                kept_window.is_none().then_some(window),
+                kept_window.is_none().then(|| window(&read)),
                 kept_consts.is_none().then_some(&consts),
                 rest,
             ),
@@ -3984,8 +4094,13 @@ impl Drawer {
                 w.2
             }
             None => {
-                let s = fresh.next().expect("staged window");
-                if let Some((lo, hi)) = read {
+                let first = fresh.next().expect("staged window");
+                // The parts after the first end the window's binding.
+                let last = (read.iter().skip(1))
+                    .map(|_| fresh.next().expect("staged window part"))
+                    .last()
+                    .unwrap_or(first);
+                if let [(lo, hi)] = read[..] {
                     // None holds this window (it was read), so those it
                     // holds are the ones from `lo` that end by `hi`.
                     let inside: Vec<u64> = (self.window_memo.range(lo..))
@@ -3995,9 +4110,9 @@ impl Drawer {
                     for a in inside {
                         self.window_memo.remove(&a);
                     }
-                    self.window_memo.insert(lo, (hi, s));
+                    self.window_memo.insert(lo, (hi, first));
                 }
-                s
+                (first.0, last.0 + last.1 - first.0)
             }
         };
         let consts_slice = match kept_consts {
@@ -4915,7 +5030,9 @@ mod tests {
             .chain(block(regs::SHADER_CONSTANT_LOOP, 32))
             .collect();
         want.extend([0x1234_5678, 77, 0, 0]);
-        assert_eq!(consts(r, 0x1234_5678), to_bytes(&want));
+        let rebase = std::array::from_fn(|k| k as i32 - 3);
+        want.extend(rebase.map(|w: i32| w as u32));
+        assert_eq!(consts(r, 0x1234_5678, &rebase), to_bytes(&want));
     }
 
     /// A drawer on the test adapter, held under one lock so the unit tests
@@ -5219,5 +5336,56 @@ mod tests {
         assert!(
             ps.contains("out.c3 = vec4<f32>((o_col[3] * 2.0).xyz, (o_col[3] * 2.0).w) * 0.03125;")
         );
+    }
+
+    #[test]
+    fn index_range_skips_resets_and_applies_the_offset() {
+        assert_eq!(index_range(&[7, u32::MAX, 3, 9], 0), Some((3, 9)));
+        assert_eq!(index_range(&[u32::MAX], 0), None);
+        assert_eq!(index_range(&[1, 2], 10), Some((11, 12)));
+        // The shader keeps 24 bits of the 32-bit sum.
+        assert_eq!(index_range(&[1, 2], 0xFF00_0000), Some((1, 2)));
+        assert_eq!(index_range(&[0, 5], 0xFF_FFFE), None);
+        assert_eq!(index_range(&[0, 5], u32::MAX - 1), None);
+        assert_eq!(index_range(&[3, 5], u32::MAX - 1), Some((1, 3)));
+    }
+
+    #[test]
+    fn fetch_range_bounds_clips_and_falls_back() {
+        let r = |stride, bounded, first, end| VertexFetchReach {
+            fetch_const: 2,
+            stride,
+            bounded,
+            first,
+            end,
+        };
+        let a = 0x1000;
+        // Vertices 4..=6 of stride 4, words 0..3 and 1..4.
+        let reach = [r(4, true, 0, 3), r(4, true, 1, 4)];
+        assert_eq!(
+            fetch_range(a, 256, 2, &reach, Some((4, 6))),
+            (a + 64, a + 112, false)
+        );
+        // Another constant's reach, or unknown indices: the whole buffer.
+        let whole = (a, a + 1024, false);
+        assert_eq!(fetch_range(a, 256, 3, &reach, Some((4, 6))), whole);
+        assert_eq!(fetch_range(a, 256, 2, &reach, None), whole);
+        assert_eq!(
+            fetch_range(a, 256, 2, &[r(4, false, 0, 1)], Some((0, 0))),
+            whole
+        );
+        // Stride 0 needs no indices; a negative offset and an end past the
+        // buffer are clipped.
+        assert_eq!(
+            fetch_range(a, 256, 2, &[r(0, true, 5, 7)], None),
+            (a + 20, a + 28, false)
+        );
+        assert_eq!(
+            fetch_range(a, 16, 2, &[r(4, true, -2, 1)], Some((0, 9))),
+            (a, a + 64, true)
+        );
+        // Entirely past the buffer: nothing, and clipped.
+        let (lo, hi, clipped) = fetch_range(a, 16, 2, &[r(4, true, 0, 1)], Some((20, 30)));
+        assert_eq!((lo == hi, clipped), (true, true));
     }
 }

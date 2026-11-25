@@ -268,7 +268,8 @@ fn vertex_window_in_a_staged_one_is_reused() {
         .shader(false, &vs_color())
         .shader(true, &ps_interp())
         .vertex_fetch(0, VERTS, 24)
-        .draw_auto(PRIM_RECT_LIST, 3)
+        // Both rectangles, so the window holds the second one's vertices.
+        .draw_auto(PRIM_RECT_LIST, 6)
         .vertex_fetch(0, VERTS + 48, 12)
         .draw_auto(PRIM_RECT_LIST, 3)
         .draw_auto(PRIM_RECT_LIST, 3);
@@ -358,7 +359,8 @@ fn vertex_window_is_reused_across_a_resolve() {
         .shader(false, &vs_color())
         .shader(true, &ps_interp())
         .vertex_fetch(0, VERTS, 24)
-        .draw_auto(PRIM_RECT_LIST, 3)
+        // Both rectangles, so the window holds the second draw's vertices.
+        .draw_auto(PRIM_RECT_LIST, 6)
         .resolve(&mut mem, W, H, true, Some((rgba(clear), 0)))
         .vertex_fetch(0, VERTS + 48, 12)
         .draw_auto(PRIM_RECT_LIST, 3);
