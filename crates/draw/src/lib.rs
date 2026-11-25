@@ -1365,6 +1365,35 @@ impl Drawer {
             self.modules.len(),
             wgsl.len(),
             wgsl.iter().sum::<usize>().div_ceil(1024),
+        ) + &self.wgpu_line()
+    }
+
+    /// What wgpu itself holds: live objects (a count that keeps rising is a
+    /// leak) and the GPU allocator's reserved against allocated bytes (a gap
+    /// that keeps widening is memory kept after frees).
+    fn wgpu_line(&self) -> String {
+        let h = self.device.get_internal_counters().hal;
+        let alloc = self.device.generate_allocator_report().map_or_else(
+            || "no allocator report".to_string(),
+            |r| {
+                format!(
+                    "GPU memory {} MB used of {} MB reserved in {} blocks",
+                    r.total_allocated_bytes >> 20,
+                    r.total_reserved_bytes >> 20,
+                    r.blocks.len()
+                )
+            },
+        );
+        format!(
+            "; wgpu live: textures {} MB, buffers {} ({} MB), views {}, bind groups {}, pipelines {}, shaders {}; {alloc}",
+            // hal's texture count misses some textures on Vulkan; its bytes do not.
+            h.texture_memory.read() >> 20,
+            h.buffers.read(),
+            h.buffer_memory.read() >> 20,
+            h.texture_views.read(),
+            h.bind_groups.read(),
+            h.render_pipelines.read() + h.compute_pipelines.read(),
+            h.shader_modules.read(),
         )
     }
 
