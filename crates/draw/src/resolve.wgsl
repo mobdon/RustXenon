@@ -18,7 +18,8 @@ struct Params {
     swap: u32,
     endian: u32,
     scale: f32,
-    pad0: u32,
+    // Word index of the destination's first byte in `dest`.
+    offset: u32,
     pad1: u32,
 }
 
@@ -142,7 +143,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 }
 
 fn store(x: u32, y: u32, w: u32) {
-    dest[tiled(x, y, p.pitch) >> 2u] = swap_endian(w, p.endian);
+    dest[p.offset + (tiled(x, y, p.pitch) >> 2u)] = swap_endian(w, p.endian);
 }
 
 // Depth copies are raw EDRAM words, as in Xenia's fast resolve: depth in
@@ -199,4 +200,47 @@ fn depth_stencil_main(@builtin(global_invocation_id) id: vec3<u32>) {
     let x = p.x0 + id.x;
     let y = p.y0 + id.y;
     store(x, y, depth_word(x, y) | (textureLoad(stencil_src, vec2<u32>(x, y), 0).r & 0xFFu));
+}
+
+// A tiled k_8_8_8_8 texture decoded from guest bytes kept on the GPU, as
+// xenon_texture::decode_base_level does on the CPU: the fetch endian, the
+// 32x32 tiling, then the fetch swizzle. One invocation per texel, into
+// rows of `row_words` words for a copy to an Rgba8Unorm texture (rows y0
+// to y0 + h).
+struct DecodeParams {
+    w: u32,
+    h: u32,
+    pitch: u32,
+    endian: u32,
+    swizzle: u32,
+    // Word index of the texture's first byte in `guest`.
+    offset: u32,
+    row_words: u32,
+    // First row decoded; `h` rows from it.
+    y0: u32,
+}
+
+@group(0) @binding(5) var<storage, read> guest: array<u32>;
+@group(0) @binding(6) var<storage, read_write> texels: array<u32>;
+@group(0) @binding(7) var<uniform> dp: DecodeParams;
+
+@compute @workgroup_size(8, 8)
+fn decode_8888(@builtin(global_invocation_id) id: vec3<u32>) {
+    if id.x >= dp.w || id.y >= dp.h {
+        return;
+    }
+    let y = dp.y0 + id.y;
+    let w = swap_endian(guest[dp.offset + (tiled(id.x, y, dp.pitch) >> 2u)], dp.endian);
+    var out = 0u;
+    for (var i = 0u; i < 4u; i++) {
+        let s = (dp.swizzle >> (3u * i)) & 7u;
+        var b = 0u;
+        if s < 4u {
+            b = (w >> (8u * s)) & 0xFFu;
+        } else if (s & 1u) != 0u {
+            b = 0xFFu;
+        }
+        out |= b << (8u * i);
+    }
+    texels[id.y * dp.row_words + id.x] = out;
 }

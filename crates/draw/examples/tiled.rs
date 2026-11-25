@@ -21,7 +21,9 @@
 //! changes every frame, so the resolved pixels do too). Nothing here comes
 //! from a game.
 //!
-//! cargo run --release -p xenon-draw --example tiled -- [frames]
+//! cargo run --release -p xenon-draw --example tiled -- [frames] [skip]
+//!
+//! `skip` sets `Drawer::skip_resolve_writeback`.
 
 #[path = "../tests/common/mod.rs"]
 mod common;
@@ -375,6 +377,7 @@ fn main() {
             std::process::exit(1);
         }
     };
+    d.skip_resolve_writeback = std::env::args().nth(2).as_deref() == Some("skip");
     println!("adapter: {}", d.adapter);
     let mut mem = SliceMemory {
         base: 0,
@@ -438,6 +441,12 @@ fn main() {
         mb(t.hashed_bytes),
         mb(t.guest_bytes),
         mb(t.readback_bytes)
+    );
+    println!(
+        "  per frame: textures from kept resolves {} ({:.1} MB not read), kept checks hashed {:.1} MB",
+        t.textures_kept / n,
+        mb(t.kept_bytes),
+        mb(t.kept_hashed_bytes)
     );
     println!(
         "  per frame: pipelines created {}, submits {}, transfers {} ({} passes)",
