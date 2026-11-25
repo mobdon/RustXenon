@@ -2918,6 +2918,9 @@ impl Drawer {
                 return Ok(None);
             }
             levels.push((m.width, m.height, m.pitch_blocks, a));
+            // shortcut: one range spans the base, the mips and any gap between
+            // them, so a resolve into the gap re-decodes the chain; keep a
+            // range per level if mips far from their base show up.
             (lo, hi) = (lo.min(a), hi.max(b));
         }
         // Only the rows resolves wrote since the last decode are decoded
