@@ -1627,13 +1627,13 @@ impl Drawer {
             written: Vec::new(),
         };
         let done = self.replay_commands(commands, &mut mem, &mut report);
-        // On an error the batch is dropped unsubmitted.
-        let done = done.and_then(|()| {
-            self.flush().map_err(|e| match e {
-                Skip::Fatal(e) => e,
-                Skip::Unsupported(why) => Error::Gpu(why),
-            })
+        // Submitted on an error too: the batch can hold resolve clears of
+        // targets that outlive the failed replay, and the first error wins.
+        let flushed = self.flush().map_err(|e| match e {
+            Skip::Fatal(e) => e,
+            Skip::Unsupported(why) => Error::Gpu(why),
         });
+        let done = done.and(flushed);
         self.batch = None;
         self.staged.clear();
         self.window_memo.clear();
