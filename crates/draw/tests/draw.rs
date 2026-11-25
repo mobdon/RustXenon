@@ -1513,3 +1513,58 @@ fn listed_writes_keep_textures_across_replays() {
     w.written = None;
     assert_eq!(replay(&mut d, &mut w), (len, true, 90));
 }
+
+/// With guest memory listing its writes, a draw's index buffer is read once
+/// and its host indices drawn again in later replays, until a listed write
+/// over it: vertices 0..3 are red and 3..6 green, and the indices move from
+/// the first three to the last.
+#[test]
+fn listed_writes_keep_indices_across_replays() {
+    let Some(mut d) = drawer() else { return };
+    let mut mem = memory();
+    let (wf, hf) = (W as f32, H as f32);
+    let red = [255, 0, 0, 255];
+    let green = [0, 255, 0, 255];
+    let corners = |c| [(0.0, 0.0, 0.0, c), (wf, 0.0, 0.0, c), (0.0, hf, 0.0, c)];
+    let verts = [corners(red), corners(green)].concat();
+    mem.write_words(VERTS, &color_verts(&verts));
+    // Big-endian 16-bit indices (k8in16 swaps them back).
+    let put = |mem: &mut xenon_gpu::SliceMemory, i: u32| {
+        mem.write_words(INDICES, &[(i << 16) | (i + 1), (i + 2) << 16]);
+    };
+    put(&mut mem, 0);
+    let mut s = Stream::default();
+    s.setup()
+        .shader(false, &vs_color())
+        .shader(true, &ps_interp())
+        .vertex_fetch(0, VERTS, 24)
+        .draw_dma16(PRIM_RECT_LIST, 3);
+    mem.write_words(CMD, &s.0);
+    let mut rec = xenon_gpu::Recorder::new();
+    rec.record_buffer(&mem, CMD, s.0.len() as u32).unwrap();
+    let cmds = rec.commands;
+    let mut w = Watched {
+        mem,
+        written: Some(vec![]),
+    };
+    let mut replay = |w: &mut Watched| {
+        let r = d
+            .replay(&cmds, w as &mut dyn xenon_draw::GuestMemory)
+            .unwrap();
+        assert_eq!(r.draws, 1, "{r:?}");
+        let img = d.read_render_target(COLOR_KEY, 0, 0, W, H).unwrap();
+        px(&img, W, 10, 10)
+    };
+    assert_eq!(replay(&mut w), red);
+    // Written but not listed: the kept indices are drawn.
+    put(&mut w.mem, 3);
+    assert_eq!(replay(&mut w), red);
+    // Listed: read again.
+    let at = u64::from(INDICES);
+    w.written = Some(vec![(at, at + 8)]);
+    assert_eq!(replay(&mut w), green);
+    // Writes unknown: read again.
+    put(&mut w.mem, 0);
+    w.written = None;
+    assert_eq!(replay(&mut w), red);
+}
