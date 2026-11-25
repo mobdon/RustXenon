@@ -166,6 +166,17 @@ fn textured_quad_samples_tiled_texture() {
     let img = d.read_render_target(COLOR_KEY, 0, 0, W, H).unwrap();
     assert_eq!(px(&img, W, 5, 7), texel(5, 7));
 
+    // Other clamp, filter and LOD fields sample the same decode.
+    let mut sampled = fetch;
+    sampled[0] &= !(0x1FF << 10);
+    sampled[3] |= 1 << 19 | 1 << 21;
+    sampled[4] = 3 << 12;
+    let mut s2 = Stream(s.0.clone());
+    s2.regs(SHADER_CONSTANT_FETCH + 6, &sampled)
+        .draw_auto(PRIM_QUAD_LIST, 4);
+    let report = run(&mut d, &s2, &mut mem);
+    assert_eq!(report.timings.textures_uploaded, 0, "{report:?}");
+
     // Rewritten guest bytes under the same fetch constant are decoded again.
     let texel2 = |x: u32, y: u32| [255 - (x * 8) as u8, (y * 8) as u8, 64, 255];
     let linear: Vec<u8> = (0..n * n).flat_map(|i| texel2(i % n, i / n)).collect();
@@ -180,6 +191,52 @@ fn textured_quad_samples_tiled_texture() {
             assert_eq!(px(&img, W, x, y), texel2(x, y), "({x}, {y})");
         }
     }
+}
+
+/// The texture cache evicts the least recently used textures when full,
+/// keeping one drawn since, and counts the re-upload of an evicted one.
+#[test]
+fn texture_cache_evicts_least_recently_used() {
+    let Some(mut d) = drawer() else { return };
+    let mut mem = memory();
+    let n = 32u32; // 4 KiB per decoded texture
+    d.texture_cache_limit = 13 << 10;
+    let verts: Vec<u32> = [(0.0, 0.0), (8.0, 0.0), (8.0, 8.0), (0.0, 8.0)]
+        .iter()
+        .flat_map(|&(x, y)| [f(x), f(y), f(0.0), f(0.5), f(0.5)])
+        .collect();
+    mem.write_words(VERTS, &verts);
+    let draw = |d: &mut xenon_draw::Drawer, mem: &mut xenon_gpu::SliceMemory, k: u32| {
+        let fetch = [
+            2 | ((n >> 5) << 22) | (1 << 31),
+            6 | (2 << 6) | (TEXTURE + k * 0x1000),
+            (n - 1) | ((n - 1) << 13),
+            ((1 << 3) | (2 << 6) | (3 << 9)) << 1,
+            0,
+            1 << 9,
+        ];
+        let mut s = Stream::default();
+        s.setup()
+            .shader(false, &vs_uv())
+            .shader(true, &ps_texture(1))
+            .vertex_fetch(0, VERTS, 20)
+            .regs(SHADER_CONSTANT_FETCH + 6, &fetch)
+            .draw_auto(PRIM_QUAD_LIST, 4);
+        let t = run(d, &s, mem).timings;
+        (
+            t.textures_uploaded,
+            t.textures_reuploaded,
+            t.textures_evicted,
+        )
+    };
+    for k in 0..3 {
+        assert_eq!(draw(&mut d, &mut mem, k), (1, 0, 0), "texture {k}");
+    }
+    assert_eq!(draw(&mut d, &mut mem, 0), (0, 0, 0));
+    // Full: evicts 1 and 2, the least recently drawn, and keeps 0.
+    assert_eq!(draw(&mut d, &mut mem, 3), (1, 0, 2));
+    assert_eq!(draw(&mut d, &mut mem, 0), (0, 0, 0));
+    assert_eq!(draw(&mut d, &mut mem, 1), (1, 1, 0));
 }
 
 /// A texture slot without a texture fetch constant, or with a format that

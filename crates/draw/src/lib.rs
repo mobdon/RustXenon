@@ -159,7 +159,7 @@ pub mod resolve;
 pub mod state;
 
 use std::collections::hash_map::DefaultHasher;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex};
@@ -383,6 +383,10 @@ pub struct Timings {
     /// not change between replays (at write-back, and at first use in the
     /// next replay).
     pub kept_hashed_bytes: u64,
+    /// Of `textures_uploaded`, those the texture cache held before and
+    /// evicted, and the textures it evicted.
+    pub textures_reuploaded: u32,
+    pub textures_evicted: u32,
 }
 
 impl std::ops::AddAssign<&Timings> for Timings {
@@ -410,6 +414,8 @@ impl std::ops::AddAssign<&Timings> for Timings {
         self.textures_kept += t.textures_kept;
         self.kept_bytes += t.kept_bytes;
         self.kept_hashed_bytes += t.kept_hashed_bytes;
+        self.textures_reuploaded += t.textures_reuploaded;
+        self.textures_evicted += t.textures_evicted;
     }
 }
 
@@ -705,10 +711,17 @@ pub struct Drawer {
     /// Destination endian of the last 32bpp resolve to each guest address,
     /// so a swap reads its front buffer in the byte order it was written.
     resolved_endian: HashMap<u32, u32>,
-    /// Decoded guest textures keyed by fetch constant and a hash of the
-    /// guest bytes they read, so an unchanged texture is not decoded again.
-    texture_cache: HashMap<([u32; 6], u64), wgpu::TextureView>,
+    /// Decoded guest textures keyed by the decode fields of the fetch
+    /// constant ([`decode_key`]) and a hash of the guest bytes they read, so
+    /// an unchanged texture is not decoded again; with their size and the
+    /// replay that last used them, for least recently used eviction.
+    texture_cache: HashMap<([u32; 6], u64), (wgpu::TextureView, u64, u64)>,
     texture_cache_bytes: u64,
+    /// Hashes of keys evicted from `texture_cache`, to count uploads of a
+    /// texture the cache held before (cache too small) apart from new ones.
+    texture_evicted: HashSet<u64>,
+    /// Replays started, the clock of `texture_cache` uses.
+    replays: u64,
     /// Textures already looked up this replay by fetch constant, with the
     /// physical `[start, end)` guest range they were read from. Guest
     /// memory only changes at a resolve or MEM_WRITE during a replay, which
@@ -758,6 +771,9 @@ pub struct Drawer {
     /// read stale bytes. A CPU write to such a destination between replays
     /// drops the GPU copy (its pixels are lost).
     pub skip_resolve_writeback: bool,
+    /// Bytes of decoded guest textures the texture cache keeps before
+    /// evicting the least recently used ones (default 256 MiB).
+    pub texture_cache_limit: u64,
     timings: Timings,
     uncaptured: Arc<Mutex<Vec<String>>>,
     max_dim: u32,
@@ -800,6 +816,22 @@ fn hash_words(words: &[u32]) -> u64 {
 
 /// Fast non-cryptographic hash of guest bytes for the texture cache. A
 /// collision only shows a stale texture.
+/// The fetch constant fields the decoded texels depend on: type, signs,
+/// pitch and tiling (dword 0), format, endian and address (1), size (2),
+/// swizzle (3) and dimension (5). Clamp, filters, LOD, exp_adjust, border
+/// and mip fields only change sampling, so textures differing in those
+/// share one decode.
+fn decode_key(c: [u32; 6]) -> [u32; 6] {
+    [
+        c[0] & !(0x1FF << 10),
+        c[1] & !(1 << 11),
+        c[2],
+        c[3] & (0xFFF << 1),
+        0,
+        c[5] & (3 << 9),
+    ]
+}
+
 fn hash_bytes(bytes: &[u8]) -> u64 {
     const K: u64 = 0x517c_c1b7_2722_0a95;
     let mut chunks = bytes.chunks_exact(8);
@@ -1136,6 +1168,8 @@ impl Drawer {
             resolved_endian: HashMap::new(),
             texture_cache: HashMap::new(),
             texture_cache_bytes: 0,
+            texture_evicted: HashSet::new(),
+            replays: 0,
             texture_memo: HashMap::new(),
             samplers: HashMap::new(),
             batch: None,
@@ -1158,6 +1192,7 @@ impl Drawer {
             mirrors: Vec::new(),
             decode_pipeline: None,
             skip_resolve_writeback: false,
+            texture_cache_limit: TEXTURE_CACHE_LIMIT,
             timings: Timings::default(),
             uncaptured,
             max_dim: limits.max_texture_dimension_2d,
@@ -1229,6 +1264,7 @@ impl Drawer {
         let mut report = Report::default();
         self.timings = Timings::default();
         self.texture_memo.clear();
+        self.replays += 1;
         for m in &mut self.mirrors {
             m.verified = false;
         }
@@ -2588,12 +2624,15 @@ impl Drawer {
             })
             .map_err(|e| e.to_string())?;
         report.timings.hashed_bytes += bytes.len() as u64;
-        let key = (self.regs.fetch_constant(n), hash_bytes(&bytes));
+        let constant = self.regs.fetch_constant(n);
+        let key = (decode_key(constant), hash_bytes(&bytes));
         let range = (u64::from(addr), u64::from(addr) + bytes.len() as u64);
-        if let Some(view) = self.texture_cache.get(&key) {
+        if let Some((view, _, used)) = self.texture_cache.get_mut(&key) {
+            *used = self.replays;
+            let view = view.clone();
             self.texture_memo
-                .insert(key.0, (view.clone(), range.0, range.1));
-            return Ok(view.clone());
+                .insert(constant, (view.clone(), range.0, range.1));
+            return Ok(view);
         }
         let signed = fetch.sign.contains(&1);
         let host = host_texture_format(fetch.format, signed, self.float32_filterable);
@@ -2650,15 +2689,48 @@ impl Drawer {
         );
         let view = tex.create_view(&Default::default());
         let len = data.len() as u64;
-        if self.texture_cache_bytes + len > TEXTURE_CACHE_LIMIT {
-            self.texture_cache.clear();
-            self.texture_cache_bytes = 0;
+        let key_hash = hash_bytes(&to_bytes(&key.0)) ^ key.1;
+        if self.texture_evicted.remove(&key_hash) {
+            report.timings.textures_reuploaded += 1;
+        }
+        let limit = self.texture_cache_limit;
+        if self.texture_cache_bytes + len > limit {
+            self.evict_textures(limit.saturating_sub(len), report);
         }
         self.texture_cache_bytes += len;
-        self.texture_cache.insert(key, view.clone());
+        self.texture_cache
+            .insert(key, (view.clone(), len, self.replays));
         self.texture_memo
-            .insert(key.0, (view.clone(), range.0, range.1));
+            .insert(constant, (view.clone(), range.0, range.1));
         Ok(view)
+    }
+
+    /// Evicts least recently used textures until the cache holds at most
+    /// 3/4 of `room` bytes, so evictions come in batches, not per upload.
+    /// Views still bound in the open batch stay alive through their clones.
+    fn evict_textures(&mut self, room: u64, report: &mut Report) {
+        let goal = room / 4 * 3;
+        let mut by_age: Vec<_> = self
+            .texture_cache
+            .iter()
+            .map(|(k, &(_, len, used))| (used, len, *k))
+            .collect();
+        by_age.sort_unstable_by_key(|e| e.0);
+        // shortcut: the evicted-key set only feeds a counter; cleared
+        // when large, which undercounts re-uploads after that.
+        if self.texture_evicted.len() > 1 << 16 {
+            self.texture_evicted.clear();
+        }
+        for (_, len, k) in by_age {
+            if self.texture_cache_bytes <= goal {
+                break;
+            }
+            self.texture_cache.remove(&k);
+            self.texture_cache_bytes -= len;
+            self.texture_evicted
+                .insert(hash_bytes(&to_bytes(&k.0)) ^ k.1);
+            report.timings.textures_evicted += 1;
+        }
     }
 
     fn sampler(
