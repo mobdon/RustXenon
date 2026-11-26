@@ -114,6 +114,9 @@ fn restore_depth(
     assert_eq!((report.draws, report.resolves), (2, 2), "{report:?}");
     assert!(report.unsupported.is_empty(), "{report:?}");
     assert!(report.warnings.is_empty(), "{report:?}");
+    // The transfer to depth (its depth and stencil-bit draws) is drawn in
+    // the colour-and-depth draw's pass, not in passes of its own.
+    assert!(report.timings.passes_merged >= 1, "{:?}", report.timings);
     let key = RenderTargetKey {
         base_tiles: 100,
         pitch: W,

@@ -116,6 +116,9 @@ fn resolve_sees_batched_draws() {
     assert_eq!(t.submits_by_site[..3], [0, 0, 0], "{t:?}");
     // The resolve's flush ends the first draw's pass.
     assert_eq!(t.render_passes, 2, "{t:?}");
+    // The colour clear is drawn at the start of the second draw's pass,
+    // not in a pass of its own, and still lands under the draw.
+    assert!(t.passes_merged >= 1, "{t:?}");
     assert!(t.queue <= t.submit, "{t:?}");
     let copy = detiled(&mem, DEST, W, H, W, 4);
     assert_eq!(px(&copy, W, 40, 40), RED);
