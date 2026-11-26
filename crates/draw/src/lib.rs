@@ -251,12 +251,12 @@ impl Tracked<'_> {
 /// A front buffer copy on its way back: the buffer, its submission, and
 /// how to read it (width, height, pitch, endian, swizzle).
 struct LateFront {
+    /// The frame's RGBA8 rows, decoded on the GPU (byte order, tiling and
+    /// fetch constant 0's swizzle, as [`detile_front`] does).
     buf: wgpu::Buffer,
-    /// The submitter's batch number of the batch that copies into `buf`.
+    /// The submitter's batch number of the batch that decodes into `buf`.
     sent: u64,
-    size: (u32, u32, u32),
-    endian: xenon_texture::Endian,
-    swizzle: Option<u16>,
+    size: (u32, u32),
 }
 
 /// Guest bytes that GPU resolves wrote, kept in a GPU buffer so that
@@ -4169,6 +4169,37 @@ impl Drawer {
         Ok((parts, lo as u32, rebase, None))
     }
 
+    /// The compute pipeline of `resolve.wgsl`'s `decode_8888`, or with
+    /// `float` its `decode_float`, made at first use.
+    fn decode_pipeline(&mut self, float: bool) -> wgpu::ComputePipeline {
+        let device = &self.device;
+        let cache = self.disk_cache.as_ref().map(|c| &c.cache);
+        let entry = ["decode_8888", "decode_float"][usize::from(float)];
+        // Set once the shader module is made, so it times the pipeline alone.
+        let mut t0 = None;
+        let pipeline = self.decode_pipelines[usize::from(float)]
+            .get_or_insert_with(|| {
+                let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                    label: Some("resolve"),
+                    source: wgpu::ShaderSource::Wgsl(include_str!("resolve.wgsl").into()),
+                });
+                t0 = Some(Instant::now());
+                device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                    label: Some(entry),
+                    layout: None,
+                    module: &module,
+                    entry_point: Some(entry),
+                    compilation_options: Default::default(),
+                    cache,
+                })
+            })
+            .clone();
+        if let Some(t0) = t0 {
+            self.pipeline_made(t0);
+        }
+        pipeline
+    }
+
     fn buffer(&self, label: &str, bytes: &[u8], usage: wgpu::BufferUsages) -> wgpu::Buffer {
         let size = (bytes.len() as u64).max(4).next_multiple_of(4);
         let buf = self.device.create_buffer(&wgpu::BufferDescriptor {
@@ -4348,31 +4379,8 @@ impl Drawer {
             }),
         };
         let scope = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
-        let device = &self.device;
-        let cache = self.disk_cache.as_ref().map(|c| &c.cache);
         let entry = ["decode_8888", "decode_float"][usize::from(mode.is_some())];
-        // Set once the shader module is made, so it times the pipeline alone.
-        let mut t0 = None;
-        let pipeline = self.decode_pipelines[usize::from(mode.is_some())]
-            .get_or_insert_with(|| {
-                let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-                    label: Some("resolve"),
-                    source: wgpu::ShaderSource::Wgsl(include_str!("resolve.wgsl").into()),
-                });
-                t0 = Some(Instant::now());
-                device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                    label: Some(entry),
-                    layout: None,
-                    module: &module,
-                    entry_point: Some(entry),
-                    compilation_options: Default::default(),
-                    cache,
-                })
-            })
-            .clone();
-        if let Some(t0) = t0 {
-            self.pipeline_made(t0);
-        }
+        let pipeline = self.decode_pipeline(mode.is_some());
         // After a resolve recorded in the batch, the decode runs after it:
         // with `decode_in_batch` (the default) it is recorded in the batch,
         // after the resolve, so the batch's earlier draws still sample the
@@ -6049,45 +6057,102 @@ impl Drawer {
             }
         }
         if let (true, Some(i)) = (self.late_front_buffer, kept) {
-            let buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+            // The GPU decodes the frame (byte order, tiling, swizzle) into
+            // RGBA8 rows, so the CPU only reads them back: untiling a 720p
+            // frame on the draw thread was a tenth of its time.
+            let size = u64::from(width) * u64::from(height) * 4;
+            let usage = |u| wgpu::BufferDescriptor {
                 label: Some("front buffer"),
-                size: u64::from(extent),
-                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                size,
+                usage: u,
                 mapped_at_creation: false,
+            };
+            let buf = (self.device).create_buffer(&usage(
+                wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            ));
+            let rows = (self.device).create_buffer(&usage(
+                wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            ));
+            let (endian, swizzle) = self.front_buffer_read(addr);
+            let pipeline = self.decode_pipeline(false);
+            let m = &self.mirrors[i];
+            let params = [
+                width,
+                height,
+                pitch,
+                endian as u32,
+                // x, y, z, w from themselves: none.
+                u32::from(swizzle.unwrap_or((1 << 3) | (2 << 6) | (3 << 9))),
+                ((lo - m.lo) / 4) as u32,
+                width,
+                0,
+                0,
+                0,
+                0,
+                0,
+            ];
+            let uniform = self.buffer(
+                "front params",
+                &to_bytes(&params),
+                wgpu::BufferUsages::UNIFORM,
+            );
+            let m = &self.mirrors[i];
+            let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("front buffer decode"),
+                layout: &pipeline.get_bind_group_layout(0),
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 5,
+                        resource: m.buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 6,
+                        resource: rows.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 7,
+                        resource: uniform.as_entire_binding(),
+                    },
+                ],
             });
-            // The copy goes at the end of the batch, after this frame's
-            // resolves, through the submit thread: the swap does not wait
-            // for the queued batches, only for last frame's copy below.
+            // At the end of the batch, after this frame's resolves, through
+            // the submit thread: the swap does not wait for the queued
+            // batches, only for last frame's decode below.
             let device = &self.device;
             let b = self.batch.get_or_insert_with(|| Batch {
                 pass: None,
                 enc: device.create_command_encoder(&Default::default()),
             });
             b.pass = None;
-            let m = &self.mirrors[i];
-            b.enc
-                .copy_buffer_to_buffer(&m.buf, lo - m.lo, &buf, 0, u64::from(extent));
+            {
+                let mut pass = b.enc.begin_compute_pass(&Default::default());
+                pass.set_pipeline(&pipeline);
+                pass.set_bind_group(0, &bg, &[]);
+                pass.dispatch_workgroups(width.div_ceil(8), height.div_ceil(8), 1);
+            }
+            b.enc.copy_buffer_to_buffer(&rows, 0, &buf, 0, size);
             self.flush().map_err(|e| match e {
                 Skip::Fatal(e) => e,
                 Skip::Unsupported(why) => Error::Gpu(why),
             })?;
             let sent = self.submitter.sent();
-            let (endian, swizzle) = self.front_buffer_read(addr);
             let new = LateFront {
                 buf,
                 sent,
-                size: (width, height, pitch),
-                endian,
-                swizzle,
+                size: (width, height),
             };
             let Some(old) = self.late_front.replace(new) else {
                 return Ok(Err("first late front buffer: no frame yet".into()));
             };
             // A frame later, its batch is most likely submitted already.
             let index = self.submitter.wait_for(old.sent);
-            let raw = self.map_submitted(&old.buf, index)?;
-            let (w, h, p) = old.size;
-            return Ok(detile_front(raw, w, h, p, old.endian, old.swizzle));
+            let rgba8 = self.map_submitted(&old.buf, index)?;
+            let (width, height) = old.size;
+            return Ok(Ok(Frame {
+                width,
+                height,
+                rgba8,
+            }));
         }
         // An older late copy would come out of order after this one.
         self.late_front = None;
