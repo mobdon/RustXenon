@@ -234,10 +234,14 @@ fn keep_open<S>(
                 }
                 // The stream plays while it lives, and it may not move to
                 // another thread, so this one keeps it until the device is
-                // lost.
+                // lost. It waits before each check, so a device that fails
+                // as soon as it starts is reopened once a HOLD, not in a spin.
                 let _stream = stream;
-                while !shared.dead.load(Ordering::Relaxed) {
+                loop {
                     wait(HOLD);
+                    if shared.dead.load(Ordering::Relaxed) {
+                        break;
+                    }
                 }
             }
             Err(e) => {
@@ -761,5 +765,28 @@ mod tests {
         assert_eq!(waits, [RETRY, RETRY, HOLD, RETRY]);
         assert_eq!(seen, ["try 1", "try 2", "opened 48000", "try 4"]);
         assert_eq!(tries, 5);
+    }
+
+    #[test]
+    fn device_thread_waits_before_reopening_a_device_lost_at_once() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut tries = 0;
+        // Each device fails before the thread first looks at it.
+        let start = || {
+            tries += 1;
+            assert!(tries <= 10, "reopened without waiting");
+            let shared = Shared::new(48_000);
+            shared.dead.store(true, Ordering::Relaxed);
+            Ok(((), 48_000, shared))
+        };
+        let (mut rx, mut waits) = (Some(rx), Vec::new());
+        keep_open(start, tx, |d| {
+            waits.push(d);
+            if waits.len() == 3 {
+                drop(rx.take()); // the speaker is gone: the thread ends
+            }
+        });
+        assert_eq!(waits, [HOLD; 3]);
+        assert_eq!(tries, 4);
     }
 }
