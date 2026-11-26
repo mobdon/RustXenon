@@ -198,6 +198,10 @@ pub fn start(rt: std::sync::Arc<Runtime>) {
                         // Frame images come one swap late, so a swap never
                         // waits for the GPU (XENON_LATE_FRAME=0 turns it off).
                         d.late_front_buffer = std::env::var("XENON_LATE_FRAME").as_deref() != Ok("0");
+                        // Frames at the drawing scale (XENON_SCALE above 1),
+                        // but captures keep guest size, which they compare.
+                        use super::gpu::capture::{FRAMES, SETTINGS};
+                        d.sharp_front = SETTINGS.get().is_none() && FRAMES.get().is_none();
                         if d.skip_resolve_writeback {
                             crate::log("[draw] resolve write-back: skipped (the CPU never sees resolve output; XENON_RESOLVE_WRITEBACK=on writes it back)");
                         }

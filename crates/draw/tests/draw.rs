@@ -2084,3 +2084,164 @@ fn half_pixel_edges_decimate_to_the_same_pixels_at_scale_2() {
     );
     assert_eq!(*resolved, *img);
 }
+
+/// Each guest pixel of `img` (`w` x `h` guest pixels at `s` host pixels
+/// each way) as the mean of its host pixels, halves up, as a resolve
+/// decimates 8-bit channels.
+fn box_mean(img: &[u8], w: u32, h: u32, s: u32) -> Vec<u8> {
+    let mut out = Vec::with_capacity((w * h * 4) as usize);
+    for y in 0..h {
+        for x in 0..w {
+            for c in 0..4 {
+                let mut sum = 0;
+                for j in 0..s {
+                    for i in 0..s {
+                        sum += u32::from(px(img, w * s, x * s + i, y * s + j)[c]);
+                    }
+                }
+                out.push(((sum + s * s / 2) / (s * s)) as u8);
+            }
+        }
+    }
+    out
+}
+
+/// With sharp front buffers on, guest memory after a resolve and a swap
+/// is the same at scales 1, 2 and 3 (half-pixel edges decimate to the same
+/// pixels), and from the second swap on the frame is the scale times the
+/// front buffer on each axis.
+#[test]
+fn sharp_front_buffer_leaves_guest_memory_as_at_scale_1() {
+    let Some(mut d) = drawer() else { return };
+    d.sharp_front = true;
+    let mut out = Vec::new();
+    for scale in [1, 2, 3] {
+        if d.set_scale(scale) != scale {
+            eprintln!("SKIP: the device cannot draw at scale {scale}");
+            break;
+        }
+        let mut mem = memory();
+        mem.write_words(
+            VERTS,
+            &color_verts(&[
+                (10.5, 20.5, 0.0, RED),
+                (40.5, 20.5, 0.0, RED),
+                (10.5, 50.5, 0.0, RED),
+            ]),
+        );
+        let mut s = Stream::default();
+        s.setup()
+            .resolve(&mut mem, W, H, false, Some((rgba(CLEAR), 0)))
+            .shader(false, &vs_color())
+            .shader(true, &ps_interp())
+            .vertex_fetch(0, VERTS, 12)
+            .regs(PA_SU_VTX_CNTL, &[0])
+            .draw_auto(PRIM_RECT_LIST, 3)
+            .regs(PA_SU_VTX_CNTL, &[1])
+            .resolve(&mut mem, W, H, true, None)
+            .swap(W, H);
+        let first = run(&mut d, &s, &mut mem);
+        assert!(first.unsupported.is_empty(), "{first:?}");
+        // Late from scale 2 on: the first swap gives no frame.
+        assert_eq!(first.frames.len(), usize::from(scale == 1), "{first:?}");
+        let r = run(&mut d, &s, &mut mem);
+        assert_eq!(r.frames.len(), 1, "{r:?}");
+        let f = &r.frames[0];
+        assert_eq!((f.width, f.height), (W * scale, H * scale));
+        assert_eq!(
+            box_mean(&f.rgba8, W, H, scale),
+            detiled(&mem, DEST, W, H, W, 4)
+        );
+        out.push(mem.data);
+    }
+    for (k, m) in out.iter().enumerate().skip(1) {
+        assert!(*m == out[0], "guest memory at scale {} differs", k + 1);
+    }
+}
+
+/// At scale 2 a 1280x720 front buffer is shown as 2560x1440 drawn pixels:
+/// along a diagonal edge they are not doubled guest pixels, and their mean
+/// is the resolve in guest memory. A CPU write to the front buffer drops
+/// the scaled copy, so the next swap shows guest memory at 1280x720.
+#[test]
+fn sharp_front_buffer_at_scale_2_has_the_drawn_detail() {
+    const FW: u32 = 1280;
+    const FH: u32 = 720;
+    let Some(mut d) = drawer() else { return };
+    if d.set_scale(2) != 2 {
+        eprintln!("SKIP: the device cannot draw at scale 2");
+        return;
+    }
+    d.sharp_front = true;
+    let mut mem = xenon_gpu::SliceMemory {
+        base: 0,
+        data: vec![0; 0x50_0000],
+    };
+    mem.write_words(
+        VERTS,
+        &color_verts(&[
+            (0.0, 0.0, 0.0, RED),
+            (FW as f32, 0.0, 0.0, RED),
+            (0.0, FH as f32, 0.0, RED),
+        ]),
+    );
+    let dest = (DEST, FW | (FH << 16), dest_info(6, 0, false));
+    let mut s = Stream::default();
+    s.setup()
+        // Colour from tile 0 (720 tiles), depth past it.
+        .regs(RB_SURFACE_INFO, &[FW, COLOR_BASE, 1024])
+        .regs(PA_SC_WINDOW_SCISSOR_TL, &[1 << 31, FW | (FH << 16)])
+        .resolve_with(
+            &mut mem,
+            (FW, FH),
+            COPY_NULL | CLEAR_COLOR,
+            dest,
+            [0, rgba(CLEAR), 0],
+        )
+        .shader(false, &vs_color())
+        .shader(true, &ps_interp())
+        .vertex_fetch(0, VERTS, 12)
+        .draw_auto(PRIM_TRI_LIST, 3)
+        .resolve_with(&mut mem, (FW, FH), 0, dest, [0; 3])
+        .swap_at(DEST, FW, FH);
+    assert!(run(&mut d, &s, &mut mem).frames.is_empty());
+    let r = run(&mut d, &s, &mut mem);
+    assert!(r.unsupported.is_empty(), "{r:?}");
+    assert_eq!(r.frames.len(), 1, "{r:?}");
+    let f = &r.frames[0];
+    assert_eq!((f.width, f.height), (2 * FW, 2 * FH));
+    let guest = detiled(&mem, DEST, FW, FH, FW, 4);
+    assert_eq!(box_mean(&f.rgba8, FW, FH, 2), guest);
+    // Guest pixels on the edge are a mix; some of their host pixels are
+    // all red and some all clear.
+    let mixed = (0..FH).find_map(|y| {
+        (0..FW)
+            .find(|&x| {
+                let g = px(&guest, FW, x, y);
+                g != RED && g != CLEAR
+            })
+            .map(|x| (x, y))
+    });
+    let (x, y) = mixed.expect("no guest pixel mixes red and clear");
+    let host: Vec<[u8; 4]> = [(0, 0), (1, 0), (0, 1), (1, 1)]
+        .map(|(i, j)| px(&f.rgba8, 2 * FW, 2 * x + i, 2 * y + j))
+        .to_vec();
+    assert!(host.contains(&RED) && host.contains(&CLEAR), "{host:?}");
+    assert!(
+        d.memory_line().contains("frames 2 scaled,"),
+        "{}",
+        d.memory_line()
+    );
+
+    // The CPU writes the front buffer: the swap reads guest memory now.
+    mem.data[DEST as usize] ^= 0xFF;
+    let mut swap = Stream::default();
+    swap.swap_at(DEST, FW, FH);
+    let r = run(&mut d, &swap, &mut mem);
+    assert_eq!(r.frames.len(), 1, "{r:?}");
+    let f = &r.frames[0];
+    assert_eq!((f.width, f.height), (FW, FH));
+    assert_eq!(f.rgba8, detiled(&mem, DEST, FW, FH, FW, 4));
+    let m = d.memory_line();
+    assert!(m.contains("1 written by the CPU"), "{m}");
+}

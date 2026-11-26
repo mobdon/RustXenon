@@ -36,7 +36,9 @@
 //! EDRAM holds 2048 rows of 1280 32-bit pixels). Its texture holds
 //! [`Drawer::scale`] host pixels per guest pixel on each axis: draws,
 //! clears and transfers address host pixels, resolves and readbacks
-//! decimate them back to guest pixels ([`formats::decimate`]).
+//! decimate them back to guest pixels ([`formats::decimate`]). With
+//! [`Drawer::sharp_front`] a swap's frame is made from the host pixels
+//! instead, kept for each 32bpp colour resolve beside its guest bytes.
 //!
 //! Each target records when it was last written (draw or clear; a transfer
 //! gives the target its source's stamp, so neither is transferred back)
@@ -296,7 +298,34 @@ struct Mirror {
     /// when the arena is replaced, and at the end of a replay for textures
     /// no longer kept.
     groups: HashMap<(wgpu::Texture, usize), wgpu::BindGroup>,
+    /// Colour resolves into the buffer kept at the drawing scale too (see
+    /// [`Drawer::sharp_front`]), apart from each other. In the mirror so
+    /// that whatever drops the mirror (a CPU write, a failed check, the
+    /// limit) drops them too.
+    scaled: Vec<Scaled>,
 }
+
+/// A 32bpp colour resolve as it would be with a guest pixel per host pixel
+/// at [`Drawer::scale`]: the same conversion, tiling and endian, from every
+/// host pixel instead of their mean, so `s` times the rectangle on each
+/// axis at `s` times the pitch. The window shows a front buffer from it
+/// instead of from the decimated guest bytes.
+struct Scaled {
+    /// Guest bytes the resolve wrote; a later resolve over any of them
+    /// drops the copy.
+    lo: u64,
+    hi: u64,
+    /// Guest pixels resolved, and the destination pitch in guest texels.
+    rect: resolve::Rect,
+    pitch: u32,
+    buf: wgpu::Buffer,
+    /// When it was made ([`Drawer::scaled_clock`]): past
+    /// [`SCALED_LIMIT`] the oldest go first.
+    stamp: u64,
+}
+
+/// Bytes of [`Scaled`] copies kept, over every kept resolve.
+const SCALED_LIMIT: u64 = 512 << 20;
 
 /// A texture decoded from a [`Mirror`].
 struct Kept {
@@ -1584,6 +1613,22 @@ pub struct Drawer {
     /// both every frame allocated 7 MB of GPU memory a frame at 720p.
     front_spare: Option<wgpu::Buffer>,
     front_rows: Option<wgpu::Buffer>,
+    /// At a [`Drawer::scale`] above 1, keep each 32bpp colour resolve at
+    /// the drawing scale too and make a swap's frame from the
+    /// copy that holds its whole front buffer, unchanged since: the frame
+    /// is then `scale` times the front buffer on each axis, and goes the
+    /// [`Drawer::late_front_buffer`] way whether that is on or not. Guest
+    /// memory is the same either way. Off by default, so frames stay at
+    /// guest size (captures compare them); the host turns it on unless it
+    /// writes captures.
+    pub sharp_front: bool,
+    /// Counts [`Scaled`] copies made, for their stamps.
+    scaled_clock: u64,
+    /// Swaps under [`Drawer::sharp_front`] at a scale above 1: from a
+    /// scaled copy, and at guest size because no kept resolve held the
+    /// front buffer, because the CPU wrote it since, or because no scaled
+    /// copy held all of it.
+    sharp_frames: [u64; 4],
     /// Records kept-texture decodes after a resolve in the open batch
     /// instead of flushing it first: about a tenth of the drawer's time in
     /// a frame of thousands of draws. `XENON_DECODE_IN_BATCH=0` turns it
@@ -2619,6 +2664,9 @@ impl Drawer {
             late_front: None,
             front_spare: None,
             front_rows: None,
+            sharp_front: false,
+            scaled_clock: 0,
+            sharp_frames: [0; 4],
             decode_in_batch: std::env::var("XENON_DECODE_IN_BATCH").as_deref() != Ok("0"),
             late: None,
             texture_cache_limit: TEXTURE_CACHE_LIMIT,
@@ -2693,7 +2741,10 @@ impl Drawer {
         self.target_views.clear();
         for m in &mut self.mirrors {
             m.groups.clear();
+            m.scaled.clear();
         }
+        // A queued frame would come out at the old scale.
+        self.late_front = None;
         // Pixel shaders that read the pixel position take the scale as a
         // pipeline constant.
         self.pipelines.retain(|k, _| k.ps_param_gen.is_none());
@@ -2925,7 +2976,26 @@ impl Drawer {
             self.modules.len(),
             wgsl.len(),
             wgsl.iter().sum::<usize>().div_ceil(1024),
-        ) + &self.wgpu_line()
+        ) + &self.sharp_line()
+            + &self.wgpu_line()
+    }
+
+    /// Under [`Drawer::sharp_front`] at a scale above 1: the scaled copies
+    /// kept, and how the swaps so far were shown.
+    fn sharp_line(&self) -> String {
+        if !(self.sharp_front && self.scale > 1) {
+            return String::new();
+        }
+        let copies: Vec<u64> = (self.mirrors.iter())
+            .flat_map(|m| &m.scaled)
+            .map(|c| c.buf.size())
+            .collect();
+        let [hit, not_kept, written, no_copy] = self.sharp_frames;
+        format!(
+            ", scaled resolves {} MB in {}, frames {hit} scaled, at guest size {not_kept} not kept, {written} written by the CPU, {no_copy} no scaled copy",
+            copies.iter().sum::<u64>() >> 20,
+            copies.len(),
+        )
     }
 
     /// What wgpu itself holds: live objects (a count that keeps rising is a
@@ -3529,7 +3599,16 @@ impl Drawer {
         let (sa, sb) = if all { (0, u64::MAX) } else { (a, b) };
         // Those touching [sa, sb) too.
         self.sync(mem, sa.saturating_sub(1), sb.saturating_add(1))?;
-        self.mirrors.retain(|m| !all && (m.hi < sa || sb < m.lo));
+        // Written back, so the new buffer holds what they held: their
+        // scaled copies inside it stay good.
+        let mut scaled = Vec::new();
+        self.mirrors.retain_mut(|m| {
+            let keep = !all && (m.hi < sa || sb < m.lo);
+            if !keep && !all {
+                scaled.extend(m.scaled.drain(..).filter(|c| a <= c.lo && c.hi <= b));
+            }
+            keep
+        });
         let Some(bytes) = mem.read_bytes(a as u32, (b - a) as usize) else {
             return Ok(None);
         };
@@ -3560,6 +3639,7 @@ impl Drawer {
             checked,
             views: HashMap::default(),
             groups: HashMap::default(),
+            scaled,
         });
         Ok(Some(self.mirrors.len() - 1))
     }
@@ -6986,9 +7066,129 @@ impl Drawer {
             let y1 = ((hi - k.lo).div_ceil(k.block) * 32).min(u64::from(k.tex.height())) as u32;
             k.stale = Some(k.stale.map_or((y0, y1), |(a, b)| (a.min(y0), b.max(y1))));
         }
+        // A scaled copy under this resolve is stale; its buffer may serve
+        // the new one.
+        let mut spare = None;
+        m.scaled.retain(|c| {
+            let apart = c.hi <= lo || hi <= c.lo;
+            if !apart {
+                spare = Some(c.buf.clone());
+            }
+            apart
+        });
+        if s > 1 && self.sharp_front && entry == 0 && dest_bytes == 4 {
+            self.resolve_scaled(params, rect, pitch, tex, pipeline, i, (lo, hi), spare)?;
+        }
         self.forget_guest(lo, hi);
         self.timings.resolve_cpu += lap(&mut t);
         Ok(())
+    }
+
+    /// The [`Scaled`] copy of the colour resolve [`Self::resolve_gpu`] just
+    /// recorded with `params`: the same shader over the host pixels, one
+    /// per guest pixel, into a buffer of its own (`spare` when the size
+    /// fits). Kept in mirror `i`, the oldest copies dropped past
+    /// [`SCALED_LIMIT`].
+    #[allow(clippy::too_many_arguments)]
+    fn resolve_scaled(
+        &mut self,
+        mut params: [u32; 12],
+        rect: resolve::Rect,
+        pitch: u32,
+        tex: &wgpu::Texture,
+        pipeline: &wgpu::ComputePipeline,
+        i: usize,
+        (lo, hi): (u64, u64),
+        spare: Option<wgpu::Buffer>,
+    ) -> Result<(), Skip> {
+        let s = self.scale;
+        let Ok(extent) =
+            xenon_texture::tile::tiled_extent_2d(s * rect.x1, s * rect.y1, s * pitch, 4)
+        else {
+            return Ok(());
+        };
+        let size = u64::from(extent);
+        if size > self.max_storage {
+            return Ok(());
+        }
+        params[..5].copy_from_slice(&[
+            s * rect.x0,
+            s * rect.y0,
+            s * rect.width(),
+            s * rect.height(),
+            s * pitch,
+        ]);
+        // From the start of its own buffer, a host pixel per guest pixel.
+        params[10] = 0;
+        params[11] = 1;
+        let offset = self.stage_uniform(&params)?;
+        let buf = spare.filter(|b| b.size() == size).unwrap_or_else(|| {
+            self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("scaled resolve"),
+                size,
+                usage: wgpu::BufferUsages::STORAGE,
+                mapped_at_creation: false,
+            })
+        });
+        let view = tex.create_view(&Default::default());
+        let arena = self.arena.as_ref().expect("staged");
+        let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("scaled resolve"),
+            layout: &self.resolve_layouts[0].0,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer: arena,
+                        offset: 0,
+                        size: wgpu::BufferSize::new(4 * params.len() as u64),
+                    }),
+                },
+            ],
+        });
+        // Staging may have submitted the batch with the resolve: then after
+        // it, in the next.
+        let device = &self.device;
+        let batch = self.batch.get_or_insert_with(|| Batch {
+            pass: None,
+            enc: device.create_command_encoder(&Default::default()),
+        });
+        batch.pass = None;
+        {
+            let mut pass = batch.enc.begin_compute_pass(&Default::default());
+            pass.set_pipeline(pipeline);
+            pass.set_bind_group(0, &bg, &[offset]);
+            pass.dispatch_workgroups(params[2].div_ceil(8), params[3].div_ceil(8), 1);
+        }
+        self.scaled_clock += 1;
+        self.mirrors[i].scaled.push(Scaled {
+            lo,
+            hi,
+            rect,
+            pitch,
+            buf,
+            stamp: self.scaled_clock,
+        });
+        loop {
+            let all = self.mirrors.iter().flat_map(|m| &m.scaled);
+            let total: u64 = all.clone().map(|c| c.buf.size()).sum();
+            match all.map(|c| c.stamp).min() {
+                Some(oldest) if total > SCALED_LIMIT => {
+                    for m in &mut self.mirrors {
+                        m.scaled.retain(|c| c.stamp != oldest);
+                    }
+                }
+                _ => return Ok(()),
+            }
+        }
     }
 
     /// Reads the front buffer: a 32x32-tiled 8_8_8_8 surface, pitch = width
@@ -7013,18 +7213,58 @@ impl Drawer {
         };
         let addr = addr & PHYSICAL_MASK;
         let (lo, hi) = (u64::from(addr), u64::from(addr) + u64::from(extent));
+        let s = self.scale;
+        let sharp = s > 1 && self.sharp_front;
+        let late = self.late_front_buffer || sharp;
         let mut kept = self.mirrors.iter().position(|m| m.lo <= lo && hi <= m.hi);
+        let found = kept.is_some();
         // A CPU write to the front buffer since the resolve drops the kept
         // copy, as the synchronous path's check does.
-        if let Some(i) = kept.filter(|_| self.late_front_buffer) {
+        if let Some(i) = kept.filter(|_| late) {
             if !self.verify(i, mem, lo, hi) {
                 kept = None;
             }
         }
-        if let (true, Some(i)) = (self.late_front_buffer, kept) {
+        // The scaled copy of the whole front buffer, if one is kept.
+        let scaled = kept.filter(|_| sharp).and_then(|i| {
+            let size = u64::from(s * width) * u64::from(s * height) * 4;
+            (self.mirrors[i].scaled.iter())
+                .find(|c| {
+                    c.lo == lo
+                        && c.pitch == pitch
+                        && (c.rect.x0, c.rect.y0) == (0, 0)
+                        && c.rect.x1 >= width
+                        && c.rect.y1 >= height
+                })
+                .filter(|_| size <= self.max_storage)
+                .map(|c| c.buf.clone())
+        });
+        if sharp {
+            let why = match (found, kept, &scaled) {
+                (_, _, Some(_)) => 0,
+                (false, _, _) => 1,
+                (true, None, _) => 2,
+                _ => 3,
+            };
+            self.sharp_frames[why] += 1;
+        }
+        if let (true, Some(i)) = (late, kept) {
             // The GPU decodes the frame (byte order, tiling, swizzle) into
             // RGBA8 rows, so the CPU only reads them back: untiling a 720p
             // frame on the draw thread was a tenth of its time.
+            let (width, height, pitch, src, offset) = match scaled {
+                Some(buf) => (s * width, s * height, s * pitch, buf, 0),
+                None => {
+                    let m = &self.mirrors[i];
+                    (
+                        width,
+                        height,
+                        pitch,
+                        m.buf.clone(),
+                        ((lo - m.lo) / 4) as u32,
+                    )
+                }
+            };
             let size = u64::from(width) * u64::from(height) * 4;
             let usage = |u| wgpu::BufferDescriptor {
                 label: Some("front buffer"),
@@ -7047,7 +7287,6 @@ impl Drawer {
             });
             let (endian, swizzle) = self.front_buffer_read(addr);
             let pipeline = self.decode_pipeline(false);
-            let m = &self.mirrors[i];
             let params = [
                 width,
                 height,
@@ -7055,7 +7294,7 @@ impl Drawer {
                 endian as u32,
                 // x, y, z, w from themselves: none.
                 u32::from(swizzle.unwrap_or((1 << 3) | (2 << 6) | (3 << 9))),
-                ((lo - m.lo) / 4) as u32,
+                offset,
                 width,
                 0,
                 0,
@@ -7068,14 +7307,13 @@ impl Drawer {
                 &to_bytes(&params),
                 wgpu::BufferUsages::UNIFORM,
             );
-            let m = &self.mirrors[i];
             let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("front buffer decode"),
                 layout: &pipeline.get_bind_group_layout(0),
                 entries: &[
                     wgpu::BindGroupEntry {
                         binding: 5,
-                        resource: m.buf.as_entire_binding(),
+                        resource: src.as_entire_binding(),
                     },
                     wgpu::BindGroupEntry {
                         binding: 6,
