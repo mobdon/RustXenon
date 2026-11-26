@@ -21,9 +21,12 @@ then speed on ARM.
   `xenon-audio`. **Fails** for `xenon-window` and so for `xenon-host`: winit
   on Android needs an `android-native-activity` or `android-game-activity`
   feature and an `AndroidApp`.
-- Compiled only. Nothing was linked (no NDK on this PC), installed or run on
-  a phone.
-- The phone could not be inspected: `adb` is not installed on this PC. The
+- Linked with NDK 30 (API 29 clang as the linker, `CC_`/`AR_` set for build
+  scripts): `cargo test --no-run -p xenon-rt -p xenon-input -p xenon-draw
+  -p xenon-audio --target aarch64-linux-android` builds every test binary,
+  wgpu's included. Nothing was installed or run on a phone.
+- The phone could not be inspected: `adb devices` lists nothing and Windows
+  shows no phone on USB (unplugged, or a charge-only cable or mode). The
   owner says it is a foldable with a Snapdragon 8 Gen 3 class SoC (Adreno 750,
   Vulkan 1.3), 12 GB RAM, arm64-v8a, Android 14 or later. Those figures are
   the published specs for that model, not read from the device. Confirm them
