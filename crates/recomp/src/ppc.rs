@@ -80,11 +80,13 @@ fn bc_cond(bo: u32, bi: u32) -> (String, String) {
     let mut pre = String::new();
     let mut parts = Vec::new();
     if bo & 4 == 0 {
+        // The test sees only CTR's low word, as on the console: a count made
+        // by negating a zero-extended word has its upper half all ones.
         pre.push_str("c.ctr = c.ctr.wrapping_sub(1); ");
         parts.push(if bo & 2 != 0 {
-            "c.ctr == 0".to_string()
+            "c.ctr as u32 == 0".to_string()
         } else {
-            "c.ctr != 0".to_string()
+            "c.ctr as u32 != 0".to_string()
         });
     }
     if bo & 0x10 == 0 {

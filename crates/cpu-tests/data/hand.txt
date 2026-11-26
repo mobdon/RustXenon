@@ -171,3 +171,9 @@ vlogefp_exact | 102011ca | v2=3f80000040000000418000003f000000 | v1=000000003f80
 vlogefp_special | 102011ca | v2=bf800000000000007f80000080000001 | v1=7fc00000ff8000007f800000ff800000 | 
 # vrsqrtefp of a negative number is the default NaN
 vrsqrtefp_negative | 1020114a | v2=bf800000408000000000000080000000 | v1=7fc000003f0000007f800000ff800000 | 
+# bc with CTR 0x1_0000_0001: the decrement leaves 0x1_0000_0000, and the console
+# tests only CTR's low word, so it counts as zero (bdnz falls through, bdz branches)
+bc_ctr_low_word_bdnz | 42000008 38a00001 38c00002 | cr=f0000000 ctr=100000001 vscr=10000 | r5=1 r6=2 ctr=100000000 | 
+bc_ctr_low_word_bdz | 42400008 38a00001 38c00002 | cr=f0000000 ctr=100000001 vscr=10000 | r6=2 ctr=100000000 | 
+bc_ctr_low_word_bdnzt | 41020008 38a00001 38c00002 | cr=f0000000 ctr=100000001 vscr=10000 | r5=1 r6=2 ctr=100000000 | 
+bc_ctr_low_word_bdzt | 41430008 38a00001 38c00002 | cr=f0000000 ctr=100000001 vscr=10000 | r6=2 ctr=100000000 | 

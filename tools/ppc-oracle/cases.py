@@ -223,6 +223,10 @@ def branch_cases():
     conds = [(12, 2), (4, 2), (12, 0), (4, 1), (16, 0), (18, 0), (8, 2), (0, 2), (10, 3), (2, 1), (20, 0)]
     for i, (bo, bi) in enumerate(conds):
         for j, (cr, ctr) in enumerate([(0x2000_0000, 1), (0x8000_0000, 2), (0x4000_0000, 0), (0xF000_0000, 0x1_0000_0001)]):
+            # The console tests only CTR's low word; QEMU's 64-bit mode tests
+            # all of it. Those cases are in hand.txt (bc_ctr_low_word_*).
+            if j == 3 and bo & 4 == 0:
+                continue
             add(f"bc_{bo}_{bi}_{j}", [bc(bo, bi, 8)] + skip, {"cr": cr, "ctr": ctr})
     for i, ctr in enumerate([1, 2, 0, 0x1_0000_0000]):
         add(f"bdnz_{i}", [bc(16, 0, 8)] + skip, {"ctr": ctr})

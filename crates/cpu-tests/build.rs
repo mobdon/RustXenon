@@ -181,6 +181,18 @@ fn main() {
             ],
             &[],
         ),
+        // li r3,0; mtctr r4; 1: addi r3,r3,1; bdnz 1b; blr
+        (
+            "count_loop_r4",
+            &[
+                0x3860_0000,
+                0x7C89_03A6,
+                0x3863_0001,
+                0x4200_FFFC,
+                0x4E80_0020,
+            ],
+            &[],
+        ),
         // li r3,5, then falls into the next function
         ("fall_off", &[0x3860_0005], &[]),
         // mtctr r3; bctr; li r4,1; blr; li r4,2; blr (table targets +8, +16)
