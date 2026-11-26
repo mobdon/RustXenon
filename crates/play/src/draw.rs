@@ -54,10 +54,12 @@ pub struct View<'a> {
     pub sel: usize,
     /// First row shown.
     pub scroll: usize,
-    /// Title of the game running now.
-    pub running: Option<&'a str>,
+    /// The game running now.
+    pub running: Option<&'a Game>,
     /// A short message for the player, such as why a dropped folder is not a game.
     pub note: Option<&'a str>,
+    /// Why settings.toml cannot be read: then its values are not known.
+    pub settings_err: Option<&'a str>,
     pub home: &'a Path,
 }
 
@@ -72,6 +74,8 @@ pub enum Hit {
     Info,
     /// A settings row's `<` (-1) or `>` (+1) arrow.
     Step(usize, i32),
+    /// A footer hint: 0 Refresh, 1 Back, 2 Start or Change, 3 Page.
+    Hint(usize),
 }
 
 // Layout on the board.
@@ -229,6 +233,9 @@ pub fn hit(w: usize, h: usize, page: Page, x: f32, y: f32) -> Option<Hit> {
     }
     if page == Page::Games && inside(info_rect(&l)) {
         return Some(Hit::Info);
+    }
+    if let Some(i) = hint_rects(page).into_iter().position(inside) {
+        return Some(Hit::Hint(i));
     }
     let r = (0..ROWS).find(|&r| inside(row_rect(&l, r)))?;
     if page == Page::Settings {
@@ -980,30 +987,49 @@ fn preview_plate(cv: &mut Cv, l: &Lay, seed: u32) {
 
 const HINT_GAP: f32 = 24.0;
 
-/// The footer's button hints (Y, B, A), each with the board x it starts at,
-/// and the x where the LB/RB page hint starts.
+/// The footer's button hints (Y, B, A), each with the board x it starts at
+/// and the keyboard key that does the same, and the x where the LB/RB page
+/// hint starts.
 #[allow(clippy::type_complexity)]
-fn hints(page: Page) -> ([(f32, &'static str, u32, &'static str); 3], f32) {
+fn hints(
+    page: Page,
+) -> (
+    [(f32, &'static str, u32, &'static str, &'static str); 3],
+    f32,
+) {
     let first = if page == Page::Games {
         "Start"
     } else {
         "Change"
     };
     let mut hints = [
-        (0.0, "Y", 0xf0b428, "Refresh"),
-        (0.0, "B", 0xe0402a, "Back"),
-        (0.0, "A", GREEN, first),
+        (0.0, "Y", 0xf0b428, "Refresh", "F5"),
+        (0.0, "B", 0xe0402a, "Back", "Esc"),
+        (0.0, "A", GREEN, first, "Enter"),
     ];
     let mut total = text_w(2.0, "Page") + pill_w(22.0, "LB") + pill_w(22.0, "RB") + 12.0;
-    for (.., label) in hints {
+    for (_, _, _, label, _) in hints {
         total += 32.0 + text_w(2.0, label) + HINT_GAP;
     }
     let mut hx = BOARD_W - M - 26.0 - total;
-    for (x, .., label) in &mut hints {
+    for (x, _, _, label, _) in &mut hints {
         *x = hx;
         hx += 32.0 + text_w(2.0, label) + HINT_GAP;
     }
     (hints, hx)
+}
+
+/// Width of the LB/RB page hint.
+fn page_hint_w() -> f32 {
+    pill_w(22.0, "LB") + pill_w(22.0, "RB") + 12.0 + text_w(2.0, "Page")
+}
+
+/// What is clicked for each footer hint: Refresh, Back, Start, Page.
+fn hint_rects(page: Page) -> [Rect; 4] {
+    let (hs, end) = hints(page);
+    let r = |x: f32, w: f32| (x - 6.0, FOOT_Y, w + 12.0, FOOT_H);
+    let h = |i: usize| r(hs[i].0, 32.0 + text_w(2.0, hs[i].3));
+    [h(0), h(1), h(2), r(end, page_hint_w())]
 }
 
 /// The slim bar of button hints at the bottom.
@@ -1018,23 +1044,22 @@ fn footer(cv: &mut Cv, page: Page) {
         c = mix(c, [255.0; 3], 0.12 * smooth(0.5, 0.0, v / h - 0.1));
         (c, 0.94)
     });
-    cv.text(
-        x + 28.0,
-        y + h / 2.0 - 7.0,
-        2.0,
-        DIM,
-        "Drop a game folder here to add it",
-    );
+    // Each label with its keyboard key under it.
     let cy = y + h / 2.0;
+    let (ly, ky) = (cy - 12.0, cy + 5.0);
+    cv.text(x + 28.0, ly, 2.0, DIM, "Drop a game folder here to add it");
+    cv.text(x + 28.0, ky, 1.4, DIM, "F11 full screen");
     let (hints, mut hx) = hints(page);
-    for (hx, key, c, label) in hints {
-        cv.button(hx + 13.0, cy, 13.0, c, key);
-        cv.text(hx + 32.0, cy - 7.0, 2.0, BONE, label);
+    for (hx, button, c, label, key) in hints {
+        cv.button(hx + 13.0, cy, 13.0, c, button);
+        cv.text(hx + 32.0, ly, 2.0, BONE, label);
+        cv.text(hx + 32.0, ky, 1.4, DIM, key);
     }
     for b in ["LB", "RB"] {
         hx += cv.pill(hx, cy - 11.0, 22.0, 0x50565a, WHITE, b) + 4.0;
     }
-    cv.text(hx + 4.0, cy - 7.0, 2.0, BONE, "Page");
+    cv.text(hx + 4.0, ly, 2.0, BONE, "Page");
+    cv.text(hx + 4.0, ky, 1.4, DIM, "Tab");
 }
 
 /// The header: the name, the 360 badge, the launcher's line.
@@ -1241,7 +1266,8 @@ fn rows(v: &View) -> Vec<Row> {
             .map(|g| Row {
                 title: g.title.clone(),
                 sub: g.game.clone(),
-                tag: if v.running.is_some_and(|r| r == g.title) {
+                // By folder: two games can have the same title.
+                tag: if v.running.is_some_and(|r| r.dir == g.dir) {
                     Some(("running", GOLD, 0x2a1c00))
                 } else if g.recent {
                     Some(("recent", 0x1c4a0c, GREEN_HI))
@@ -1257,13 +1283,34 @@ fn rows(v: &View) -> Vec<Row> {
             .enumerate()
             .map(|(i, f)| Row {
                 title: f.label.into(),
-                sub: format!("[{}] {}", f.table, f.key),
+                sub: if v.settings_err.is_none() && !v.settings.valid(i) {
+                    format!("[{}] {}: not valid", f.table, f.key)
+                } else {
+                    format!("[{}] {}", f.table, f.key)
+                },
                 tag: None,
                 tile: format!("{:02}", i + 1),
                 seed: 100 + i as u32 % 6,
             })
             .collect(),
     }
+}
+
+/// Settings field `i` as shown: "?" while settings.toml cannot be read.
+fn setting(v: &View, i: usize) -> String {
+    match v.settings_err {
+        Some(_) => "?".into(),
+        None => v.settings.show(i),
+    }
+}
+
+/// Lines a note may take: it goes over the preview plate, clear of the text.
+const NOTE_LINES: usize = 6;
+
+/// The note box for a note of `lines` lines, at the top of the preview.
+fn note_rect(l: &Lay, lines: usize) -> Rect {
+    let (x, y, w, _) = preview_rect(l);
+    (x, y, w, lines as f32 * 22.0 + 18.0)
 }
 
 /// The rows and the details panel.
@@ -1371,7 +1418,7 @@ pub fn overlay(px: &mut [u32], w: usize, h: usize, v: &View, t: f32) {
                 let ax = |r: Rect| r.0 + 12.0;
                 text(&mut cv, ax(down), y + 17.0, 3.0, tc, "<");
                 text(&mut cv, ax(up), y + 17.0, 3.0, tc, ">");
-                let val = v.settings.show(i);
+                let val = setting(v, i);
                 let mid = (ax(down) + ax(up) + text_w(3.0, ">")) / 2.0;
                 text(
                     &mut cv,
@@ -1402,10 +1449,9 @@ pub fn overlay(px: &mut [u32], w: usize, h: usize, v: &View, t: f32) {
     // Dim the footer hints that do nothing now: all of them while a game
     // runs, A when there is no game to start.
     let (hs, end) = hints(v.page);
-    let (a_x, .., a_label) = hs[2];
+    let (a_x, _, _, a_label, _) = hs[2];
     let dim = if v.running.is_some() {
-        let pills = pill_w(22.0, "LB") + pill_w(22.0, "RB");
-        Some((hs[0].0, end + pills + 12.0 + text_w(2.0, "Page")))
+        Some((hs[0].0, end + page_hint_w()))
     } else if v.page == Page::Games && v.games.is_empty() {
         Some((a_x, a_x + 32.0 + text_w(2.0, a_label)))
     } else {
@@ -1435,7 +1481,7 @@ fn empty(cv: &mut Cv, l: &Lay, home: &Path) {
         ("Or drop a built game folder on this window,", WHITE),
         ("or on rustxenon-play.exe in Explorer.", WHITE),
         ("", WHITE),
-        ("Press Y to look again.", SUB),
+        ("Press Y (F5 on a keyboard) to look again.", SUB),
     ];
     for (s, c) in lines {
         cv.text_sh(x, y, 2.0, c, s);
@@ -1467,10 +1513,17 @@ fn details(cv: &mut Cv, l: &Lay, v: &View, pulse: f32) {
         cv.text_sh(x, *y, 2.0, WHITE, &tail(value, 2.0, iw));
         *y += 24.0;
     };
+    // A note goes over the preview plate, so it never hides the text.
+    let note = v.note.or(v.settings_err);
+    let preview = |cv: &mut Cv, big: &str| {
+        if note.is_none() {
+            preview_text(cv, l, big)
+        }
+    };
     match v.page {
         Page::Games => match v.games.get(v.sel) {
             Some(g) => {
-                preview_text(cv, l, &initials(&g.title));
+                preview(cv, &initials(&g.title));
                 for s in wrap(&g.title, 3.0, iw, 2) {
                     cv.text_sh(x, y, 3.0, WHITE, &s);
                     y += 28.0;
@@ -1481,18 +1534,29 @@ fn details(cv: &mut Cv, l: &Lay, v: &View, pulse: f32) {
                 pair(cv, &mut y, "Game files", &g.game);
             }
             None => {
-                preview_text(cv, l, "?");
+                preview(cv, "?");
                 cv.text_sh(x, y, 3.0, WHITE, "Nothing selected");
             }
         },
         Page::Settings => {
             let i = v.sel.min(FIELDS.len() - 1);
             let f = &FIELDS[i];
-            preview_text(cv, l, &v.settings.show(i));
+            preview(cv, &setting(v, i));
             cv.text_sh(x, y, 3.0, WHITE, &head(f.label, 3.0, iw));
             y += 32.0;
-            for s in wrap(f.help, 2.0, iw, 3) {
-                cv.text_sh(x, y, 2.0, PALE, &s);
+            let bad = v.settings_err.is_none() && !v.settings.valid(i);
+            let why = "The value in settings.toml is not one the game takes: it uses this default.";
+            let lines = wrap(f.help, 2.0, iw, 3)
+                .into_iter()
+                .map(|s| (s, PALE))
+                .chain(
+                    bad.then(|| wrap(why, 2.0, iw, 2))
+                        .into_iter()
+                        .flatten()
+                        .map(|s| (s, WARN)),
+                );
+            for (s, c) in lines {
+                cv.text_sh(x, y, 2.0, c, &s);
                 y += 22.0;
             }
         }
@@ -1501,7 +1565,7 @@ fn details(cv: &mut Cv, l: &Lay, v: &View, pulse: f32) {
     // The info box, then any note above it.
     let info = info_rect(l);
     let (ix, iy) = (info.0 + 16.0, info.1);
-    if let Some(title) = v.running {
+    if let Some(Game { title, .. }) = v.running {
         let a = 0.6 + 0.4 * pulse;
         cv.glow(info, 14.0, 12.0, GOLD, 0.25 * a);
         cv.text_glow(ix, iy + 9.0, 3.0, GOLD, "Running", 6.0, 0.5 * a);
@@ -1527,12 +1591,21 @@ fn details(cv: &mut Cv, l: &Lay, v: &View, pulse: f32) {
             0.2 + 0.25 * pulse,
         );
         cv.text(ix + 42.0, iy + 18.0, 3.0, GREEN_HI, "Start game");
+        let kx = ix + 42.0 + text_w(3.0, "Start game") + 14.0;
+        cv.text(kx, iy + 22.0, 1.8, DIM, "or Enter");
     } else if v.page == Page::Games {
         cv.button(ix + 15.0, iy + INFO_H / 2.0, 15.0, 0xf0b428, "Y");
         cv.text(ix + 42.0, iy + 21.0, 2.0, GREEN_HI, "Look again");
+        let kx = ix + 42.0 + text_w(2.0, "Look again") + 14.0;
+        cv.text(kx, iy + 22.0, 1.8, DIM, "or F5");
     } else {
-        let path = format!("Saved in {}", v.home.join("settings.toml").display());
-        cv.text(ix, iy + 12.0, 1.8, GREEN_HI, &tail(&path, 1.8, iw - 32.0));
+        // The label stays; the path loses its start if it is long.
+        let label = "Saved in ";
+        cv.text(ix, iy + 12.0, 1.8, GREEN_HI, label);
+        let path = v.home.join("settings.toml").display().to_string();
+        let lw = text_w(1.8, label) + 4.0;
+        let path = tail(&path, 1.8, iw - 32.0 - lw);
+        cv.text(ix + lw, iy + 12.0, 1.8, GREEN_HI, &path);
         cv.text(
             ix,
             iy + 32.0,
@@ -1541,10 +1614,9 @@ fn details(cv: &mut Cv, l: &Lay, v: &View, pulse: f32) {
             "A game's own run.toml overrides these.",
         );
     }
-    if let Some(note) = v.note {
-        let ls = wrap(note, 2.0, iw - 32.0, 4);
-        let nh = ls.len() as f32 * 22.0 + 18.0;
-        let ny = iy - 10.0 - nh;
+    if let Some(note) = note {
+        let ls = wrap(note, 2.0, iw - 32.0, NOTE_LINES);
+        let (_, ny, _, nh) = note_rect(l, ls.len());
         cv.fill((x, ny, iw, nh), 12.0, WARN, 0.9);
         cv.fill(
             (x + 1.5, ny + 1.5, iw - 3.0, nh - 3.0),
@@ -1573,6 +1645,7 @@ mod tests {
             scroll: 0,
             running: None,
             note: Some("not a built game folder"),
+            settings_err: None,
             home: Path::new("C:\\home"),
         }
     }
@@ -1599,8 +1672,12 @@ mod tests {
             let mut v = view(&games, &s);
             v.scroll = 2;
             v.sel = 3;
-            v.running = Some("Test Game One");
+            v.running = Some(&games[0]);
             render(&mut px, w, h, &v, 0.3);
+            v.settings_err = Some("TOML parse error at line 3, column 10: invalid string");
+            v.page = Page::Settings;
+            render(&mut px, w, h, &v, 0.3);
+            v.settings_err = None;
             v.games = &[];
             v.page = Page::Settings;
             render(&mut px, w, h, &v, 0.0);
@@ -1661,6 +1738,11 @@ mod tests {
                     };
                     assert_eq!(at(tuck, y + sh / 2.0), None);
                 }
+                // The footer hints are buttons.
+                for (i, (x, y, hw, hh)) in hint_rects(page).into_iter().enumerate() {
+                    assert_eq!(at(x + hw / 2.0, y + hh / 2.0), Some(Hit::Hint(i)));
+                }
+                assert_eq!(at(M + 40.0, FOOT_Y + FOOT_H / 2.0), None);
                 let (x, y, iw, ih) = info_rect(&l);
                 let info = (page == Page::Games).then_some(Hit::Info);
                 assert_eq!(at(x + iw / 2.0, y + ih / 2.0), info);
@@ -1709,6 +1791,33 @@ mod tests {
             let green = px_at(&px, l.dx - 8.0, LIST_Y + 250.0);
             assert!(green[1] > green[0] + 60.0, "{page:?} blade {green:?}");
         }
+    }
+
+    /// The longest note stays on the preview plate, above the details text.
+    #[test]
+    fn note_clear_of_details() {
+        for page in PAGES {
+            let l = lay(page);
+            let (_, py, _, ph) = preview_rect(&l);
+            let (_, ny, _, nh) = note_rect(&l, NOTE_LINES);
+            assert!(ny >= py && ny + nh <= py + ph, "{page:?}");
+        }
+    }
+
+    /// Only the game started is tagged running, not another with its title;
+    /// settings show "?" while the file cannot be read.
+    #[test]
+    fn running_tag_and_unknown_settings() {
+        let s = Settings::default();
+        let mut games = games();
+        games[1].dir = "C:\\home\\games\\cd".into();
+        let mut v = view(&games, &s);
+        v.running = Some(&games[1]);
+        let tags: Vec<_> = rows(&v).iter().map(|r| r.tag.map(|t| t.0)).collect();
+        assert_eq!(tags[..3], [Some("recent"), Some("running"), Some("recent")]);
+        assert_eq!(setting(&v, 0), "1280");
+        v.settings_err = Some("broken");
+        assert_eq!(setting(&v, 0), "?");
     }
 
     #[test]
