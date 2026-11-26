@@ -1064,7 +1064,13 @@ fn f32_to_short(w: u32) -> u16 {
 /// [`f32_to_short`] does (NaN takes `lo`).
 fn f32_to_bits_in(w: u32, lo: u32, hi: u32, mask: u32) -> u32 {
     let (f, l, h) = (f32::from_bits(w), f32::from_bits(lo), f32::from_bits(hi));
-    let c = if f >= h { hi } else if f >= l { w } else { lo };
+    let c = if f >= h {
+        hi
+    } else if f >= l {
+        w
+    } else {
+        lo
+    };
     c & mask
 }
 
@@ -1114,7 +1120,12 @@ pub fn vupkd3d(b: V128, typ: u32) -> Option<V128> {
         ],
         2 => {
             let w = b[3];
-            [ten_to_f32(w), ten_to_f32(w >> 10), ten_to_f32(w >> 20), one | w >> 30]
+            [
+                ten_to_f32(w),
+                ten_to_f32(w >> 10),
+                ten_to_f32(w >> 20),
+                one | w >> 30,
+            ]
         }
         3 => [
             half_to_f32((b[3] >> 16) as u16),
@@ -1156,7 +1167,12 @@ pub fn vpkd3d(d: V128, b: V128, typ: u32, pack: u32, shift: u32) -> Option<V128>
         2 => {
             let ten = |w| f32_to_bits_in(w, 0x403F_FE01, 0x4040_01FF, 0x3FF);
             let two = f32_to_bits_in(b[3], 0x3F80_0000, 0x3F80_0003, 3);
-            [0, 0, 0, two << 30 | ten(b[2]) << 20 | ten(b[1]) << 10 | ten(b[0])]
+            [
+                0,
+                0,
+                0,
+                two << 30 | ten(b[2]) << 20 | ten(b[1]) << 10 | ten(b[0]),
+            ]
         }
         3 => [
             0,
