@@ -60,7 +60,7 @@ bin=$ANDROID_NDK/toolchains/llvm/prebuilt/windows-x86_64/bin
 tools=$ANDROID_SDK/build-tools/$BUILD_TOOLS
 jar=$ANDROID_SDK/platforms/$PLATFORM/android.jar
 for f in "$bin/aarch64-linux-android29-clang.cmd" "$tools/aapt2.exe" "$tools/zipalign.exe" \
-    "$tools/apksigner.bat" "$jar" "$JAVA_HOME/bin/keytool.exe"; do
+    "$tools/apksigner.bat" "$tools/d8.bat" "$jar" "$JAVA_HOME/bin/keytool.exe" "$JAVA_HOME/bin/javac.exe"; do
     [ -e "$f" ] || { echo "build-apk.sh: missing $f (set ANDROID_SDK, ANDROID_NDK or JAVA_HOME)" >&2; exit 1; }
 done
 export JAVA_HOME
@@ -127,12 +127,20 @@ open(dst, "w", encoding="utf-8").write(text)
 EOF
 "$tools/aapt2.exe" link -o "$stage/base.apk" -I "$jar" --manifest "$stage/AndroidManifest.xml"
 
+# The activity class (org.rustxenon.GameActivity): hides the system bars.
+echo "== javac, d8"
+mkdir -p "$stage/classes" "$stage/dex"
+"$JAVA_HOME/bin/javac.exe" --release 17 -classpath "$jar" -d "$stage/classes"     "$here/java/org/rustxenon/GameActivity.java"
+"$tools/d8.bat" --release --min-api 29 --lib "$jar" --output "$stage/dex"     $(find "$stage/classes" -name '*.class')
+[ -f "$stage/dex/classes.dex" ] || { echo "build-apk.sh: d8 made no classes.dex" >&2; exit 1; }
+
 # Native libraries go in STORED, so the phone maps them straight from the APK
 # (extractNativeLibs=false).
 python - "$stage/base.apk" "$stage" <<'EOF'
 import os, sys, zipfile
 apk, stage = sys.argv[1], sys.argv[2]
 with zipfile.ZipFile(apk, "a") as z:
+    z.write(os.path.join(stage, "dex", "classes.dex"), "classes.dex", zipfile.ZIP_DEFLATED)
     libs = os.path.join(stage, "lib", "arm64-v8a")
     for name in sorted(os.listdir(libs)):
         z.write(os.path.join(libs, name), "lib/arm64-v8a/" + name, zipfile.ZIP_STORED)
