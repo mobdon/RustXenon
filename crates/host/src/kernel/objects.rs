@@ -554,11 +554,19 @@ pub fn ke_try_to_acquire_spin_lock_at_raised_irql(rt: &Runtime, c: &mut Context)
     let ok = spin(rt, c, arg(rt, c, 0), true);
     ret(c, ok as u32);
 }
+/// Frees a spin lock. The fence makes the holder's writes visible before
+/// the free word (the console's kernel has a barrier here too): x86 orders
+/// stores anyway, but on ARM another core could take the lock and still
+/// read stale data.
+fn unspin(rt: &Runtime, a: u32) {
+    std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
+    rt.mem.write_u32(a, 0);
+}
 pub fn kf_release_spin_lock(rt: &Runtime, c: &mut Context) {
-    rt.mem.write_u32(arg(rt, c, 0), 0);
+    unspin(rt, arg(rt, c, 0));
 }
 pub fn ke_release_spin_lock_from_raised_irql(rt: &Runtime, c: &mut Context) {
-    rt.mem.write_u32(arg(rt, c, 0), 0);
+    unspin(rt, arg(rt, c, 0));
 }
 pub fn ke_raise_irql_to_dpc_level(_: &Runtime, c: &mut Context) {
     ret(c, 0);
