@@ -71,6 +71,8 @@ pub fn decode(rt: &Runtime, a: u32) -> bool {
         return false;
     };
     let c = xma::Context(std::array::from_fn(|i| rt.mem.read_u32(a + 4 * i as u32)));
+    // The buffers the context points at are read after it (ARM ordering).
+    std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
     let mut all = CTXS.lock().unwrap();
     let s = all.get_or_insert_with(HashMap::new).entry(a).or_default();
     let off = c.read_offset();
@@ -140,6 +142,8 @@ pub fn decode(rt: &Runtime, a: u32) -> bool {
     // other buffer's valid bit and pointer while the decoder runs.
     let new_off = if moved { packet << 14 } else { off };
     s.expect = Some(new_off);
+    // Decoded output first, then the context words the guest polls.
+    std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
     if new_off != off {
         let w2 = rt.mem.read_u32(a + 8);
         rt.mem.write_u32(a + 8, w2 & !0x03FF_FFFF | new_off);

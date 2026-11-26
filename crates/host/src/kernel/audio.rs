@@ -95,6 +95,8 @@ static XMA: Mutex<Option<(u32, Vec<bool>)>> = Mutex::new(None);
 fn drain(rt: &Runtime, ctx: u32) {
     let w0 = rt.mem.read_u32(ctx);
     let w1 = rt.mem.read_u32(ctx + 4);
+    // The buffers the context points at are read after it (ARM ordering).
+    std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
     if std::env::var_os("XENON_TRACE_XMA").is_some() {
         static LAST: Mutex<Vec<(u32, [u32; 10])>> = Mutex::new(Vec::new());
         let words: [u32; 10] = std::array::from_fn(|i| rt.mem.read_u32(ctx + 4 * i as u32));
@@ -144,6 +146,8 @@ fn drain(rt: &Runtime, ctx: u32) {
         w0n = (w0n & !(31 << 27)) | wr << 27;
     }
     if w0n != w0 {
+        // The output ring first, then the word the guest polls.
+        std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
         rt.mem.write_u32(ctx, w0n);
     }
 }

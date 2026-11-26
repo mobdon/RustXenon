@@ -146,6 +146,9 @@ fn physical_ranges(written: &[(u64, u64)]) -> Vec<(u64, u64)> {
 
 /// A GPU write of `v` at physical `addr` in byte order `e`.
 fn store(rt: &Runtime, addr: u32, e: Endian, v: u32) {
+    // A fence or event value the guest waits on: whatever the GPU wrote
+    // before it must be visible first (ARM does not order plain stores).
+    std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
     rt.mem
         .write_bytes(gpu_to_cpu(addr & !3), &e.to_guest_bytes(v));
 }
@@ -453,6 +456,7 @@ impl Gpu {
         if (SCRATCH_REG0..SCRATCH_REG0 + 8).contains(&i) {
             let n = i - SCRATCH_REG0;
             if self.rec.regs.get(SCRATCH_UMSK) >> n & 1 != 0 {
+                std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
                 rt.mem
                     .write_u32(gpu_to_cpu(self.rec.regs.get(SCRATCH_ADDR) + 4 * n), v);
             }
@@ -469,7 +473,10 @@ impl Gpu {
 
     fn holds(&self, rt: &Runtime, w: &WaitRegMem) -> bool {
         let v = if w.memory {
-            load(rt, w.poll_addr, w.endian)
+            let v = load(rt, w.poll_addr, w.endian);
+            // What the guest wrote before the polled word is read after it.
+            std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
+            v
         } else {
             self.rec.regs.get(w.poll_addr)
         };
@@ -567,6 +574,7 @@ impl Gpu {
                 }
                 // Screen extents: min/max x, y, z as 16-bit values.
                 (EventKind::ScreenExtent, Some(a)) => {
+                    std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
                     for (k, v) in [0u16, 8192 >> 3, 0, 8192 >> 3, 0, 1]
                         .into_iter()
                         .enumerate()

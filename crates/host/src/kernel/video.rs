@@ -195,6 +195,8 @@ pub fn start(rt: std::sync::Arc<Runtime>) {
                         // visual change and saved about 23 ms a frame.
                         let mode = std::env::var("XENON_RESOLVE_WRITEBACK");
                         d.skip_resolve_writeback = !matches!(mode.as_deref(), Ok("on" | "late"));
+                        // The command processor applies MEM_WRITE in ring order.
+                        d.apply_mem_writes = false;
                         // Frame images come one swap late, so a swap never
                         // waits for the GPU (XENON_LATE_FRAME=0 turns it off).
                         d.late_front_buffer = std::env::var("XENON_LATE_FRAME").as_deref() != Ok("0");
@@ -246,6 +248,9 @@ pub fn start(rt: std::sync::Arc<Runtime>) {
                 if ring != 0 {
                     let words = ((1u32 << (log2 + 3)) / 4).max(1);
                     let w = rt.mem.read_u32(GPU_REGS + 4 * CP_RB_WPTR) % words;
+                    // The ring words (and what they point at) are read after
+                    // the write pointer: ARM could read them first, stale.
+                    std::sync::atomic::fence(Ordering::Acquire);
                     super::gpu::STATE.store(1, Ordering::Relaxed);
                     if rptr != w {
                         rptr = gpu.run_ring(&rt, ring, words, rptr, w, &mut idle);

@@ -1561,6 +1561,12 @@ pub struct Drawer {
     /// `XENON_RESOLVE_WRITEBACK=skip` turns it on at [`Drawer::new`]; the
     /// host turns it on unless that variable is `on` or `late`.
     pub skip_resolve_writeback: bool,
+    /// Apply MEM_WRITE packets to guest memory (default). A host whose
+    /// command processor already applied them in ring order turns this
+    /// off: the drawer replays a frame or more later, and writing the
+    /// value again could set back a fence the guest has moved past since,
+    /// so the guest waits for good (seen on a phone, where the drawer lags).
+    pub apply_mem_writes: bool,
     /// Queue the end-of-replay write-back of kept resolves without waiting
     /// for it, and write it to guest memory when the next replay starts:
     /// the CPU sees resolve output one frame late, in exchange for no GPU
@@ -2603,6 +2609,7 @@ impl Drawer {
             mirrors: Vec::new(),
             decode_pipelines: [None, None],
             skip_resolve_writeback: std::env::var("XENON_RESOLVE_WRITEBACK").as_deref() == Ok("skip"),
+            apply_mem_writes: true,
             late_writeback: std::env::var("XENON_RESOLVE_WRITEBACK").as_deref() == Ok("late"),
             late_front_buffer: std::env::var("XENON_LATE_FRAME").as_deref() == Ok("1"),
             late_front: None,
@@ -3144,7 +3151,7 @@ impl Drawer {
                     addr,
                     endian,
                     values,
-                } => {
+                } if self.apply_mem_writes => {
                     let a = u64::from(addr & PHYSICAL_MASK);
                     self.sync(mem, a, a + 4 * values.len() as u64)?;
                     for (i, &v) in values.iter().enumerate() {
