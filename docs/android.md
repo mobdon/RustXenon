@@ -14,6 +14,41 @@ Goal: a game built by RustXenon runs on an Android phone, played with an Xbox
 controller paired over Bluetooth. No touch controls. A game picker on the
 phone is driven by the controller only.
 
+## Status on the first phone (2026-11-26)
+
+A recompiled game runs on the phone (foldable, Snapdragon 8 Gen 3,
+Android 17) from an APK built with `tools/android`, with the player's files
+pushed to the app's folder and a Bluetooth Xbox controller connected.
+
+Seen on the phone:
+
+- Loading screens run at 60 fps. Gameplay ran at about 10 fps, falling to
+  1-2 fps in heavy scenes, before the speed work below.
+- Freezes at the start of play came from code that was only correct
+  because x86 orders memory strongly: spin-lock release without a release
+  fence, the command processor reading ring words before the write pointer
+  it had just read, GPU writes and XMA context words without fences, and
+  the drawer re-applying `MEM_WRITE` a frame late (setting a fence back).
+  All fixed; no freeze since in unattended runs.
+- A 10 s black screen when play starts was pipeline compilation (about
+  0.35 s each on the phone's Vulkan driver). The pipeline cache is now on
+  by default on Android, in the game folder, so only the first run pays.
+
+Speed work merged, measured in parts but not yet together in the game:
+
+| Change | Measured |
+|---|---|
+| Write watch on Linux and Android (`mprotect` + `SIGSEGV`, `crates/rt/src/watch.rs`) | Drawer re-hashed ~100 MB of guest memory a frame without it (textures 335 ms of a 580 ms frame); tests not yet run on the phone in the final form |
+| Guest calls without thread-locals (each one a libc call on Android); aligned guest memory access inlined | 9.5 to 4.6 ns per traced call on the phone |
+| NEON paths for the hot VMX float ops and `vperm` | 2-11x faster per op on the phone, bit-exact against the scalar code |
+| Clears and EDRAM transfers drawn inside the next draw pass; stencil transfer passes read stencil only | 93 fewer passes per replay of a captured frame; image identical on Windows; phone timing not yet taken (expected about 25 ms less GPU time a frame) |
+| Generated code at opt-level 3 for the phone (`CARGO_PROFILE_DEV_OPT_LEVEL=3`) | Build time about the same as opt-level 1 (4-5 min at 6 jobs) |
+
+Next on the phone: install the latest APK, run the rt and draw test
+binaries there, measure gameplay fps, then profile again. Known further
+costs: remaining render passes on the tiled GPU (each about 0.8 ms),
+transfers' 8 stencil-bit passes, `lvlx`/`lvrx` byte loops.
+
 ## Verdict
 
 Feasible. Most crates already build for `aarch64-linux-android` unchanged.
