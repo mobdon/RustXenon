@@ -1,14 +1,24 @@
 //! The launcher screen, drawn with the CPU into 0RGB pixels of any size.
 //!
+//! The screen is a stack of blades: the page shown is one tall glossy green
+//! blade over rusted metal, the other pages are narrow rusted steel strips at
+//! the left and right edges with their names written up the strip. Inside the
+//! blade: the page title, a list of rows on the left and a details panel on
+//! the right. A slim bar of button hints sits below.
+//!
 //! The design is laid out on a 1280x720 board, scaled to fit the window and
 //! centred; the background fills the whole window. Drawing is split in two:
-//! [`backdrop`] (background, title, tabs, rusted panels, footer: slow, only
-//! redrawn when the size or page changes) and [`overlay`] (rows, details,
-//! notes: every frame). [`render`] does both.
+//! [`backdrop`] (background, title, blades, preview plate, footer: slow,
+//! only redrawn when the size or page changes) and [`overlay`] (rows,
+//! details, notes: every frame). [`render`] does both. The rusted thumbnail
+//! tiles the overlay draws are made once per size and kept.
 
 use crate::settings::{Settings, FIELDS};
 use crate::{font, Game};
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::path::Path;
+use std::rc::Rc;
 
 /// The design board.
 pub const BOARD_W: f32 = 1280.0;
@@ -16,10 +26,23 @@ pub const BOARD_H: f32 = 720.0;
 /// Rows the list shows at once.
 pub const ROWS: usize = 7;
 
+/// The pages, in blade order from left to right.
+pub const PAGES: [Page; 2] = [Page::Games, Page::Settings];
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Page {
     Games,
     Settings,
+}
+
+impl Page {
+    /// The name written up its blade.
+    fn name(self) -> &'static str {
+        match self {
+            Page::Games => "games",
+            Page::Settings => "settings",
+        }
+    }
 }
 
 /// Everything the screen shows.
@@ -41,40 +64,122 @@ pub struct View<'a> {
 /// What a point of the window is over.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Hit {
+    /// The side blade of another page.
     Tab(Page),
     /// A list row, counted from the first row shown.
     Row(usize),
 }
 
 // Layout on the board.
-const M: f32 = 56.0;
-const TAB_Y: f32 = 92.0;
-const TAB_W: f32 = 200.0;
-const TAB_H: f32 = 38.0;
-const TAB_SLANT: f32 = 16.0;
-const TAB_GAP: f32 = 14.0;
-const PANEL_Y: f32 = 160.0;
-const PANEL_H: f32 = 476.0;
-const LIST_W: f32 = 736.0;
-const DETAIL_X: f32 = 812.0;
-const DETAIL_W: f32 = BOARD_W - M - DETAIL_X;
-const FRAME: f32 = 16.0;
-const ROW_Y: f32 = PANEL_Y + FRAME + 12.0;
+const M: f32 = 26.0;
+const BLADE_Y: f32 = 86.0;
+const BLADE_H: f32 = 548.0;
+const BLADE_R: f32 = 26.0;
+/// Rusted rim round the active blade.
+const RIM: f32 = 7.0;
+/// Visible width of a side blade, and how far it tucks under its neighbour.
+const STRIP_W: f32 = 58.0;
+const STRIP_TUCK: f32 = 18.0;
+const STRIP_INSET: f32 = 12.0;
+const PAD: f32 = 40.0;
+const LIST_Y: f32 = BLADE_Y + 96.0;
 const ROW_H: f32 = 60.0;
-const ROW_X: f32 = M + FRAME + 10.0;
-const ROW_W: f32 = LIST_W - 2.0 * FRAME - 34.0;
-const FOOT_Y: f32 = 652.0;
-const FOOT_H: f32 = 50.0;
+const ROW_GAP: f32 = 6.0;
+const ROW_R: f32 = 12.0;
+const TILE: f32 = 44.0;
+const PREVIEW_H: f32 = 164.0;
+const INFO_H: f32 = 56.0;
+const FOOT_Y: f32 = 648.0;
+const FOOT_H: f32 = 48.0;
 
 const GREEN: u32 = 0x5ad41e;
 const GREEN_HI: u32 = 0xc8ff96;
+const GREEN_DEEP: u32 = 0x173f06;
+const PALE: u32 = 0xe6ffd2;
+const SUB: u32 = 0xd2efbe;
+const WHITE: u32 = 0xffffff;
+const BLACK: u32 = 0x000000;
 const BONE: u32 = 0xe8dcc4;
 const DIM: u32 = 0x9a8670;
-const INK: u32 = 0x061004;
+const INK: u32 = 0x0e2a06;
 const WARN: u32 = 0xff8a3c;
+const GOLD: u32 = 0xffd040;
 const RUST_DARK: u32 = 0x4a2410;
 const RUST_MID: u32 = 0x7a3a12;
 const RUST_HI: u32 = 0xb7541a;
+
+/// Where the active blade and its insides go for a page.
+#[derive(Clone, Copy, Debug)]
+struct Lay {
+    bx: f32,
+    bw: f32,
+    list_x: f32,
+    list_w: f32,
+    /// The details panel.
+    dx: f32,
+    dw: f32,
+}
+
+fn index(page: Page) -> usize {
+    PAGES.iter().position(|&p| p == page).unwrap_or(0)
+}
+
+fn lay(page: Page) -> Lay {
+    let i = index(page);
+    let after = PAGES.len() - 1 - i;
+    let bx = M + i as f32 * STRIP_W;
+    let bw = BOARD_W - M - after as f32 * STRIP_W - bx;
+    let list_w = ((bw - 2.0 * PAD - 30.0) * 0.585).round();
+    let dx = bx + PAD + list_w + 30.0;
+    Lay {
+        bx,
+        bw,
+        list_x: bx + PAD,
+        list_w,
+        dx,
+        dw: bx + bw - PAD - dx,
+    }
+}
+
+type Rect = (f32, f32, f32, f32);
+
+/// Board rectangle of the side blade of `other` while `page` is shown,
+/// including the part tucked under the active blade.
+fn strip_rect(page: Page, other: Page) -> Option<Rect> {
+    let (i, j) = (index(page), index(other));
+    let (y, h, w) = (
+        BLADE_Y + STRIP_INSET,
+        BLADE_H - 2.0 * STRIP_INSET,
+        STRIP_W + STRIP_TUCK,
+    );
+    match j.cmp(&i) {
+        std::cmp::Ordering::Less => Some((M + j as f32 * STRIP_W, y, w, h)),
+        std::cmp::Ordering::Greater => {
+            let right = BOARD_W - M - (PAGES.len() - 1 - j) as f32 * STRIP_W;
+            Some((right - w, y, w, h))
+        }
+        std::cmp::Ordering::Equal => None,
+    }
+}
+
+/// Board rectangle of list row `r` (counted from the first row shown).
+fn row_rect(l: &Lay, r: usize) -> Rect {
+    (
+        l.list_x,
+        LIST_Y + r as f32 * ROW_H,
+        l.list_w,
+        ROW_H - ROW_GAP,
+    )
+}
+
+fn preview_rect(l: &Lay) -> Rect {
+    (l.dx, LIST_Y, l.dw, PREVIEW_H)
+}
+
+fn info_rect(l: &Lay) -> Rect {
+    let bottom = LIST_Y + ROWS as f32 * ROW_H - ROW_GAP;
+    (l.dx, bottom - INFO_H, l.dw, INFO_H)
+}
 
 /// Board scale and offset for a `w` x `h` window.
 fn fit(w: usize, h: usize) -> (f32, f32, f32) {
@@ -86,19 +191,22 @@ fn fit(w: usize, h: usize) -> (f32, f32, f32) {
     )
 }
 
-/// What window pixel (`x`, `y`) is over.
-pub fn hit(w: usize, h: usize, x: f32, y: f32) -> Option<Hit> {
+/// What window pixel (`x`, `y`) is over while `page` is shown.
+pub fn hit(w: usize, h: usize, page: Page, x: f32, y: f32) -> Option<Hit> {
     let (k, ox, oy) = fit(w, h);
     let (x, y) = ((x - ox) / k, (y - oy) / k);
-    for (i, p) in [Page::Games, Page::Settings].into_iter().enumerate() {
-        let tx = M + i as f32 * (TAB_W + TAB_GAP);
-        if (TAB_Y..TAB_Y + TAB_H).contains(&y) && (tx..tx + TAB_W + TAB_SLANT).contains(&x) {
+    let inside = |(rx, ry, rw, rh): Rect| (rx..rx + rw).contains(&x) && (ry..ry + rh).contains(&y);
+    let l = lay(page);
+    // Only the part of a side blade that shows: the active blade covers its tuck.
+    if !(l.bx..l.bx + l.bw).contains(&x) {
+        if let Some(p) = PAGES
+            .into_iter()
+            .find(|&p| strip_rect(page, p).is_some_and(inside))
+        {
             return Some(Hit::Tab(p));
         }
     }
-    let r = ((y - ROW_Y) / ROW_H).floor();
-    ((ROW_X..ROW_X + ROW_W).contains(&x) && (0.0..ROWS as f32).contains(&r))
-        .then_some(Hit::Row(r as usize))
+    (0..ROWS).find(|&r| inside(row_rect(&l, r))).map(Hit::Row)
 }
 
 /// Draws the whole screen.
@@ -139,6 +247,23 @@ fn scale(a: Rgb, s: f32) -> Rgb {
 fn smooth(e0: f32, e1: f32, x: f32) -> f32 {
     let t = ((x - e0) / (e1 - e0)).clamp(0.0, 1.0);
     t * t * (3.0 - 2.0 * t)
+}
+
+/// A colour ramp through evenly spaced stops, `t` in 0..1.
+fn ramp(stops: &[u32], t: f32) -> Rgb {
+    let n = stops.len() - 1;
+    let f = t.clamp(0.0, 1.0) * n as f32;
+    let i = (f.floor() as usize).min(n - 1);
+    mix(rgb(stops[i]), rgb(stops[i + 1]), f - i as f32)
+}
+
+/// Signed distance from (`u`, `v`) to a rounded rectangle, negative inside.
+fn rr(u: f32, v: f32, (x, y, w, h): Rect, r: f32) -> f32 {
+    let r = r.min(w / 2.0).min(h / 2.0);
+    let qx = (u - x - w / 2.0).abs() - (w / 2.0 - r);
+    let qy = (v - y - h / 2.0).abs() - (h / 2.0 - r);
+    let (ox, oy) = (qx.max(0.0), qy.max(0.0));
+    (ox * ox + oy * oy).sqrt() + qx.max(qy).min(0.0) - r
 }
 
 // ---------------------------------------------------------------- noise
@@ -199,6 +324,138 @@ fn rust(u: f32, v: f32, px: i32, py: i32, seed: u32) -> Rgb {
     scale(c, 0.9 + 0.2 * unit(hash(px, py, seed + 6)))
 }
 
+/// Rust textures by pixel size, scale and seed.
+type Plates = HashMap<(i32, i32, u32, u32), Rc<Vec<u32>>>;
+
+thread_local! {
+    static PLATES: RefCell<Plates> = RefCell::new(HashMap::new());
+}
+
+/// A `w` x `h` pixel rust texture at scale `k`, made once and kept.
+fn rust_tex(w: i32, h: i32, k: f32, seed: u32) -> Rc<Vec<u32>> {
+    PLATES.with(|m| {
+        let mut m = m.borrow_mut();
+        // A resize leaves old sizes behind; drop them all now and then.
+        if m.len() > 48 {
+            m.clear();
+        }
+        m.entry((w, h, k.to_bits(), seed))
+            .or_insert_with(|| {
+                let mut t = Vec::with_capacity((w.max(0) * h.max(0)) as usize);
+                for y in 0..h {
+                    for x in 0..w {
+                        let (u, v) = ((x as f32 + 0.5) / k, (y as f32 + 0.5) / k);
+                        t.push(pack(rust(u, v, x, y, seed)));
+                    }
+                }
+                Rc::new(t)
+            })
+            .clone()
+    })
+}
+
+// ---------------------------------------------------------------- text
+
+/// How much of each screen pixel a piece of text covers.
+struct Mask {
+    x0: i32,
+    y0: i32,
+    w: i32,
+    h: i32,
+    a: Vec<f32>,
+}
+
+/// The coverage of `s` drawn with its cap top left at board (`x`, `y`), one
+/// font pixel `size` board units. `up` turns it a quarter turn anticlockwise
+/// to read bottom to top, its first letter at the bottom: then (`x`, `y`) is
+/// the top left of its box. The font bitmap is sampled smoothly and cut at
+/// `thr`, so the letters are rounded and smooth at any size; a lower `thr`
+/// is bolder.
+fn text_mask(fit: (f32, f32, f32), x: f32, y: f32, size: f32, s: &str, up: bool) -> Mask {
+    let (k, ox, oy) = fit;
+    let bw = font::width(s).max(0) as usize;
+    let bh = font::ROWS;
+    let p = (size * k).max(0.05);
+    if bw == 0 {
+        return Mask {
+            x0: 0,
+            y0: 0,
+            w: 0,
+            h: 0,
+            a: Vec::new(),
+        };
+    }
+    // The bitmap with a blank border, so sampling needs no bounds checks.
+    let bm = font::bitmap(s);
+    let pw = bw + 2;
+    let mut pad = vec![0f32; pw * (bh + 2)];
+    for j in 0..bh {
+        for i in 0..bw {
+            pad[(j + 1) * pw + i + 1] = bm[j * bw + i] as f32;
+        }
+    }
+    let (sx0, sy0) = (ox + x * k, oy + y * k);
+    let (ew, eh) = if up {
+        (bh as f32 * p, bw as f32 * p)
+    } else {
+        (bw as f32 * p, bh as f32 * p)
+    };
+    let (x0, y0) = (sx0.floor() as i32 - 1, sy0.floor() as i32 - 1);
+    let (mw, mh) = (
+        (sx0 + ew).ceil() as i32 + 1 - x0,
+        (sy0 + eh).ceil() as i32 + 1 - y0,
+    );
+    // Each screen column or row: the padded font cell before it and the weight
+    // of the one after, sampling at pixel centres.
+    let axis = |start: i32, n: i32, origin: f32, flip: Option<f32>, cells: usize| {
+        (0..n)
+            .map(|i| {
+                let s = (start + i) as f32 + 0.5 - origin;
+                let f = flip.map_or(s, |e| e - s) / p - 0.5;
+                let f = f.clamp(-1.0, cells as f32 - 0.001);
+                let fi = f.floor();
+                ((fi + 1.0) as usize, f - fi)
+            })
+            .collect::<Vec<_>>()
+    };
+    let (cols, rows) = if up {
+        (axis(x0, mw, sx0, None, bh), axis(y0, mh, sy0, Some(eh), bw))
+    } else {
+        (axis(x0, mw, sx0, None, bw), axis(y0, mh, sy0, None, bh))
+    };
+    let thr = if p >= 4.0 { 0.44 } else { 0.5 };
+    // About one screen pixel of edge ramp.
+    let sharp = p.max(1.0) * 1.25;
+    let mut a = vec![0f32; (mw * mh) as usize];
+    let at = |i: usize, j: usize| pad[j * pw + i];
+    for (r, &(rj, rt)) in rows.iter().enumerate() {
+        let line = &mut a[r * mw as usize..(r + 1) * mw as usize];
+        for (o, &(cj, ct)) in line.iter_mut().zip(&cols) {
+            // Font column and row, whichever way the text runs.
+            let ((i, tu), (j, tv)) = if up {
+                ((rj, rt), (cj, ct))
+            } else {
+                ((cj, ct), (rj, rt))
+            };
+            let f = (at(i, j) * (1.0 - tu) + at(i + 1, j) * tu) * (1.0 - tv)
+                + (at(i, j + 1) * (1.0 - tu) + at(i + 1, j + 1) * tu) * tv;
+            *o = ((f - thr) * sharp + 0.5).clamp(0.0, 1.0);
+        }
+    }
+    Mask {
+        x0,
+        y0,
+        w: mw,
+        h: mh,
+        a,
+    }
+}
+
+/// Width of `s` in board units at font size `size`.
+fn text_w(size: f32, s: &str) -> f32 {
+    font::width(s) as f32 * size
+}
+
 // ---------------------------------------------------------------- canvas
 
 struct Cv<'a> {
@@ -225,6 +482,10 @@ impl Cv<'_> {
         }
     }
 
+    fn fit(&self) -> (f32, f32, f32) {
+        (self.k, self.ox, self.oy)
+    }
+
     fn sx(&self, x: f32) -> i32 {
         (self.ox + x * self.k).round() as i32
     }
@@ -241,32 +502,29 @@ impl Cv<'_> {
         )
     }
 
-    fn get(&self, x: i32, y: i32) -> Rgb {
-        rgb(self.px[(y * self.w + x) as usize])
-    }
-
-    fn set(&mut self, x: i32, y: i32, c: Rgb) {
-        if x >= 0 && y >= 0 && x < self.w && y < self.h {
-            self.px[(y * self.w + x) as usize] = pack(c);
-        }
-    }
-
     fn blend(&mut self, x: i32, y: i32, c: Rgb, a: f32) {
-        if x >= 0 && y >= 0 && x < self.w && y < self.h && a > 0.0 {
-            let old = self.get(x, y);
-            self.set(x, y, mix(old, c, a.min(1.0)));
+        if x < 0 || y < 0 || x >= self.w || y >= self.h || a <= 0.0 {
+            return;
         }
+        let p = &mut self.px[(y * self.w + x) as usize];
+        *p = if a >= 1.0 {
+            pack(c)
+        } else {
+            pack(mix(rgb(*p), c, a))
+        };
     }
 
     fn add(&mut self, x: i32, y: i32, c: Rgb, a: f32) {
-        if x >= 0 && y >= 0 && x < self.w && y < self.h && a > 0.0 {
-            let o = self.get(x, y);
-            self.set(x, y, [o[0] + c[0] * a, o[1] + c[1] * a, o[2] + c[2] * a]);
+        if x < 0 || y < 0 || x >= self.w || y >= self.h || a <= 0.0 {
+            return;
         }
+        let p = &mut self.px[(y * self.w + x) as usize];
+        let o = rgb(*p);
+        *p = pack([o[0] + c[0] * a, o[1] + c[1] * a, o[2] + c[2] * a]);
     }
 
     /// Screen pixel rectangle of a board rectangle, clipped.
-    fn rect(&self, x: f32, y: f32, w: f32, h: f32) -> (i32, i32, i32, i32) {
+    fn rect(&self, (x, y, w, h): Rect) -> (i32, i32, i32, i32) {
         (
             self.sx(x).max(0),
             self.sy(y).max(0),
@@ -275,119 +533,191 @@ impl Cv<'_> {
         )
     }
 
-    fn fill(&mut self, x: f32, y: f32, w: f32, h: f32, c: u32, a: f32) {
-        let (x0, y0, x1, y1) = self.rect(x, y, w, h);
-        let c = rgb(c);
+    /// Shades a rounded rectangle: `f(u, v, depth, px, py)` gives the colour
+    /// and strength at board point (`u`, `v`) relative to its top left,
+    /// `depth` board units in from its edge. The edge is smoothed.
+    fn shape(
+        &mut self,
+        (x, y, w, h): Rect,
+        r: f32,
+        mut f: impl FnMut(f32, f32, f32, i32, i32) -> (Rgb, f32),
+    ) {
+        let (x0, y0, x1, y1) = self.rect((x - 1.0, y - 1.0, w + 2.0, h + 2.0));
         for py in y0..y1 {
             for px in x0..x1 {
-                self.blend(px, py, c, a);
+                let (u, v) = self.board(px, py);
+                let d = rr(u, v, (x, y, w, h), r);
+                let cover = (0.5 - d * self.k).clamp(0.0, 1.0);
+                if cover <= 0.0 {
+                    continue;
+                }
+                let (c, a) = f(u - x, v - y, -d, px, py);
+                self.blend(px, py, c, a * cover);
             }
         }
     }
 
-    /// Screen size of one font pixel at board size `s`.
-    fn font_px(&self, s: f32) -> i32 {
-        (s * self.k).round().max(1.0) as i32
+    /// A flat rounded rectangle, filled a span at a time.
+    fn fill(&mut self, (x, y, w, h): Rect, r: f32, c: u32, a: f32) {
+        let (c, k) = (rgb(c), self.k);
+        let r = r.min(w / 2.0).min(h / 2.0);
+        let (_, y0, _, y1) = self.rect((x, y - 1.0, w, h + 2.0));
+        for py in y0..y1 {
+            let (_, v) = self.board(0, py);
+            let vy = ((v - y).min(y + h - v) * k + 0.5).clamp(0.0, 1.0);
+            if vy <= 0.0 {
+                continue;
+            }
+            // How far the corner rounding pulls this line in.
+            let dv = (y + r - v).max(v - (y + h - r)).max(0.0).min(r);
+            let inset = r - (r * r - dv * dv).sqrt();
+            let (sl, sr) = (self.ox + (x + inset) * k, self.ox + (x + w - inset) * k);
+            for px in (sl.floor() as i32).max(0)..(sr.ceil() as i32).min(self.w) {
+                let cov = ((px as f32 + 1.0).min(sr) - (px as f32).max(sl)).clamp(0.0, 1.0);
+                self.blend(px, py, c, a * cov * vy);
+            }
+        }
     }
 
-    /// Width of `s` in board units at font size `size`.
-    fn text_w(&self, size: f32, s: &str) -> f32 {
-        font::width(s) as f32 * self.font_px(size) as f32 / self.k
+    /// A soft shadow (black) or halo (added light) round a rounded rectangle.
+    fn glow(&mut self, (x, y, w, h): Rect, r: f32, reach: f32, c: u32, a: f32) {
+        let (x0, y0, x1, y1) = self.rect((x - reach, y - reach, w + 2.0 * reach, h + 2.0 * reach));
+        let (c, add) = (rgb(c), c != BLACK);
+        // Lines beside the straight sides only need the bands left and right.
+        let (il, ir) = (self.sx(x + r).max(x0), self.sx(x + w - r).min(x1));
+        for py in y0..y1 {
+            let (_, v) = self.board(0, py);
+            let side = v > y + r && v < y + h - r && il < ir;
+            let mut px = x0;
+            while px < x1 {
+                if side && px == il {
+                    px = ir;
+                    continue;
+                }
+                let (u, _) = self.board(px, py);
+                let d = rr(u, v, (x, y, w, h), r);
+                if d > 0.0 && d < reach {
+                    let s = (1.0 - d / reach).powi(2) * a;
+                    if add {
+                        self.add(px, py, c, s);
+                    } else {
+                        self.blend(px, py, c, s);
+                    }
+                }
+                px += 1;
+            }
+        }
+    }
+
+    fn mask(&mut self, m: &Mask, dx: i32, dy: i32, c: Rgb, a: f32) {
+        for my in 0..m.h {
+            for mx in 0..m.w {
+                let cov = m.a[(my * m.w + mx) as usize];
+                if cov > 0.0 {
+                    self.blend(m.x0 + mx + dx, m.y0 + my + dy, c, cov * a);
+                }
+            }
+        }
+    }
+
+    fn text_ex(&mut self, x: f32, y: f32, size: f32, c: u32, s: &str, a: f32, up: bool) {
+        let m = text_mask(self.fit(), x, y, size, s, up);
+        self.mask(&m, 0, 0, rgb(c), a);
     }
 
     fn text(&mut self, x: f32, y: f32, size: f32, c: u32, s: &str) {
-        let (p, x0, y0) = (self.font_px(size), self.sx(x), self.sy(y));
-        let c = rgb(c);
-        font::each(s, |fx, fy| {
-            for dy in 0..p {
-                for dx in 0..p {
-                    self.set(x0 + fx * p + dx, y0 + fy * p + dy, c);
-                }
-            }
-        });
+        self.text_ex(x, y, size, c, s, 1.0, false);
+    }
+
+    /// Text with a soft dark drop shadow, for light text on the gloss.
+    fn text_sh(&mut self, x: f32, y: f32, size: f32, c: u32, s: &str) {
+        let m = text_mask(self.fit(), x, y, size, s, false);
+        let o = (size * 0.45 * self.k).round().max(1.0) as i32;
+        self.mask(&m, (o + 1) / 2, o, [0.0; 3], 0.4);
+        self.mask(&m, 0, 0, rgb(c), 1.0);
     }
 
     fn text_right(&mut self, right: f32, y: f32, size: f32, c: u32, s: &str) {
-        let w = self.text_w(size, s);
-        self.text(right - w, y, size, c, s);
+        self.text(right - text_w(size, s), y, size, c, s);
     }
 
-    /// A soft halo around `s`: its pixels blurred and added in `c`.
+    /// A soft halo round `s`: its pixels blurred and added in `c`.
     fn text_glow(&mut self, x: f32, y: f32, size: f32, c: u32, s: &str, radius: f32, amount: f32) {
-        let p = self.font_px(size);
+        let m = text_mask(self.fit(), x, y, size, s, false);
         let r = (radius * self.k).max(1.0) as i32;
-        let pad = r * 3;
-        let (tw, th) = (font::width(s) * p, 7 * p);
-        let (mw, mh) = (tw + 2 * pad, th + 2 * pad);
-        let mut m = vec![0f32; (mw * mh) as usize];
-        font::each(s, |fx, fy| {
-            for dy in 0..p {
-                for dx in 0..p {
-                    m[((pad + fy * p + dy) * mw + pad + fx * p + dx) as usize] = 1.0;
-                }
-            }
-        });
-        blur(&mut m, mw as usize, mh as usize, r as usize);
-        let (x0, y0, c) = (self.sx(x) - pad, self.sy(y) - pad, rgb(c));
-        for my in 0..mh {
-            for mx in 0..mw {
-                let a = m[(my * mw + mx) as usize] * amount;
-                self.add(x0 + mx, y0 + my, c, a);
+        let pad = r * 3 + 2;
+        let (mw, mh) = (m.w + 2 * pad, m.h + 2 * pad);
+        let mut g = vec![0f32; (mw * mh) as usize];
+        for my in 0..m.h {
+            for mx in 0..m.w {
+                g[((my + pad) * mw + mx + pad) as usize] = m.a[(my * m.w + mx) as usize];
             }
         }
-    }
-
-    /// A soft halo around a board rectangle.
-    fn rect_glow(&mut self, x: f32, y: f32, w: f32, h: f32, radius: f32, c: u32, amount: f32) {
-        let (x0, y0, x1, y1) =
-            self.rect(x - radius, y - radius, w + 2.0 * radius, h + 2.0 * radius);
+        blur(&mut g, mw as usize, mh as usize, r as usize);
         let c = rgb(c);
-        for py in y0..y1 {
-            for px in x0..x1 {
-                let (u, v) = self.board(px, py);
-                let dx = (x - u).max(u - (x + w)).max(0.0);
-                let dy = (y - v).max(v - (y + h)).max(0.0);
-                let d = (dx * dx + dy * dy).sqrt() / radius;
-                if d < 1.0 && (dx > 0.0 || dy > 0.0) {
-                    self.add(px, py, c, (1.0 - d).powi(2) * amount);
-                }
+        for gy in 0..mh {
+            for gx in 0..mw {
+                let a = g[(gy * mw + gx) as usize] * amount;
+                self.add(m.x0 - pad + gx, m.y0 - pad + gy, c, a);
             }
         }
     }
 
-    /// A round button face with a letter, centred on (`cx`, `cy`).
+    /// A glossy round controller button with a letter, centred on (`cx`, `cy`).
     fn button(&mut self, cx: f32, cy: f32, r: f32, c: u32, letter: &str) {
-        let (x0, y0, x1, y1) = self.rect(cx - r - 1.0, cy - r - 1.0, 2.0 * r + 2.0, 2.0 * r + 2.0);
         let base = rgb(c);
-        for py in y0..y1 {
-            for px in x0..x1 {
-                let (u, v) = self.board(px, py);
-                let (dx, dy) = ((u - cx) / r, (v - cy) / r);
-                let d = (dx * dx + dy * dy).sqrt();
-                let cover = ((1.0 - d) * r * self.k + 0.5).clamp(0.0, 1.0);
-                let shade = 1.15 - 0.45 * (dy + 1.0) / 2.0;
-                let ring = smooth(0.78, 0.95, d) * 0.35;
-                self.blend(px, py, scale(base, shade * (1.0 - ring)), cover);
-            }
-        }
-        let tw = self.text_w(2.0, letter);
-        let th = 7.0 * self.font_px(2.0) as f32 / self.k;
-        self.text(cx - tw / 2.0, cy - th / 2.0, 2.0, INK, letter);
+        let disc = (cx - r, cy - r, 2.0 * r, 2.0 * r);
+        self.glow((cx - r, cy - r + 1.5, 2.0 * r, 2.0 * r), r, 4.0, BLACK, 0.5);
+        self.shape(disc, r, |u, v, depth, _, _| {
+            let (dx, dy) = ((u - r) / r, (v - r) / r);
+            let mut col = scale(base, 1.15 - 0.5 * (dy + 1.0) / 2.0);
+            // Dark outer ring, a sheen cap on top.
+            col = scale(col, 0.55 + 0.45 * smooth(0.0, 2.2, depth));
+            let cap = smooth(0.05, -0.15, dy + 0.35 * dx * dx) * smooth(-1.0, -0.6, dy);
+            (mix(col, [255.0; 3], cap * 0.55), 1.0)
+        });
+        let size = r * 0.12;
+        let tw = text_w(size, letter);
+        let (lx, ly) = (cx - tw / 2.0, cy - 3.5 * size);
+        self.text_sh(lx, ly, size, WHITE, letter);
     }
 
-    /// A keyboard key cap with a label; returns its width.
-    fn keycap(&mut self, x: f32, cy: f32, label: &str) -> f32 {
-        let w = self.text_w(2.0, label) + 14.0;
-        let (y, h) = (cy - 12.0, 24.0);
-        self.fill(x, y, w, h, 0x1a120c, 0.9);
-        self.fill(x, y, w, 1.5, BONE, 0.7);
-        self.fill(x, y + h - 2.0, w, 2.0, 0x000000, 0.6);
-        self.fill(x, y, 1.5, h, BONE, 0.5);
-        self.fill(x + w - 1.5, y, 1.5, h, BONE, 0.3);
-        let th = 7.0 * self.font_px(2.0) as f32 / self.k;
-        self.text(x + 7.0, cy - th / 2.0, 2.0, BONE, label);
+    /// A rounded label pill; returns its width.
+    fn pill(&mut self, x: f32, y: f32, h: f32, bg: u32, fg: u32, label: &str) -> f32 {
+        let size = (h - 8.0) / 7.0;
+        let w = pill_w(h, label);
+        let base = rgb(bg);
+        self.shape((x, y, w, h), h / 2.0, |_, v, depth, _, _| {
+            let mut c = scale(base, 1.12 - 0.3 * v / h);
+            c = mix(c, [255.0; 3], 0.25 * smooth(1.6, 0.4, depth));
+            (c, 0.95)
+        });
+        self.text(x + h * 0.45, y + (h - 7.0 * size) / 2.0, size, fg, label);
         w
     }
+
+    /// A bevelled rusted plate from a kept texture.
+    fn plate(&mut self, (x, y, w, h): Rect, r: f32, seed: u32) {
+        let (sx0, sy0) = (self.sx(x), self.sy(y));
+        let (tw, th) = (self.sx(x + w) - sx0 + 2, self.sy(y + h) - sy0 + 2);
+        let tex = rust_tex(tw, th, self.k, seed);
+        self.shape((x, y, w, h), r, |u, v, depth, px, py| {
+            let (i, j) = ((px - sx0).clamp(0, tw - 1), (py - sy0).clamp(0, th - 1));
+            let mut c = rgb(tex[(j * tw + i) as usize]);
+            if depth < 2.0 {
+                c = if u.min(v) < 2.5 {
+                    mix(c, rgb(0xf0a060), 0.45)
+                } else {
+                    scale(c, 0.45)
+                };
+            }
+            (c, 1.0)
+        });
+    }
+}
+
+fn pill_w(h: f32, label: &str) -> f32 {
+    text_w((h - 8.0) / 7.0, label) + h * 0.9
 }
 
 /// Three box blurs (close to a Gaussian) of radius `r`, in place.
@@ -416,103 +746,32 @@ fn blur(m: &mut [f32], w: usize, h: usize, r: usize) {
     }
 }
 
-// ---------------------------------------------------------------- pieces
+// ---------------------------------------------------------------- backdrop
 
 fn background(cv: &mut Cv) {
     let (w, h) = (cv.w as f32, cv.h as f32);
-    let (cx, cy) = (w * 0.5, h * 0.4);
-    let reach = w.max(h) * 0.72;
-    let base = rgb(0x050705);
+    let (cx, cy) = (w * 0.5, h * 0.42);
+    let reach = w.max(h) * 0.75;
+    let base = rgb(0x050805);
     let green = rgb(GREEN);
-    let line = (cv.k * 2.0).round().max(1.0) as i32;
     for py in 0..cv.h {
         for px in 0..cv.w {
             let d = ((px as f32 - cx).powi(2) + (py as f32 - cy).powi(2)).sqrt() / reach;
-            let glow = (1.0 - d).max(0.0).powf(2.2) * 0.42;
+            let glow = (1.0 - d).max(0.0).powf(2.2) * 0.34;
             let mut c = mix(base, green, glow);
             c = scale(c, 1.0 - 0.55 * (d * d).min(1.0));
-            // A faint dot grid and scan lines.
+            // A faint dot grid.
             let (u, v) = cv.board(px, py);
             if (u.rem_euclid(32.0) - 16.0).abs() < 1.0 && (v.rem_euclid(32.0) - 16.0).abs() < 1.0 {
-                c = mix(c, green, 0.08);
+                c = mix(c, green, 0.07);
             }
-            if (py / line) % 2 == 1 {
-                c = scale(c, 0.9);
-            }
-            cv.set(px, py, c);
+            cv.blend(px, py, c, 1.0);
         }
-    }
-}
-
-/// A plate of rusted metal: a frame `frame` thick round a dark recessed
-/// middle, two corners cut, rivets at the corners.
-fn panel(cv: &mut Cv, x: f32, y: f32, w: f32, h: f32, frame: f32, seed: u32) {
-    let cut = frame * 1.9;
-    let inner_cut = cut - frame * 0.9;
-    let (x0, y0, x1, y1) = cv.rect(x, y, w, h);
-    let bevel = 2.2;
-    for py in y0..y1 {
-        for px in x0..x1 {
-            let (bu, bv) = cv.board(px, py);
-            let (u, v) = (bu - x, bv - y);
-            let (ru, rv) = (w - u, h - v);
-            // Cut corners top left and bottom right.
-            let diag = (u + v).min(ru + rv);
-            if diag < cut {
-                continue;
-            }
-            let edge = u
-                .min(v)
-                .min(ru)
-                .min(rv)
-                .min((diag - cut) / std::f32::consts::SQRT_2);
-            let mut c = rust(bu, bv, px, py, seed);
-            let (iu, iv, iru, irv) = (u - frame, v - frame, ru - frame, rv - frame);
-            let idiag = (iu + iv).min(iru + irv);
-            let inside = iu > 0.0 && iv > 0.0 && iru > 0.0 && irv > 0.0 && idiag > inner_cut;
-            if inside {
-                // Recessed: dark oxide, deeper towards the rim.
-                let ie = iu
-                    .min(iv)
-                    .min(iru)
-                    .min(irv)
-                    .min((idiag - inner_cut) / std::f32::consts::SQRT_2);
-                c = scale(c, 0.2 + 0.08 * smooth(0.0, 14.0, ie));
-                c = mix(c, rgb(0x0a0604), 0.35);
-                if ie < bevel {
-                    c = if iu.min(iv) < bevel {
-                        scale(c, 0.4)
-                    } else {
-                        scale(c, 1.9)
-                    };
-                }
-            } else if edge < bevel {
-                // Raised outer edge: lit from the top left.
-                c = if u.min(v) < bevel || (u + v) - cut < bevel * 1.5 {
-                    mix(c, rgb(0xf0a060), 0.45)
-                } else {
-                    scale(c, 0.45)
-                };
-            }
-            let a = (edge * cv.k).clamp(0.0, 1.0);
-            cv.blend(px, py, c, a);
-        }
-    }
-    let r = frame * 0.28;
-    let m = frame * 0.5;
-    let d = (cut + inner_cut + 2.0 * frame) / 4.0;
-    for (cx, cy) in [
-        (x + d, y + d),
-        (x + w - m, y + m),
-        (x + m, y + h - m),
-        (x + w - d, y + h - d),
-    ] {
-        rivet(cv, cx, cy, r);
     }
 }
 
 fn rivet(cv: &mut Cv, cx: f32, cy: f32, r: f32) {
-    let (x0, y0, x1, y1) = cv.rect(cx - r - 2.0, cy - r - 2.0, 2.0 * r + 4.0, 2.0 * r + 4.0);
+    let (x0, y0, x1, y1) = cv.rect((cx - r - 2.0, cy - r - 2.0, 2.0 * r + 4.0, 2.0 * r + 4.0));
     let light = [-0.45f32, -0.6, 0.66];
     for py in y0..y1 {
         for px in x0..x1 {
@@ -520,7 +779,7 @@ fn rivet(cv: &mut Cv, cx: f32, cy: f32, r: f32) {
             // Shadow below right.
             let (sx, sy) = ((u - cx - 1.0) / r, (v - cy - 1.4) / r);
             let sd = (sx * sx + sy * sy).sqrt();
-            cv.blend(px, py, rgb(0x000000), (1.0 - sd).clamp(0.0, 1.0) * 0.6);
+            cv.blend(px, py, [0.0; 3], (1.0 - sd).clamp(0.0, 1.0) * 0.6);
             let (dx, dy) = ((u - cx) / r, (v - cy) / r);
             let d2 = dx * dx + dy * dy;
             if d2 >= 1.0 {
@@ -536,90 +795,234 @@ fn rivet(cv: &mut Cv, cx: f32, cy: f32, r: f32) {
     }
 }
 
-/// A slanted tab blade; returns nothing, the page decides the look.
-fn tab(cv: &mut Cv, x: f32, label: &str, active: bool, seed: u32) {
-    let (y, h) = (TAB_Y, TAB_H);
-    if active {
-        cv.rect_glow(x + TAB_SLANT / 2.0, y, TAB_W, h, 18.0, GREEN, 0.45);
-    }
-    let (x0, y0, x1, y1) = cv.rect(x, y, TAB_W + TAB_SLANT, h);
-    for py in y0..y1 {
-        for px in x0..x1 {
-            let (u, v) = cv.board(px, py);
-            let f = (v - y) / h;
-            let left = x + TAB_SLANT * (1.0 - f);
-            let d = (u - left).min(left + TAB_W - u);
-            if d <= -0.5 / cv.k {
-                continue;
-            }
-            let a = (d * cv.k + 0.5).clamp(0.0, 1.0);
-            let c = if active {
-                let mut c = mix(rgb(0x9cff5a), rgb(0x2f8a0c), f);
-                if v - y < 2.0 {
-                    c = rgb(0xe6ffcc);
-                }
-                c
-            } else {
-                let mut c = scale(rust(u, v, px, py, seed), 0.55);
-                if v - y < 1.6 {
-                    c = mix(c, rgb(0xf0a060), 0.5);
-                } else if y + h - v < 1.6 {
-                    c = scale(c, 0.4);
-                }
-                c
-            };
-            cv.blend(px, py, c, a);
+/// A side blade: a curved strip of brushed steel, rusting from its edges,
+/// riveted top and bottom, its page's name written up it. `left` says which
+/// edge of the screen it is at; its name sits in the part that shows.
+fn strip(cv: &mut Cv, (x, y, w, h): Rect, name: &str, left: bool, seed: u32) {
+    let r = 16.0;
+    cv.glow((x, y + 4.0, w, h), r, 14.0, BLACK, 0.55);
+    let shown_x = if left { x } else { x + STRIP_TUCK };
+    cv.shape((x, y, w, h), r, |u, v, depth, px, py| {
+        let (bu, bv) = (u + x, v + y);
+        // A cylinder lit from the upper left: one bright band down the strip.
+        let s = (bu - shown_x) / STRIP_W;
+        let band = (-((s - 0.32) / 0.2).powi(2)).exp();
+        let mut c = scale(rgb(0xc9cdd2), 0.5 + 0.48 * band + 0.12 * (1.0 - v / h));
+        // Brushed along its length.
+        c = scale(c, 0.9 + 0.16 * vnoise(bu / 1.3, bv / 46.0, seed + 20));
+        // Rust creeping in from the edges and in blotches.
+        let n =
+            0.6 * vnoise(bu / 22.0, bv / 30.0, seed) + 0.4 * vnoise(bu / 7.0, bv / 9.0, seed + 1);
+        // Less in the middle, where the name is written.
+        let mid = (-((s - 0.5) / 0.22).powi(2)).exp() * smooth(30.0, 50.0, v);
+        let amt = smooth(
+            0.54,
+            0.72,
+            n + 0.35 * (1.0 - smooth(0.0, 12.0, depth)) - 0.22 * mid,
+        );
+        if amt > 0.0 {
+            c = mix(c, rust(bu, bv, px, py, seed), amt);
         }
+        // A bevelled rim.
+        if depth < 1.8 {
+            c = if v < h / 2.0 {
+                mix(c, [255.0; 3], 0.35)
+            } else {
+                scale(c, 0.55)
+            };
+        }
+        (c, 1.0)
+    });
+    let cx = shown_x + STRIP_W / 2.0;
+    for cy in [y + 20.0, y + h - 20.0] {
+        rivet(cv, cx, cy, 4.2);
     }
-    let tw = cv.text_w(3.0, label);
-    let tx = x + TAB_SLANT / 2.0 + (TAB_W - tw) / 2.0;
-    let ty = y + (h - 21.0) / 2.0;
-    if active {
-        cv.text(tx, ty, 3.0, INK, label);
-    } else {
-        cv.text(tx + 1.0, ty + 1.0, 3.0, 0x000000, label);
-        cv.text(tx, ty, 3.0, BONE, label);
+    // The name reads up the strip from a little below its top, embossed.
+    let size = 3.4;
+    let (tx, ty) = (cx - 3.5 * size, y + 42.0);
+    let m = text_mask(cv.fit(), tx, ty, size, name, true);
+    cv.mask(&m, 1, 1, [255.0; 3], 0.55);
+    cv.mask(&m, 0, 0, rgb(0x1c1e20), 0.92);
+}
+
+/// The active blade: green gloss over rusted metal, a rusted rim, rust
+/// creeping in and pitting the paint near its edge.
+fn blade(cv: &mut Cv, l: &Lay) {
+    let (x, y, w, h) = (l.bx, BLADE_Y, l.bw, BLADE_H);
+    cv.glow((x, y + 8.0, w, h), BLADE_R, 22.0, BLACK, 0.7);
+    cv.shape((x, y, w, h), BLADE_R, |u, v, depth, px, py| {
+        let (bu, bv) = (u + x, v + y);
+        if depth < RIM {
+            let mut c = rust(bu, bv, px, py, 3);
+            if depth < 1.8 {
+                // Raised outer edge, lit from the top.
+                c = if v < h * 0.5 {
+                    mix(c, rgb(0xf0a060), 0.5)
+                } else {
+                    scale(c, 0.5)
+                };
+            } else if depth > RIM - 1.6 {
+                // Shadow where the paint starts.
+                c = scale(c, 0.45);
+            }
+            return (c, 1.0);
+        }
+        let t = v / h;
+        // The gloss: light at the top, saturated, dark at the bottom.
+        let mut c = ramp(&[0xa8f46c, GREEN, 0x3a9a12, GREEN_DEEP], t.powf(0.85));
+        // A soft sheen band across the top, curving down at the sides.
+        let s = u / w - 0.5;
+        let tb = t - 0.24 * s * s;
+        let band = smooth(0.012, 0.05, tb) * (1.0 - smooth(0.09, 0.2, tb));
+        c = mix(c, [255.0; 3], 0.3 * band);
+        // Light pooling at the upper left, falling off to the right.
+        c = scale(c, 1.06 - 0.14 * (u / w));
+        // Faint brushed metal under the paint.
+        c = scale(c, 0.95 + 0.07 * vnoise(bu / 70.0, bv / 1.6, 9));
+        // A thin light rim inside the rust.
+        let inward = depth - RIM;
+        c = mix(c, rgb(GREEN_HI), 0.6 * (1.0 - smooth(0.0, 2.2, inward)));
+        if inward < 40.0 {
+            // Rust creeping in from the rim in blotches.
+            let n = 0.65 * vnoise(bu / 16.0, bv / 16.0, 5) + 0.35 * vnoise(bu / 5.0, bv / 5.0, 6);
+            let amt = smooth(0.62, 0.7, n + 0.4 - inward / 30.0);
+            if amt > 0.0 {
+                c = mix(c, scale(rust(bu, bv, px, py, 3), 0.85), amt);
+            }
+        }
+        // Pits in the paint near the rim, rarer further in.
+        let near = 1.0 - smooth(6.0, 60.0, inward);
+        let (pit, core) = pit(bu, bv, 0.006 + 0.2 * near, 8);
+        if pit > 0.0 {
+            c = mix(c, rgb(RUST_HI), pit * 0.9);
+            c = mix(c, rgb(0x1a0a04), core * 0.85);
+        }
+        (c, 1.0)
+    });
+}
+
+/// A round pit at board point (`u`, `v`): at most one in each 10-unit cell,
+/// in `density` of the cells. Gives how much of the pit and of its dark
+/// core the point is in.
+fn pit(u: f32, v: f32, density: f32, seed: u32) -> (f32, f32) {
+    const CELL: f32 = 10.0;
+    let (cx, cy) = ((u / CELL).floor(), (v / CELL).floor());
+    let (ix, iy) = (cx as i32, cy as i32);
+    if unit(hash(ix, iy, seed)) >= density {
+        return (0.0, 0.0);
+    }
+    let r = 0.7 + 1.8 * unit(hash(ix, iy, seed + 1));
+    let px = cx * CELL + r + 0.5 + (CELL - 2.0 * r - 1.0) * unit(hash(ix, iy, seed + 2));
+    let py = cy * CELL + r + 0.5 + (CELL - 2.0 * r - 1.0) * unit(hash(ix, iy, seed + 3));
+    let d = ((u - px).powi(2) + (v - py).powi(2)).sqrt();
+    (
+        smooth(r + 0.5, r - 0.5, d),
+        smooth(r * 0.55 + 0.4, r * 0.55 - 0.4, d),
+    )
+}
+
+/// The preview box's rusted plate, riveted, darker in the middle.
+fn preview_plate(cv: &mut Cv, l: &Lay, seed: u32) {
+    let (x, y, w, h) = preview_rect(l);
+    cv.glow((x, y + 3.0, w, h), 12.0, 12.0, BLACK, 0.5);
+    cv.plate((x, y, w, h), 12.0, seed);
+    cv.shape((x, y, w, h), 12.0, |u, v, _, _, _| {
+        let (dx, dy) = (u / w - 0.5, v / h - 0.5);
+        ([0.0; 3], 0.55 * (dx * dx * 2.4 + dy * dy * 2.6).min(1.0))
+    });
+    for (cx, cy) in [
+        (x + 12.0, y + 12.0),
+        (x + w - 12.0, y + 12.0),
+        (x + 12.0, y + h - 12.0),
+        (x + w - 12.0, y + h - 12.0),
+    ] {
+        rivet(cv, cx, cy, 4.0);
     }
 }
 
-/// Button hints, right-aligned in the footer.
-fn hints(cv: &mut Cv, page: Page) {
+/// The slim bar of button hints at the bottom.
+fn footer(cv: &mut Cv, page: Page) {
+    let (x, y, w, h) = (M, FOOT_Y, BOARD_W - 2.0 * M, FOOT_H);
+    cv.glow((x, y + 3.0, w, h), h / 2.0, 10.0, BLACK, 0.5);
+    cv.shape((x, y, w, h), h / 2.0, |u, v, depth, px, py| {
+        let mut c = mix(rgb(0x2a2e30), rgb(0x0c0e0e), v / h);
+        if depth < 2.5 {
+            c = scale(rust(u + x, v + y, px, py, 31), 0.9);
+        }
+        c = mix(c, [255.0; 3], 0.12 * smooth(0.5, 0.0, v / h - 0.1));
+        (c, 0.94)
+    });
+    cv.text(
+        x + 28.0,
+        y + h / 2.0 - 7.0,
+        2.0,
+        DIM,
+        "Drop a game folder here to add it",
+    );
     let first = if page == Page::Games {
-        "START"
+        "Start"
     } else {
-        "CHANGE"
+        "Change"
     };
-    let list: [(&str, Option<u32>, &str); 5] = [
-        ("A", Some(GREEN), first),
-        ("B", Some(0xe0402a), "BACK"),
-        ("Y", Some(0xf0b428), "REFRESH"),
-        ("ENTER", None, first),
-        ("ESC", None, "BACK"),
+    let hints: [(&str, u32, &str); 3] = [
+        ("Y", 0xf0b428, "Refresh"),
+        ("B", 0xe0402a, "Back"),
+        ("A", GREEN, first),
     ];
-    let cy = FOOT_Y + FOOT_H / 2.0;
-    let gap = 26.0;
-    let mut total = 0.0;
-    for (key, btn, label) in list {
-        let kw = if btn.is_some() {
-            24.0
-        } else {
-            cv.text_w(2.0, key) + 14.0
-        };
-        total += kw + 10.0 + cv.text_w(2.0, label) + gap;
+    let cy = y + h / 2.0;
+    let gap = 24.0;
+    let mut total = text_w(2.0, "Page") + pill_w(22.0, "LB") + pill_w(22.0, "RB") + 12.0;
+    for (_, _, label) in hints {
+        total += 32.0 + text_w(2.0, label) + gap;
     }
-    let mut x = BOARD_W - M - 26.0 - (total - gap);
-    for (key, btn, label) in list {
-        let kw = match btn {
-            Some(c) => {
-                cv.button(x + 12.0, cy, 12.0, c, key);
-                24.0
-            }
-            None => cv.keycap(x, cy, key),
-        };
-        x += kw + 10.0;
-        cv.text(x, cy - 7.0, 2.0, BONE, label);
-        x += cv.text_w(2.0, label) + gap;
+    let mut hx = x + w - 26.0 - total;
+    for (key, c, label) in hints {
+        cv.button(hx + 13.0, cy, 13.0, c, key);
+        hx += 32.0;
+        cv.text(hx, cy - 7.0, 2.0, BONE, label);
+        hx += text_w(2.0, label) + gap;
     }
+    for b in ["LB", "RB"] {
+        hx += cv.pill(hx, cy - 11.0, 22.0, 0x50565a, WHITE, b) + 4.0;
+    }
+    cv.text(hx + 4.0, cy - 7.0, 2.0, BONE, "Page");
+}
+
+/// The header: the name, the 360 badge, the launcher's line.
+fn header(cv: &mut Cv) {
+    let (tx, ty, ts) = (M + 8.0, 22.0, 5.6);
+    cv.text_glow(tx, ty, ts, GREEN, "RUSTXENON", 10.0, 1.4);
+    cv.text_ex(tx + 2.5, ty + 3.0, ts, BLACK, "RUSTXENON", 0.7, false);
+    // RUST in oxide, XENON in pale green.
+    cv.text(tx, ty, ts, 0xe8823a, "RUST");
+    cv.text(tx + text_w(ts, "RUST ") - 2.0 * ts, ty, ts, PALE, "XENON");
+    // The badge: a glowing green pill with 360 in it.
+    let bx = tx + text_w(ts, "RUSTXENON") + 18.0;
+    let badge = (bx, ty - 0.5, 86.0, 38.0);
+    let (_, by, bw, bh) = badge;
+    cv.glow(badge, bh / 2.0, 22.0, GREEN, 0.55);
+    cv.shape(badge, bh / 2.0, |_, v, depth, _, _| {
+        let t = v / bh;
+        let mut c = ramp(&[0xe4ffc8, 0x8af04a, GREEN, 0x2c8a0a], t);
+        let sheen = smooth(0.0, 0.1, t) * (1.0 - smooth(0.38, 0.5, t));
+        c = mix(c, [255.0; 3], 0.35 * sheen);
+        if depth < 1.6 {
+            c = mix(c, rgb(0x123a06), 0.6);
+        }
+        (c, 1.0)
+    });
+    let s = 3.6;
+    let nx = bx + (bw - text_w(s, "360")) / 2.0;
+    let ny = by + (bh - 7.0 * s) / 2.0;
+    cv.text_ex(nx, ny + 1.5, s, WHITE, "360", 0.5, false);
+    cv.text(nx, ny, s, INK, "360");
+    cv.text_right(
+        BOARD_W - M - 8.0,
+        26.0,
+        2.0,
+        DIM,
+        "recompiled game launcher",
+    );
 }
 
 /// The slow part: everything that changes only with the size or page.
@@ -627,91 +1030,89 @@ pub fn backdrop(w: usize, h: usize, page: Page) -> Vec<u32> {
     let mut px = vec![0u32; w * h];
     let mut cv = Cv::new(&mut px, w, h);
     background(&mut cv);
-
-    // RUST in oxide orange, XENON in green, one halo behind both.
-    let (tx, ty, ts) = (M, 26.0, 6.0);
-    cv.text_glow(tx, ty, ts, GREEN, "RUSTXENON", 12.0, 1.9);
-    cv.text(tx + 3.0, ty + 3.0, ts, 0x000000, "RUSTXENON");
-    cv.text(tx, ty, ts, 0xe07a32, "RUST");
-    // Four glyphs of six font pixels each.
-    let rw = 24.0 * cv.font_px(ts) as f32 / cv.k;
-    cv.text(tx + rw, ty, ts, GREEN_HI, "XENON");
-    cv.text_right(BOARD_W - M, 32.0, 2.0, DIM, "RECOMPILED GAME LAUNCHER");
-
-    for (i, (p, label)) in [(Page::Games, "GAMES"), (Page::Settings, "SETTINGS")]
-        .into_iter()
-        .enumerate()
-    {
-        tab(
-            &mut cv,
-            M + i as f32 * (TAB_W + TAB_GAP),
-            label,
-            p == page,
-            40 + i as u32,
-        );
+    header(&mut cv);
+    let l = lay(page);
+    let i = index(page);
+    // Outermost strips first, so each tucks under its inner neighbour.
+    let mut order: Vec<usize> = (0..PAGES.len()).filter(|&j| j != i).collect();
+    order.sort_by_key(|&j| std::cmp::Reverse(j.abs_diff(i)));
+    for j in order {
+        if let Some(r) = strip_rect(page, PAGES[j]) {
+            strip(&mut cv, r, PAGES[j].name(), j < i, 40 + j as u32);
+        }
     }
-    // A glowing rule under the tabs.
-    cv.fill(M, TAB_Y + TAB_H + 10.0, BOARD_W - 2.0 * M, 1.5, GREEN, 0.8);
-    cv.rect_glow(
-        M,
-        TAB_Y + TAB_H + 10.0,
-        BOARD_W - 2.0 * M,
-        1.5,
-        8.0,
-        GREEN,
-        0.35,
+    blade(&mut cv, &l);
+    let title = match page {
+        Page::Games => "Select a Game",
+        Page::Settings => "Player Settings",
+    };
+    let (tx, ty) = (l.bx + PAD + 4.0, BLADE_Y + 30.0);
+    cv.text_glow(tx, ty, 5.0, WHITE, title, 6.0, 0.18);
+    cv.text_sh(tx, ty, 5.0, WHITE, title);
+    preview_plate(&mut cv, &l, 150 + i as u32);
+    // The info box under the details.
+    let (ix, iy, iw, ih) = info_rect(&l);
+    cv.fill((ix, iy, iw, ih), 14.0, 0x9ae06a, 0.8);
+    cv.shape(
+        (ix + 1.5, iy + 1.5, iw - 3.0, ih - 3.0),
+        12.5,
+        |_, v, _, _, _| (mix(rgb(0x0c2004), rgb(0x020800), v / ih), 0.75),
     );
-
-    panel(&mut cv, M, PANEL_Y, LIST_W, PANEL_H, FRAME, 7);
-    panel(&mut cv, DETAIL_X, PANEL_Y, DETAIL_W, PANEL_H, FRAME, 11);
-    panel(&mut cv, M, FOOT_Y, BOARD_W - 2.0 * M, FOOT_H, 8.0, 23);
-    hints(&mut cv, page);
-    cv.text(
-        M + 26.0,
-        FOOT_Y + FOOT_H / 2.0 - 7.0,
-        2.0,
-        DIM,
-        "DROP A GAME FOLDER HERE TO ADD IT",
-    );
+    footer(&mut cv, page);
     px
 }
 
 // ---------------------------------------------------------------- overlay
 
-/// `s` cut to `max` characters, keeping the end (paths end in what matters).
-fn tail(s: &str, max: usize) -> String {
-    let n = s.chars().count();
-    if n <= max {
+/// `s` cut from the end to fit `room` board units at `size`, ending "..".
+fn head(s: &str, size: f32, room: f32) -> String {
+    if text_w(size, s) <= room {
         return s.into();
     }
-    let keep: String = s.chars().skip(n + 2 - max).collect();
-    format!("..{keep}")
+    let mut c: Vec<char> = s.chars().collect();
+    while c.pop().is_some() {
+        let t: String = c.iter().chain(['.', '.'].iter()).collect();
+        if text_w(size, &t) <= room {
+            return t;
+        }
+    }
+    String::new()
 }
 
-/// `s` cut to `max` characters, keeping the start.
-fn head(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
+/// `s` cut from the start to fit, starting ".." (paths end in what matters).
+fn tail(s: &str, size: f32, room: f32) -> String {
+    if text_w(size, s) <= room {
         return s.into();
     }
-    let keep: String = s.chars().take(max.saturating_sub(2)).collect();
-    format!("{keep}..")
+    let c: Vec<char> = s.chars().collect();
+    for skip in 1..=c.len() {
+        let t: String = ['.', '.'].iter().chain(&c[skip..]).collect();
+        if text_w(size, &t) <= room {
+            return t;
+        }
+    }
+    String::new()
 }
 
-/// Words of `s` in lines of at most `max` characters, at most `lines` lines.
-fn wrap(s: &str, max: usize, lines: usize) -> Vec<String> {
+/// Words of `s` in lines that fit `room` at `size`, at most `lines` lines.
+fn wrap(s: &str, size: f32, room: f32, lines: usize) -> Vec<String> {
+    let fits = |t: &str| text_w(size, t) <= room;
     let mut out: Vec<String> = Vec::new();
     let mut cur = String::new();
     for word in s.split_whitespace() {
         let mut word: String = word.into();
-        while word.chars().count() > max {
+        while !fits(&word) && word.chars().count() > 1 {
             if !cur.is_empty() {
                 out.push(std::mem::take(&mut cur));
             }
-            let first: String = word.chars().take(max).collect();
-            word = word.chars().skip(max).collect();
-            out.push(first);
+            let mut n = word.chars().count() - 1;
+            while n > 1 && !fits(&word.chars().take(n).collect::<String>()) {
+                n -= 1;
+            }
+            out.push(word.chars().take(n).collect());
+            word = word.chars().skip(n).collect();
         }
-        if !cur.is_empty() && cur.chars().count() + 1 + word.chars().count() > max {
+        if !cur.is_empty() && !fits(&format!("{cur} {word}")) {
             out.push(std::mem::take(&mut cur));
         }
         if !cur.is_empty() {
@@ -725,263 +1126,343 @@ fn wrap(s: &str, max: usize, lines: usize) -> Vec<String> {
     if out.len() > lines {
         out.truncate(lines);
         let last = out.last_mut().unwrap();
-        *last = head(&format!("{last}   "), max);
+        let t = format!("{last}..");
+        *last = if fits(&t) {
+            t
+        } else {
+            head(&format!("{t}...."), size, room)
+        };
     }
     out
 }
 
-fn chars_in(cv: &Cv, width: f32, size: f32) -> usize {
-    (width / (6.0 * cv.font_px(size) as f32 / cv.k))
-        .floor()
-        .max(1.0) as usize
+/// Up to two capitals for a placeholder picture: the first letters of the
+/// first two words.
+fn initials(title: &str) -> String {
+    let s: String = title
+        .split_whitespace()
+        .filter_map(|w| w.chars().find(|c| c.is_alphanumeric()))
+        .take(2)
+        .flat_map(char::to_uppercase)
+        .collect();
+    if s.is_empty() {
+        "?".into()
+    } else {
+        s
+    }
+}
+
+/// A small number from a title, to vary the rust of its tile.
+fn seed_of(title: &str) -> u32 {
+    100 + title
+        .bytes()
+        .fold(7u32, |h, b| h.wrapping_mul(31) ^ b as u32)
+        % 6
+}
+
+/// One list row.
+struct Row {
+    title: String,
+    sub: String,
+    /// Label, background and text colour.
+    tag: Option<(&'static str, u32, u32)>,
+    tile: String,
+    seed: u32,
+}
+
+fn rows(v: &View) -> Vec<Row> {
+    match v.page {
+        Page::Games => v
+            .games
+            .iter()
+            .map(|g| Row {
+                title: g.title.clone(),
+                sub: g.game.clone(),
+                tag: if v.running.is_some_and(|r| r == g.title) {
+                    Some(("running", GOLD, 0x2a1c00))
+                } else if g.recent {
+                    Some(("recent", 0x1c4a0c, GREEN_HI))
+                } else {
+                    None
+                },
+                tile: initials(&g.title),
+                seed: seed_of(&g.title),
+            })
+            .collect(),
+        Page::Settings => FIELDS
+            .iter()
+            .enumerate()
+            .map(|(i, f)| Row {
+                title: f.label.into(),
+                sub: format!("[{}] {}", f.table, f.key),
+                tag: None,
+                tile: format!("{:02}", i + 1),
+                seed: 100 + i as u32 % 6,
+            })
+            .collect(),
+    }
 }
 
 /// The rows and the details panel.
 pub fn overlay(px: &mut [u32], w: usize, h: usize, v: &View, t: f32) {
     let mut cv = Cv::new(px, w, h);
     let pulse = 0.5 + 0.5 * (t * 3.2).sin();
+    let l = lay(v.page);
 
     // Status at the top right.
     let (status, sc) = match v.running {
-        Some(_) => ("RUNNING", 0xffd040),
-        None => ("READY", GREEN),
+        Some(_) => ("running", GOLD),
+        None => ("ready", GREEN),
     };
-    cv.text_right(BOARD_W - M, 56.0, 2.0, sc, status);
-    let sw = cv.text_w(2.0, status);
-    cv.button(BOARD_W - M - sw - 14.0, 63.0, 5.0, sc, "");
+    let right = BOARD_W - M - 8.0;
+    cv.text_right(right, 52.0, 2.0, sc, status);
+    let dot = (right - text_w(2.0, status) - 18.0, 55.0, 8.0, 8.0);
+    cv.glow(dot, 4.0, 6.0, sc, 0.3 + 0.3 * pulse);
+    cv.fill(dot, 4.0, sc, 1.0);
     let count = match v.page {
         Page::Games => format!(
-            "{} GAME{}",
+            "{} game{}",
             v.games.len(),
-            if v.games.len() == 1 { "" } else { "S" }
+            if v.games.len() == 1 { "" } else { "s" }
         ),
-        Page::Settings => "PLAYER DEFAULTS".into(),
+        Page::Settings => "player defaults".into(),
     };
-    cv.text_right(BOARD_W - M - sw - 32.0, 56.0, 2.0, DIM, &count);
+    cv.text_right(l.bx + l.bw - PAD, BLADE_Y + 44.0, 2.4, PALE, &count);
 
-    let rows: Vec<(String, String, Option<&str>)> = match v.page {
-        Page::Games => v
-            .games
-            .iter()
-            .map(|g| {
-                let tag = if v.running.is_some_and(|r| r == g.title) {
-                    Some("RUNNING")
-                } else if g.recent {
-                    Some("RECENT")
-                } else {
-                    None
-                };
-                (g.title.clone(), g.game.clone(), tag)
-            })
-            .collect(),
-        Page::Settings => (0..FIELDS.len())
-            .map(|i| (FIELDS[i].label.into(), v.settings.show(i), None))
-            .collect(),
-    };
-
+    let rows = rows(v);
     if rows.is_empty() {
-        empty(&mut cv, v.home);
+        empty(&mut cv, &l, v.home);
     }
-    for (i, (title, sub, tag)) in rows.iter().enumerate().skip(v.scroll).take(ROWS) {
-        let y = ROW_Y + (i - v.scroll) as f32 * ROW_H;
+    for (i, row) in rows.iter().enumerate().skip(v.scroll).take(ROWS) {
+        let r = row_rect(&l, i - v.scroll);
+        let (rx, y, rw, rh) = r;
         let sel = i == v.sel;
-        let (rx, rh) = (ROW_X, ROW_H - 6.0);
         if sel {
-            cv.rect_glow(rx, y, ROW_W, rh, 16.0, GREEN, 0.3 + 0.25 * pulse);
-            let (x0, y0, x1, y1) = cv.rect(rx, y, ROW_W, rh);
-            for py in y0..y1 {
-                let f = (py - y0) as f32 / (y1 - y0).max(1) as f32;
-                let c = mix(rgb(0x8ef04c), rgb(0x3c9e12), f);
-                for px in x0..x1 {
-                    cv.blend(px, py, c, 0.86 + 0.1 * pulse);
+            cv.glow(r, ROW_R, 16.0, 0xeaffd4, 0.22 + 0.18 * pulse);
+            cv.shape(r, ROW_R, |_, rv, depth, _, _| {
+                let f = rv / rh;
+                let mut c = ramp(&[0xf6ffec, 0xd4f7b4, 0xa6e676], f);
+                // Glossy top half.
+                c = mix(c, [255.0; 3], 0.4 * (1.0 - smooth(0.42, 0.5, f)));
+                if depth < 1.4 {
+                    c = if f < 0.5 { [255.0; 3] } else { rgb(0x5a9a2a) };
                 }
-            }
-            cv.fill(rx, y, ROW_W, 2.0, 0xeaffd4, 0.9);
-            cv.fill(rx, y, 6.0, rh, 0xeaffd4, 0.9);
+                (c, 0.97)
+            });
         } else {
-            cv.fill(rx, y + rh + 2.0, ROW_W, 1.0, BONE, 0.08);
+            cv.fill(r, ROW_R, 0x000c00, 0.2);
+            cv.fill((rx + ROW_R, y, rw - 2.0 * ROW_R, 1.2), 0.0, WHITE, 0.16);
         }
-        let (tc, subc) = if sel { (INK, 0x1e4a0a) } else { (BONE, DIM) };
-        cv.text(
-            rx + 20.0,
-            y + 8.0,
-            2.0,
-            if sel { 0x1e4a0a } else { 0x5a8a3a },
-            &format!("{:02}", i + 1),
+        // The thumbnail tile.
+        let tile = (rx + 5.0, y + (rh - TILE) / 2.0, TILE, TILE);
+        let (ix, iy, ..) = tile;
+        cv.glow((ix, iy + 1.5, TILE, TILE), 8.0, 5.0, BLACK, 0.45);
+        cv.plate(tile, 8.0, row.seed);
+        let ts = if row.tile.chars().count() > 1 {
+            2.6
+        } else {
+            3.2
+        };
+        let tw = text_w(ts, &row.tile);
+        cv.text_sh(
+            ix + (TILE - tw) / 2.0,
+            iy + (TILE - 7.0 * ts) / 2.0,
+            ts,
+            BONE,
+            &row.tile,
         );
-        let tx = rx + 56.0;
+        let (tc, subc) = if sel { (INK, 0x2f6a14) } else { (WHITE, SUB) };
+        let tx = ix + TILE + 16.0;
+        let text = |cv: &mut Cv, x: f32, y: f32, size: f32, c: u32, s: &str| {
+            if sel {
+                cv.text(x, y, size, c, s)
+            } else {
+                cv.text_sh(x, y, size, c, s)
+            }
+        };
         match v.page {
             Page::Games => {
-                let room = ROW_W - 56.0 - 20.0 - tag.map_or(0.0, |_| 110.0);
-                cv.text(tx, y + 8.0, 3.0, tc, &head(title, chars_in(&cv, room, 3.0)));
-                cv.text(
-                    tx,
-                    y + 34.0,
-                    2.0,
-                    subc,
-                    &tail(sub, chars_in(&cv, room, 2.0)),
-                );
-                if let Some(tag) = tag {
-                    let tw = cv.text_w(2.0, tag);
-                    let (bx, by) = (rx + ROW_W - 16.0 - tw - 12.0, y + 16.0);
-                    let (bg, fg) = if sel {
+                let tag_w = row
+                    .tag
+                    .map_or(0.0, |(label, ..)| pill_w(22.0, label) + 16.0);
+                let room = rx + rw - tx - 16.0 - tag_w;
+                text(&mut cv, tx, y + 9.0, 3.0, tc, &head(&row.title, 3.0, room));
+                text(&mut cv, tx, y + 35.0, 1.8, subc, &tail(&row.sub, 1.8, room));
+                if let Some((label, bg, fg)) = row.tag {
+                    let (bg, fg) = if sel && bg != GOLD {
                         (INK, GREEN_HI)
                     } else {
-                        (0x1c2a10, GREEN)
+                        (bg, fg)
                     };
-                    cv.fill(bx, by, tw + 12.0, 22.0, bg, 0.9);
-                    cv.text(bx + 6.0, by + 4.0, 2.0, fg, tag);
+                    let px = rx + rw - 14.0 - pill_w(22.0, label);
+                    cv.pill(px, y + (rh - 22.0) / 2.0, 22.0, bg, fg, label);
                 }
             }
             Page::Settings => {
-                cv.text(tx, y + 16.0, 3.0, tc, title);
-                let val = if sel {
-                    format!("< {sub} >")
-                } else {
-                    sub.clone()
-                };
-                cv.text_right(rx + ROW_W - 20.0, y + 16.0, 3.0, tc, &val);
+                text(&mut cv, tx, y + 9.0, 3.0, tc, &row.title);
+                text(&mut cv, tx, y + 35.0, 1.8, subc, &row.sub);
+                let val = v.settings.show(i);
+                let val = if sel { format!("< {val} >") } else { val };
+                let vx = rx + rw - 20.0 - text_w(3.0, &val);
+                text(&mut cv, vx, y + 17.0, 3.0, tc, &val);
             }
         }
     }
     // Scroll bar.
     if rows.len() > ROWS {
-        let (bx, by, bh) = (ROW_X + ROW_W + 10.0, ROW_Y, ROWS as f32 * ROW_H - 6.0);
-        cv.fill(bx, by, 4.0, bh, 0x000000, 0.5);
+        let (bx, by, bh) = (
+            l.list_x + l.list_w + 10.0,
+            LIST_Y,
+            ROWS as f32 * ROW_H - ROW_GAP,
+        );
+        cv.fill((bx, by, 6.0, bh), 3.0, BLACK, 0.3);
         let th = bh * ROWS as f32 / rows.len() as f32;
         let ty = by + (bh - th) * v.scroll as f32 / (rows.len() - ROWS) as f32;
-        cv.fill(bx, ty, 4.0, th, GREEN, 0.9);
+        cv.fill((bx, ty, 6.0, th), 3.0, 0xeaffd4, 0.9);
     }
 
-    details(&mut cv, v, pulse);
+    details(&mut cv, &l, v, pulse);
 }
 
-fn empty(cv: &mut Cv, home: &Path) {
-    let (x, mut y) = (ROW_X + 20.0, ROW_Y + 14.0);
-    cv.text_glow(x, y, 4.0, GREEN, "NO GAMES YET", 6.0, 0.8);
-    cv.text(x, y, 4.0, GREEN_HI, "NO GAMES YET");
-    y += 56.0;
-    let n = chars_in(cv, ROW_W - 40.0, 2.0);
+fn empty(cv: &mut Cv, l: &Lay, home: &Path) {
+    let (x, y0, w, h) = (l.list_x, LIST_Y, l.list_w, ROWS as f32 * ROW_H - ROW_GAP);
+    cv.fill((x, y0, w, h), 14.0, BLACK, 0.22);
+    let (x, mut y) = (x + 26.0, y0 + 26.0);
+    cv.text_glow(x, y, 4.4, GREEN_HI, "No games yet", 8.0, 0.5);
+    cv.text_sh(x, y, 4.4, WHITE, "No games yet");
+    y += 58.0;
     let games = home.join("games");
+    let path = tail(&format!("{}\\<sha256>\\", games.display()), 2.0, w - 52.0);
     let lines = [
-        ("Put each built game folder in:", BONE),
-        (
-            &*tail(&format!("{}\\<sha256>\\", games.display()), n),
-            GREEN,
-        ),
-        ("", BONE),
-        ("A built game folder holds game.exe and run.toml.", BONE),
-        ("", BONE),
-        ("Or drop a built game folder on this window,", BONE),
-        ("or on rustxenon-play.exe in Explorer.", BONE),
-        ("", BONE),
-        ("Press Y to look again.", DIM),
+        ("Put each built game folder in:", WHITE),
+        (&*path, GREEN_HI),
+        ("", WHITE),
+        ("A built game folder holds game.exe and run.toml.", WHITE),
+        ("", WHITE),
+        ("Or drop a built game folder on this window,", WHITE),
+        ("or on rustxenon-play.exe in Explorer.", WHITE),
+        ("", WHITE),
+        ("Press Y to look again.", SUB),
     ];
     for (s, c) in lines {
-        cv.text(x, y, 2.0, c, s);
+        cv.text_sh(x, y, 2.0, c, s);
         y += 26.0;
     }
 }
 
-/// The right-hand panel: the selected row in full, notes, the prompt.
-fn details(cv: &mut Cv, v: &View, pulse: f32) {
-    let x = DETAIL_X + FRAME + 18.0;
-    let iw = DETAIL_W - 2.0 * FRAME - 36.0;
-    let mut y = PANEL_Y + FRAME + 18.0;
-    let n2 = chars_in(cv, iw, 2.0);
-    let n4 = chars_in(cv, iw, 4.0);
-    let label = |cv: &mut Cv, y: &mut f32, s: &str| {
-        cv.text(x, *y, 2.0, 0x5a8a3a, s);
-        *y += 22.0;
-    };
-    let lines = |cv: &mut Cv, y: &mut f32, ls: Vec<String>, size: f32, c: u32, step: f32| {
-        for l in ls {
-            cv.text(x, *y, size, c, &l);
-            *y += step;
-        }
+/// Big letters on the preview plate.
+fn preview_text(cv: &mut Cv, l: &Lay, big: &str) {
+    let (x, y, w, h) = preview_rect(l);
+    let size = (h * 0.5 / 7.0).min((w - 60.0) / (font::width(big).max(1) as f32));
+    let (tx, ty) = (
+        x + (w - text_w(size, big)) / 2.0,
+        y + (h - 7.0 * size) / 2.0,
+    );
+    let m = text_mask(cv.fit(), tx, ty, size, big, false);
+    let o = (2.5 * cv.k).round().max(1.0) as i32;
+    cv.mask(&m, o, o + 1, [0.0; 3], 0.6);
+    cv.mask(&m, 0, 0, rgb(0xf2e8d2), 1.0);
+}
+
+/// The right-hand panel: a preview, the selected row in full, notes, the prompt.
+fn details(cv: &mut Cv, l: &Lay, v: &View, pulse: f32) {
+    let (x, iw) = (l.dx, l.dw);
+    let mut y = LIST_Y + PREVIEW_H + 16.0;
+    let pair = |cv: &mut Cv, y: &mut f32, name: &str, value: &str| {
+        cv.text_sh(x, *y, 1.7, GREEN_HI, name);
+        *y += 16.0;
+        cv.text_sh(x, *y, 2.0, WHITE, &tail(value, 2.0, iw));
+        *y += 24.0;
     };
     match v.page {
         Page::Games => match v.games.get(v.sel) {
             Some(g) => {
-                label(cv, &mut y, "SELECTED");
-                lines(cv, &mut y, wrap(&g.title, n4, 2), 4.0, BONE, 36.0);
-                y += 10.0;
-                for (name, value) in [
-                    ("FOLDER", &g.dir.to_string_lossy().into_owned()),
-                    ("EXECUTABLE", &g.exe),
-                    ("GAME FILES", &g.game),
-                ] {
-                    label(cv, &mut y, name);
-                    lines(cv, &mut y, vec![tail(value, n2)], 2.0, DIM, 26.0);
+                preview_text(cv, l, &initials(&g.title));
+                for s in wrap(&g.title, 3.0, iw, 2) {
+                    cv.text_sh(x, y, 3.0, WHITE, &s);
+                    y += 28.0;
                 }
+                y += 4.0;
+                pair(cv, &mut y, "Folder", &g.dir.to_string_lossy());
+                pair(cv, &mut y, "Executable", &g.exe);
+                pair(cv, &mut y, "Game files", &g.game);
             }
             None => {
-                label(cv, &mut y, "SELECTED");
-                cv.text(x, y, 3.0, DIM, "NOTHING");
+                preview_text(cv, l, "?");
+                cv.text_sh(x, y, 3.0, WHITE, "Nothing selected");
             }
         },
         Page::Settings => {
-            let f = &FIELDS[v.sel.min(FIELDS.len() - 1)];
-            label(cv, &mut y, "SETTING");
-            lines(cv, &mut y, wrap(f.label, n4, 2), 4.0, BONE, 36.0);
-            y += 6.0;
-            lines(cv, &mut y, wrap(f.help, n2, 4), 2.0, DIM, 24.0);
-            y += 12.0;
-            label(cv, &mut y, "SAVED IN");
-            lines(
-                cv,
-                &mut y,
-                vec![tail(&v.home.join("settings.toml").to_string_lossy(), n2)],
-                2.0,
-                DIM,
-                26.0,
-            );
-            lines(
-                cv,
-                &mut y,
-                wrap("A game's own run.toml overrides these.", n2, 2),
-                2.0,
-                DIM,
-                24.0,
-            );
+            let i = v.sel.min(FIELDS.len() - 1);
+            let f = &FIELDS[i];
+            preview_text(cv, l, &v.settings.show(i));
+            cv.text_sh(x, y, 3.0, WHITE, &head(f.label, 3.0, iw));
+            y += 32.0;
+            for s in wrap(f.help, 2.0, iw, 3) {
+                cv.text_sh(x, y, 2.0, PALE, &s);
+                y += 22.0;
+            }
         }
     }
 
-    // From the bottom up: the prompt, then any note above it.
-    let bottom = PANEL_Y + PANEL_H - FRAME - 18.0;
-    let py = bottom - 28.0;
+    // The info box, then any note above it.
+    let info = info_rect(l);
+    let (ix, iy) = (info.0 + 16.0, info.1);
     if let Some(title) = v.running {
         let a = 0.6 + 0.4 * pulse;
-        cv.text_glow(x, py - 34.0, 4.0, 0xffd040, "RUNNING", 6.0, 0.5 * a);
-        cv.text(x, py - 34.0, 4.0, 0xffe080, "RUNNING");
-        cv.text(x, py + 4.0, 2.0, DIM, &head(title, n2));
-        cv.text(x, py + 24.0, 2.0, DIM, "back here when it closes");
+        cv.glow(info, 14.0, 12.0, GOLD, 0.25 * a);
+        cv.text_glow(ix, iy + 9.0, 3.0, GOLD, "Running", 6.0, 0.5 * a);
+        cv.text(ix, iy + 9.0, 3.0, 0xffe080, "Running");
+        let rx = ix + text_w(3.0, "Running") + 14.0;
+        cv.text(
+            rx,
+            iy + 13.0,
+            2.0,
+            BONE,
+            &head(title, 2.0, x + iw - rx - 16.0),
+        );
+        cv.text(ix, iy + 35.0, 1.8, DIM, "back here when it closes");
     } else if v.page == Page::Games && !v.games.is_empty() {
-        cv.rect_glow(x, py - 6.0, iw, 40.0, 12.0, GREEN, 0.18 + 0.2 * pulse);
-        cv.fill(x, py - 6.0, iw, 40.0, 0x0c1a06, 0.9);
-        cv.fill(x, py - 6.0, iw, 1.5, GREEN, 0.9);
-        cv.button(x + 26.0, py + 14.0, 13.0, GREEN, "A");
-        cv.text(x + 52.0, py + 3.0, 3.0, GREEN_HI, "START GAME");
-    } else if v.page == Page::Settings {
-        cv.text(x, py + 6.0, 2.0, 0x5a8a3a, "LEFT / RIGHT TO CHANGE");
+        cv.button(ix + 15.0, iy + INFO_H / 2.0, 15.0, GREEN, "A");
+        cv.text_glow(
+            ix + 42.0,
+            iy + 18.0,
+            3.0,
+            GREEN,
+            "Start game",
+            6.0,
+            0.2 + 0.25 * pulse,
+        );
+        cv.text(ix + 42.0, iy + 18.0, 3.0, GREEN_HI, "Start game");
+    } else if v.page == Page::Games {
+        cv.button(ix + 15.0, iy + INFO_H / 2.0, 15.0, 0xf0b428, "Y");
+        cv.text(ix + 42.0, iy + 21.0, 2.0, GREEN_HI, "Look again");
+    } else {
+        let path = format!("Saved in {}", v.home.join("settings.toml").display());
+        cv.text(ix, iy + 12.0, 1.8, GREEN_HI, &tail(&path, 1.8, iw - 32.0));
+        cv.text(
+            ix,
+            iy + 32.0,
+            1.8,
+            DIM,
+            "A game's own run.toml overrides these.",
+        );
     }
     if let Some(note) = v.note {
-        let ls = wrap(note, n2, 4);
-        let mut ny = py - 64.0 - (ls.len() as f32 - 1.0) * 24.0;
-        if v.running.is_some() {
-            ny -= 20.0;
-        }
+        let ls = wrap(note, 2.0, iw - 32.0, 4);
+        let nh = ls.len() as f32 * 22.0 + 18.0;
+        let ny = iy - 10.0 - nh;
+        cv.fill((x, ny, iw, nh), 12.0, WARN, 0.9);
         cv.fill(
-            x - 8.0,
-            ny - 10.0,
-            3.0,
-            ls.len() as f32 * 24.0 + 6.0,
-            WARN,
-            0.9,
+            (x + 1.5, ny + 1.5, iw - 3.0, nh - 3.0),
+            10.5,
+            0x2a1004,
+            0.95,
         );
-        for l in ls {
-            cv.text(x + 4.0, ny, 2.0, WARN, &l);
-            ny += 24.0;
+        let mut ly = ny + 10.0;
+        for s in ls {
+            cv.text(x + 16.0, ly, 2.0, WARN, &s);
+            ly += 22.0;
         }
     }
 }
@@ -1003,9 +1484,7 @@ mod tests {
         }
     }
 
-    #[test]
-    fn renders_any_size() {
-        let s = Settings::default();
+    fn games() -> Vec<Game> {
         let g = Game {
             dir: "C:\\home\\games\\ab".into(),
             title: "Test Game One".into(),
@@ -1015,15 +1494,24 @@ mod tests {
             data: None,
             recent: true,
         };
-        let games = vec![g; 9];
-        for (w, h) in [(1280, 720), (333, 777), (1, 1), (64, 16)] {
+        vec![g; 9]
+    }
+
+    #[test]
+    fn renders_any_size() {
+        let s = Settings::default();
+        let games = games();
+        for (w, h) in [(1280, 720), (333, 777), (1, 1), (64, 16), (800, 600)] {
             let mut px = vec![0; w * h];
             let mut v = view(&games, &s);
             v.scroll = 2;
             v.sel = 3;
+            v.running = Some("Test Game One");
             render(&mut px, w, h, &v, 0.3);
             v.games = &[];
             v.page = Page::Settings;
+            render(&mut px, w, h, &v, 0.0);
+            v.page = Page::Games;
             render(&mut px, w, h, &v, 0.0);
         }
         // Deterministic, and not blank.
@@ -1037,26 +1525,126 @@ mod tests {
 
     #[test]
     fn hits() {
-        // Centre of the first row and of the settings tab, at 1x and 2x.
+        // Row corners and centres and the other page's side blade, at 1x and
+        // 2x, on both pages.
         for k in [1.0, 2.0] {
             let (w, h) = ((BOARD_W * k) as usize, (BOARD_H * k) as usize);
-            let at = |x: f32, y: f32| hit(w, h, x * k, y * k);
-            assert_eq!(at(ROW_X + 100.0, ROW_Y + 20.0), Some(Hit::Row(0)));
-            assert_eq!(at(ROW_X + 100.0, ROW_Y + 2.5 * ROW_H), Some(Hit::Row(2)));
-            assert_eq!(
-                at(M + TAB_W + TAB_GAP + 50.0, TAB_Y + 10.0),
-                Some(Hit::Tab(Page::Settings))
+            for page in PAGES {
+                let at = |x: f32, y: f32| hit(w, h, page, x * k, y * k);
+                let l = lay(page);
+                for r in 0..ROWS {
+                    let (x, y, rw, rh) = row_rect(&l, r);
+                    assert_eq!(at(x + rw / 2.0, y + rh / 2.0), Some(Hit::Row(r)));
+                    assert_eq!(at(x + 3.0, y + 3.0), Some(Hit::Row(r)));
+                    assert_eq!(at(x + rw - 3.0, y + rh - 3.0), Some(Hit::Row(r)));
+                }
+                for other in PAGES.into_iter().filter(|&p| p != page) {
+                    let (x, y, sw, sh) = strip_rect(page, other).unwrap();
+                    // The middle of the part that shows.
+                    let cx = if x < l.bx {
+                        x + STRIP_W / 2.0
+                    } else {
+                        x + sw - STRIP_W / 2.0
+                    };
+                    assert_eq!(at(cx, y + sh / 2.0), Some(Hit::Tab(other)));
+                    // The tucked part is the active blade's.
+                    let tuck = if x < l.bx {
+                        l.bx + 4.0
+                    } else {
+                        l.bx + l.bw - 4.0
+                    };
+                    assert_eq!(at(tuck, y + sh / 2.0), None);
+                }
+                assert_eq!(at(l.bx + PAD + 10.0, BLADE_Y + 40.0), None);
+                assert_eq!(at(5.0, 5.0), None);
+            }
+        }
+    }
+
+    /// The rows and blades are drawn where the hit test finds them: the
+    /// selected row's glossy bar is lighter than the rows round it, and a
+    /// side blade's steel is grey where the active blade is green.
+    #[test]
+    fn drawn_where_hit() {
+        let s = Settings::default();
+        let games = games();
+        let (w, h) = (1280, 720);
+        let px_at = |px: &[u32], x: f32, y: f32| rgb(px[y as usize * w + x as usize]);
+        for (page, sel) in [(Page::Games, 2), (Page::Settings, 4)] {
+            let mut v = view(&games, &s);
+            v.page = page;
+            v.sel = sel;
+            v.note = None;
+            let mut px = vec![0; w * h];
+            render(&mut px, w, h, &v, 0.0);
+            let l = lay(page);
+            let luma = |r: usize| {
+                let (x, y, rw, rh) = row_rect(&l, r);
+                // A blank spot of the row between the text and the end.
+                let c = px_at(&px, x + rw * 0.7, y + rh - 4.0);
+                c[0] + c[1] + c[2]
+            };
+            for r in (0..ROWS).filter(|&r| r != sel) {
+                assert!(luma(sel) > luma(r) + 150.0, "{page:?} row {r}");
+            }
+            let other = PAGES.into_iter().find(|&p| p != page).unwrap();
+            let (sx, sy, sw, sh) = strip_rect(page, other).unwrap();
+            let cx = if sx < l.bx { sx + 8.0 } else { sx + sw - 8.0 };
+            let steel = px_at(&px, cx, sy + sh / 2.0);
+            assert!(
+                (steel[1] - steel[0]).abs() < 60.0,
+                "{page:?} strip {steel:?}"
             );
-            assert_eq!(at(5.0, 5.0), None);
+            let green = px_at(&px, l.bx + l.bw / 2.0, LIST_Y - 20.0);
+            assert!(green[1] > green[0] + 60.0, "{page:?} blade {green:?}");
         }
     }
 
     #[test]
     fn text_fitting() {
-        assert_eq!(tail("abcdefgh", 5), "..fgh");
-        assert_eq!(head("abcdefgh", 5), "abc..");
-        assert_eq!(wrap("one two three", 7, 3), ["one two", "three"]);
-        assert_eq!(wrap("abcdefghij", 4, 3), ["abcd", "efgh", "ij"]);
-        assert_eq!(wrap("a b c d e f", 3, 2), ["a b", "c.."]);
+        let w = |s: &str| text_w(1.0, s);
+        assert_eq!(head("abcdefgh", 1.0, w("abcdefgh")), "abcdefgh");
+        let h = head("abcdefgh", 1.0, w("abcd.."));
+        assert_eq!(h, "abcd..");
+        let t = tail("C:\\games\\folder", 1.0, w("..folder"));
+        assert_eq!(t, "..folder");
+        assert_eq!(
+            wrap("one two three", 1.0, w("one two"), 3),
+            ["one two", "three"]
+        );
+        // A word too long for a line is split.
+        assert_eq!(wrap("abcdefgh", 1.0, w("abcd"), 3), ["abcd", "efgh"]);
+        // Too many lines: the last one says so.
+        let ls = wrap("a b c d e f", 1.0, w("a b"), 2);
+        assert_eq!(ls.len(), 2);
+        assert!(ls[1].ends_with(".."), "{ls:?}");
+        assert!(ls.iter().all(|l| w(l) <= w("a b")));
+        assert_eq!(initials("Test Game One"), "TG");
+        assert_eq!(initials("  "), "?");
+    }
+
+    /// Frame time at 1920x1080:
+    /// `cargo test --release -p xenon-play frame_time -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn frame_time() {
+        let s = Settings::default();
+        let mut games = games();
+        games[1].exe = "C:\\x\\default.xex".into();
+        let (w, h) = (1920, 1080);
+        for page in PAGES {
+            let mut v = view(&games, &s);
+            v.page = page;
+            v.sel = 1;
+            let back = backdrop(w, h, page);
+            let mut px = back.clone();
+            overlay(&mut px, w, h, &v, 0.0);
+            let t = std::time::Instant::now();
+            for i in 0..20 {
+                px.copy_from_slice(&back);
+                overlay(&mut px, w, h, &v, i as f32 * 0.03);
+            }
+            eprintln!("{page:?}: {:?} a frame", t.elapsed() / 20);
+        }
     }
 }
