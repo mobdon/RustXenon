@@ -70,6 +70,55 @@ impl xenon_draw::GuestMemory for Physical<'_> {
     }
 }
 
+/// [`Physical`] memory whose written ranges were taken on the command
+/// processor thread when its ring span was queued, so the draw thread does
+/// not walk the OS write record itself.
+struct Taken<'a>(&'a Runtime, Option<Vec<(u64, u64)>>);
+
+impl GuestRead for Taken<'_> {
+    fn read_u32(&self, addr: u32) -> Option<u32> {
+        Physical(self.0).read_u32(addr)
+    }
+    fn read_bytes(&self, addr: u32, len: usize) -> Option<Vec<u8>> {
+        Physical(self.0).read_bytes(addr, len)
+    }
+    fn read_into(&self, addr: u32, out: &mut [u8]) -> bool {
+        Physical(self.0).read_into(addr, out)
+    }
+}
+
+impl xenon_draw::GuestMemory for Taken<'_> {
+    fn write_bytes(&mut self, addr: u32, bytes: &[u8]) -> bool {
+        Physical(self.0).write_bytes(addr, bytes)
+    }
+
+    fn take_written(&mut self) -> Option<Vec<(u64, u64)>> {
+        self.1.take()
+    }
+}
+
+/// One ring span for the drawer: its commands, the guest ranges written
+/// since the span before ([`Physical`]'s `take_written`) and the time
+/// taking them cost.
+struct Span {
+    cmds: Vec<Command>,
+    written: Option<Vec<(u64, u64)>>,
+    watch: std::time::Duration,
+}
+
+impl Span {
+    /// Takes the written ranges now, after the span's own memory writes.
+    fn new(rt: &Runtime, cmds: Vec<Command>) -> Span {
+        let start = std::time::Instant::now();
+        let written = xenon_draw::GuestMemory::take_written(&mut Physical(rt));
+        Span {
+            cmds,
+            written,
+            watch: start.elapsed(),
+        }
+    }
+}
+
 /// The guest range every physical view aliases to (see [`physical_ranges`]).
 const PHYSICAL_VIEW: (u64, u64) = (0xA000_0000, 0xC000_0000);
 
@@ -119,7 +168,7 @@ pub struct Gpu {
 enum Draw {
     Inline(Box<DrawSide>),
     /// Batches go to the draw thread through this queue.
-    Thread(Arc<xenon_gpu::ahead::Ahead<Vec<Command>>>),
+    Thread(Arc<xenon_gpu::ahead::Ahead<Span>>),
 }
 
 /// The drawer and what it reports, on the GPU thread or the draw thread.
@@ -132,7 +181,8 @@ struct DrawSide {
 
 impl DrawSide {
     /// Replays one ring span; false once the drawer stopped.
-    fn replay(&mut self, rt: &Runtime, cmds: &[Command]) -> bool {
+    fn replay(&mut self, rt: &Runtime, span: &mut Span) -> bool {
+        let cmds = &span.cmds;
         // Every 30 s, what the drawer holds, to tell cache growth from a leak.
         static NEXT: AtomicU32 = AtomicU32::new(0);
         let now = crate::ms();
@@ -141,7 +191,9 @@ impl DrawSide {
             crate::log(&self.drawer.memory_line());
         }
         let start = std::time::Instant::now();
-        let replayed = self.drawer.replay(cmds, &mut Physical(rt));
+        let replayed = self
+            .drawer
+            .replay(cmds, &mut Taken(rt, span.written.take()));
         let busy = start.elapsed();
         // The drawer is never dropped at exit (its thread is left running),
         // so new pipelines reach the cache file here at most 5 s late.
@@ -154,7 +206,7 @@ impl DrawSide {
         }
         match replayed {
             Ok(r) => {
-                self.stats.add(&r, busy);
+                self.stats.add(&r, busy, span.watch);
                 for u in r.unsupported.iter().chain(&r.warnings) {
                     capture::note(u);
                 }
@@ -183,19 +235,27 @@ struct DrawStats {
     resolves: u32,
     /// Wall time inside the drawer.
     busy: std::time::Duration,
+    /// Taking the written ranges, on the command processor thread.
+    watch: std::time::Duration,
     t: xenon_draw::Timings,
 }
 
 impl DrawStats {
     const EVERY: std::time::Duration = std::time::Duration::from_secs(5);
 
-    fn add(&mut self, r: &xenon_draw::Report, busy: std::time::Duration) {
+    fn add(
+        &mut self,
+        r: &xenon_draw::Report,
+        busy: std::time::Duration,
+        watch: std::time::Duration,
+    ) {
         let since = *self.since.get_or_insert_with(std::time::Instant::now);
         self.replays += 1;
         self.frames += r.frames.len() as u32;
         self.draws += r.draws;
         self.resolves += r.resolves;
         self.busy += busy;
+        self.watch += watch;
         self.t += &r.timings;
         let window = since.elapsed();
         if window >= Self::EVERY {
@@ -226,7 +286,8 @@ impl DrawStats {
              {} resolves, {} submits ({} resolve, {} transfer, {} decode, {} flush/other), {} transfers ({} passes, {} set up), {} render passes, {} write-backs, readback {:.1} MB, \
              hashed {:.1} MB (kept resolves {:.1} MB), {} textures uploaded ({:.1} MB, {} evicted before), \
              {} evicted, {} from kept resolves, {} pipelines created; guest data {:.1} MB ({} windows reused, {:.1} MB); \
-             uploads by format: rgba8 {}, bc {}, f16 {}, f32 {}, other {}",
+             uploads by format: rgba8 {}, bc {}, f16 {}, f32 {}, other {}; \
+             write watch {:.1} ms per {per} on the gpu thread",
             window.as_secs_f64(),
             self.frames,
             self.replays,
@@ -279,6 +340,7 @@ impl DrawStats {
             by(2),
             by(3),
             by(4),
+            ms(self.watch),
         ) + &if t.passes_timed > 0 {
             format!(
                 "; GPU ms per {per} (timestamps, {} passes): draw {:.1}, clear {:.1}, resolve {:.1}",
@@ -315,7 +377,7 @@ impl Gpu {
             return;
         }
         // 256 ring spans between swaps bound what the queue holds.
-        let q = Arc::new(xenon_gpu::ahead::Ahead::<Vec<Command>>::new(ahead, 256));
+        let q = Arc::new(xenon_gpu::ahead::Ahead::<Span>::new(ahead, 256));
         let (q2, rt) = (q.clone(), rt.clone());
         // Replayed commands are freed on a thread of their own: thousands of
         // small allocations a frame, made on the command thread, were a
@@ -327,10 +389,10 @@ impl Gpu {
         let spawned = std::thread::Builder::new()
             .name("draw".into())
             .spawn(move || {
-                while let Some((cmds, swaps)) = q2.pop() {
-                    let ok = side.replay(&rt, &cmds);
+                while let Some((mut span, swaps)) = q2.pop() {
+                    let ok = side.replay(&rt, &mut span);
                     q2.done(swaps);
-                    if let Err(e) = spent.send(cmds) {
+                    if let Err(e) = spent.send(span.cmds) {
                         drop(e.0);
                     }
                     if !ok {
@@ -404,9 +466,18 @@ impl Gpu {
         for c in &cmds {
             self.apply(rt, c, idle);
         }
+        // Every command of the span is applied (its memory and fence writes
+        // done), so its interrupts and a due vertical blank go now: drawing
+        // below can wait on the drawer, and the guest need not wait with it.
+        idle(self);
         let mut cmds = cmds;
         let going = match &mut self.draw {
-            Some(Draw::Inline(d)) => d.replay(rt, &cmds),
+            Some(Draw::Inline(d)) => {
+                let mut span = Span::new(rt, std::mem::take(&mut cmds));
+                let going = d.replay(rt, &mut span);
+                cmds = span.cmds;
+                going
+            }
             Some(Draw::Thread(q)) => {
                 let swaps = cmds
                     .iter()
@@ -416,7 +487,9 @@ impl Gpu {
                     Some(_) => cmds.clone(),
                     None => std::mem::take(&mut cmds),
                 };
-                q.push(batch, swaps)
+                // Per span, in ring order, so each replay sees the writes
+                // made before its own commands were applied.
+                q.push(Span::new(rt, batch), swaps)
             }
             None => true,
         };
@@ -872,6 +945,7 @@ mod tests {
             draws: 2760,
             resolves: 84,
             busy: ms(2000),
+            watch: ms(3),
             ..Default::default()
         };
         s.t.readback = ms(300);
@@ -905,6 +979,7 @@ mod tests {
             "readback 40.0 MB",
             "140 submits (44 resolve, 19 transfer, 17 decode, 60 flush/other)",
             "guest data 4.5 MB (450 windows reused, 1.5 MB)",
+            "write watch 1.5 ms per frame on the gpu thread",
             "rgba8 300 (100.0 MB), bc 20 (4.0 MB), f16 3 (0.0 MB), f32 0 (0.0 MB), other 0",
         ] {
             assert!(line.contains(part), "{part}: {line}");

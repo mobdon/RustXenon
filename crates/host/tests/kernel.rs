@@ -512,6 +512,44 @@ fn command_processor_applies_writes_waits_and_interrupts() {
     assert_eq!(gpu.interrupts, vec![4]);
 }
 
+/// A span's interrupts reach the caller before `run_ring` hands the span
+/// to the drawer (which can block), and only once the span's fence writes
+/// are done.
+#[test]
+fn command_processor_raises_interrupts_before_drawing() {
+    let e = env();
+    let rt = &e.rt;
+    let ring = 0x1000;
+    let type3 = |op: u32, n: u32| 0xC000_0000 | (n - 1) << 16 | op << 8;
+    let words = [
+        // INTERRUPT for processor 2, then a fence of 7 at 0x400 after it.
+        type3(0x54, 1),
+        4,
+        type3(0x3D, 2),
+        0x400 | 2,
+        7,
+    ];
+    for (i, w) in words.iter().enumerate() {
+        rt.mem.write_u32(0xA000_0000 + ring + 4 * i as u32, *w);
+    }
+    let mut gpu = Gpu::default();
+    let mut seen = Vec::new();
+    let mut idle = |g: &mut Gpu| {
+        seen.push((
+            std::mem::take(&mut g.interrupts),
+            rt.mem.read_u32(0xA000_0400),
+        ));
+    };
+    let r = gpu.run_ring(rt, ring, 64, 0, words.len() as u32, &mut idle);
+    assert_eq!(r, words.len() as u32);
+    assert_eq!(
+        seen,
+        [(vec![4], 7)],
+        "raised inside run_ring, after the fence"
+    );
+    assert!(gpu.interrupts.is_empty());
+}
+
 #[test]
 fn signed_in_profile_and_settings() {
     use xenon_host::kernel::profile;
