@@ -575,9 +575,8 @@ type SubmitJob = (
 #[derive(Default)]
 struct SubmitState {
     pending: usize,
-    /// Batches sent, and batches submitted, since the start.
+    /// Batches sent since the start.
     sent: u64,
-    done: u64,
     queue: Duration,
     finish: Duration,
     error: Option<String>,
@@ -697,7 +696,6 @@ impl Submitter {
         while st.pending > n {
             let (f, e, error, index) = rx.recv().expect("submit thread alive");
             st.pending -= 1;
-            st.done += 1;
             st.finish += f;
             st.queue += e;
             if st.error.is_none() {
@@ -712,7 +710,7 @@ impl Submitter {
     fn wait_for(&self, sent: u64) -> wgpu::SubmissionIndex {
         let pending = {
             let st = self.state.lock().expect("submit state");
-            st.sent - sent.min(st.sent)
+            st.sent.saturating_sub(sent)
         };
         self.drain_to(pending as usize);
         let st = self.state.lock().expect("submit state");
