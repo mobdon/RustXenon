@@ -1,8 +1,50 @@
-//! A built-in 5x7 capitals-only pixel font. Lower case draws as upper case;
-//! anything without a glyph draws as `?`.
+//! A built-in 5x7 pixel font with lower case. Capitals sit in rows 0-6;
+//! the descenders of g, j, p, q and y use rows 7-8. Anything without a glyph
+//! draws as `?`.
+
+/// Glyph rows: 7 above the baseline, 2 below.
+pub const ROWS: usize = 9;
 
 /// Rows top to bottom, bit 4 the leftmost column.
-pub fn glyph(c: char) -> [u8; 7] {
+pub fn glyph(c: char) -> [u8; ROWS] {
+    let g: [u8; 7] = match c {
+        'a' => return low([0x0E, 0x01, 0x0F, 0x11, 0x0F], [0, 0]),
+        'b' => [0x10, 0x10, 0x16, 0x19, 0x11, 0x11, 0x1E],
+        'c' => return low([0x0E, 0x10, 0x10, 0x11, 0x0E], [0, 0]),
+        'd' => [0x01, 0x01, 0x0D, 0x13, 0x11, 0x11, 0x0F],
+        'e' => return low([0x0E, 0x11, 0x1F, 0x10, 0x0E], [0, 0]),
+        'f' => [0x06, 0x09, 0x08, 0x1C, 0x08, 0x08, 0x08],
+        'g' => return low([0x0F, 0x11, 0x11, 0x11, 0x0F], [0x01, 0x0E]),
+        'h' => [0x10, 0x10, 0x16, 0x19, 0x11, 0x11, 0x11],
+        'i' => [0x04, 0, 0x0C, 0x04, 0x04, 0x04, 0x0E],
+        'j' => return [0x02, 0, 0x06, 0x02, 0x02, 0x02, 0x02, 0x12, 0x0C],
+        'k' => [0x10, 0x10, 0x12, 0x14, 0x18, 0x14, 0x12],
+        'l' => [0x0C, 0x04, 0x04, 0x04, 0x04, 0x04, 0x0E],
+        'm' => return low([0x1A, 0x15, 0x15, 0x15, 0x15], [0, 0]),
+        'n' => return low([0x16, 0x19, 0x11, 0x11, 0x11], [0, 0]),
+        'o' => return low([0x0E, 0x11, 0x11, 0x11, 0x0E], [0, 0]),
+        'p' => return low([0x1E, 0x11, 0x11, 0x11, 0x1E], [0x10, 0x10]),
+        'q' => return low([0x0F, 0x11, 0x11, 0x11, 0x0F], [0x01, 0x01]),
+        'r' => return low([0x16, 0x19, 0x10, 0x10, 0x10], [0, 0]),
+        's' => return low([0x0F, 0x10, 0x0E, 0x01, 0x1E], [0, 0]),
+        't' => [0x08, 0x08, 0x1C, 0x08, 0x08, 0x09, 0x06],
+        'u' => return low([0x11, 0x11, 0x11, 0x13, 0x0D], [0, 0]),
+        'v' => return low([0x11, 0x11, 0x11, 0x0A, 0x04], [0, 0]),
+        'w' => return low([0x11, 0x11, 0x15, 0x15, 0x0A], [0, 0]),
+        'x' => return low([0x11, 0x0A, 0x04, 0x0A, 0x11], [0, 0]),
+        'y' => return low([0x11, 0x11, 0x11, 0x11, 0x0F], [0x01, 0x0E]),
+        'z' => return low([0x1F, 0x02, 0x04, 0x08, 0x1F], [0, 0]),
+        _ => upper(c),
+    };
+    [g[0], g[1], g[2], g[3], g[4], g[5], g[6], 0, 0]
+}
+
+/// A lower case glyph: five rows of x-height and two below the baseline.
+fn low(x: [u8; 5], below: [u8; 2]) -> [u8; ROWS] {
+    [0, 0, x[0], x[1], x[2], x[3], x[4], below[0], below[1]]
+}
+
+fn upper(c: char) -> [u8; 7] {
     match c.to_ascii_uppercase() {
         ' ' => [0; 7],
         'A' => [0x0E, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11],
@@ -69,21 +111,71 @@ pub fn glyph(c: char) -> [u8; 7] {
     }
 }
 
-/// Width in font pixels of `s`: 5 per glyph plus 1 between glyphs.
-pub fn width(s: &str) -> i32 {
-    let n = s.chars().count() as i32;
-    (n * 6 - 1).max(0)
+/// The lit columns of a glyph: first and one past the last. A space is
+/// two columns wide.
+fn cols(g: &[u8; ROWS]) -> (usize, usize) {
+    let bits = g.iter().fold(0u8, |a, b| a | b);
+    if bits == 0 {
+        return (0, 2);
+    }
+    let first = (0..5).find(|c| bits & (0x10 >> c) != 0).unwrap_or(0);
+    let last = (0..5).rev().find(|c| bits & (0x10 >> c) != 0).unwrap_or(4);
+    (first, last + 1)
 }
 
-/// Calls `plot(x, y)` for each lit font pixel of `s`, origin at its top left.
-pub fn each(s: &str, mut plot: impl FnMut(i32, i32)) {
-    for (i, c) in s.chars().enumerate() {
-        for (row, bits) in glyph(c).iter().enumerate() {
-            for col in 0..5 {
+/// Width in font pixels of `s`: each glyph as wide as its lit columns, one
+/// column between glyphs.
+pub fn width(s: &str) -> i32 {
+    let n: usize = s
+        .chars()
+        .map(|c| {
+            let (a, b) = cols(&glyph(c));
+            b - a + 1
+        })
+        .sum();
+    n.saturating_sub(1) as i32
+}
+
+/// `s` as a bitmap of 0 and 1, [`width`] columns by [`ROWS`] rows.
+pub fn bitmap(s: &str) -> Vec<u8> {
+    let w = width(s).max(0) as usize;
+    let mut m = vec![0u8; w * ROWS];
+    let mut x = 0;
+    for c in s.chars() {
+        let g = glyph(c);
+        let (a, b) = cols(&g);
+        for (row, bits) in g.iter().enumerate() {
+            for col in a..b {
                 if bits & (0x10 >> col) != 0 {
-                    plot(i as i32 * 6 + col, row as i32);
+                    m[row * w + x + col - a] = 1;
                 }
             }
         }
+        x += b - a + 1;
+    }
+    m
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lower_case_has_its_own_glyphs() {
+        assert_ne!(glyph('a'), glyph('A'));
+        assert_eq!(glyph('A')[7..], [0, 0]);
+        // Descenders hang below the baseline.
+        assert_ne!(glyph('g')[7..], [0, 0]);
+    }
+
+    #[test]
+    fn proportional() {
+        // i is narrower than m; a space is two columns; one column between.
+        assert!(width("i") < width("m"));
+        assert_eq!(width("m"), 5);
+        assert_eq!(width("m m"), 5 + 1 + 2 + 1 + 5);
+        let m = bitmap("mm");
+        assert_eq!(m.len(), 11 * ROWS);
+        assert_eq!(m[2 * 11 + 5], 0, "the gap column between glyphs is empty");
     }
 }

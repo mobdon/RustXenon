@@ -3,7 +3,7 @@
 //!
 //! ```text
 //! rustxenon-play [--home <dir>] [<built game folder>...]
-//! rustxenon-play --screenshot <out.png> [--page games|settings] [--home <dir>]
+//! rustxenon-play --screenshot <out.png> [--page games|settings] [--size <w>x<h>] [--home <dir>]
 //! ```
 //!
 //! Home is the launcher's own folder unless `--home` says otherwise. A folder
@@ -69,6 +69,7 @@ fn run(exe_dir: PathBuf) -> Result<(), String> {
     let mut home = exe_dir;
     let mut shot = None;
     let mut page = Page::Games;
+    let mut size = (1280, 720);
     let mut folders = Vec::new();
     let mut it = std::env::args_os().skip(1);
     while let Some(a) = it.next() {
@@ -82,6 +83,15 @@ fn run(exe_dir: PathBuf) -> Result<(), String> {
                     Some("settings") => Page::Settings,
                     _ => return Err("--page is games or settings".into()),
                 }
+            }
+            Some("--size") => {
+                let v = val("--size")?;
+                size = v
+                    .to_str()
+                    .and_then(|s| s.split_once('x'))
+                    .and_then(|(w, h)| Some((w.parse().ok()?, h.parse().ok()?)))
+                    .filter(|&(w, h)| w > 0 && h > 0)
+                    .ok_or("--size is <width>x<height>")?;
             }
             Some(s) if s.starts_with("--") => return Err(format!("unknown option {s}")),
             _ => folders.push(PathBuf::from(a)),
@@ -97,9 +107,21 @@ fn run(exe_dir: PathBuf) -> Result<(), String> {
         app.add_folder(&f);
     }
     if let Some(out) = shot {
-        let (w, h) = (1280, 720);
+        let (w, h) = size;
         let mut px = vec![0; w * h];
-        draw::render(&mut px, w, h, &app.view(), 0.0);
+        let t0 = Instant::now();
+        let back = draw::backdrop(w, h, app.page);
+        let t1 = Instant::now();
+        // The overlay is drawn every frame: time a few.
+        for _ in 0..10 {
+            px.copy_from_slice(&back);
+            draw::overlay(&mut px, w, h, &app.view(), 0.0);
+        }
+        let frame = t1.elapsed() / 10;
+        log(&format!(
+            "screenshot {w}x{h}: backdrop {:?}, frame {frame:?}",
+            t1 - t0
+        ));
         return write_png(&out, w, h, &px);
     }
     let ev = EventLoop::new().map_err(|e| e.to_string())?;
@@ -151,8 +173,8 @@ struct App {
     note: Option<String>,
     running: Option<(String, Child)>,
     window: Option<(Rc<Window>, Surface)>,
-    /// The backdrop for this size and page.
-    back: Option<(usize, usize, Page, Vec<u32>)>,
+    /// The backdrop of each page seen at this size, so a page switch is free.
+    back: Vec<(usize, usize, Page, Vec<u32>)>,
     pad: xinput::Reader,
     buttons: u16,
     held: Option<(Act, Instant)>,
@@ -175,7 +197,7 @@ impl App {
             note: None,
             running: None,
             window: None,
-            back: None,
+            back: Vec::new(),
             pad: xinput::Reader::default(),
             buttons: 0,
             held: None,
@@ -358,14 +380,15 @@ impl App {
             return;
         }
         let page = self.page;
-        if !matches!(&self.back, Some((bw, bh, bp, _)) if (*bw, *bh, *bp) == (w, h, page)) {
-            self.back = Some((w, h, page, draw::backdrop(w, h, page)));
+        if !self.back.iter().any(|b| (b.0, b.1, b.2) == (w, h, page)) {
+            self.back.retain(|b| (b.0, b.1) == (w, h));
+            self.back.push((w, h, page, draw::backdrop(w, h, page)));
         }
         let Some((_, s)) = self.window.as_mut() else {
             return;
         };
         let Ok(mut buf) = s.buffer_mut() else { return };
-        if let Some((.., back)) = &self.back {
+        if let Some((.., back)) = self.back.iter().find(|b| b.2 == page) {
             buf.copy_from_slice(back);
         }
         // Not self.view(): self.window is borrowed mutably for the buffer.
@@ -499,7 +522,8 @@ impl ApplicationHandler for App {
             WindowEvent::CursorMoved { position, .. } => {
                 let (w, h) = self.size();
                 self.cursor = (position.x as f32, position.y as f32);
-                if let Some(Hit::Row(r)) = draw::hit(w, h, self.cursor.0, self.cursor.1) {
+                if let Some(Hit::Row(r)) = draw::hit(w, h, self.page, self.cursor.0, self.cursor.1)
+                {
                     let i = self.scroll[self.page as usize] + r;
                     if i < self.len() && self.running.is_none() {
                         self.select(i);
@@ -512,7 +536,7 @@ impl ApplicationHandler for App {
                 ..
             } => {
                 let (w, h) = self.size();
-                match draw::hit(w, h, self.cursor.0, self.cursor.1) {
+                match draw::hit(w, h, self.page, self.cursor.0, self.cursor.1) {
                     Some(Hit::Tab(p)) if self.running.is_none() => self.page = p,
                     Some(Hit::Row(r))
                         if self.running.is_none()
@@ -521,7 +545,29 @@ impl ApplicationHandler for App {
                         self.select(self.scroll[self.page as usize] + r);
                         self.act(Act::Go);
                     }
+                    Some(Hit::Info) if self.running.is_none() => {
+                        self.act(if self.games.is_empty() {
+                            Act::Refresh
+                        } else {
+                            Act::Go
+                        })
+                    }
                     _ => {}
+                }
+            }
+            // A right click on a settings row steps its value down.
+            WindowEvent::MouseInput {
+                state: ElementState::Pressed,
+                button: MouseButton::Right,
+                ..
+            } if self.page == Page::Settings && self.running.is_none() => {
+                let (w, h) = self.size();
+                if let Some(Hit::Row(r)) = draw::hit(w, h, self.page, self.cursor.0, self.cursor.1)
+                {
+                    if self.scroll[self.page as usize] + r < self.len() {
+                        self.select(self.scroll[self.page as usize] + r);
+                        self.change(-1);
+                    }
                 }
             }
             WindowEvent::MouseWheel { delta, .. } => {
