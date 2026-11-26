@@ -6,7 +6,8 @@
 //! no window or sound unless `--window` or `--sound` is given.
 //!
 //! A generated game crate calls [`run`] with the SHA-256 it was built from
-//! and the register functions of its code crates.
+//! and the register functions of its code crates; on Android its
+//! `android_main` calls [`android_main`] instead.
 
 pub mod cpu_profile;
 pub mod heap;
@@ -23,6 +24,8 @@ use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use xenon_rt::{Context, GuestMemory, Runtime};
+#[cfg(target_os = "android")]
+pub use xenon_window::android::AndroidApp;
 
 /// Guest address space: the whole 32-bit range (pages are only touched
 /// when used).
@@ -459,8 +462,8 @@ fn claim_stop(code: i32) {
         .compare_exchange(0, code, Ordering::SeqCst, Ordering::SeqCst)
         .is_err()
     {
-        if std::thread::current().name() == Some("window") {
-            std::process::exit(STOPPED.load(Ordering::SeqCst));
+        if on_window_thread() {
+            quit(STOPPED.load(Ordering::SeqCst));
         }
         loop {
             std::thread::park();
@@ -474,6 +477,11 @@ fn tail() -> Vec<String> {
     t.iter().cloned().collect()
 }
 
+/// Whether this is the thread that pumps the window, which must not park.
+fn on_window_thread() -> bool {
+    xenon_window::is_pump_thread()
+}
+
 /// Ends the run with `code` (see [`show`]).
 fn hold(code: i32) -> ! {
     claim_stop(code);
@@ -485,7 +493,7 @@ fn hold(code: i32) -> ! {
 /// its close handler then exits.
 fn show(code: i32, lines: Vec<String>) -> ! {
     if let Some(w) = kernel::input::WINDOW.get() {
-        if std::thread::current().name() != Some("window") {
+        if !on_window_thread() {
             kernel::sound::silence();
             w.show_text(lines);
             loop {
@@ -493,7 +501,22 @@ fn show(code: i32, lines: Vec<String>) -> ! {
             }
         }
     }
-    std::process::exit(code);
+    quit(code);
+}
+
+/// Ends the process with `code`. On Android with `_exit`: exit() would run
+/// C++ static destructors while ART and the game's threads still run.
+/// shortcut: the activity is not finished first (android-activity only
+/// finishes it when `android_main` returns); do that if Android restarts it.
+fn quit(code: i32) -> ! {
+    #[cfg(target_os = "android")]
+    {
+        let _ = std::io::stdout().flush();
+        // SAFETY: ends the process at once; the log file is unbuffered.
+        unsafe { libc::_exit(code) }
+    }
+    #[cfg(not(target_os = "android"))]
+    std::process::exit(code)
 }
 
 /// Logs why the run cannot go on and ends it (see [`hold`]).
@@ -560,9 +583,75 @@ fn opt(args: &[String], name: &str) -> Option<String> {
 
 /// Entry point of a generated game crate.
 pub fn run(sha256: &str, regs: &[fn(&mut Runtime)]) -> ExitCode {
+    run_with(
+        sha256,
+        regs,
+        std::env::args().skip(1).collect(),
+        std::env::current_exe().unwrap_or_default(),
+    )
+}
+
+/// Entry point of a generated game crate on Android, called from its
+/// `android_main`. The player's folder is the app's external files folder
+/// (else its internal one); this game's log, run.toml, stdout.log and an
+/// optional args.txt (more options, split at whitespace) live in
+/// `<home>/games/<sha256>/`, which is also the current directory, so
+/// relative paths in run.toml start there. The game runs on its own thread
+/// and its end exits the process; this thread pumps the window.
+#[cfg(target_os = "android")]
+pub fn android_main(app: AndroidApp, sha256: &'static str, regs: &'static [fn(&mut Runtime)]) {
+    let home = app
+        .external_data_path()
+        .or_else(|| app.internal_data_path())
+        .unwrap_or_else(|| PathBuf::from("."));
+    let dir = home.join("games").join(sha256);
+    let _ = std::fs::create_dir_all(&dir);
+    let _ = std::env::set_current_dir(&dir);
+    redirect_output(&dir.join("stdout.log"));
+    let mut args = vec![
+        "--window".to_string(),
+        "--home".to_string(),
+        home.display().to_string(),
+    ];
+    if let Ok(more) = std::fs::read_to_string(dir.join("args.txt")) {
+        args.extend(more.split_whitespace().map(String::from));
+    }
+    let me = dir.join("game");
+    std::thread::Builder::new()
+        .name("game".into())
+        .stack_size(16 << 20)
+        .spawn(move || {
+            let code = run_with(sha256, regs, args, me);
+            quit(if code == ExitCode::SUCCESS { 0 } else { 1 });
+        })
+        .expect("game thread");
+    xenon_window::android::run(app)
+}
+
+/// Sends stdout and stderr (Android drops both) to `path`.
+#[cfg(target_os = "android")]
+fn redirect_output(path: &std::path::Path) {
+    use std::os::fd::AsRawFd;
+    let Ok(f) = std::fs::File::create(path) else {
+        return;
+    };
+    // SAFETY: dup2 onto the standard descriptors; `f` stays open until
+    // they hold their own copies.
+    unsafe {
+        libc::dup2(f.as_raw_fd(), 1);
+        libc::dup2(f.as_raw_fd(), 2);
+    }
+}
+
+/// [`run`] with the options (without the program name) and this program's
+/// path given: the log and run.toml go beside `me`.
+pub fn run_with(
+    sha256: &str,
+    regs: &[fn(&mut Runtime)],
+    args: Vec<String>,
+    me: PathBuf,
+) -> ExitCode {
     START.get_or_init(Instant::now);
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    let me = std::env::current_exe().unwrap_or_default();
     let me_dir = me
         .parent()
         .unwrap_or(std::path::Path::new("."))
@@ -635,7 +724,7 @@ pub fn run(sha256: &str, regs: &[fn(&mut Runtime)]) -> ExitCode {
             if code == 0 {
                 report();
             }
-            std::process::exit(code);
+            quit(code);
         });
         let _ = kernel::input::WINDOW.set(link);
     }

@@ -2,6 +2,14 @@
 
 Status: plan. Nothing here runs on a phone yet.
 
+Done since (compiled and unit tested, not run on a phone): the Android path
+in `xenon-window` (`android::run`, the NativeActivity event pump, CPU fill of
+the native window), `xenon_host::android_main`, and a game crate whose
+library builds as the Android `cdylib` (`cargo rustc -p game --lib
+--crate-type cdylib --target aarch64-linux-android`). Its files live in
+`<external files>/games/<sha256>/`: run.toml, an optional args.txt, the log
+and stdout.log.
+
 Goal: a game built by RustXenon runs on an Android phone, played with an Xbox
 controller paired over Bluetooth. No touch controls. A game picker on the
 phone is driven by the controller only.
@@ -106,6 +114,13 @@ the first controller is read, the same as the Windows path.
   and thin. Letterbox the 16:9 frame to the largest fit. Folding or unfolding
   destroys and recreates the native window (`TerminateWindow` /
   `InitWindow`), so the surface must be rebuilt without stopping the game.
+- The APK manifest's NativeActivity must declare
+  `android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|density|keyboard|keyboardHidden|navigation"`
+  and `android:screenOrientation="sensorLandscape"`. Without them a fold or
+  unfold restarts the activity: `Destroy` arrives, and the player exits on
+  `Destroy`. With them it arrives as `ConfigChanged` / `WindowResized`.
+- The player does not pause on `Pause` or `Stop` yet: the game and its sound
+  keep running in the background until the activity is destroyed.
 - Present through a wgpu surface on the drawer's device instead of
   softbuffer's CPU copy. The phone's memory bandwidth is shared with the GPU,
   so the per-frame RGBA copy that is cheap on a PC costs more here.

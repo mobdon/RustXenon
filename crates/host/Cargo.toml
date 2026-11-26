@@ -19,3 +19,6 @@ xenon-recomp = { path = "../recomp" }
 xenon-rt = { path = "../rt" }
 xenon-texture = { path = "../texture" }
 xenon-window = { path = "../window" }
+
+[target.'cfg(target_os = "android")'.dependencies]
+libc = "0.2"

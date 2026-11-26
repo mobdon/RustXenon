@@ -2987,6 +2987,7 @@ dependencies = [
 name = "xenon-host"
 version = "0.0.0"
 dependencies = [
+ "libc",
  "sha1",
  "sha2",
  "toml",
@@ -3060,6 +3061,7 @@ version = "0.0.0"
 name = "xenon-window"
 version = "0.0.0"
 dependencies = [
+ "android-activity",
  "font8x8",
  "softbuffer",
  "winit",

@@ -218,7 +218,10 @@ layout, with its interleaved hash tables), refusing unsafe names.
   a job) in the workspace's `.cargo/config.toml`, and a profile without
   debug info or incremental state.
 
-The game crate calls `xenon_host::run` with the executable's SHA-256; the
+The game crate's library holds the executable's SHA-256 and the register
+list; its `main.rs` passes them to `xenon_host::run`, and on Android its
+`android_main` passes them to `xenon_host::android_main` (built with `cargo
+rustc -p game --lib --crate-type cdylib --target aarch64-linux-android`). The
 host refuses any other executable. Everything under the build folder is
 derived from the game and stays local.
 

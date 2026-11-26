@@ -1,6 +1,6 @@
 [package]
 name = "xenon-window"
-description = "The game window: shows the drawer's frames and reads an XInput controller and the keyboard. Thin glue over xenon-input."
+description = "The game window: shows the drawer's frames and reads an XInput controller and the keyboard, or an Android activity's controller. Thin glue over xenon-input."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -9,6 +9,12 @@ license.workspace = true
 
 [dependencies]
 font8x8 = { version = "0.3", default-features = false }
+xenon-input = { path = "../input" }
+
+[target.'cfg(not(target_os = "android"))'.dependencies]
 softbuffer = "0.4"
 winit = "0.30"
-xenon-input = { path = "../input" }
+
+# ndk comes re-exported from android-activity, so the two always match.
+[target.'cfg(target_os = "android")'.dependencies]
+android-activity = { version = "0.6", features = ["native-activity"] }

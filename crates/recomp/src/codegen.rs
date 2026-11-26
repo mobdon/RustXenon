@@ -8,7 +8,11 @@
 //!   [`crate::emit::block_function`]).
 //! - Parallel compile jobs are capped by a memory budget (`.cargo/config.toml`),
 //!   which also builds for the building machine's CPU (`target-cpu=native`):
-//!   a built game is for that machine.
+//!   a built game is for that machine. Android builds (`cargo rustc -p game
+//!   --lib --crate-type cdylib --target aarch64-linux-android`) are for any
+//!   phone CPU at least a Cortex-A76.
+//! - The `game` crate's library holds the SHA-256 and the register list;
+//!   its `main.rs` runs them, and on Android its `android_main` does.
 //!
 //! The output is derived from the player's game and never goes in git.
 
@@ -148,7 +152,7 @@ pub fn write(img: &Image, a: &Analysis, out: &Path, o: &Options) -> io::Result<S
     let mut regs = String::new();
     for m in &members {
         let _ = writeln!(deps, "{m} = {{ path = \"../gen/{m}\" }}");
-        let _ = write!(regs, "{m}::register, ");
+        let _ = writeln!(regs, "    {m}::register,");
     }
     put(
         &out.join("game/Cargo.toml"),
@@ -161,11 +165,24 @@ pub fn write(img: &Image, a: &Analysis, out: &Path, o: &Options) -> io::Result<S
         &mut st,
     )?;
     put(
-        &out.join("game/src/main.rs"),
+        &out.join("game/src/lib.rs"),
         &format!(
-            "//! Generated. Never commit.\n#![cfg_attr(feature = \"player\", windows_subsystem = \"windows\")]\nfn main() -> std::process::ExitCode {{\n    xenon_host::run(\"{}\", &[{regs}])\n}}\n",
+            "//! Generated. Never commit.\n\n\
+             /// The executable this build is for.\n\
+             pub const SHA256: &str = \"{}\";\n\n\
+             /// Every generated crate's register function.\n\
+             pub static REGS: &[fn(&mut xenon_rt::Runtime)] = &[\n{regs}];\n\n\
+             #[cfg(target_os = \"android\")]\n\
+             #[no_mangle]\n\
+             fn android_main(app: xenon_host::AndroidApp) {{\n    \
+             xenon_host::android_main(app, SHA256, REGS)\n}}\n",
             o.sha256
         ),
+        &mut st,
+    )?;
+    put(
+        &out.join("game/src/main.rs"),
+        "//! Generated. Never commit.\n#![cfg_attr(feature = \"player\", windows_subsystem = \"windows\")]\nfn main() -> std::process::ExitCode {\n    xenon_host::run(game::SHA256, game::REGS)\n}\n",
         &mut st,
     )?;
     let list: Vec<String> = members.iter().map(|m| format!("\"gen/{m}\"")).collect();
@@ -197,7 +214,12 @@ pub fn write(img: &Image, a: &Analysis, out: &Path, o: &Options) -> io::Result<S
              # The build runs on the machine that built it: code for its CPU\n\
              # (fused multiply-add and wide vectors instead of library calls\n\
              # took about a sixth off a game's render thread).\n\
-             rustflags = [\"-C\", \"target-cpu=native\"]\n",
+             [target.'cfg(not(target_os = \"android\"))']\n\
+             rustflags = [\"-C\", \"target-cpu=native\"]\n\n\
+             # A phone is not the building machine: a core every recent phone\n\
+             # CPU (and each core of a big.LITTLE one) can run.\n\
+             [target.aarch64-linux-android]\n\
+             rustflags = [\"-C\", \"target-cpu=cortex-a76\"]\n",
             o.jobs
         ),
         &mut st,
@@ -280,6 +302,49 @@ mod tests {
         };
         let st = write(&img, &a, Path::new(&out), &o).unwrap();
         eprintln!("{st:?}");
+    }
+
+    #[test]
+    fn game_crate_runs_on_desktop_and_android() {
+        use crate::fixture::{Packing, XexSpec};
+        let spec = XexSpec::sample();
+        let img = crate::xex::load(&spec.build(&spec.image(), Packing::None, None), &[]).unwrap();
+        let a = crate::analysis::analyze(&img, &crate::hooks::Hooks::default());
+        let out = std::env::temp_dir().join(format!("xenon-codegen-game-{}", std::process::id()));
+        let o = Options {
+            range: DEFAULT_RANGE,
+            max_part: 4000,
+            jobs: 3,
+            crates: Path::new(env!("CARGO_MANIFEST_DIR")).join(".."),
+            sha256: "ab".repeat(32),
+        };
+        write(&img, &a, &out, &o).unwrap();
+        let read = |p: &str| std::fs::read_to_string(out.join(p)).unwrap();
+        let lib = read("game/src/lib.rs");
+        assert!(lib.contains(&format!("pub const SHA256: &str = \"{}\";", o.sha256)));
+        assert!(lib.contains("pub static REGS: &[fn(&mut xenon_rt::Runtime)] = &[\n    g"));
+        assert!(lib.contains("::register,\n];"));
+        assert!(lib.contains(
+            "#[cfg(target_os = \"android\")]\n#[no_mangle]\nfn android_main(app: xenon_host::AndroidApp) {\n    xenon_host::android_main(app, SHA256, REGS)\n}"
+        ));
+        let main = read("game/src/main.rs");
+        assert!(main.contains("windows_subsystem"));
+        assert!(main.contains("xenon_host::run(game::SHA256, game::REGS)"));
+        // No crate-type: a desktop build links one program, not a library too.
+        assert!(!read("game/Cargo.toml").contains("crate-type"));
+        let config: toml::Table = read(".cargo/config.toml").parse().unwrap();
+        assert_eq!(config["build"]["jobs"].as_integer(), Some(3));
+        let flags = |t: &str| config["target"][t]["rustflags"].as_array().unwrap().clone();
+        assert_eq!(
+            flags("cfg(not(target_os = \"android\"))"),
+            ["-C", "target-cpu=native"].map(toml::Value::from)
+        );
+        assert_eq!(
+            flags("aarch64-linux-android"),
+            ["-C", "target-cpu=cortex-a76"].map(toml::Value::from)
+        );
+        assert!(config["build"].get("rustflags").is_none());
+        std::fs::remove_dir_all(out).unwrap();
     }
 
     #[test]
