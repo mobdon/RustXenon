@@ -70,6 +70,8 @@ pub enum Hit {
     Row(usize),
     /// The Games page's prompt box under the details (start, or look again).
     Info,
+    /// A settings row's `<` (-1) or `>` (+1) arrow.
+    Step(usize, i32),
 }
 
 // Layout on the board.
@@ -174,6 +176,23 @@ fn row_rect(l: &Lay, r: usize) -> Rect {
     )
 }
 
+/// Width of the settings value column, wide enough for `< 3840 >`.
+const VAL_COL: f32 = 190.0;
+
+/// A settings row's `<` and `>` arrows: what is drawn and what is clicked
+/// (the arrow plus some room round it, the full row height).
+fn arrow_rects(l: &Lay, r: usize) -> (Rect, Rect) {
+    let (rx, ry, rw, rh) = row_rect(l, r);
+    let aw = text_w(3.0, ">");
+    let right = rx + rw - 20.0 - aw;
+    let left = rx + rw - 20.0 - VAL_COL;
+    let pad = 12.0;
+    (
+        (left - pad, ry, aw + 2.0 * pad, rh),
+        (right - pad, ry, aw + 2.0 * pad, rh),
+    )
+}
+
 fn preview_rect(l: &Lay) -> Rect {
     (l.dx, LIST_Y, l.dw, PREVIEW_H)
 }
@@ -211,7 +230,17 @@ pub fn hit(w: usize, h: usize, page: Page, x: f32, y: f32) -> Option<Hit> {
     if page == Page::Games && inside(info_rect(&l)) {
         return Some(Hit::Info);
     }
-    (0..ROWS).find(|&r| inside(row_rect(&l, r))).map(Hit::Row)
+    let r = (0..ROWS).find(|&r| inside(row_rect(&l, r)))?;
+    if page == Page::Settings {
+        let (down, up) = arrow_rects(&l, r);
+        if inside(down) {
+            return Some(Hit::Step(r, -1));
+        }
+        if inside(up) {
+            return Some(Hit::Step(r, 1));
+        }
+    }
+    Some(Hit::Row(r))
 }
 
 /// Draws the whole screen.
@@ -1336,10 +1365,22 @@ pub fn overlay(px: &mut [u32], w: usize, h: usize, v: &View, t: f32) {
             Page::Settings => {
                 text(&mut cv, tx, y + 9.0, 3.0, tc, &row.title);
                 text(&mut cv, tx, y + 35.0, 1.8, subc, &row.sub);
+                // Fixed arrows (they are click targets), the value centred
+                // between them.
+                let (down, up) = arrow_rects(&l, i - v.scroll);
+                let ax = |r: Rect| r.0 + 12.0;
+                text(&mut cv, ax(down), y + 17.0, 3.0, tc, "<");
+                text(&mut cv, ax(up), y + 17.0, 3.0, tc, ">");
                 let val = v.settings.show(i);
-                let val = if sel { format!("< {val} >") } else { val };
-                let vx = rx + rw - 20.0 - text_w(3.0, &val);
-                text(&mut cv, vx, y + 17.0, 3.0, tc, &val);
+                let mid = (ax(down) + ax(up) + text_w(3.0, ">")) / 2.0;
+                text(
+                    &mut cv,
+                    mid - text_w(3.0, &val) / 2.0,
+                    y + 17.0,
+                    3.0,
+                    tc,
+                    &val,
+                );
             }
         }
     }
@@ -1588,7 +1629,20 @@ mod tests {
                     let (x, y, rw, rh) = row_rect(&l, r);
                     assert_eq!(at(x + rw / 2.0, y + rh / 2.0), Some(Hit::Row(r)));
                     assert_eq!(at(x + 3.0, y + 3.0), Some(Hit::Row(r)));
-                    assert_eq!(at(x + rw - 3.0, y + rh - 3.0), Some(Hit::Row(r)));
+                    // The arrows only step on the Settings page.
+                    let (down, up) = arrow_rects(&l, r);
+                    let mid = |r: Rect| (r.0 + r.2 / 2.0, r.1 + r.3 / 2.0);
+                    let (dx, dy) = mid(down);
+                    let (ux, uy) = mid(up);
+                    if page == Page::Settings {
+                        assert_eq!(at(dx, dy), Some(Hit::Step(r, -1)));
+                        assert_eq!(at(ux, uy), Some(Hit::Step(r, 1)));
+                        // Between the arrows (on the value) only selects.
+                        assert_eq!(at((dx + ux) / 2.0, dy), Some(Hit::Row(r)));
+                    } else {
+                        assert_eq!(at(dx, dy), Some(Hit::Row(r)));
+                        assert_eq!(at(x + rw - 3.0, y + rh - 3.0), Some(Hit::Row(r)));
+                    }
                 }
                 for other in PAGES.into_iter().filter(|&p| p != page) {
                     let (x, y, sw, sh) = strip_rect(page, other).unwrap();

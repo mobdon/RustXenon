@@ -543,7 +543,17 @@ impl ApplicationHandler for App {
                             && self.scroll[self.page as usize] + r < self.len() =>
                     {
                         self.select(self.scroll[self.page as usize] + r);
-                        self.act(Act::Go);
+                        // A settings row changes only through its arrows.
+                        if self.page == Page::Games {
+                            self.act(Act::Go);
+                        }
+                    }
+                    Some(Hit::Step(r, dir))
+                        if self.running.is_none()
+                            && self.scroll[self.page as usize] + r < self.len() =>
+                    {
+                        self.select(self.scroll[self.page as usize] + r);
+                        self.change(dir);
                     }
                     Some(Hit::Info) if self.running.is_none() => {
                         self.act(if self.games.is_empty() {
