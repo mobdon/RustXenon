@@ -3233,6 +3233,18 @@ name = "xenon-input"
 version = "0.0.0"
 
 [[package]]
+name = "xenon-play"
+version = "0.0.0"
+dependencies = [
+ "png 0.17.16",
+ "serde",
+ "softbuffer",
+ "toml",
+ "winit",
+ "xenon-input",
+]
+
+[[package]]
 name = "xenon-recomp"
 version = "0.0.0"
 dependencies = [
