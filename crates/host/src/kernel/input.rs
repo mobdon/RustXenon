@@ -20,6 +20,10 @@ const KEYS: [u16; 14] = [
 ];
 
 const HOLD_MS: u64 = 150;
+/// Script-only bits for the triggers (`lt`, `rt`), which XInput reports as
+/// bytes, not buttons: two button bits XInput leaves unused.
+const SCRIPT_LT: u16 = 0x0400;
+const SCRIPT_RT: u16 = 0x0800;
 const ERROR_EMPTY: u32 = 0x10D2;
 
 pub enum Script {
@@ -52,7 +56,8 @@ static LAST_STATE: Mutex<(Pad, u32)> = Mutex::new((
     0,
 ));
 
-/// Parses `--press` text: `5000:start,6500:a+b`.
+/// Parses `--press` text: `5000:start,6500:a+b`. `lt` and `rt` pull a
+/// trigger fully.
 pub fn parse(text: &str) -> Result<Script, String> {
     let mut v = Vec::new();
     for item in text.split(',').filter(|s| !s.trim().is_empty()) {
@@ -66,11 +71,17 @@ pub fn parse(text: &str) -> Result<Script, String> {
         let mut bits = 0;
         for name in b.split('+') {
             let name = name.trim().to_ascii_lowercase();
-            bits |= BUTTONS
-                .iter()
-                .find(|x| x.0 == name)
-                .ok_or_else(|| format!("unknown button {name:?}"))?
-                .1;
+            bits |= match name.as_str() {
+                "lt" => SCRIPT_LT,
+                "rt" => SCRIPT_RT,
+                _ => {
+                    BUTTONS
+                        .iter()
+                        .find(|x| x.0 == name)
+                        .ok_or_else(|| format!("unknown button {name:?}"))?
+                        .1
+                }
+            };
         }
         v.push((t, bits));
     }
@@ -117,10 +128,19 @@ fn now() -> Option<Pad> {
     if let (Script::Live, Some(w)) = (s, WINDOW.get()) {
         return Some(w.pad());
     }
-    buttons_at(s, crate::ms() as u64).map(|buttons| Pad {
-        buttons,
+    buttons_at(s, crate::ms() as u64).map(scripted_pad)
+}
+
+/// The pad a script's bits stand for: its buttons, and a trigger fully
+/// pulled for each trigger bit.
+fn scripted_pad(bits: u16) -> Pad {
+    let pulled = |bit| if bits & bit != 0 { 255 } else { 0 };
+    Pad {
+        buttons: bits & !(SCRIPT_LT | SCRIPT_RT),
+        lt: pulled(SCRIPT_LT),
+        rt: pulled(SCRIPT_RT),
         ..Pad::default()
-    })
+    }
 }
 
 fn connected(user: u32) -> bool {
@@ -225,6 +245,12 @@ mod tests {
         assert_eq!(buttons_at(&s, 1150), Some(0));
         assert_eq!(buttons_at(&s, 2010), Some(0x3000));
         assert!(parse("10:jump").is_err());
+        // Triggers are bytes in the pad, not button bits.
+        let t = parse("0:rt+a,500:lt").unwrap();
+        let pad = scripted_pad(buttons_at(&t, 10).unwrap());
+        assert_eq!((pad.buttons, pad.lt, pad.rt), (0x1000, 0, 255));
+        let pad = scripted_pad(buttons_at(&t, 510).unwrap());
+        assert_eq!((pad.buttons, pad.lt, pad.rt), (0, 255, 0));
         assert!(parse("start").is_err());
         assert_eq!(buttons_at(&Script::Unplugged, 0), None);
         assert_eq!(buttons_at(&Script::Default, 5000), Some(0x10));
