@@ -55,6 +55,7 @@ const EAGAIN: c_int = if cfg!(target_os = "macos") { -35 } else { -11 };
 const EOF: c_int = -(0x2046_4F45); // FFERRTAG('E','O','F',' ')
 const AVMEDIA_TYPE_AUDIO: c_int = 1;
 const PADDING: usize = 64; // AV_INPUT_BUFFER_PADDING_SIZE
+const AV_LOG_ERROR: c_int = 16;
 
 // Field offsets on 64-bit targets, unchanged from FFmpeg 4 to 7.
 const CODEC_ID: usize = 20; // AVCodec.id
@@ -134,6 +135,7 @@ api! {
     u av_opt_set: fn(P, *const c_char, *const c_char, c_int) -> c_int;
     u av_opt_set_int: fn(P, *const c_char, i64, c_int) -> c_int;
     u av_mallocz: fn(usize) -> P;
+    u av_log_set_level: fn(c_int);
 }
 
 /// Opens one library. On Windows a library given by full path has its own
@@ -201,6 +203,10 @@ impl Ffmpeg {
             if !ff.license.starts_with("LGPL") {
                 return Err(Error::NotLgpl(ff.license));
             }
+            // Only real errors: the xma2 decoder warns that it could not
+            // update timestamps for skipped samples over a hundred times a
+            // second.
+            unsafe { (ff.av_log_set_level)(AV_LOG_ERROR) };
             return Ok(ff);
         }
         Err(Error::NotFound(tried.join(", ")))
