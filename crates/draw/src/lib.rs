@@ -1470,10 +1470,10 @@ pub struct Drawer {
     index_memo_bytes: usize,
     /// See [`Drawer::transfer_setup`].
     transfer_setups: HashMap<(RenderTargetKey, u32, RenderTargetKey, u32), Arc<TransferSetup>>,
-    /// The last `Consts` block staged in the arena and its (offset, size),
-    /// bound again by a draw with the same bytes. Cleared with
-    /// `window_memo` when the arena wraps or grows.
-    staged_consts: Option<(ConstsBlock, (u64, u64))>,
+    /// The last `Consts` block staged in the arena, as prefix and suffix,
+    /// and its (offset, size), bound again by a draw with the same bytes.
+    /// Cleared with `window_memo` when the arena wraps or grows.
+    staged_consts: Option<(ConstsBlock, [u32; CONSTS_SUFFIX], (u64, u64))>,
     /// Counts the arena's wraps (from 1): a slice staged in an earlier
     /// epoch is overwritten (see [`HostIndices::staged`]).
     arena_epoch: u64,
@@ -1486,8 +1486,10 @@ pub struct Drawer {
     /// Bumped by every register write to the constants a `Consts` block
     /// holds, so a draw rebuilds the block only after one.
     consts_gen: u64,
-    /// The last `Consts` block built, by (generation, window base, rebase).
-    consts_built: Option<(ConstsKey, ConstsBlock)>,
+    /// The last `Consts` block prefix built, by generation: the same
+    /// block while its registers hold the same words, so draws compare
+    /// blocks by pointer.
+    consts_built: Option<(u64, ConstsBlock)>,
     /// Kept-resolve texture decodes recorded since the last flush,
     /// submitted with (before) the batch's draws.
     pre: Option<wgpu::CommandEncoder>,
@@ -1843,10 +1845,9 @@ fn to_bytes(words: &[u32]) -> Vec<u8> {
     out
 }
 
-/// A built `Consts` block, shared by the draws that bind it.
+/// A built `Consts` block prefix ([`consts_prefix`]), shared by the draws
+/// that bind it.
 type ConstsBlock = Arc<Vec<u8>>;
-/// (register generation, window base, rebase words) of a `Consts` block.
-type ConstsKey = (u64, u32, [i32; 96]);
 
 /// Registers of one stage's 256 float constants (4 each): the vertex
 /// stage's, then the pixel stage's.
@@ -1887,30 +1888,41 @@ const CONSTS_REGS: [std::ops::Range<u32>; 3] = [
     regs::VGT_INDX_OFFSET..regs::VGT_INDX_OFFSET + 1,
 ];
 
-/// The `Consts` uniform of the shader binding contract: fetch, bool and
-/// loop constants, then the window base, the index offset and the 96
-/// vertex fetch constants' rebase words. (The float constants are bound
-/// apart, a span for each stage: see [`FLOAT_STAGE_REGS`].)
-fn consts(r: &regs::RegisterFile, window_base: u32, rebase: &[i32; 96]) -> Vec<u8> {
+/// Words of a `Consts` block's suffix: the window base, the index offset,
+/// two of padding and the 96 rebase words.
+const CONSTS_SUFFIX: usize = 4 + 96;
+
+/// Bytes of a `Consts` block: its prefix (see [`consts_prefix`]) and suffix.
+const CONSTS_BYTES: usize = 4 * (192 + 8 + 32) + 4 * CONSTS_SUFFIX;
+
+/// The `Consts` uniform of the shader binding contract is this prefix, the
+/// fetch, bool and loop constants, which only register writes change, then
+/// [`consts_suffix`]. (The float constants are bound apart, a span for
+/// each stage: see [`FLOAT_STAGE_REGS`].)
+fn consts_prefix(r: &regs::RegisterFile) -> Vec<u8> {
     // Bool and loop constants are adjacent.
     const _: () = assert!(regs::SHADER_CONSTANT_BOOL + 8 == regs::SHADER_CONSTANT_LOOP);
-    let tail = [window_base, r.get(regs::VGT_INDX_OFFSET), 0, 0];
-    let rebase = rebase.map(|w| w as u32);
-    let blocks = [
-        r.slice(regs::SHADER_CONSTANT_FETCH, 192),
-        r.slice(regs::SHADER_CONSTANT_BOOL, 8 + 32),
-        &tail,
-        &rebase,
-    ];
-    let mut b = vec![0; 4 * (192 + 8 + 32 + 4 + 96)];
-    let mut at = 0;
-    for block in blocks {
-        for (o, w) in b[at..][..4 * block.len()].chunks_exact_mut(4).zip(block) {
-            o.copy_from_slice(&w.to_le_bytes());
-        }
-        at += 4 * block.len();
-    }
+    let fetch = r.slice(regs::SHADER_CONSTANT_FETCH, 192);
+    let bool_loop = r.slice(regs::SHADER_CONSTANT_BOOL, 8 + 32);
+    let mut b = vec![0; 4 * (fetch.len() + bool_loop.len())];
+    words_into(fetch, &mut b);
+    words_into(bool_loop, &mut b[4 * fetch.len()..]);
     b
+}
+
+/// The rest of a `Consts` block, which each draw's window sets: the window
+/// base, the index offset and the 96 vertex fetch constants' rebase words.
+fn consts_suffix(
+    r: &regs::RegisterFile,
+    window_base: u32,
+    rebase: &[i32; 96],
+) -> [u32; CONSTS_SUFFIX] {
+    let mut s = [0; CONSTS_SUFFIX];
+    s[..2].copy_from_slice(&[window_base, r.get(regs::VGT_INDX_OFFSET)]);
+    for (o, &w) in s[4..].iter_mut().zip(rebase) {
+        *o = w as u32;
+    }
+    s
 }
 
 /// Adds the epilogue and the extra outputs to a translated vertex shader.
@@ -4646,11 +4658,6 @@ impl Drawer {
         buf
     }
 
-    /// The `Consts` uniform of the shader binding contract.
-    fn consts(&self, window_base: u32, rebase: &[i32; 96]) -> Vec<u8> {
-        consts(&self.regs, window_base, rebase)
-    }
-
     /// Texture and sampler for fetch constant slot `n`. A slot without a
     /// texture fetch constant, or whose texture cannot be read or decoded,
     /// gets a 1x1 texture of zeros (as Xenia binds its null image) and a
@@ -5640,15 +5647,21 @@ impl Drawer {
         let indices = offset_range(idx.min_max, self.regs.get(regs::VGT_INDX_OFFSET));
         let (mut read, window_base, rebase, staged) =
             self.guest_window(vf_mask, indices, mem, report)?;
-        let key = (self.consts_gen, window_base, rebase);
+        let gen = self.consts_gen;
         let consts = match &self.consts_built {
-            Some((k, c)) if *k == key => c.clone(),
-            _ => {
-                let c = Arc::new(self.consts(window_base, &rebase));
-                self.consts_built = Some((key, c.clone()));
+            Some((g, c)) if *g == gen => c.clone(),
+            built => {
+                // Registers written with the words they held keep the block.
+                let c = consts_prefix(&self.regs);
+                let c = match built {
+                    Some((_, old)) if **old == c => old.clone(),
+                    _ => Arc::new(c),
+                };
+                self.consts_built = Some((gen, c.clone()));
                 c
             }
         };
+        let suffix = consts_suffix(&self.regs, window_base, &rebase);
         let epi = state::epilogue(&self.regs, w, h);
         // The indices are staged once and bound again by later draws of
         // them until the arena wraps: a frame draws the same meshes many
@@ -5661,8 +5674,8 @@ impl Drawer {
         let mut kept_window =
             staged.filter(|((a, b, s), _)| self.window_memo.get(a) == Some(&(*b, *s)));
         let mut kept_consts = (self.staged_consts.as_ref())
-            .filter(|(b, _)| Arc::ptr_eq(b, &consts) || **b == *consts)
-            .map(|&(_, s)| s);
+            .filter(|(b, s, _)| *s == suffix && (Arc::ptr_eq(b, &consts) || **b == *consts))
+            .map(|&(_, _, s)| s);
         // Each stage's float constants: those it reads, staged again only
         // when one of the stage's registers was written since.
         let float_masks = [&vs_t.info, &ps_t.info].map(|info| info.float_consts_bound());
@@ -5687,7 +5700,7 @@ impl Drawer {
                 .map(|&(lo, hi)| self.staged_size(hi - lo))
                 .sum(),
         };
-        let consts_need = self.staged_size(consts.len() as u64);
+        let consts_need = self.staged_size(CONSTS_BYTES as u64);
         let float_need = float_len.map(|n| n.map_or(0, |n| self.staged_size(n as u64)));
         let epi_need = self.staged_size(4 * epi.len() as u64);
         let index_need = self.staged_size(idx.bytes.len() as u64);
@@ -5777,8 +5790,14 @@ impl Drawer {
                 s
             }
             None => {
-                let s = self.push_bytes(&consts);
-                self.staged_consts = Some((consts, s));
+                let s = (self.push(CONSTS_BYTES, |b| {
+                    let (prefix, rest) = b.split_at_mut(consts.len());
+                    prefix.copy_from_slice(&consts);
+                    words_into(&suffix, rest);
+                    true
+                }))
+                .expect("constants staged");
+                self.staged_consts = Some((consts, suffix, s));
                 s
             }
         };
@@ -7179,7 +7198,10 @@ mod tests {
         want.extend([0x1234_5678, 77, 0, 0]);
         let rebase = std::array::from_fn(|k| k as i32 - 3);
         want.extend(rebase.map(|w: i32| w as u32));
-        assert_eq!(consts(r, 0x1234_5678, &rebase), to_bytes(&want));
+        let mut got = consts_prefix(r);
+        got.extend(to_bytes(&consts_suffix(r, 0x1234_5678, &rebase)));
+        assert_eq!(got, to_bytes(&want));
+        assert_eq!(got.len(), CONSTS_BYTES);
     }
 
     /// A drawer on the test adapter, held under one lock so the unit tests
