@@ -36,47 +36,33 @@ unsafe impl Sync for GuestMemory {}
 /// by hand, touching every page). Covers the widest atomic access.
 const ALIGN: usize = 16;
 
+// The aligned path is forced inline: as a plain `#[inline]` LLVM keeps
+// every access in a large generated function as a call (seen on aarch64 at
+// opt-level 1 and 3), which showed in profiles as read_u32 / write_u32.
+// The unaligned paths stay out of line.
 macro_rules! access {
     ($read:ident, $write:ident, $t:ty, $atomic:ty) => {
-        #[inline]
+        #[inline(always)]
         pub fn $read(&self, addr: u32) -> $t {
             const N: usize = size_of::<$t>();
             if addr as usize % N == 0 {
                 let p = self.at(addr, N);
                 // SAFETY: in bounds and aligned (the base is 16-byte aligned).
                 <$t>::from_be(unsafe { <$atomic>::from_ptr(p.cast()) }.load(Relaxed))
-            } else if crosses_view(addr, N) {
-                let mut b = [0u8; N];
-                for (i, x) in b.iter_mut().enumerate() {
-                    *x = self.read_u8(addr.wrapping_add(i as u32));
-                }
-                <$t>::from_be_bytes(b)
             } else {
-                let p = self.at(addr, N);
-                let mut b = [0u8; N];
-                for (i, x) in b.iter_mut().enumerate() {
-                    *x = byte(p, i).load(Relaxed);
-                }
-                <$t>::from_be_bytes(b)
+                <$t>::from_be_bytes(self.read_unaligned::<N>(addr))
             }
         }
 
-        #[inline]
+        #[inline(always)]
         pub fn $write(&self, addr: u32, v: $t) {
             const N: usize = size_of::<$t>();
             if addr as usize % N == 0 {
                 let p = self.at(addr, N);
                 // SAFETY: in bounds and aligned.
                 unsafe { <$atomic>::from_ptr(p.cast()) }.store(v.to_be(), Relaxed);
-            } else if crosses_view(addr, N) {
-                for (i, x) in v.to_be_bytes().into_iter().enumerate() {
-                    self.write_u8(addr.wrapping_add(i as u32), x);
-                }
             } else {
-                let p = self.at(addr, N);
-                for (i, x) in v.to_be_bytes().into_iter().enumerate() {
-                    byte(p, i).store(x, Relaxed);
-                }
+                self.write_unaligned::<N>(addr, v.to_be_bytes());
             }
         }
     };
@@ -86,7 +72,7 @@ macro_rules! access {
 /// 0xA0000000 (64 KB pages), 0xC0000000 (16 MB pages) and 0xE0000000 (4 KB
 /// pages, offset by 4 KB). The upper two views are folded onto the first, so
 /// a buffer written through one view reads back through another.
-#[inline]
+#[inline(always)]
 pub(crate) fn alias(addr: u32) -> u32 {
     if addr < 0xC000_0000 {
         return addr;
@@ -205,7 +191,7 @@ impl GuestMemory {
     /// Host pointer for `n` bytes at `addr`; stops with the address when the
     /// range is outside guest memory (one compare, and it keeps the pointer
     /// math sound).
-    #[inline]
+    #[inline(always)]
     fn at(&self, addr: u32, n: usize) -> *mut u8 {
         let a = alias(addr) as usize;
         if a + n > self.len {
@@ -222,6 +208,38 @@ impl GuestMemory {
     #[inline]
     pub fn write_u8(&self, addr: u32, v: u8) {
         byte(self.at(addr, 1), 0).store(v, Relaxed)
+    }
+
+    /// The `N` bytes of an unaligned scalar at `addr`, byte by byte.
+    #[inline(never)]
+    fn read_unaligned<const N: usize>(&self, addr: u32) -> [u8; N] {
+        let mut b = [0u8; N];
+        if crosses_view(addr, N) {
+            for (i, x) in b.iter_mut().enumerate() {
+                *x = self.read_u8(addr.wrapping_add(i as u32));
+            }
+        } else {
+            let p = self.at(addr, N);
+            for (i, x) in b.iter_mut().enumerate() {
+                *x = byte(p, i).load(Relaxed);
+            }
+        }
+        b
+    }
+
+    /// Stores an unaligned scalar's bytes `b` at `addr`, byte by byte.
+    #[inline(never)]
+    fn write_unaligned<const N: usize>(&self, addr: u32, b: [u8; N]) {
+        if crosses_view(addr, N) {
+            for (i, x) in b.into_iter().enumerate() {
+                self.write_u8(addr.wrapping_add(i as u32), x);
+            }
+        } else {
+            let p = self.at(addr, N);
+            for (i, x) in b.into_iter().enumerate() {
+                byte(p, i).store(x, Relaxed);
+            }
+        }
     }
 
     access!(read_u16, write_u16, u16, AtomicU16);

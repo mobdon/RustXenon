@@ -15,7 +15,6 @@ pub mod kernel;
 pub mod settings;
 
 use sha2::{Digest, Sha256};
-use std::cell::Cell;
 use std::collections::VecDeque;
 use std::io::Write;
 use std::path::PathBuf;
@@ -36,9 +35,8 @@ static THUNKS: (AtomicU32, AtomicU32) = (AtomicU32::new(0), AtomicU32::new(0));
 static START: OnceLock<Instant> = OnceLock::new();
 
 thread_local! {
-    /// Guest stack pointer at the newest call.
-    static SP: Cell<u32> = const { Cell::new(0) };
-    /// This thread's entry in [`ACTIVITY`].
+    /// This thread's entry in [`ACTIVITY`]. Entries are never removed, so
+    /// a pointer to one (kept in [`Context::host`]) stays valid.
     static MINE: Arc<Activity> = {
         let a = Arc::new(Activity::default());
         let t = std::thread::current();
@@ -177,7 +175,7 @@ fn activity_report() {
 /// newest call (each frame links to its caller's; the caller's saved link
 /// register sits 8 bytes below that).
 fn backtrace(rt: &Runtime) -> Vec<u32> {
-    backtrace_from(rt, SP.with(Cell::get))
+    backtrace_from(rt, MINE.with(|m| m.sp.load(Ordering::Relaxed)))
 }
 
 fn backtrace_from(rt: &Runtime, mut sp: u32) -> Vec<u32> {
@@ -373,23 +371,29 @@ fn watch(c: &Context, addr: u32) {
     }
 }
 
-fn trace(c: &Context, addr: u32) {
+fn trace(c: &mut Context, addr: u32) {
     if DEBUG_HOOKS.load(Ordering::Relaxed) {
         profile_call(addr);
         watch(c, addr);
     }
-    SP.with(|s| s.set(c.r[1] as u32));
-    MINE.with(|m| {
-        let h = m.head.load(Ordering::Relaxed);
-        m.ring[(h % 8) as usize].store(addr, Ordering::Relaxed);
-        m.head.store(h.wrapping_add(1), Ordering::Relaxed);
-        m.call.store(addr, Ordering::Relaxed);
-        m.sp.store(c.r[1] as u32, Ordering::Relaxed);
-        m.r3.store(c.r[3] as u32, Ordering::Relaxed);
-        if is_thunk(addr) {
-            import_call(m, c, addr);
-        }
-    });
+    // This thread's entry, found once per context instead of per call: a
+    // thread-local lookup is a libc call on Android.
+    if c.host.0.is_null() {
+        c.host.0 = MINE.with(Arc::as_ptr).cast();
+    }
+    // SAFETY: set just above on this host thread from an entry that is
+    // never freed; the runtime resets the slot when a context moves to a
+    // new thread or is cloned.
+    let m = unsafe { &*c.host.0.cast::<Activity>() };
+    let h = m.head.load(Ordering::Relaxed);
+    m.ring[(h % 8) as usize].store(addr, Ordering::Relaxed);
+    m.head.store(h.wrapping_add(1), Ordering::Relaxed);
+    m.call.store(addr, Ordering::Relaxed);
+    m.sp.store(c.r[1] as u32, Ordering::Relaxed);
+    m.r3.store(c.r[3] as u32, Ordering::Relaxed);
+    if is_thunk(addr) {
+        import_call(m, c, addr);
+    }
 }
 
 /// The import half of [`trace`], out of line so the per-call hook stays small.
@@ -1129,12 +1133,48 @@ mod tests {
         assert!(clean);
     }
 
+    /// Cost of one guest call through `Runtime::call` with the host's trace
+    /// hook, on a guest thread: `cargo test -p xenon-host --release --lib
+    /// -- --ignored traced_call_speed --nocapture`.
+    #[test]
+    #[ignore]
+    fn traced_call_speed() {
+        use std::sync::atomic::AtomicU64;
+        use xenon_rt::{Context, GuestMemory, Runtime};
+        const N: u64 = 1_000_000;
+        static NS: AtomicU64 = AtomicU64::new(0);
+        fn leaf(_: &Runtime, c: &mut Context) {
+            c.r[3] += 1;
+        }
+        fn entry(rt: &Runtime, c: &mut Context) {
+            let t = std::time::Instant::now();
+            for i in 0..N {
+                c.r[1] = 0x7000_0000 - (i & 0xF0);
+                rt.call(c, 0x8200_0010);
+            }
+            NS.store(t.elapsed().as_nanos() as u64, super::Ordering::Relaxed);
+        }
+        let mut rt = Runtime::new(GuestMemory::new(16));
+        rt.register(0x8200_0000, entry);
+        rt.register(0x8200_0010, leaf);
+        super::install_trace(&mut rt);
+        let rt = rt.share();
+        let id = rt.spawn(0x8200_0000, Context::new(), false);
+        assert_eq!(rt.join(id), N);
+        let ns = NS.load(super::Ordering::Relaxed) as f64;
+        eprintln!(
+            "traced call: {:.2} ns per call, {:.1} ms per million",
+            ns / N as f64,
+            ns / 1e6 * (1e6 / N as f64)
+        );
+    }
+
     #[test]
     fn ring_keeps_the_last_eight_calls_and_wait_marker_clears() {
         let mut c = xenon_rt::Context::new();
         for a in 1..=10u32 {
             c.r[3] = u64::from(0x4000_0000 + a);
-            super::trace(&c, 0x8200_0000 + 4 * a);
+            super::trace(&mut c, 0x8200_0000 + 4 * a);
         }
         assert_eq!(
             super::MINE.with(|m| m.r3.load(super::Ordering::Relaxed)),
@@ -1143,6 +1183,10 @@ mod tests {
         let want: Vec<u32> = (3..=10).map(|a| 0x8200_0000 + 4 * a).collect();
         assert_eq!(super::MINE.with(|m| m.recent()), want);
         assert_eq!(super::last_call(), 0x8200_0028);
+        // The hook found this thread's entry once and kept it in the context.
+        let mine = super::MINE.with(super::Arc::as_ptr).cast::<()>();
+        assert_eq!(c.host.0, mine);
+        assert!(c.clone().host.0.is_null());
         {
             let _w = super::waiting(0x4000_0010, 3);
             assert_eq!(
