@@ -320,7 +320,6 @@ fn vperm_scalar(a: V128, b: V128, c: V128) -> V128 {
 
 // ---------------------------------------------------------------- merge, splat
 
-#[inline]
 pub fn vmrghb(a: V128, b: V128) -> V128 {
     let (a, b) = (bytes(a), bytes(b));
     from_bytes(core::array::from_fn(|i| {
@@ -331,7 +330,6 @@ pub fn vmrghb(a: V128, b: V128) -> V128 {
         }
     }))
 }
-#[inline]
 pub fn vmrglb(a: V128, b: V128) -> V128 {
     let (a, b) = (bytes(a), bytes(b));
     from_bytes(core::array::from_fn(|i| {
@@ -342,7 +340,6 @@ pub fn vmrglb(a: V128, b: V128) -> V128 {
         }
     }))
 }
-#[inline]
 pub fn vmrghh(a: V128, b: V128) -> V128 {
     let (a, b) = (halves(a), halves(b));
     from_halves(core::array::from_fn(|i| {
@@ -353,7 +350,6 @@ pub fn vmrghh(a: V128, b: V128) -> V128 {
         }
     }))
 }
-#[inline]
 pub fn vmrglh(a: V128, b: V128) -> V128 {
     let (a, b) = (halves(a), halves(b));
     from_halves(core::array::from_fn(|i| {
@@ -1613,14 +1609,15 @@ pub fn vpkd3d(d: V128, b: V128, typ: u32, pack: u32, shift: u32) -> Option<V128>
 /// `lvsl`: permute control for a left shift by `ea & 15`.
 #[inline]
 pub fn lvsl(ea: u32) -> V128 {
-    let sh = (ea & 15) as u8;
-    from_bytes(core::array::from_fn(|i| sh + i as u8))
+    // Word-wise so inlined unoptimised callers stay small; bytes never carry.
+    let sh = (ea & 15) * 0x0101_0101;
+    [0x0001_0203, 0x0405_0607, 0x0809_0A0B, 0x0C0D_0E0F].map(|w| w + sh)
 }
 /// `lvsr`: permute control for a right shift by `ea & 15`.
 #[inline]
 pub fn lvsr(ea: u32) -> V128 {
-    let sh = (ea & 15) as u8;
-    from_bytes(core::array::from_fn(|i| 16 - sh + i as u8))
+    let sh = (ea & 15) * 0x0101_0101;
+    [0x1011_1213, 0x1415_1617, 0x1819_1A1B, 0x1C1D_1E1F].map(|w| w - sh)
 }
 
 /// `lvx` and the element loads (`lvebx`, `lvehx`, `lvewx`), which load the
@@ -1739,6 +1736,18 @@ mod tests {
                     (s >> 32) as u32
                 }
             })
+        }
+    }
+
+    #[test]
+    fn lvsl_lvsr_match_bytewise() {
+        for sh in 0..16u8 {
+            let l = from_bytes(core::array::from_fn(|i| sh + i as u8));
+            let r = from_bytes(core::array::from_fn(|i| 16 - sh + i as u8));
+            // Low bits only, as an address.
+            let ea = 0x8000_0010 | sh as u32;
+            assert_eq!(lvsl(ea), l, "lvsl {sh}");
+            assert_eq!(lvsr(ea), r, "lvsr {sh}");
         }
     }
 
