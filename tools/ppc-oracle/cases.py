@@ -223,6 +223,10 @@ def branch_cases():
     conds = [(12, 2), (4, 2), (12, 0), (4, 1), (16, 0), (18, 0), (8, 2), (0, 2), (10, 3), (2, 1), (20, 0)]
     for i, (bo, bi) in enumerate(conds):
         for j, (cr, ctr) in enumerate([(0x2000_0000, 1), (0x8000_0000, 2), (0x4000_0000, 0), (0xF000_0000, 0x1_0000_0001)]):
+            # The console tests only CTR's low word; QEMU's 64-bit mode tests
+            # all of it. Those cases are in hand.txt (bc_ctr_low_word_*).
+            if j == 3 and bo & 4 == 0:
+                continue
             add(f"bc_{bo}_{bi}_{j}", [bc(bo, bi, 8)] + skip, {"cr": cr, "ctr": ctr})
     for i, ctr in enumerate([1, 2, 0, 0x1_0000_0000]):
         add(f"bdnz_{i}", [bc(16, 0, 8)] + skip, {"ctr": ctr})
@@ -608,10 +612,6 @@ def vx128_cases():
                 words=[enc_vx128_1(xo, vd, 4, 5)], rename={vd: 1})
 
 
-# Doubleword ops (primary 31): their record forms keep CR0 from all 64 bits.
-DWORD_XO = {27, 539, 794, 58, 986, 9, 73}
-DWORD_X9 = {233, 457, 489}
-
 # Logical and shift ops (primary 31) that write rA rather than rD.
 RA_XO = {28, 60, 444, 412, 316, 476, 124, 284, 24, 536, 792, 824, 27, 539, 794, 954, 922, 986, 26, 58}
 
@@ -620,21 +620,17 @@ def console_cr0(word, out):
     """The console's titles see CR0 of an integer record form from the low
     32 bits of the result (the reference CPU compares all 64), so a C
     runtime count stored as -1 and reloaded zero-extended still tests
-    negative. Rewrites CR0 in `out` for such an instruction. Doubleword
-    ops (rld*, sld, srd, srad(i), cntlzd, extsw, mulld, mulhd(u), divd(u))
-    keep the reference CPU's 64-bit CR0."""
+    negative. Rewrites CR0 in `out` for such an instruction."""
     op = word >> 26
     rd, ra = (word >> 21) & 31, (word >> 16) & 31
     if op == 31 and word & 1:
         xo = (word >> 1) & 0x3FF
         if xo in (0, 32, 150, 214):  # compares and conditional stores
             return
-        if xo in DWORD_XO or xo & 0x1FF in DWORD_X9 or (word >> 2) & 0x1FF == 413:
-            return
         dest = ra if xo in RA_XO or (word >> 2) & 0x1FF == 413 else rd
     elif op == 13:
         dest = rd
-    elif op in (28, 29) or (op in (20, 21, 23) and word & 1):
+    elif op in (28, 29) or (op in (20, 21, 23, 30) and word & 1):
         dest = ra
     else:
         return
@@ -650,6 +646,16 @@ CARRY_XO = {
     10: (False, "rb", 0), 138: (False, "rb", "ca"), 202: (False, 0, "ca"), 234: (False, "ones", "ca"),
     8: (True, "rb", 1), 136: (True, "rb", "ca"), 200: (True, 0, "ca"), 232: (True, "ones", "ca"),
 }
+
+
+def console_mulhw(word, out):
+    """mulhw leaves the high word undefined; the reference CPU zero-extends,
+    and both reference translators that run titles sign-extend. Rewrites rD
+    in `out` to the sign-extended high product."""
+    if word >> 26 == 31 and (word >> 1) & 0x1FF == 75:
+        rd = (word >> 21) & 31
+        v = out.get(f"r{rd}", 0) & 0xFFFF_FFFF
+        out[f"r{rd}"] = v | (0xFFFF_FFFF_0000_0000 if v >> 31 else 0)
 
 
 def console_ca(word, st, out):
@@ -699,6 +705,7 @@ def main():
             words = [next(std_words) for _ in lines]
         if len(words) == 1:
             console_ca(words[0], oracle_input(st, ren), out)
+            console_mulhw(words[0], out)
             console_cr0(words[0], out)
         oin = harness.full_state(oracle_input(st, ren))
         diff = {k: v for k, v in out.items() if oin[k] != v and k not in scrub}

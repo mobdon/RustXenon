@@ -194,7 +194,22 @@ fn pixel_shader_texture_fetch() {
     let words = assemble(&[exec(0, 2, true)], &[tfetch(tf), alu(export(1, r(1)))]);
     let t = ok(&words, Pixel);
     assert_eq!(t.info.textures_used, 1 << 5);
-    assert_eq!(t.info.texture_filter_overrides, 1 << 5);
+    assert_eq!(t.info.texture_filters[5], Some([1, 3, 3, 7]));
+    assert_eq!(t.info.texture_filters[0], None);
+    assert_eq!(t.info.texture_filter_conflicts, 0);
+    // A second fetch of the slot with other filters is a conflict; the
+    // first fetch's filters stay.
+    let two = assemble(
+        &[exec(0, 3, true)],
+        &[
+            tfetch(tf),
+            tfetch(TextureFetch::fetch_2d(1, 0, 5)),
+            alu(export(1, r(1))),
+        ],
+    );
+    let t2 = ok(&two, Pixel);
+    assert_eq!(t2.info.texture_filters[5], Some([1, 3, 3, 7]));
+    assert_eq!(t2.info.texture_filter_conflicts, 1 << 5);
     assert_eq!(t.info.texture_explicit_lod, 0);
     assert_eq!(t.info.texture_lod_bias, 1 << 5);
     // A fixed LOD (no computed LOD) counts as explicit.

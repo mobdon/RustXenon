@@ -1134,8 +1134,15 @@ struct DiskCache {
 /// order.
 type TextureGroupKey = (u32, Vec<(wgpu::TextureView, wgpu::Sampler)>);
 
-/// A draw's texture slot mask and the fetch constants of those slots.
-type TextureSetKey = (u32, Vec<[u32; 6]>);
+/// A draw's texture slot mask, and the fetch constants of those slots with
+/// each slot's packed fetch filter overrides ([`pack_filters`]).
+type TextureSetKey = (u32, Vec<([u32; 6], u32)>);
+
+/// A fetch instruction's filter overrides as one word: 0 for none, else
+/// bit 31 with mag, min, mip and aniso in bytes 0 to 3.
+fn pack_filters(f: Option<[u8; 4]>) -> u32 {
+    f.map_or(0, |f| 1 << 31 | u32::from_le_bytes(f))
+}
 
 /// A program's translation, or why it failed.
 type Translation = Result<Arc<Translated>, String>;
@@ -1305,7 +1312,7 @@ pub struct Drawer {
     /// Guest texture bytes are read into this buffer, kept across lookups:
     /// a fresh one per texture costs zeroing and page faults every frame.
     texture_scratch: Vec<u8>,
-    samplers: HashMap<([u8; 3], u8, u8, u8, u32), wgpu::Sampler>,
+    samplers: HashMap<SamplerKey, wgpu::Sampler>,
     /// Draws recorded but not yet submitted (see [`Batch`]).
     batch: Option<Batch>,
     /// Texture bind groups by texture slot mask and the slots' views and
@@ -1329,7 +1336,7 @@ pub struct Drawer {
     texture_set_flags: HashMap<[u32; 6], Vec<Arc<AtomicBool>>>,
     /// The fetch constants of a draw's texture set, kept so looking a set
     /// up does not allocate.
-    texture_set_key: Vec<[u32; 6]>,
+    texture_set_key: Vec<([u32; 6], u32)>,
     /// Counts the changes that drop all [`Drawer::texture_memo`] entries.
     texture_memo_epoch: u64,
     /// Group 0 bind groups over `arena`, by the sizes of the four slices
@@ -1400,6 +1407,9 @@ pub struct Drawer {
     /// Whether `Rgba32Float` textures can be sampled with filtering; without
     /// it wide formats are uploaded as `Rgba16Float`.
     float32_filterable: bool,
+    /// The device has `ADDRESS_MODE_CLAMP_TO_BORDER`; without it border
+    /// clamps are drawn as edge clamps.
+    clamp_to_border: bool,
     /// Compute pipeline of resolve.wgsl, made on the first GPU resolve.
     /// Colour, depth and depth + stencil entry points of resolve.wgsl.
     resolve_pipelines: [Option<wgpu::ComputePipeline>; 3],
@@ -1985,15 +1995,95 @@ fn drop_depth_wgsl(ps: &str) -> Result<String, String> {
         .replacen(DEPTH_STORE, "", 1))
 }
 
-fn sampler_address(clamp: u8) -> (wgpu::AddressMode, bool) {
+/// The address mode of a `ClampMode`, and whether it is exact. `border`:
+/// the device has `ADDRESS_MODE_CLAMP_TO_BORDER`.
+fn sampler_address(clamp: u8, border: bool) -> (wgpu::AddressMode, bool) {
     use wgpu::AddressMode as A;
     match clamp {
         0 => (A::Repeat, true),
         1 => (A::MirrorRepeat, true),
         2 => (A::ClampToEdge, true),
-        // Mirror-once, half-way and border modes have no plain wgpu
-        // equivalent (border needs an optional feature): edge clamp.
+        6 if border => (A::ClampToBorder, true),
+        // Xenia draws the mirror-once modes (to edge, half-way, border) as
+        // mirror clamp to edge, which wgpu lacks.
+        // shortcut: edge clamp, right for coordinates >= 0 and wrong for
+        // negative ones (the guest mirrors them); upgrade when a trace shows
+        // negative coordinates on a mirror-once fetch, with abs() on the
+        // coordinate from a per-slot bit the translated fetch reads.
+        3 | 5 | 7 => (A::ClampToEdge, false),
+        // Half-way clamp is edge clamp, as in Xenia; border without the
+        // feature too.
         _ => (A::ClampToEdge, false),
+    }
+}
+
+/// What a guest sampler is made from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct SamplerKey {
+    address: [wgpu::AddressMode; 3],
+    mag: wgpu::FilterMode,
+    min: wgpu::FilterMode,
+    mip: wgpu::MipmapFilterMode,
+    /// 1 is off.
+    anisotropy: u16,
+    /// Only with a `ClampToBorder` address mode.
+    border: Option<wgpu::SamplerBorderColor>,
+    /// The first mip level the fetch samples: the lowest LOD.
+    min_level: u32,
+    /// Base map mip filter: LODs up to `min_level` + 0.25 only.
+    base_map: bool,
+}
+
+/// The sampler of `fetch` with a fetch instruction's mag, min, mip and
+/// aniso filter `overrides` (3, 3, 3 and 7 keep the constant's), as Xenia's
+/// GetSamplerParameters and UseSampler. `border`: the device has
+/// `ADDRESS_MODE_CLAMP_TO_BORDER`.
+fn sampler_key(
+    fetch: &xenon_texture::TextureFetch,
+    overrides: Option<[u8; 4]>,
+    border: bool,
+) -> SamplerKey {
+    let [mag, min, mip, aniso] = overrides.unwrap_or([3, 3, 3, 7]);
+    let pick = |o: u8, keep: u8, f: u8| if o == keep { f } else { o };
+    let (mag, min) = (
+        pick(mag, 3, fetch.mag_filter),
+        pick(min, 3, fetch.min_filter),
+    );
+    let (mip, aniso) = (
+        pick(mip, 3, fetch.mip_filter),
+        pick(aniso, 7, fetch.aniso_filter),
+    );
+    let address = fetch.clamp.map(|c| sampler_address(c, border).0);
+    // As Xenia, any anisotropy (1:1 too) makes every filter linear, which
+    // wgpu also needs for anisotropy. Xenia: border colours other than
+    // opaque white are transparent black (CrYCb ones are not done).
+    let (mag_f, min_f, mip_linear) = if aniso != 0 {
+        (1, 1, true)
+    } else {
+        (mag, min, mip == 1)
+    };
+    SamplerKey {
+        address,
+        mag: filter(mag_f),
+        min: filter(min_f),
+        mip: if mip_linear {
+            wgpu::MipmapFilterMode::Linear
+        } else {
+            wgpu::MipmapFilterMode::Nearest
+        },
+        anisotropy: match aniso {
+            0 => 1,
+            a => 1 << (a.min(5) - 1),
+        },
+        border: address
+            .contains(&wgpu::AddressMode::ClampToBorder)
+            .then_some(if fetch.border_color == 1 {
+                wgpu::SamplerBorderColor::OpaqueWhite
+            } else {
+                wgpu::SamplerBorderColor::TransparentBlack
+            }),
+        min_level: fetch.mip_range().0,
+        base_map: mip == 2,
     }
 }
 
@@ -2068,7 +2158,8 @@ impl Drawer {
             & (wgpu::Features::FLOAT32_FILTERABLE | wgpu::Features::TEXTURE_COMPRESSION_BC);
         required_features.set(wgpu::Features::DEPTH32FLOAT_STENCIL8, float_stencil);
         required_features.set(snorm16_features, snorm16);
-        required_features |= adapter.features() & wgpu::Features::PIPELINE_CACHE;
+        required_features |= adapter.features()
+            & (wgpu::Features::PIPELINE_CACHE | wgpu::Features::ADDRESS_MODE_CLAMP_TO_BORDER);
         if timestamps {
             required_features |= adapter.features() & wgpu::Features::TIMESTAMP_QUERY;
         }
@@ -2249,6 +2340,8 @@ impl Drawer {
             zero_texture,
             zero_sampler,
             float32_filterable: required_features.contains(wgpu::Features::FLOAT32_FILTERABLE),
+            clamp_to_border: required_features
+                .contains(wgpu::Features::ADDRESS_MODE_CLAMP_TO_BORDER),
             resolve_pipelines: [None, None, None],
             float_stencil,
             snorm16,
@@ -4392,10 +4485,12 @@ impl Drawer {
     /// Texture and sampler for fetch constant slot `n`. A slot without a
     /// texture fetch constant, or whose texture cannot be read or decoded,
     /// gets a 1x1 texture of zeros (as Xenia binds its null image) and a
-    /// warning, so the draw still happens.
+    /// warning, so the draw still happens. `filters`: the fetch
+    /// instruction's filter overrides of the slot.
     fn texture(
         &mut self,
         n: u32,
+        filters: Option<[u8; 4]>,
         mem: &mut Tracked,
         report: &mut Report,
     ) -> Result<(wgpu::TextureView, wgpu::Sampler), Skip> {
@@ -4404,7 +4499,7 @@ impl Drawer {
             report.warn("texture slot without a texture fetch constant drawn with zeros");
             return Ok((self.zero_texture.clone(), self.zero_sampler.clone()));
         }
-        let sampler = self.sampler(&fetch, report);
+        let sampler = self.sampler(&fetch, filters, report);
         let constant = self.regs.fetch_constant(n);
         if let Some((view, _, _, key)) = self.texture_memo.get(&constant) {
             let view = view.clone();
@@ -4860,51 +4955,39 @@ impl Drawer {
     fn sampler(
         &mut self,
         fetch: &xenon_texture::TextureFetch,
+        overrides: Option<[u8; 4]>,
         report: &mut Report,
     ) -> wgpu::Sampler {
-        let mut addr_mode = |c: u8| {
-            let (m, exact) = sampler_address(c);
+        for c in fetch.clamp {
+            let (m, exact) = sampler_address(c, self.clamp_to_border);
             if !exact {
-                report.warn(format!("texture clamp mode {c} drawn as clamp to edge"));
+                report.warn(format!("texture clamp mode {c} drawn as {m:?}"));
             }
-            m
-        };
-        let modes = fetch.clamp.map(&mut addr_mode);
+        }
+        let k = sampler_key(fetch, overrides, self.clamp_to_border);
         let device = &self.device;
         // As Xenia's sampler: LODs from the first mip level the fetch
         // samples; base map mip filtering is point at that level (+0.25
         // keeps magnification apart from minification).
-        // shortcut: the instruction's mip filter override is not applied;
-        // samplers are made per fetch constant.
-        let min_level = fetch.mip_range().0;
-        let base_map = fetch.mip_filter == 2;
         self.samplers
-            .entry((
-                fetch.clamp,
-                fetch.mag_filter,
-                fetch.min_filter,
-                fetch.mip_filter,
-                min_level,
-            ))
+            .entry(k)
             .or_insert_with(|| {
                 device.create_sampler(&wgpu::SamplerDescriptor {
                     label: Some("guest sampler"),
-                    address_mode_u: modes[0],
-                    address_mode_v: modes[1],
-                    address_mode_w: modes[2],
-                    mag_filter: filter(fetch.mag_filter),
-                    min_filter: filter(fetch.min_filter),
-                    mipmap_filter: if fetch.mip_filter == 1 {
-                        wgpu::MipmapFilterMode::Linear
-                    } else {
-                        wgpu::MipmapFilterMode::Nearest
-                    },
-                    lod_min_clamp: min_level as f32,
-                    lod_max_clamp: if base_map {
-                        min_level as f32 + 0.25
+                    address_mode_u: k.address[0],
+                    address_mode_v: k.address[1],
+                    address_mode_w: k.address[2],
+                    mag_filter: k.mag,
+                    min_filter: k.min,
+                    mipmap_filter: k.mip,
+                    lod_min_clamp: k.min_level as f32,
+                    lod_max_clamp: if k.base_map {
+                        k.min_level as f32 + 0.25
                     } else {
                         32.0
                     },
+                    anisotropy_clamp: k.anisotropy,
+                    border_color: k.border,
                     ..Default::default()
                 })
             })
@@ -5193,8 +5276,16 @@ impl Drawer {
             )
         };
         let (vf_mask, tex_mask) = info(&vs_t.info, &ps_t.info);
-        if (vs_t.info.texture_filter_overrides | ps_t.info.texture_filter_overrides) != 0 {
-            report.warn("texture fetch filter overrides ignored");
+        // Each slot has one sampler: the vertex stage's filters, else the
+        // pixel stage's.
+        let (vs_i, ps_i) = (&vs_t.info, &ps_t.info);
+        let filters =
+            |n: u32| vs_i.texture_filters[n as usize].or(ps_i.texture_filters[n as usize]);
+        let both = vs_i.textures_used & ps_i.textures_used;
+        let differ = (0..32)
+            .any(|n| both & (1 << n) != 0 && vs_i.texture_filters[n] != ps_i.texture_filters[n]);
+        if differ || (vs_i.texture_filter_conflicts | ps_i.texture_filter_conflicts) != 0 {
+            report.warn("texture fetches of one slot with different filters drawn with one");
         }
         let extra = ps_t.info.interpolators_read & !vs_t.info.interpolators_written;
         let vs_mod = self.module(vs.hash, true, extra, vs_variant, None, &vs_t)?;
@@ -5520,7 +5611,7 @@ impl Drawer {
         (key.1).extend(
             (0..32)
                 .filter(|n| tex_mask & (1 << n) != 0)
-                .map(|n| regs.fetch_constant(n)),
+                .map(|n| (regs.fetch_constant(n), pack_filters(filters(n)))),
         );
         let set = (self.texture_sets.get(&key))
             .filter(|(_, epoch, kept)| {
@@ -5531,7 +5622,7 @@ impl Drawer {
         let mut textures = Vec::new();
         if set.is_none() {
             for n in (0..32).filter(|n| tex_mask & (1 << n) != 0) {
-                textures.push(self.texture(n, mem, report)?);
+                textures.push(self.texture(n, filters(n), mem, report)?);
             }
         }
         self.timings.textures += lap(&mut t);
@@ -5588,24 +5679,24 @@ impl Drawer {
                 self.texture_sets.clear();
                 self.texture_set_flags.clear();
             }
-            let constants: Vec<[u32; 6]> = (0..32)
+            let constants: Vec<([u32; 6], u32)> = (0..32)
                 .filter(|n| tex_mask & (1 << n) != 0)
-                .map(|n| self.regs.fetch_constant(n))
+                .map(|n| (self.regs.fetch_constant(n), pack_filters(filters(n))))
                 .collect();
             // Only a set whose textures all came from the texture memo: a
             // texture that could not be read or decoded is drawn as zeros
             // with no memo entry, so no guest write would move the epoch
             // and the set would keep its zeros after the data is fixed.
             // (Slots without a texture fetch constant read no memory.)
-            let found = constants.iter().all(|c| {
+            let found = constants.iter().all(|(c, _)| {
                 xenon_texture::TextureFetch::decode(*c).fetch_type != 2
                     || self.texture_memo.contains_key(c)
             });
             if found {
                 let kept = Arc::new(AtomicBool::new(true));
-                for c in constants
+                for (c, _) in constants
                     .iter()
-                    .filter(|c| self.texture_memo.contains_key(*c))
+                    .filter(|(c, _)| self.texture_memo.contains_key(c))
                 {
                     let flags = self.texture_set_flags.entry(*c).or_default();
                     // A set made again after its flag was cleared leaves the
@@ -5616,7 +5707,8 @@ impl Drawer {
                     flags.push(kept.clone());
                 }
                 let epoch = self.texture_memo_epoch;
-                (self.texture_sets).insert((tex_mask, constants), (g.clone(), epoch, kept));
+                let key = (tex_mask, constants);
+                (self.texture_sets).insert(key, (g.clone(), epoch, kept));
             }
             g
         };
@@ -6628,6 +6720,106 @@ fn host_texture_format(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A fetch constant with clamp modes, filters (mag, min, mip, aniso)
+    /// and border colour.
+    fn sampler_fetch(clamp: [u32; 3], f: [u32; 4], border: u32) -> xenon_texture::TextureFetch {
+        let w0 = 2 | clamp[0] << 10 | clamp[1] << 13 | clamp[2] << 16;
+        let w3 = f[0] << 19 | f[1] << 21 | f[2] << 23 | f[3] << 25;
+        xenon_texture::TextureFetch::decode([w0, 0, 0, w3, 0, border])
+    }
+
+    /// Every clamp mode, with and without the border feature.
+    #[test]
+    fn sampler_key_address_modes() {
+        use wgpu::AddressMode as A;
+        let want = [
+            (A::Repeat, A::Repeat),
+            (A::MirrorRepeat, A::MirrorRepeat),
+            (A::ClampToEdge, A::ClampToEdge),
+            (A::ClampToEdge, A::ClampToEdge),
+            (A::ClampToEdge, A::ClampToEdge),
+            (A::ClampToEdge, A::ClampToEdge),
+            (A::ClampToEdge, A::ClampToBorder),
+            (A::ClampToEdge, A::ClampToEdge),
+        ];
+        for (c, &(plain, border)) in want.iter().enumerate() {
+            let f = sampler_fetch([c as u32, 0, 2], [1, 1, 0, 0], 1);
+            let k = sampler_key(&f, None, false);
+            assert_eq!(k.address, [plain, A::Repeat, A::ClampToEdge], "mode {c}");
+            assert_eq!(k.border, None, "mode {c}");
+            let k = sampler_key(&f, None, true);
+            assert_eq!(k.address[0], border, "mode {c}");
+            let colour = (c == 6).then_some(wgpu::SamplerBorderColor::OpaqueWhite);
+            assert_eq!(k.border, colour, "mode {c}");
+            let exact = sampler_address(c as u8, true).1;
+            assert_eq!(exact, matches!(c, 0 | 1 | 2 | 6), "mode {c}");
+        }
+        // Other border colours are transparent black, as in Xenia.
+        let f = sampler_fetch([6, 6, 6], [0; 4], 0);
+        let k = sampler_key(&f, None, true);
+        assert_eq!(k.border, Some(wgpu::SamplerBorderColor::TransparentBlack));
+    }
+
+    /// Instruction filter fields override the fetch constant's unless 3
+    /// (aniso 7); any anisotropy makes every filter linear, as in Xenia.
+    #[test]
+    fn sampler_key_filters_and_anisotropy() {
+        use wgpu::FilterMode::{Linear, Nearest};
+        use wgpu::MipmapFilterMode as M;
+        let point = sampler_fetch([0; 3], [0, 0, 0, 0], 0);
+        let k = sampler_key(&point, None, false);
+        assert_eq!(
+            (k.mag, k.min, k.mip, k.anisotropy),
+            (Nearest, Nearest, M::Nearest, 1)
+        );
+        assert_eq!(sampler_key(&point, Some([3, 3, 3, 7]), false), k);
+        let k = sampler_key(&point, Some([1, 3, 1, 7]), false);
+        assert_eq!((k.mag, k.min, k.mip), (Linear, Nearest, M::Linear));
+        let k = sampler_key(&point, Some([1, 1, 2, 7]), false);
+        assert!(k.base_map);
+        for (aniso, want) in [(0, 1), (1, 1), (2, 2), (3, 4), (4, 8), (5, 16), (6, 16)] {
+            let f = sampler_fetch([0; 3], [1, 1, 1, aniso], 0);
+            assert_eq!(
+                sampler_key(&f, None, false).anisotropy,
+                want,
+                "aniso {aniso}"
+            );
+            // The instruction's aniso over point filters: linear filters
+            // with it, point ones without.
+            let k = sampler_key(&point, Some([3, 3, 3, aniso as u8]), false);
+            let (f_want, m_want) = if aniso != 0 {
+                (Linear, M::Linear)
+            } else {
+                (Nearest, M::Nearest)
+            };
+            assert_eq!(
+                (k.mag, k.min, k.mip, k.anisotropy),
+                (f_want, f_want, m_want, want),
+                "aniso {aniso} over point"
+            );
+            // A base map mip filter stays one under anisotropy.
+            let k = sampler_key(&point, Some([0, 0, 2, aniso as u8]), false);
+            assert!(k.base_map, "aniso {aniso}");
+        }
+        // The instruction turns the constant's anisotropy off.
+        let f = sampler_fetch([0; 3], [1, 1, 1, 5], 0);
+        assert_eq!(sampler_key(&f, Some([3, 3, 3, 0]), false).anisotropy, 1);
+    }
+
+    /// Packed filter overrides tell no override from all-zero ones and
+    /// keep every field.
+    #[test]
+    fn packed_filters_differ() {
+        assert_eq!(pack_filters(None), 0);
+        assert_ne!(pack_filters(Some([0; 4])), 0);
+        let base = pack_filters(Some([1, 2, 3, 4]));
+        for i in 0..4 {
+            let mut f = [1, 2, 3, 4];
+            f[i] = 0;
+            assert_ne!(pack_filters(Some(f)), base, "field {i}");
+        }
+    }
 
     /// `meets` over merged ranges agrees with checking every range.
     #[test]

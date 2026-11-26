@@ -81,9 +81,14 @@ pub struct ShaderInfo {
     /// Bit n: texture fetch slot n is sampled (bindings 2n and 2n+1 of
     /// group 1 are declared).
     pub textures_used: u32,
-    /// Bit n: slot n's fetch overrides a filter of the fetch constant. The
-    /// override is ignored; the drawer's sampler decides the filtering.
-    pub texture_filter_overrides: u32,
+    /// Entry n: the mag, min, mip and aniso filter fields of slot n's
+    /// fetches when they override the fetch constant's (3, 3, 3 and 7 keep
+    /// its value); `None` when they all keep it. The drawer's sampler
+    /// applies them.
+    pub texture_filters: [Option<[u8; 4]>; 32],
+    /// Bit n: fetches of slot n give different filter fields; the first
+    /// fetch's are in [`Self::texture_filters`].
+    pub texture_filter_conflicts: u32,
     /// Bit n: some fetch of slot n picks its LOD itself (a fixed or register
     /// LOD, or register gradients) instead of the hardware-computed one.
     pub texture_explicit_lod: u32,
@@ -1281,16 +1286,16 @@ impl Gen {
         // also give the vertex stage a computed LOD.
         let grad_lod = t.use_computed_lod && t.use_register_gradients;
         let n = t.slot;
-        self.info.textures_used |= 1 << n;
-        let overrides = t.mag_filter != 3
-            || t.min_filter != 3
-            || t.mip_filter != 3
-            || t.aniso_filter != 7
-            || t.vol_mag_filter != 3
-            || t.vol_min_filter != 3;
-        if overrides {
-            self.info.texture_filter_overrides |= 1 << n;
+        // Volume filters are left out: only 2D fetches get here.
+        let filters = [t.mag_filter, t.min_filter, t.mip_filter, t.aniso_filter].map(|f| f as u8);
+        let filters = (filters != [3, 3, 3, 7]).then_some(filters);
+        let slot = &mut self.info.texture_filters[n as usize];
+        if self.info.textures_used & (1 << n) == 0 {
+            *slot = filters;
+        } else if *slot != filters {
+            self.info.texture_filter_conflicts |= 1 << n;
         }
+        self.info.textures_used |= 1 << n;
         if let Some(v) = t.predicate {
             self.line(&format!("if (p0 == {v}) {{"));
         } else {
