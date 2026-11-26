@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Template: build-apk.sh replaces @PACKAGE@, @LABEL@ and @DEBUGGABLE@
+     (true for dev builds, false for release). -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="@PACKAGE@"
+    android:versionCode="1"
+    android:versionName="0.1">
+
+    <uses-sdk android:minSdkVersion="29" android:targetSdkVersion="35" />
+
+    <!-- Played with a controller; touch is never needed. -->
+    <uses-feature android:name="android.hardware.gamepad" android:required="false" />
+    <uses-feature android:name="android.hardware.touchscreen" android:required="false" />
+    <uses-feature android:name="android.hardware.screen.landscape" android:required="false" />
+    <uses-feature android:name="android.hardware.vulkan.version" android:version="0x401000" android:required="false" />
+
+    <application
+        android:label="@LABEL@"
+        android:hasCode="false"
+        android:isGame="true"
+        android:appCategory="game"
+        android:extractNativeLibs="false"
+        android:debuggable="@DEBUGGABLE@"
+        android:theme="@android:style/Theme.NoTitleBar.Fullscreen">
+
+        <!-- configChanges: folding, rotating or a controller connecting must
+             not restart the game; the native window is rebuilt instead. -->
+        <activity
+            android:name="android.app.NativeActivity"
+            android:label="@LABEL@"
+            android:exported="true"
+            android:screenOrientation="sensorLandscape"
+            android:resizeableActivity="true"
+            android:launchMode="singleTask"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboard|keyboardHidden|navigation|uiMode|density">
+            <meta-data android:name="android.app.lib_name" android:value="game" />
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>
