@@ -120,7 +120,8 @@ impl Settings {
         }
     }
 
-    /// Moves field `i` one value up (`dir` > 0) or down; a bool flips.
+    /// Moves field `i` one value up (`dir` > 0) or down, wrapping round at
+    /// either end so a single button reaches every value; a bool flips.
     pub fn step(&mut self, i: usize, dir: i32) {
         let f = &FIELDS[i];
         let v = match f.kind {
@@ -128,11 +129,13 @@ impl Settings {
             Kind::Int(choices, _) => {
                 let cur = self.int(i);
                 let next = if dir > 0 {
-                    choices.iter().copied().find(|&c| c > cur)
+                    let up = choices.iter().copied().find(|&c| c > cur);
+                    up.unwrap_or(choices[0])
                 } else {
-                    choices.iter().rev().copied().find(|&c| c < cur)
+                    let down = choices.iter().rev().copied().find(|&c| c < cur);
+                    down.unwrap_or(choices[choices.len() - 1])
                 };
-                Value::Integer(next.unwrap_or(cur))
+                Value::Integer(next)
             }
         };
         let t = self
@@ -153,6 +156,27 @@ mod tests {
     use super::*;
 
     #[test]
+    fn every_field_reaches_every_value_both_ways() {
+        for (i, f) in FIELDS.iter().enumerate() {
+            let n = match f.kind {
+                Kind::Bool(_) => 2,
+                Kind::Int(c, _) => c.len(),
+            };
+            for dir in [1, -1] {
+                let mut s = Settings::default();
+                let mut seen = std::collections::BTreeSet::new();
+                for _ in 0..n {
+                    s.step(i, dir);
+                    seen.insert(s.show(i));
+                }
+                assert_eq!(seen.len(), n, "{} dir {dir}", f.key);
+                // n steps in one direction come back to the start.
+                assert_eq!(s.show(i), Settings::default().show(i), "{}", f.key);
+            }
+        }
+    }
+
+    #[test]
     fn defaults_steps_and_unknown_keys() {
         let mut s = Settings::default();
         assert_eq!(s.show(0), "1280");
@@ -161,10 +185,15 @@ mod tests {
         assert_eq!(s.int(0), 1600);
         s.step(0, -1);
         s.step(0, -1);
+        assert_eq!(s.int(0), 960);
         s.step(0, -1);
-        assert_eq!(s.int(0), 960, "stops at the smallest");
+        assert_eq!(s.int(0), 3840, "wraps from the smallest to the largest");
+        s.step(0, 1);
+        assert_eq!(s.int(0), 960, "and back");
         s.step(2, 1);
         assert_eq!(s.show(2), "On");
+        s.step(2, -1);
+        assert_eq!(s.show(2), "Off");
 
         // A value not offered steps to its neighbour; other keys survive.
         let dir = crate::tests::temp("settings");

@@ -555,6 +555,21 @@ impl ApplicationHandler for App {
                     _ => {}
                 }
             }
+            // A right click on a settings row steps its value down.
+            WindowEvent::MouseInput {
+                state: ElementState::Pressed,
+                button: MouseButton::Right,
+                ..
+            } if self.page == Page::Settings && self.running.is_none() => {
+                let (w, h) = self.size();
+                if let Some(Hit::Row(r)) = draw::hit(w, h, self.page, self.cursor.0, self.cursor.1)
+                {
+                    if self.scroll[self.page as usize] + r < self.len() {
+                        self.select(self.scroll[self.page as usize] + r);
+                        self.change(-1);
+                    }
+                }
+            }
             WindowEvent::MouseWheel { delta, .. } => {
                 // A touchpad sends many small steps: add them up, one row per 60 px.
                 self.wheel += match delta {
