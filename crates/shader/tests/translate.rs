@@ -132,6 +132,7 @@ fn pixel_param_gen() {
     let plain = ok(&words, Pixel);
     assert_eq!(plain.info.interpolators_read, 0b11);
     assert!(!plain.wgsl.contains("xe_frag_coord"));
+    assert!(!plain.wgsl.contains("xe_scale"));
     let gen = |primitive| {
         let t = translate_with(
             &words,
@@ -145,7 +146,8 @@ fn pixel_param_gen() {
         common::validate(&t.wgsl);
         assert_eq!(t.info.interpolators_read, 0b01);
         has(&t, "@builtin(position) xe_frag_coord: vec4<f32>,");
-        has(&t, "let xy = floor(input.xe_frag_coord.xy);");
+        has(&t, "override xe_scale: f32 = 1.0;");
+        has(&t, "let xy = floor(input.xe_frag_coord.xy / xe_scale);");
         assert!(!t.wgsl.contains("r[1] = input.i1;"));
         t
     };
@@ -220,6 +222,11 @@ fn pixel_shader_texture_fetch() {
     assert_eq!(t.info.colour_targets_written, 0b10);
     has(&t, "@group(1) @binding(10) var tex5: texture_2d<f32>;");
     has(&t, "@group(1) @binding(11) var samp5: sampler;");
+    // Slot 5's dwords 2 and 5 are fetch dwords 32 and 35.
+    has(
+        &t,
+        "let size = xe_tfetch_size(consts.fetch[8u][0u], consts.fetch[8u][3u]);",
+    );
     has(&t, "let uv = r[0].yx + vec2<f32>(0.5f, -1.0f) / size;");
     // Slot 5's dword 4 is fetch dword 34: fetch[8][2].
     has(
@@ -240,6 +247,13 @@ fn texture_fetch_variants() {
     tf.predicate = Some(true);
     let words = assemble(&[exec(0, 2, true)], &[tfetch(tf), alu(export(62, r(2)))]);
     let t = ok(&words, Vertex);
+    // The size is the guest's, from slot 0's dwords 2 and 5, not the host
+    // texture's.
+    has(
+        &t,
+        "let size = xe_tfetch_size(consts.fetch[0u][2u], consts.fetch[1u][1u]);",
+    );
+    assert!(!t.wgsl.contains("textureDimensions"));
     has(&t, "let uv = (r[3].xy) / size;");
     has(&t, "textureSampleLevel(tex0, samp0, uv, lod)");
     has(&t, "r[2].z = 0.0;");

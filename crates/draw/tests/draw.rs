@@ -243,6 +243,41 @@ fn textured_quad_samples_tiled_texture() {
             assert_eq!(px(&img, W, x, y), texel2(x, y), "({x}, {y})");
         }
     }
+
+    // Unnormalized coordinates (in texels, over the fetch constant's size)
+    // sample the same texels.
+    use xenon_shader::asm::*;
+    use xenon_shader::ucode::*;
+    let verts: Vec<u32> = [(0.0, 0.0), (q, 0.0), (q, q), (0.0, q)]
+        .iter()
+        .flat_map(|&(x, y)| [f(x), f(y), f(0.0), f(x), f(y)])
+        .collect();
+    mem.write_words(VERTS, &verts);
+    let mut tf = TextureFetch::fetch_2d(1, 0, 1);
+    tf.unnormalized = true;
+    let ps = assemble(
+        &[exec(0, 2, true)],
+        &[
+            Instr::Fetch(FetchInstr::Texture(tf)),
+            export(0, AluSrc::temp(1, SWZ_XYZW)),
+        ],
+    );
+    let mut s = Stream::default();
+    s.setup()
+        .resolve(&mut mem, W, H, false, Some((rgba(CLEAR), 0)))
+        .shader(false, &vs_uv())
+        .shader(true, &ps)
+        .vertex_fetch(0, VERTS, 20)
+        .regs(SHADER_CONSTANT_FETCH + 6, &fetch)
+        .draw_auto(PRIM_QUAD_LIST, 4);
+    let report = run(&mut d, &s, &mut mem);
+    assert_eq!(report.draws, 1, "{report:?}");
+    let img = d.read_render_target(COLOR_KEY, 0, 0, W, H).unwrap();
+    for y in 0..n {
+        for x in 0..n {
+            assert_eq!(px(&img, W, x, y), texel2(x, y), "({x}, {y})");
+        }
+    }
 }
 
 /// A tiled 8_8_8_8 texture with a mip page: a 32x32 red base and a 16x16
