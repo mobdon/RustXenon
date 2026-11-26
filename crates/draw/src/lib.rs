@@ -1438,6 +1438,17 @@ pub struct Drawer {
     /// Group 0 bind groups over `arena`, by the sizes of the four slices
     /// they bind (at dynamic offsets). Cleared when the arena is replaced.
     arena_groups: HashMap<[u64; 6], wgpu::BindGroup>,
+    /// The clear bind group over `arena`, its value at a dynamic offset.
+    /// Dropped when the arena is replaced.
+    clear_group: Option<wgpu::BindGroup>,
+    /// Resolve bind groups by kept resolve buffer, source texture and
+    /// [`Self::resolve_pipelines`] entry, the parameters in `arena` at a
+    /// dynamic offset. Dropped when the arena is replaced, and at the end
+    /// of a replay for buffers and textures no longer kept.
+    resolve_groups: HashMap<(wgpu::Buffer, wgpu::Texture, usize), wgpu::BindGroup>,
+    /// Views of render target textures for clears, kept as long as the
+    /// target.
+    target_views: HashMap<wgpu::Texture, wgpu::TextureView>,
     /// Draw buffers (guest window, constants, epilogue, indices) staged
     /// since the last flush, as slices of `arena` from `staged_base`,
     /// written to it at the next flush. The arena is a ring: flushes
@@ -1511,6 +1522,8 @@ pub struct Drawer {
     /// Compute pipeline of resolve.wgsl, made on the first GPU resolve.
     /// Colour, depth and depth + stencil entry points of resolve.wgsl.
     resolve_pipelines: [Option<wgpu::ComputePipeline>; 3],
+    /// Their bind group and pipeline layouts.
+    resolve_layouts: [(wgpu::BindGroupLayout, wgpu::PipelineLayout); 3],
     /// kD24FS8 is hosted as `Depth32FloatStencil8` (else `Depth32Float`).
     float_stencil: bool,
     /// `Rg16Snorm` and `Rgba16Snorm` can be render targets (k_16_16 and
@@ -1658,6 +1671,9 @@ const ARENA_GROUP_CAP: usize = 4096;
 
 /// Texture bind groups kept between evictions and replay ends.
 const TEXTURE_GROUP_CAP: usize = 4096;
+
+/// Resolve bind groups kept between replay ends.
+const RESOLVE_GROUP_CAP: usize = 1024;
 
 /// Bytes of each upload staging chunk, and the most one belt write takes.
 const BELT_CHUNK: u64 = 4 << 20;
@@ -2286,11 +2302,6 @@ impl Drawer {
             ty,
             count: None,
         };
-        let uniform = wgpu::BindingType::Buffer {
-            ty: wgpu::BufferBindingType::Uniform,
-            has_dynamic_offset: false,
-            min_binding_size: None,
-        };
         let vf = wgpu::ShaderStages::VERTEX_FRAGMENT;
         // Arena slices are bound at dynamic offsets, so draws whose slices
         // have the same sizes share one bind group.
@@ -2322,10 +2333,56 @@ impl Drawer {
                 ),
             ],
         });
+        // Clear values and resolve parameters are staged in the arena too.
         let clear_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("clear"),
-            entries: &[entry(0, vf, uniform)],
+            entries: &[entry(0, vf, dyn_uniform)],
         });
+        // resolve.wgsl's main, depth_main and depth_stencil_main: the
+        // source (colour, depth, depth and stencil), the kept resolve
+        // buffer and the parameters.
+        let resolve_layouts = {
+            let cs = wgpu::ShaderStages::COMPUTE;
+            let texture = |sample_type| wgpu::BindingType::Texture {
+                sample_type,
+                view_dimension: wgpu::TextureViewDimension::D2,
+                multisampled: false,
+            };
+            let dest = entry(
+                1,
+                cs,
+                wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: false },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+            );
+            let color = entry(
+                0,
+                cs,
+                texture(wgpu::TextureSampleType::Float { filterable: false }),
+            );
+            let depth = entry(3, cs, texture(wgpu::TextureSampleType::Depth));
+            let stencil = entry(4, cs, texture(wgpu::TextureSampleType::Uint));
+            let params = entry(2, cs, dyn_uniform);
+            [
+                vec![color, dest, params],
+                vec![dest, params, depth],
+                vec![dest, params, depth, stencil],
+            ]
+            .map(|entries| {
+                let group = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some("resolve"),
+                    entries: &entries,
+                });
+                let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                    label: Some("resolve"),
+                    bind_group_layouts: &[Some(&group)],
+                    immediate_size: 0,
+                });
+                (group, layout)
+            })
+        };
         let clear_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("clear"),
             source: wgpu::ShaderSource::Wgsl(CLEAR_WGSL.into()),
@@ -2409,6 +2466,9 @@ impl Drawer {
             texture_set_key: Vec::new(),
             texture_memo_epoch: 0,
             arena_groups: HashMap::default(),
+            clear_group: None,
+            resolve_groups: HashMap::default(),
+            target_views: HashMap::default(),
             staged: Vec::new(),
             arena: None,
             window_memo: BTreeMap::new(),
@@ -2443,6 +2503,7 @@ impl Drawer {
             clamp_to_border: required_features
                 .contains(wgpu::Features::ADDRESS_MODE_CLAMP_TO_BORDER),
             resolve_pipelines: [None, None, None],
+            resolve_layouts,
             float_stencil,
             snorm16,
             snorm16_blend,
@@ -2867,6 +2928,13 @@ impl Drawer {
         kept?;
         let t = Instant::now();
         self.drop_targets(&mut report);
+        // Views and resolve groups hold their textures and buffers: only
+        // those of kept targets and kept resolves stay.
+        let (targets, mirrors) = (&self.targets, &self.mirrors);
+        let live = |tex: &wgpu::Texture| targets.values().any(|t| t == tex);
+        self.target_views.retain(|t, _| live(t));
+        (self.resolve_groups)
+            .retain(|(buf, tex, _), _| live(tex) && mirrors.iter().any(|m| m.buf == *buf));
         self.timings.edges += t.elapsed();
         // Counts made where only the report is mutable (durations there
         // are zero).
@@ -3474,6 +3542,8 @@ impl Drawer {
                 // from an odd size would).
                 self.staged = Vec::with_capacity(size.min(STAGED_RESERVE) as usize);
                 self.arena_groups.clear();
+                self.clear_group = None;
+                self.resolve_groups.clear();
                 self.arena = Some(self.device.create_buffer(&wgpu::BufferDescriptor {
                     label: Some("draw arena"),
                     size,
@@ -3513,6 +3583,20 @@ impl Drawer {
             true
         })
         .expect("bytes staged")
+    }
+
+    /// Stages `words` (a clear value or resolve parameters) for a uniform
+    /// binding of the arena at a dynamic offset, and returns the offset.
+    /// Submits the batch first when the arena is full, like a draw.
+    fn stage_uniform(&mut self, words: &[u32]) -> Result<u32, Skip> {
+        self.reserve(self.staged_size(4 * words.len() as u64))?;
+        let (offset, _) = (self.push(4 * words.len(), |b| {
+            words_into(words, b);
+            true
+        }))
+        .expect("uniform staged");
+        u32::try_from(offset)
+            .map_err(|_| Skip::Unsupported("draw data past 4 GiB of the arena".into()))
     }
 
     /// Whether `need` bytes of parts can be staged without submitting the
@@ -6151,19 +6235,29 @@ impl Drawer {
         }
         let format = self.host_format(key.format);
         let pipeline = self.clear_pipeline(format)?;
-        let mut v: Vec<u32> = color.iter().map(|c| c.to_bits()).collect();
-        v.extend([depth.to_bits(), 0, 0, 0]);
-        let ub = self.buffer("clear value", &to_bytes(&v), wgpu::BufferUsages::UNIFORM);
-        let scope = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
-        let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("clear"),
-            layout: &self.clear_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: ub.as_entire_binding(),
-            }],
-        });
-        let view = tex.create_view(&Default::default());
+        let c = color.map(f32::to_bits);
+        let value = [c[0], c[1], c[2], c[3], depth.to_bits(), 0, 0, 0];
+        let offset = self.stage_uniform(&value)?;
+        let (device, layout) = (&self.device, &self.clear_layout);
+        let arena = self.arena.as_ref().expect("staged");
+        let bg = (self.clear_group.get_or_insert_with(|| {
+            device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("clear"),
+                layout,
+                entries: &[wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer: arena,
+                        offset: 0,
+                        size: wgpu::BufferSize::new(4 * value.len() as u64),
+                    }),
+                }],
+            })
+        }))
+        .clone();
+        let view = (self.target_views.entry(tex.clone()))
+            .or_insert_with(|| tex.create_view(&Default::default()))
+            .clone();
         let is_depth = format.is_depth_stencil_format();
         let keep = wgpu::Operations {
             load: wgpu::LoadOp::Load,
@@ -6207,13 +6301,10 @@ impl Drawer {
                 ..Default::default()
             });
             pass.set_pipeline(&pipeline);
-            pass.set_bind_group(0, &bg, &[]);
+            pass.set_bind_group(0, &bg, &[offset]);
             pass.set_scissor_rect(rect.x0, rect.y0, rect.width(), rect.height());
             pass.set_stencil_reference(stencil);
             pass.draw(0..3, 0..1);
-        }
-        if let Some(e) = block_on(scope.pop()) {
-            return Err(Skip::Fatal(Error::Gpu(e.to_string())));
         }
         self.mark_written(key, rect.y1, msaa);
         Ok(())
@@ -6520,14 +6611,10 @@ impl Drawer {
             ((lo - self.mirrors[i].lo) / 4) as u32,
             0,
         ];
-        let uniform = self.buffer(
-            "resolve params",
-            &to_bytes(&params),
-            wgpu::BufferUsages::UNIFORM,
-        );
-        let scope = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let offset = self.stage_uniform(&params)?;
         let device = &self.device;
         let cache = self.disk_cache.as_ref().map(|c| &c.cache);
+        let layouts = &self.resolve_layouts[entry];
         // Set once the shader module is made, so it times the pipeline alone.
         let mut t0 = None;
         let pipeline = self.resolve_pipelines[entry].get_or_insert_with(|| {
@@ -6538,7 +6625,7 @@ impl Drawer {
             t0 = Some(Instant::now());
             device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                 label: Some("resolve"),
-                layout: None,
+                layout: Some(&layouts.1),
                 module: &module,
                 entry_point: Some(["main", "depth_main", "depth_stencil_main"][entry]),
                 compilation_options: Default::default(),
@@ -6549,42 +6636,58 @@ impl Drawer {
         if let Some(t0) = t0 {
             self.pipeline_made(t0);
         }
-        let aspect = |aspect| {
-            tex.create_view(&wgpu::TextureViewDescriptor {
-                aspect,
-                ..Default::default()
+        // The source's aspect views and the buffer, made once for each
+        // pair: a frame resolves the same targets into the same buffers.
+        if self.resolve_groups.len() >= RESOLVE_GROUP_CAP {
+            self.resolve_groups.clear();
+        }
+        let (device, layouts) = (&self.device, &self.resolve_layouts[entry]);
+        let arena = self.arena.as_ref().expect("staged");
+        let buf = &self.mirrors[i].buf;
+        let bg = (self.resolve_groups.entry((buf.clone(), tex.clone(), entry)))
+            .or_insert_with(|| {
+                let aspect = |aspect| {
+                    tex.create_view(&wgpu::TextureViewDescriptor {
+                        aspect,
+                        ..Default::default()
+                    })
+                };
+                let views = match entry {
+                    0 => vec![(0, aspect(wgpu::TextureAspect::All))],
+                    1 => vec![(3, aspect(wgpu::TextureAspect::DepthOnly))],
+                    _ => vec![
+                        (3, aspect(wgpu::TextureAspect::DepthOnly)),
+                        (4, aspect(wgpu::TextureAspect::StencilOnly)),
+                    ],
+                };
+                let mut entries: Vec<_> = views
+                    .iter()
+                    .map(|(binding, view)| wgpu::BindGroupEntry {
+                        binding: *binding,
+                        resource: wgpu::BindingResource::TextureView(view),
+                    })
+                    .collect();
+                entries.extend([
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                            buffer: arena,
+                            offset: 0,
+                            size: wgpu::BufferSize::new(4 * params.len() as u64),
+                        }),
+                    },
+                ]);
+                device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("resolve"),
+                    layout: &layouts.0,
+                    entries: &entries,
+                })
             })
-        };
-        let views = match entry {
-            0 => vec![(0, aspect(wgpu::TextureAspect::All))],
-            1 => vec![(3, aspect(wgpu::TextureAspect::DepthOnly))],
-            _ => vec![
-                (3, aspect(wgpu::TextureAspect::DepthOnly)),
-                (4, aspect(wgpu::TextureAspect::StencilOnly)),
-            ],
-        };
-        let mut entries: Vec<_> = views
-            .iter()
-            .map(|(binding, view)| wgpu::BindGroupEntry {
-                binding: *binding,
-                resource: wgpu::BindingResource::TextureView(view),
-            })
-            .collect();
-        entries.extend([
-            wgpu::BindGroupEntry {
-                binding: 1,
-                resource: self.mirrors[i].buf.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 2,
-                resource: uniform.as_entire_binding(),
-            },
-        ]);
-        let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("resolve"),
-            layout: &pipeline.get_bind_group_layout(0),
-            entries: &entries,
-        });
+            .clone();
         // Recorded in the batch after its draws, which end their render
         // pass here; submitted with them.
         let device = &self.device;
@@ -6599,14 +6702,11 @@ impl Drawer {
                 timestamp_writes: GpuClock::compute(&mut self.gpu_clock, 2),
             });
             pass.set_pipeline(pipeline);
-            pass.set_bind_group(0, &bg, &[]);
+            pass.set_bind_group(0, &bg, &[offset]);
             pass.dispatch_workgroups(rect.width().div_ceil(8), rect.height().div_ceil(8), 1);
         }
         self.resolve_pending = true;
         self.timings.resolve_cpu += lap(&mut t);
-        if let Some(e) = block_on(scope.pop()) {
-            return Err(Skip::Fatal(Error::Gpu(e.to_string())));
-        }
         let m = &mut self.mirrors[i];
         let (mut a, mut b) = (lo, hi);
         m.dirty.retain(|&(x, y)| {
