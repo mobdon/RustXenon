@@ -246,6 +246,30 @@ pub fn mip_level(fetch: &TextureFetch, level: u32) -> Result<MipLevel, Error> {
     })
 }
 
+/// Mip `level` of `fetch` as a fetch whose base level it is: its size,
+/// pitch and address (`mip_address` plus the level's offset), no mips. So
+/// [`bytes_needed`] and the base level decoders read the level.
+pub fn mip_fetch(fetch: &TextureFetch, level: u32) -> Result<TextureFetch, Error> {
+    let m = mip_level(fetch, level)?;
+    Ok(TextureFetch {
+        // Mip pitches are whole tiles of blocks, so whole 32-texel units.
+        pitch: (m.pitch_blocks * fetch.format.info().block_width) >> 5,
+        base_address: fetch.mip_address.wrapping_add(m.offset as u32),
+        size: (m.width - 1) | ((m.height - 1) << 13),
+        mip_min_level: 0,
+        mip_max_level: 0,
+        mip_address: 0,
+        ..*fetch
+    })
+}
+
+/// [`mip_fetch`] of each level after the base that `fetch` samples, in
+/// order: 1 up to the last of [`TextureFetch::mip_range`], stopping before
+/// the first level [`mip_level`] does not lay out (the packed mip tail).
+pub fn mip_fetches(fetch: &TextureFetch) -> impl Iterator<Item = TextureFetch> + '_ {
+    (1..=fetch.mip_range().1).map_while(|l| mip_fetch(fetch, l).ok())
+}
+
 /// First level of a `width` x `height` chain stored in the packed mip tail,
 /// as Xenia's GetPackedMipLevel: the levels whose shorter side is 16 or
 /// less. Levels before it keep the unpacked layout.
@@ -404,6 +428,52 @@ mod tests {
                 .map(|(w, h)| packed_mip_level(w, h)),
             [4, 2, 1, 0, 0]
         );
+    }
+
+    #[test]
+    fn mip_fetches_decode_each_level() {
+        // 64x64 tiled k_8_8_8_8 with mip_max_level 3, unpacked: levels 1-3
+        // (32x32 to 8x8), each a pattern of its own, decode from the mip page.
+        let texel = |l: u32, x: u32, y: u32| [l as u8 * 60, x as u8, y as u8, 255];
+        let mut words = fetch_words(
+            TextureFormat::K8_8_8_8,
+            Endian::None,
+            true,
+            64,
+            64,
+            64,
+            RGBA,
+        );
+        words[4] = 3 << 6;
+        words[5] |= 0x0010_0000;
+        let fetch = TextureFetch::decode(words);
+        let chain: Vec<_> = mip_fetches(&fetch).collect();
+        assert_eq!(chain.len(), 3);
+        let mut mip_page = Vec::new();
+        for (l, m) in (1..).zip(&chain) {
+            assert_eq!((m.width(), m.height()), (64 >> l, 64 >> l));
+            assert_eq!(m.mip_range(), (0, 0));
+            let n = 64 >> l;
+            let linear: Vec<u8> = (0..n * n).flat_map(|i| texel(l, i % n, i / n)).collect();
+            let tiled = tile::tile_2d(&linear, n, n, m.pitch_texels(), 4).unwrap();
+            let at = (m.base_address - fetch.mip_address) as usize;
+            assert_eq!(at, mip_level(&fetch, l).unwrap().offset);
+            mip_page.resize(at, 0);
+            mip_page.extend_from_slice(&tiled);
+        }
+        for (l, m) in (1..).zip(&chain) {
+            let at = (m.base_address - fetch.mip_address) as usize;
+            let img = decode_base_level(m, &mip_page[at..]).unwrap();
+            let n = 64 >> l;
+            let expect: Vec<u8> = (0..n * n).flat_map(|i| texel(l, i % n, i / n)).collect();
+            assert_eq!(img.rgba8, expect, "level {l}");
+        }
+        // Packed mips: 64 packs from level 2, so only level 1 is listed.
+        words[5] |= 1 << 11;
+        assert_eq!(mip_fetches(&TextureFetch::decode(words)).count(), 1);
+        // No mip page: none.
+        words[5] &= 0xFFF;
+        assert_eq!(mip_fetches(&TextureFetch::decode(words)).count(), 0);
     }
 
     #[test]

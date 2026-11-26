@@ -1596,17 +1596,18 @@ fn hash_words(words: &[u32]) -> u64 {
 /// collision only shows a stale texture.
 /// The fetch constant fields the decoded texels depend on: type, signs,
 /// pitch and tiling (dword 0), format, endian and address (1), size (2),
-/// swizzle (3) and dimension (5). Clamp, filters, LOD, exp_adjust, border
-/// and mip fields only change sampling, so textures differing in those
-/// share one decode.
+/// swizzle (3), mip levels (4), and dimension, packed mips and mip address
+/// (5), which pick the mip levels decoded. Clamp, filters, LOD bias,
+/// exp_adjust and border only change sampling, so textures differing in
+/// those share one decode.
 fn decode_key(c: [u32; 6]) -> [u32; 6] {
     [
         c[0] & !(0x1FF << 10),
         c[1] & !(1 << 11),
         c[2],
         c[3] & (0xFFF << 1),
-        0,
-        c[5] & (3 << 9),
+        c[4] & (0xFF << 2),
+        c[5] & !0x1FF,
     ]
 }
 
@@ -4403,7 +4404,12 @@ impl Drawer {
                     .insert(constant, (view.clone(), lo, hi, None));
                 return Ok((view, sampler));
             }
-            self.sync(mem, addr, end)?;
+            if reads_base(&fetch) {
+                self.sync(mem, addr, end)?;
+            }
+            for (a, b) in xenon_texture::mip_fetches(&fetch).map_while(|m| level_range(&m)) {
+                self.sync(mem, a, b)?;
+            }
         }
         let view = self
             .guest_texture(n, &fetch, &*mem, report)
@@ -4661,7 +4667,9 @@ impl Drawer {
     /// component, upload as floats; unsigned DXT1..5 as BC blocks where
     /// [`bc_blocks`] takes them. The cache key holds the whole fetch
     /// constant (sign bits included), so signed and unsigned views of the
-    /// same bytes are separate textures.
+    /// same bytes are separate textures. The mip levels of
+    /// [`xenon_texture::mip_fetches`] are read after the base, which is
+    /// zeros when [`reads_base`] is false.
     fn guest_texture(
         &mut self,
         n: u32,
@@ -4673,11 +4681,22 @@ impl Drawer {
         let len = xenon_texture::bytes_needed(fetch).map_err(|e| e.to_string())?;
         let mut bytes = std::mem::take(&mut self.texture_scratch);
         bytes.resize(len, 0);
-        let view = if mem.read_into(addr, &mut bytes) {
+        let mut read = if reads_base(fetch) {
+            mem.read_into(addr, &mut bytes)
+        } else {
+            bytes.fill(0);
+            true
+        };
+        for (a, b) in xenon_texture::mip_fetches(fetch).map_while(|m| level_range(&m)) {
+            let at = bytes.len();
+            bytes.resize(at + (b - a) as usize, 0);
+            read &= mem.read_into(a as u32, &mut bytes[at..]);
+        }
+        let view = if read {
             self.texture_from(n, fetch, &bytes, report)
         } else {
             Err(xenon_texture::Error::TooShort {
-                needed: len,
+                needed: bytes.len(),
                 got: 0,
             }
             .to_string())
@@ -4686,7 +4705,8 @@ impl Drawer {
         view
     }
 
-    /// [`Self::guest_texture`] from the guest bytes `bytes` of `fetch`.
+    /// [`Self::guest_texture`] from the guest bytes `bytes` of `fetch`: the
+    /// base level's, then each mip level's in turn.
     fn texture_from(
         &mut self,
         n: u32,
@@ -4694,11 +4714,31 @@ impl Drawer {
         bytes: &[u8],
         report: &mut Report,
     ) -> Result<wgpu::TextureView, String> {
-        let addr = fetch.base_address & PHYSICAL_MASK;
+        let addr = u64::from(fetch.base_address & PHYSICAL_MASK);
+        let base_len = xenon_texture::bytes_needed(fetch).map_err(|e| e.to_string())?;
         report.timings.hashed_bytes += bytes.len() as u64;
         let constant = self.regs.fetch_constant(n);
         let key = (decode_key(constant), hash_bytes(bytes));
-        let range = (u64::from(addr), u64::from(addr) + bytes.len() as u64);
+        // shortcut: one range spans the base, the mips and any gap between
+        // them, so a write into the gap decodes the chain again; keep a
+        // range per level if mips far from their base show up.
+        let mut range = match reads_base(fetch) {
+            true => (addr, addr + base_len as u64),
+            false => (u64::MAX, 0),
+        };
+        // (fetch, offset in `bytes`, length) of each mip level.
+        let mut mips = Vec::new();
+        let mut at = base_len;
+        for m in xenon_texture::mip_fetches(fetch) {
+            let Some((a, b)) = level_range(&m) else { break };
+            let len = (b - a) as usize;
+            if bytes.len() < at + len {
+                break;
+            }
+            range = (range.0.min(a), range.1.max(b));
+            mips.push((m, at, len));
+            at += len;
+        }
         if let Some((view, _, used)) = self.texture_cache.get_mut(&key) {
             *used = self.replays;
             let view = view.clone();
@@ -4706,42 +4746,27 @@ impl Drawer {
                 .insert(constant, (view.clone(), range.0, range.1, Some(key)));
             return Ok(view);
         }
-        let signed = fetch.sign.contains(&1);
-        let mut host = host_texture_format(fetch.format, fetch.sign, self.float32_filterable);
-        let bc = if self.bc_textures && !signed {
-            bc_blocks(fetch, bytes).map_err(|e| e.to_string())?
-        } else {
-            None
-        };
-        let (width, height, data) = if let Some((format, blocks)) = bc {
-            host = format;
-            (fetch.width(), fetch.height(), blocks)
-        } else if host == wgpu::TextureFormat::Rgba8Unorm {
-            let img = xenon_texture::decode_base_level(fetch, bytes).map_err(|e| e.to_string())?;
-            (img.width, img.height, img.rgba8)
-        } else {
-            let img =
-                xenon_texture::decode_base_level_f32(fetch, bytes).map_err(|e| e.to_string())?;
-            let data = if host == wgpu::TextureFormat::Rgba32Float {
-                img.rgba.iter().flat_map(|v| v.to_le_bytes()).collect()
-            } else {
-                img.rgba
-                    .iter()
-                    .flat_map(|&v| formats::f32_to_half(v).to_le_bytes())
-                    .collect()
-            };
-            (img.width, img.height, data)
-        };
+        let bc = self.bc_textures && !fetch.sign.contains(&1);
+        let float32 = self.float32_filterable;
+        let (host, width, height, data) =
+            decode_level(fetch, &bytes[..base_len], bc, float32).map_err(|e| e.to_string())?;
         if width > self.max_dim || height > self.max_dim {
             return Err(format!("texture {width}x{height}"));
         }
-        let size = wgpu::Extent3d {
-            width,
-            height,
-            depth_or_array_layers: 1,
-        };
+        let mut levels = vec![(width, height, data)];
+        for &(m, at, len) in &mips {
+            // shortcut: the chain stops at a level that does not decode to
+            // the base's host format (a DXT level not whole blocks) or at
+            // all; sampled LODs past it clamp to the last level decoded.
+            let bc = bc && host.is_compressed();
+            match decode_level(&m, &bytes[at..at + len], bc, float32) {
+                Ok((h, w, hh, d)) if h == host => levels.push((w, hh, d)),
+                _ => break,
+            }
+        }
+        let len: u64 = levels.iter().map(|l| l.2.len() as u64).sum();
         report.timings.textures_uploaded += 1;
-        report.timings.texture_bytes += data.len() as u64;
+        report.timings.texture_bytes += len;
         let bucket = match host {
             wgpu::TextureFormat::Rgba8Unorm => 0,
             _ if host.is_compressed() => 1,
@@ -4751,36 +4776,45 @@ impl Drawer {
         };
         let by = &mut report.timings.uploads_by_format[bucket];
         by.0 += 1;
-        by.1 += data.len() as u64;
-        // Rows of blocks: a BC row holds four rows of texels.
-        let rows = height / host.block_dimensions().1;
+        by.1 += len;
         let tex = self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("guest texture"),
-            size,
-            mip_level_count: 1,
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: levels.len() as u32,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: host,
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
-        self.queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: &tex,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            &data,
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(data.len() as u32 / rows),
-                rows_per_image: Some(rows),
-            },
-            size,
-        );
+        for (level, (w, h, data)) in levels.iter().enumerate() {
+            // Rows of blocks: a BC row holds four rows of texels.
+            let rows = h / host.block_dimensions().1;
+            self.queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &tex,
+                    mip_level: level as u32,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                data,
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(data.len() as u32 / rows),
+                    rows_per_image: Some(rows),
+                },
+                wgpu::Extent3d {
+                    width: *w,
+                    height: *h,
+                    depth_or_array_layers: 1,
+                },
+            );
+        }
         let view = tex.create_view(&Default::default());
-        let len = data.len() as u64;
         let key_hash = hash_bytes(&to_bytes(&key.0)) ^ key.1;
         if self.texture_evicted.remove(&key_hash) {
             report.timings.textures_reuploaded += 1;
@@ -6456,6 +6490,53 @@ fn detile_front(
 }
 
 impl Drawer {}
+
+/// The base level of `fetch` from its guest bytes as host texels: host
+/// format, width, height and texel bytes. BC blocks when `bc` and
+/// [`bc_blocks`] takes them; Rgba8Unorm, or floats where
+/// [`host_texture_format`] picks them (32-bit ones with `float32`).
+fn decode_level(
+    fetch: &xenon_texture::TextureFetch,
+    bytes: &[u8],
+    bc: bool,
+    float32: bool,
+) -> Result<(wgpu::TextureFormat, u32, u32, Vec<u8>), xenon_texture::Error> {
+    if bc {
+        if let Some((format, blocks)) = bc_blocks(fetch, bytes)? {
+            return Ok((format, fetch.width(), fetch.height(), blocks));
+        }
+    }
+    let host = host_texture_format(fetch.format, fetch.sign, float32);
+    if host == wgpu::TextureFormat::Rgba8Unorm {
+        let img = xenon_texture::decode_base_level(fetch, bytes)?;
+        return Ok((host, img.width, img.height, img.rgba8));
+    }
+    let img = xenon_texture::decode_base_level_f32(fetch, bytes)?;
+    let data = if host == wgpu::TextureFormat::Rgba32Float {
+        img.rgba.iter().flat_map(|v| v.to_le_bytes()).collect()
+    } else {
+        img.rgba
+            .iter()
+            .flat_map(|&v| formats::f32_to_half(v).to_le_bytes())
+            .collect()
+    };
+    Ok((host, img.width, img.height, data))
+}
+
+/// Whether the guest path reads the base level of `fetch`: not when the
+/// fetch samples from a mip level up and has mips to read (its base page
+/// may be 0, as Xenia's [`xenon_texture::TextureFetch::mip_range`] has
+/// it); the base then decodes from zeros, which no LOD reaches.
+fn reads_base(fetch: &xenon_texture::TextureFetch) -> bool {
+    fetch.mip_range().0 == 0 || xenon_texture::mip_fetches(fetch).next().is_none()
+}
+
+/// The physical guest range `[lo, hi)` the base level of `fetch` reads.
+fn level_range(fetch: &xenon_texture::TextureFetch) -> Option<(u64, u64)> {
+    let a = u64::from(fetch.base_address & PHYSICAL_MASK);
+    let len = xenon_texture::bytes_needed(fetch).ok()?;
+    Some((a, a + len as u64))
+}
 
 /// The base level of an unsigned DXT1, DXT2/3 or DXT4/5 `fetch` as linear
 /// BC1, BC2 or BC3 blocks (endian swapped and detiled, as the CPU decoder
