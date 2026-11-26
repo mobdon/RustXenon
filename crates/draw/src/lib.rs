@@ -1277,7 +1277,13 @@ impl<K: PartialEq, T> Spares<K, T> {
     fn put(&mut self, key: K, bytes: u64, t: T) {
         self.items.push_back((key, bytes, t));
         self.bytes += bytes;
-        while self.items.len() > self.max_count || self.bytes > self.max_bytes {
+        self.trim(self.max_count, self.max_bytes);
+    }
+
+    /// Frees the oldest until at most `max_count` of at most `max_bytes`
+    /// are left.
+    fn trim(&mut self, max_count: usize, max_bytes: u64) {
+        while self.items.len() > max_count || self.bytes > max_bytes {
             let Some((_, b, _)) = self.items.pop_front() else {
                 break;
             };
@@ -1291,11 +1297,6 @@ impl<K: PartialEq, T> Spares<K, T> {
         let (_, b, t) = self.items.remove(i)?;
         self.bytes -= b;
         Some(t)
-    }
-
-    fn clear(&mut self) {
-        self.items.clear();
-        self.bytes = 0;
     }
 }
 
@@ -3795,7 +3796,8 @@ impl Drawer {
     /// the rows of, with no newer alias whose words do not transfer:
     /// their next use takes that target's words (or newer ones) as it
     /// would without the drop; their textures are kept as spares for new
-    /// targets. Then, past the cap, frees the spares and drops the
+    /// targets. Then frees the oldest spares past the cap on targets and
+    /// spares together, and past it on targets alone drops the
     /// least recently written targets; one still holding the newest
     /// pixels of its tiles comes back cleared, as EDRAM garbage would, and
     /// is reported. Runs with no batch recorded.
@@ -3836,12 +3838,13 @@ impl Drawer {
             self.target_drops += 1;
         }
         let mut total: u64 = self.targets.values().map(texture_bytes).sum();
+        // The spares count against the cap and go first; targets dropped
+        // below are freed, not kept.
+        let room = self.target_cap.saturating_sub(total);
+        self.spare_targets.trim(usize::MAX, room);
         if total <= self.target_cap {
             return;
         }
-        // Over the cap the spares go first, and targets dropped below are
-        // freed, not kept.
-        self.spare_targets.clear();
         let mut by_age: Vec<(u64, RenderTargetKey)> = self
             .targets
             .keys()
@@ -6983,8 +6986,44 @@ mod tests {
         s.put('e', 11, 7);
         assert_eq!((s.items.len(), s.bytes), (0, 0));
         s.put('f', 1, 8);
-        s.clear();
-        assert_eq!((s.take(&'f'), s.bytes), (None, 0));
+        s.put('g', 2, 9);
+        s.trim(usize::MAX, 2);
+        assert_eq!((s.take(&'f'), s.bytes), (None, 2));
+        s.trim(usize::MAX, 0);
+        assert_eq!((s.take(&'g'), s.bytes), (None, 0));
+    }
+
+    /// The spares count against the target cap: past it with the live
+    /// targets under it, the oldest spares go and the targets stay.
+    #[test]
+    fn target_cap_counts_the_spares() {
+        let Some(mut d) = gpu() else { return };
+        let key = |base_tiles| RenderTargetKey {
+            base_tiles,
+            pitch: 64,
+            format: TargetFormat::Rgba8,
+        };
+        let mut report = Report::default();
+        for base in [0, 100, 200, 300, 400] {
+            d.target(key(base), 64, 0, &mut report).unwrap();
+        }
+        for base in [0, 100, 200] {
+            d.mark_written(key(base), 64, 0);
+        }
+        for base in [300, 400] {
+            let tex = d.targets.remove(&key(base)).unwrap();
+            d.spare_targets
+                .put(spare_key(&tex), texture_bytes(&tex), tex);
+        }
+        // 64 x 2048 x 4 bytes each: three live and two spare are 2.5 MB.
+        d.target_cap = 2 << 20;
+        d.drop_targets(&mut report);
+        assert_eq!(d.render_targets().len(), 3);
+        assert_eq!(d.spare_targets.items.len(), 1);
+        let live: u64 = d.targets.values().map(texture_bytes).sum();
+        assert!(live + d.spare_targets.bytes <= d.target_cap);
+        assert!(report.warnings.is_empty(), "{report:?}");
+        d.flush().unwrap();
     }
 
     /// A new target that takes a dropped one's texture starts zeroed, as
@@ -7020,6 +7059,143 @@ mod tests {
         assert_eq!(d.read_render_target(key(100), 0, 0, 2, 2).unwrap(), [0; 16]);
         let m = d.memory_line();
         assert!(m.contains(", 1 made, 1 reused, 0 spare (0 MB),"), "{m}");
+    }
+
+    /// Texel (0, 0) of a depth target: depth (loaded in a compute pass, as
+    /// Depth24PlusStencil8 depth cannot be copied out) and stencil (0
+    /// without a stencil aspect).
+    fn read_depth_stencil(d: &Drawer, tex: &wgpu::Texture) -> (f32, u8) {
+        let module = d.device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: None,
+            source: wgpu::ShaderSource::Wgsl(
+                "@group(0) @binding(0) var depth: texture_depth_2d;\n\
+                 @group(0) @binding(1) var<storage, read_write> out: array<f32>;\n\
+                 @compute @workgroup_size(1)\n\
+                 fn main() { out[0] = textureLoad(depth, vec2<i32>(0, 0), 0); }\n"
+                    .into(),
+            ),
+        });
+        let pipeline = d
+            .device
+            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: None,
+                layout: None,
+                module: &module,
+                entry_point: Some("main"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
+        let buffer = |usage| {
+            d.device.create_buffer(&wgpu::BufferDescriptor {
+                label: None,
+                size: 256 + 256 * u64::from(tex.height()),
+                usage,
+                mapped_at_creation: false,
+            })
+        };
+        let out = buffer(wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC);
+        let read = buffer(wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST);
+        let view = tex.create_view(&wgpu::TextureViewDescriptor {
+            aspect: wgpu::TextureAspect::DepthOnly,
+            ..Default::default()
+        });
+        let group = d.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &pipeline.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: out.as_entire_binding(),
+                },
+            ],
+        });
+        let mut enc = d.device.create_command_encoder(&Default::default());
+        {
+            let mut pass = enc.begin_compute_pass(&Default::default());
+            pass.set_pipeline(&pipeline);
+            pass.set_bind_group(0, &group, &[]);
+            pass.dispatch_workgroups(1, 1, 1);
+        }
+        enc.copy_buffer_to_buffer(&out, 0, &read, 0, Some(4));
+        if tex.format().has_stencil_aspect() {
+            enc.copy_texture_to_buffer(
+                wgpu::TexelCopyTextureInfo {
+                    texture: tex,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::StencilOnly,
+                },
+                wgpu::TexelCopyBufferInfo {
+                    buffer: &read,
+                    layout: wgpu::TexelCopyBufferLayout {
+                        offset: 256,
+                        bytes_per_row: Some(256),
+                        rows_per_image: None,
+                    },
+                },
+                // Depth and stencil copies take the whole texture.
+                tex.size(),
+            );
+        }
+        let scope = d.device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let cmd = enc.finish();
+        if let Some(e) = block_on(scope.pop()) {
+            panic!("{e}");
+        }
+        let data = d.map_read(&read, d.submit_now([cmd])).unwrap();
+        (f32::from_le_bytes(data[..4].try_into().unwrap()), data[256])
+    }
+
+    /// A depth target that takes a dropped one's texture starts with depth
+    /// and stencil 0, and its clear passes validation.
+    #[test]
+    fn reused_depth_target_texture_starts_cleared() {
+        let Some(mut d) = gpu() else { return };
+        for format in [TargetFormat::D24S8, TargetFormat::D24FS8] {
+            let key = |base_tiles| RenderTargetKey {
+                base_tiles,
+                pitch: 64,
+                format,
+            };
+            let mut report = Report::default();
+            let tex = d.target(key(0), 64, 0, &mut report).unwrap();
+            d.flush().unwrap();
+            let stencil = tex.format().has_stencil_aspect();
+            let view = tex.create_view(&Default::default());
+            let mut enc = d.device.create_command_encoder(&Default::default());
+            enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(0.75),
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: stencil.then_some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(0x5A),
+                        store: wgpu::StoreOp::Store,
+                    }),
+                }),
+                ..Default::default()
+            });
+            d.submit_now([enc.finish()]);
+            let want = if stencil { 0x5A } else { 0 };
+            assert_eq!(read_depth_stencil(&d, &tex), (0.75, want), "{format:?}");
+            let tex = d.targets.remove(&key(0)).unwrap();
+            d.spare_targets
+                .put(spare_key(&tex), texture_bytes(&tex), tex);
+            let tex = d.target(key(100), 64, 0, &mut report).unwrap();
+            d.flush().unwrap();
+            assert!(d.spare_targets.items.is_empty(), "{format:?}");
+            assert_eq!(read_depth_stencil(&d, &tex), (0.0, 0), "{format:?}");
+            // A validation error on the submit thread comes out here.
+            d.flush().unwrap();
+            assert!(report.warnings.is_empty(), "{report:?}");
+            d.targets.clear();
+        }
     }
 
     #[test]
