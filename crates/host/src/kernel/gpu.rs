@@ -100,6 +100,15 @@ impl xenon_draw::GuestMemory for Taken<'_> {
 /// One ring span for the drawer: its commands, the guest ranges written
 /// since the span before ([`Physical`]'s `take_written`) and the time
 /// taking them cost.
+///
+/// With the draw thread the ranges are taken when the span is queued, not
+/// when it is replayed: a CPU write made while the span waits in the queue
+/// is listed only with the next span queued. Until that replay, memo hits
+/// (textures, indices, windows, kept resolves) give the bytes from before
+/// the write while memo misses read the new ones. The drawer's memos thus
+/// follow memory as the command processor saw it; nothing stays stale past
+/// the next span. Inline drawing takes the ranges just before replaying,
+/// as before.
 struct Span {
     cmds: Vec<Command>,
     written: Option<Vec<(u64, u64)>>,
@@ -466,10 +475,6 @@ impl Gpu {
         for c in &cmds {
             self.apply(rt, c, idle);
         }
-        // Every command of the span is applied (its memory and fence writes
-        // done), so its interrupts and a due vertical blank go now: drawing
-        // below can wait on the drawer, and the guest need not wait with it.
-        idle(self);
         let mut cmds = cmds;
         let going = match &mut self.draw {
             Some(Draw::Inline(d)) => {
@@ -487,8 +492,8 @@ impl Gpu {
                     Some(_) => cmds.clone(),
                     None => std::mem::take(&mut cmds),
                 };
-                // Per span, in ring order, so each replay sees the writes
-                // made before its own commands were applied.
+                // Per span, in ring order: each replay sees the writes made
+                // before its span was queued (see [`Span`]).
                 q.push(Span::new(rt, batch), swaps)
             }
             None => true,
@@ -932,6 +937,30 @@ mod tests {
                 (0x1FFF_F000, 0x2000_0000)
             ]
         );
+    }
+
+    /// A span lists the physical writes made before it was made; a write
+    /// made while it waits for the drawer is not given to its replay but
+    /// to the next span's.
+    #[test]
+    fn span_takes_writes_made_before_it() {
+        let mem = xenon_rt::GuestMemory::new_watched(PHYSICAL_VIEW.0 as usize + (1 << 20));
+        if !mem.watched() {
+            return;
+        }
+        let rt = Runtime::new(mem);
+        let _ = Span::new(&rt, Vec::new());
+        rt.mem.write_u32(0xA000_1000, 1);
+        let mut span = Span::new(&rt, Vec::new());
+        rt.mem.write_u32(0xA000_3000, 2);
+        let mut taken = Taken(&rt, span.written.take());
+        assert_eq!(
+            xenon_draw::GuestMemory::take_written(&mut taken),
+            Some(vec![(0x1000, 0x2000)])
+        );
+        assert_eq!(xenon_draw::GuestMemory::take_written(&mut taken), None);
+        let next = Span::new(&rt, Vec::new());
+        assert_eq!(next.written, Some(vec![(0x3000, 0x4000)]));
     }
 
     /// The stats line divides by the frames of the window, or by one window

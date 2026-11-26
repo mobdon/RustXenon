@@ -512,11 +512,10 @@ fn command_processor_applies_writes_waits_and_interrupts() {
     assert_eq!(gpu.interrupts, vec![4]);
 }
 
-/// A span's interrupts reach the caller before `run_ring` hands the span
-/// to the drawer (which can block), and only once the span's fence writes
-/// are done.
+/// A span without waits leaves its interrupts to the caller, raised after
+/// `run_ring` returns (the span drawn or queued, the read pointer moved).
 #[test]
-fn command_processor_raises_interrupts_before_drawing() {
+fn command_processor_leaves_interrupts_to_the_caller() {
     let e = env();
     let rt = &e.rt;
     let ring = 0x1000;
@@ -542,12 +541,9 @@ fn command_processor_raises_interrupts_before_drawing() {
     };
     let r = gpu.run_ring(rt, ring, 64, 0, words.len() as u32, &mut idle);
     assert_eq!(r, words.len() as u32);
-    assert_eq!(
-        seen,
-        [(vec![4], 7)],
-        "raised inside run_ring, after the fence"
-    );
-    assert!(gpu.interrupts.is_empty());
+    assert!(seen.is_empty(), "no idle inside run_ring: {seen:?}");
+    assert_eq!(gpu.interrupts, vec![4]);
+    assert_eq!(rt.mem.read_u32(0xA000_0400), 7);
 }
 
 #[test]
