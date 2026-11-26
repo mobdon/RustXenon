@@ -476,6 +476,9 @@ pub struct Timings {
     pub indices_reused: u32,
     /// Draws that bound a texture bind group made earlier in their replay.
     pub texture_groups_reused: u32,
+    /// Draws that bound a texture bind group found by their fetch
+    /// constants, without looking each texture up.
+    pub texture_sets_reused: u32,
     /// Render passes begun for draws: each target change or flush ends one.
     pub render_passes: u32,
     /// GPU time measured by timestamps around the batch's draw passes,
@@ -530,6 +533,7 @@ impl std::ops::AddAssign<&Timings> for Timings {
         self.consts_reused += t.consts_reused;
         self.indices_reused += t.indices_reused;
         self.texture_groups_reused += t.texture_groups_reused;
+        self.texture_sets_reused += t.texture_sets_reused;
         self.queue += t.queue;
         self.upload += t.upload;
         self.submit_thread += t.submit_thread;
@@ -1122,6 +1126,9 @@ struct DiskCache {
 /// order.
 type TextureGroupKey = (u32, Vec<(wgpu::TextureView, wgpu::Sampler)>);
 
+/// A draw's texture slot mask and the fetch constants of those slots.
+type TextureSetKey = (u32, Vec<[u32; 6]>);
+
 /// A program's translation, or why it failed.
 type Translation = Result<Arc<Translated>, String>;
 
@@ -1301,6 +1308,13 @@ pub struct Drawer {
     /// than that. (Cleared at every replay's end, a frame made its
     /// thousands again: a tenth of the draw thread.)
     texture_groups: HashMap<TextureGroupKey, (wgpu::BindGroup, u64)>,
+    /// A draw's texture bind group by its slot mask and the fetch constants
+    /// of those slots, with the [`Drawer::texture_memo_epoch`] it was found
+    /// in: a later draw with the same constants binds it without looking
+    /// each texture up again, until the texture memo drops an entry.
+    texture_sets: HashMap<TextureSetKey, (wgpu::BindGroup, u64)>,
+    /// Counts the changes that drop [`Drawer::texture_memo`] entries.
+    texture_memo_epoch: u64,
     /// Group 0 bind groups over `arena`, by the sizes of the four slices
     /// they bind (at dynamic offsets). Cleared when the arena is replaced.
     arena_groups: HashMap<[u64; 6], wgpu::BindGroup>,
@@ -2168,6 +2182,8 @@ impl Drawer {
             samplers: HashMap::default(),
             batch: None,
             texture_groups: HashMap::default(),
+            texture_sets: HashMap::default(),
+            texture_memo_epoch: 0,
             arena_groups: HashMap::default(),
             staged: Vec::new(),
             arena: None,
@@ -2574,6 +2590,7 @@ impl Drawer {
             _ => {
                 self.watching = false;
                 self.texture_memo.clear();
+                self.texture_memo_epoch += 1;
                 self.index_memo.clear();
                 self.index_memo_bytes = 0;
                 // Windows staged by a watched replay: anything may have
@@ -2741,8 +2758,12 @@ impl Drawer {
         if ranges.is_empty() {
             return;
         }
+        let had = self.texture_memo.len();
         self.texture_memo
             .retain(|_, &mut (_, a, b, _)| !meets(ranges, a, b));
+        if self.texture_memo.len() != had {
+            self.texture_memo_epoch += 1;
+        }
         self.window_memo
             .retain(|&a, &mut (b, _)| !meets(ranges, a, b));
         self.index_memo
@@ -4167,6 +4188,43 @@ impl Drawer {
         Ok((parts, lo as u32, rebase, None))
     }
 
+    /// The texture bind group of `textures` at the slots of `mask`, from
+    /// [`Drawer::texture_groups`] or made and kept there.
+    fn texture_group(
+        &mut self,
+        tex_mask: u32,
+        textures: Vec<(wgpu::TextureView, wgpu::Sampler)>,
+        g1_layout: &wgpu::BindGroupLayout,
+    ) -> wgpu::BindGroup {
+        match self.texture_groups.entry((tex_mask, textures)) {
+            Entry::Occupied(mut g) => {
+                self.timings.texture_groups_reused += 1;
+                g.get_mut().1 = self.replays;
+                g.get().0.clone()
+            }
+            Entry::Vacant(v) => {
+                let slots = (0..32).filter(|n| tex_mask & (1 << n) != 0);
+                let mut entries = Vec::new();
+                for (n, (view, sampler)) in slots.zip(&v.key().1) {
+                    entries.push(wgpu::BindGroupEntry {
+                        binding: 2 * n,
+                        resource: wgpu::BindingResource::TextureView(view),
+                    });
+                    entries.push(wgpu::BindGroupEntry {
+                        binding: 2 * n + 1,
+                        resource: wgpu::BindingResource::Sampler(sampler),
+                    });
+                }
+                let g = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("draw group 1"),
+                    layout: g1_layout,
+                    entries: &entries,
+                });
+                v.insert((g, self.replays)).0.clone()
+            }
+        }
+    }
+
     fn buffer(&self, label: &str, bytes: &[u8], usage: wgpu::BufferUsages) -> wgpu::Buffer {
         let size = (bytes.len() as u64).max(4).next_multiple_of(4);
         let buf = self.device.create_buffer(&wgpu::BufferDescriptor {
@@ -4654,7 +4712,9 @@ impl Drawer {
         by_age.sort_unstable_by_key(|e| e.0);
         // Groups and the memo hold views; drop them so evicted textures go too.
         self.texture_groups.clear();
+        self.texture_sets.clear();
         self.texture_memo.clear();
+        self.texture_memo_epoch += 1;
         // shortcut: the evicted-key set only feeds a counter; cleared
         // when large, which undercounts re-uploads after that.
         if self.texture_evicted.len() > 1 << 16 {
@@ -5320,9 +5380,21 @@ impl Drawer {
                 report.warn(texture_log_line(ps.hash, n, c, lod, bias));
             }
         }
+        // shortcut: a set found here neither reports its textures'
+        // warnings again nor marks them used for eviction; the first draw
+        // of the set in each memo epoch does both.
+        let constants: Vec<[u32; 6]> = (0..32)
+            .filter(|n| tex_mask & (1 << n) != 0)
+            .map(|n| self.regs.fetch_constant(n))
+            .collect();
+        let set = (self.texture_sets.get(&(tex_mask, constants)))
+            .filter(|(_, epoch)| *epoch == self.texture_memo_epoch)
+            .map(|(g, _)| g.clone());
         let mut textures = Vec::new();
-        for n in (0..32).filter(|n| tex_mask & (1 << n) != 0) {
-            textures.push(self.texture(n, mem, report)?);
+        if set.is_none() {
+            for n in (0..32).filter(|n| tex_mask & (1 << n) != 0) {
+                textures.push(self.texture(n, mem, report)?);
+            }
         }
         self.timings.textures += lap(&mut t);
         let arena = self.arena.clone().expect("staged");
@@ -5369,32 +5441,21 @@ impl Drawer {
         if self.texture_groups.len() >= TEXTURE_GROUP_CAP {
             self.texture_groups.clear();
         }
-        let g1 = match self.texture_groups.entry((tex_mask, textures)) {
-            Entry::Occupied(mut g) => {
-                self.timings.texture_groups_reused += 1;
-                g.get_mut().1 = self.replays;
-                g.get().0.clone()
+        let g1 = if let Some(g) = set {
+            self.timings.texture_sets_reused += 1;
+            g
+        } else {
+            let g = self.texture_group(tex_mask, textures, &g1_layout);
+            if self.texture_sets.len() >= TEXTURE_GROUP_CAP {
+                self.texture_sets.clear();
             }
-            Entry::Vacant(v) => {
-                let slots = (0..32).filter(|n| tex_mask & (1 << n) != 0);
-                let mut entries = Vec::new();
-                for (n, (view, sampler)) in slots.zip(&v.key().1) {
-                    entries.push(wgpu::BindGroupEntry {
-                        binding: 2 * n,
-                        resource: wgpu::BindingResource::TextureView(view),
-                    });
-                    entries.push(wgpu::BindGroupEntry {
-                        binding: 2 * n + 1,
-                        resource: wgpu::BindingResource::Sampler(sampler),
-                    });
-                }
-                let g = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some("draw group 1"),
-                    layout: &g1_layout,
-                    entries: &entries,
-                });
-                v.insert((g, self.replays)).0.clone()
-            }
+            let constants = (0..32)
+                .filter(|n| tex_mask & (1 << n) != 0)
+                .map(|n| self.regs.fetch_constant(n))
+                .collect();
+            let epoch = self.texture_memo_epoch;
+            (self.texture_sets).insert((tex_mask, constants), (g.clone(), epoch));
+            g
         };
         let (pass, bound) = self.pass((color, depth_key), &color_tex, depth_tex.as_ref());
         if bound.pipeline.as_ref() != Some(&pipeline) {
