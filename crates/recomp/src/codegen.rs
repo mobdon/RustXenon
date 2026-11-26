@@ -154,7 +154,11 @@ pub fn write(img: &Image, a: &Analysis, out: &Path, o: &Options) -> io::Result<S
     put(
         &out.join("game/Cargo.toml"),
         &format!(
-            "[package]\nname = \"game\"\nversion = \"0.0.0\"\nedition = \"2021\"\npublish = false\n\n[dependencies]\nxenon-host = {{ path = \"{host}\" }}\nxenon-rt = {{ path = \"{rt}\" }}\n{deps}\n[build-dependencies]\nxenon-icon = {{ path = \"{icon}\" }}\n"
+            "[package]\nname = \"game\"\nversion = \"0.0.0\"\nedition = \"2021\"\npublish = false\n\n\
+             # `cargo build --features game/player`: no console window.\n\
+             [features]\nplayer = []\n\n\
+             [dependencies]\nxenon-host = {{ path = \"{host}\" }}\nxenon-rt = {{ path = \"{rt}\" }}\n{deps}\n\
+             [build-dependencies]\nxenon-icon = {{ path = \"{icon}\" }}\n"
         ),
         &mut st,
     )?;
@@ -164,7 +168,7 @@ pub fn write(img: &Image, a: &Analysis, out: &Path, o: &Options) -> io::Result<S
     put(
         &out.join("game/src/main.rs"),
         &format!(
-            "//! Generated. Never commit.\nfn main() -> std::process::ExitCode {{\n    xenon_host::run(\"{}\", &[{regs}])\n}}\n",
+            "//! Generated. Never commit.\n#![cfg_attr(feature = \"player\", windows_subsystem = \"windows\")]\nfn main() -> std::process::ExitCode {{\n    xenon_host::run(\"{}\", &[{regs}])\n}}\n",
             o.sha256
         ),
         &mut st,

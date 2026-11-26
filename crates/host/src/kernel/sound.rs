@@ -188,6 +188,16 @@ pub fn start_speaker() {
     }
 }
 
+/// Stops playing on the speaker (the run has stopped). try_lock: this
+/// runs in the panic hook, maybe on a thread that holds the lock.
+pub fn silence() {
+    if let Ok(mut o) = OUT.try_lock() {
+        if let Some(o) = o.as_mut() {
+            o.speaker = None;
+        }
+    }
+}
+
 /// (driver, samples): one 5.1 frame of 256 big-endian floats per channel.
 pub fn submit(rt: &Runtime, driver: u32, samples: u32) {
     let mut o = OUT.lock().unwrap();

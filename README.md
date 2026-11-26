@@ -94,6 +94,34 @@ Keys are physical positions, so they sit in the same place on any keyboard
 layout. Stick keys push the stick fully; controller sticks use XInput's
 standard dead zones.
 
+Everything the game logs also goes to `rustxenon-play.log` beside the
+program. If the game stops with an error while the window is open, the
+window shows the last lines of the log until you close it (Esc, B or Back).
+
+Settings files (all keys optional; a bad value is logged and ignored):
+`<home>\settings.toml` holds your defaults and `<home>\games\<sha256>\run.toml`
+(or a `run.toml` beside the program) one game's paths and overrides.
+`<home>` is `--home`, else the folder above `games\<sha256>\` when the
+program is `game.exe` there, else the program's folder.
+
+```toml
+title = "shown in the launcher"
+exe = 'C:\path\to\patched executable'   # used when --exe is not given
+game = 'C:\path\to\unpacked game folder' # likewise --game, update, data
+[window]
+width = 1280
+height = 720
+fullscreen = false   # true: that mode at refresh Hz if the monitor has it, else borderless
+refresh = 60
+[draw]
+aniso = 16           # XENON_ANISO
+force_linear = false # XENON_FORCE_LINEAR
+scale = 1            # XENON_SCALE
+```
+
+`run.toml` wins over `settings.toml`; the environment variables, when set,
+win over both.
+
 Diagnostic sampler flags (environment variables, off by default):
 
 - `XENON_ANISO=N` (2, 4, 8 or 16; anything else warns and stays off) gives
@@ -167,6 +195,8 @@ xenon-recomp unpack <your disc image> <game folder>
 xenon-recomp unpack <your title update package> <update folder>
 xenon-recomp build <executable> --out <build folder> [--mem-gb 16]
 cd <build folder> && cargo build
+# or, for the double-click player (no console window):
+cd <build folder> && cargo build --features game/player
 ```
 
 `unpack` reads the console's disc file system (at any of the disc
