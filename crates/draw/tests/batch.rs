@@ -246,17 +246,18 @@ fn a_full_upload_arena_submits_and_continues() {
         .shader(false, &vs_color_all_consts())
         .shader(true, &ps_interp_all_consts());
     // Both stages read a float constant by a dynamic index, so a draw after
-    // a write to each stage's constants stages all 256 of both: about 10
-    // KiB per draw with the other constants, and 2001 draws need two arena
-    // fills.
-    for i in 0..2001 {
+    // a write to a stage's constants stages all 256 of it. Only the vertex
+    // ones are written each draw: the arena fills on a draw that binds the
+    // pixel constants staged before, which are then staged again. 3601
+    // draws of about 6 KiB need two arena fills.
+    s.regs(SHADER_CONSTANT_FLOAT + 1024, &[1]);
+    for i in 0..3601 {
         s.regs(SHADER_CONSTANT_FLOAT, &[i])
-            .regs(SHADER_CONSTANT_FLOAT + 1024, &[i])
             .vertex_fetch(0, VERTS + 48 * (i % 2), 12)
             .draw_auto(PRIM_RECT_LIST, 3);
     }
     let report = run(&mut d, &s, &mut mem);
-    assert_eq!(report.draws, 2001, "{report:?}");
+    assert_eq!(report.draws, 3601, "{report:?}");
     assert_eq!(report.timings.submits, 2, "{report:?}");
     let img = d.read_render_target(COLOR_KEY, 0, 0, W, H).unwrap();
     assert_eq!(px(&img, W, 40, 40), RED);

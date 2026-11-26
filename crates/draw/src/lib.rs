@@ -5103,11 +5103,10 @@ impl Drawer {
                 .filter(|((k, _), key)| k == key)
                 .map(|((_, s), _)| s)
         });
-        let float_bytes = [0, 1].map(|i| {
-            // Not built for a stage whose staged ones are bound again.
-            (float_masks[i].filter(|_| kept_floats[i].is_none()))
-                .map(|mask| float_consts(&self.regs, i as u32, &mask))
-        });
+        // Built even for a stage whose staged ones are bound again: a full
+        // arena below stages them anew.
+        let float_bytes =
+            [0, 1].map(|i| float_masks[i].map(|mask| float_consts(&self.regs, i as u32, &mask)));
         // The stages' float constants to stage: those read and not kept.
         let floats = |kept: &[Option<(u64, u64)>; 2]| -> [Option<&[u8]>; 2] {
             [0, 1].map(|i| float_bytes[i].as_deref().filter(|_| kept[i].is_none()))
