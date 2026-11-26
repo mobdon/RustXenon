@@ -3599,8 +3599,27 @@ impl Drawer {
         let (sa, sb) = if all { (0, u64::MAX) } else { (a, b) };
         // Those touching [sa, sb) too.
         self.sync(mem, sa.saturating_sub(1), sb.saturating_add(1))?;
-        // Written back, so the new buffer holds what they held: their
-        // scaled copies inside it stay good.
+        // Written back, so the new buffer holds what they held, unless the
+        // CPU wrote a clean one since: that only unchecked its blocks, and
+        // the new buffer and hashes are made from guest memory as it is
+        // now. So their scaled copies inside it go over only where guest
+        // memory still matches; a failed check drops the kept resolve with
+        // its copies, which the merge would drop anyway.
+        if !all {
+            let mut i = 0;
+            while i < self.mirrors.len() {
+                let m = &self.mirrors[i];
+                let copies: Vec<(u64, u64)> = if m.hi < sa || sb < m.lo {
+                    Vec::new()
+                } else {
+                    m.scaled.iter().map(|c| (c.lo, c.hi)).collect()
+                };
+                // A failed check removed mirror i; the next one moved to i.
+                if copies.iter().all(|&(l, h)| self.verify(i, mem, l, h)) {
+                    i += 1;
+                }
+            }
+        }
         let mut scaled = Vec::new();
         self.mirrors.retain_mut(|m| {
             let keep = !all && (m.hi < sa || sb < m.lo);

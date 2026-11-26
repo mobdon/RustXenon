@@ -2245,3 +2245,71 @@ fn sharp_front_buffer_at_scale_2_has_the_drawn_detail() {
     let m = d.memory_line();
     assert!(m.contains("1 written by the CPU"), "{m}");
 }
+
+/// A kept resolve written back at the end of a replay, then written by the
+/// CPU, merges into the kept resolve of a resolve next to it: the merged
+/// buffer is read from guest memory as the CPU left it, so the old scaled
+/// copy does not go over and the front buffer is shown at guest size from
+/// guest memory.
+#[test]
+fn sharp_front_buffer_merge_drops_a_copy_the_cpu_wrote_over() {
+    let Some(mut d) = drawer() else { return };
+    if d.set_scale(2) != 2 {
+        eprintln!("SKIP: the device cannot draw at scale 2");
+        return;
+    }
+    d.sharp_front = true;
+    let mut mem = memory();
+    mem.write_words(
+        VERTS,
+        &color_verts(&[
+            (10.5, 20.5, 0.0, RED),
+            (40.5, 20.5, 0.0, RED),
+            (10.5, 50.5, 0.0, RED),
+        ]),
+    );
+    let mut s = Stream::default();
+    s.setup()
+        .resolve(&mut mem, W, H, false, Some((rgba(CLEAR), 0)))
+        .shader(false, &vs_color())
+        .shader(true, &ps_interp())
+        .vertex_fetch(0, VERTS, 12)
+        .regs(PA_SU_VTX_CNTL, &[0])
+        .draw_auto(PRIM_RECT_LIST, 3)
+        .regs(PA_SU_VTX_CNTL, &[1])
+        .resolve(&mut mem, W, H, true, None)
+        .swap(W, H);
+    run(&mut d, &s, &mut mem);
+    let r = run(&mut d, &s, &mut mem);
+    assert_eq!(r.frames.len(), 1, "{r:?}");
+    assert_eq!((r.frames[0].width, r.frames[0].height), (2 * W, 2 * H));
+
+    // The CPU writes the front buffer, then a resolve just past it merges
+    // its kept resolve.
+    mem.data[DEST as usize] ^= 0xFF;
+    let next = DEST + xenon_texture::tile::tiled_extent_2d(W, H, W, 4).unwrap();
+    let mut s = Stream::default();
+    s.setup()
+        .resolve_with(
+            &mut mem,
+            (W, H),
+            0,
+            (next, W | (H << 16), dest_info(6, 0, false)),
+            [0; 3],
+        )
+        .swap(W, H);
+    run(&mut d, &s, &mut mem);
+    let m = d.memory_line();
+    assert!(
+        m.contains("frames 2 scaled,") && m.contains("1 no scaled copy"),
+        "{m}"
+    );
+    // The late frame of that swap.
+    let mut swap = Stream::default();
+    swap.swap(W, H);
+    let r = run(&mut d, &swap, &mut mem);
+    assert_eq!(r.frames.len(), 1, "{r:?}");
+    let f = &r.frames[0];
+    assert_eq!((f.width, f.height), (W, H));
+    assert_eq!(f.rgba8, detiled(&mem, DEST, W, H, W, 4));
+}
