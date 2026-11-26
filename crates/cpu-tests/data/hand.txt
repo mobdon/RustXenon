@@ -187,3 +187,7 @@ vpkd3d128_2101010 | 18891e13 | v99=40400001403fffff404001ff3f800003 v4=cdcdcdcdc
 vpkd3d128_2101010_saturates | 18891e13 | v99=41200000c12000004040000040a00000 v4=cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd | v4=cdcdcdcdcdcdcdcdcdcdcdcdc00805ff | 
 # mulhw: the high word is sign-extended, as the reference translators do
 mulhw_sign_extends | 7c642896 | r4=ffffffff r5=1 vscr=10000 | r3=ffffffffffffffff | 
+# bnel, bnelrl and bnectrl not taken still set LR to the next instruction
+bnel_untaken_sets_lr | 40820009 38a00001 | cr=20000000 lr=82000500 vscr=10000 | r5=1 lr=82000004 | 
+bnelrl_untaken_sets_lr | 4c820021 38a00001 | cr=20000000 lr=82000500 vscr=10000 | r5=1 lr=82000004 | 
+bnectrl_untaken_sets_lr | 4c820421 38a00001 | cr=20000000 ctr=82000500 lr=82000500 vscr=10000 | r5=1 lr=82000004 | 

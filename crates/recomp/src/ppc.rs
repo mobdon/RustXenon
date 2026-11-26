@@ -705,9 +705,10 @@ pub fn translate(w: u32, pc: u32, func: &Func) -> Ins {
                 pc.wrapping_add(bd as u32)
             };
             let (pre, cond) = bc_cond(d, a);
+            // LK sets LR whether or not the branch is taken.
             let code = if w & 1 != 0 {
                 format!(
-                    "{pre}if {cond} {{ c.lr = {next:#x}; {} }}",
+                    "{pre}c.lr = {next:#x}; if {cond} {{ {} }}",
                     call(&format!("{t:#010x}"))
                 )
             } else {
@@ -903,7 +904,7 @@ fn op19(
             if w & 1 != 0 {
                 Some((
                     "bclrl",
-                    format!("{pre}if {cond} {{ let t = c.lr as u32; c.lr = {next:#x}; rt.call(c, t); }}"),
+                    format!("{pre}let t = c.lr as u32; c.lr = {next:#x}; if {cond} {{ rt.call(c, t); }}"),
                 ))
             } else {
                 if cond == "true" {
@@ -918,7 +919,7 @@ fn op19(
                 Some((
                     "bcctrl",
                     format!(
-                        "if {cond} {{ let t = c.ctr as u32; c.lr = {next:#x}; rt.call(c, t); }}"
+                        "let t = c.ctr as u32; c.lr = {next:#x}; if {cond} {{ rt.call(c, t); }}"
                     ),
                 ))
             } else {
