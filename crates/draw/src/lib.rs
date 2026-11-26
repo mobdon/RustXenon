@@ -3670,7 +3670,8 @@ impl Drawer {
     /// writing the newly staged bytes to the arena. The windows and
     /// constants staged so far stay in the arena for later batches.
     fn flush(&mut self) -> Result<(), Skip> {
-        self.settle()?;
+        // Submitted on a settle error too, with the rest of the batch.
+        let settled = self.settle();
         // The arena upload counts as submit time too.
         let t = Instant::now();
         // A few batches in flight, so their staged copies stay few; the
@@ -3694,7 +3695,8 @@ impl Drawer {
             let e = t.elapsed();
             self.timings.submit += e;
             self.timings.queue += e;
-            return self.take_submitted();
+            self.take_submitted()?;
+            return settled;
         }
         let site = if pre.is_some() && batch.is_none() {
             Site::Decode
@@ -3735,7 +3737,8 @@ impl Drawer {
                 .clone();
             self.read_gpu_clock(index.expect("submitted"))?;
         }
-        self.take_submitted()
+        self.take_submitted()?;
+        settled
     }
 
     /// Submits now, after the batches the submit thread holds.
@@ -3986,6 +3989,10 @@ impl Drawer {
                         let (merged, left): (Vec<_>, Vec<_>) =
                             ops.into_iter().zip(here).partition(|(_, h)| *h);
                         self.timings.passes_merged += merged.len() as u32;
+                        // Counted once placed: only transfer draws have no
+                        // uniform offset.
+                        self.timings.transfer_passes +=
+                            first.iter().filter(|d| d.offset.is_none()).count() as u32;
                         self.pending = left.into_iter().map(|(op, _)| op).collect();
                     }
                     // In passes of their own, as without merging.
@@ -6512,7 +6519,6 @@ impl Drawer {
             }],
             PendingOp::Transfer { src, dst, rows, .. } => {
                 let setup = self.transfer_setup(*src, *dst, place)?;
-                self.timings.transfer_passes += setup.pipelines.len() as u32;
                 let scissor = (0, 0, op.dst.width(), *rows);
                 (setup.pipelines.iter().zip(&setup.groups))
                     .enumerate()
@@ -6531,10 +6537,23 @@ impl Drawer {
     }
 
     /// Draws the pending clears and transfers, each in a render pass of its
-    /// own, in order.
+    /// own, in order. An op that fails is skipped and the rest are still
+    /// drawn; the first failure is returned at the end.
     fn settle(&mut self) -> Result<(), Skip> {
+        let mut failed = Ok(());
         for op in std::mem::take(&mut self.pending) {
-            let draws = self.op_draws(&op, None)?;
+            let draws = match self.op_draws(&op, None) {
+                Ok(d) => d,
+                Err(e) => {
+                    if failed.is_ok() {
+                        failed = Err(e);
+                    }
+                    continue;
+                }
+            };
+            if let PendingOp::Transfer { .. } = op.op {
+                self.timings.transfer_passes += draws.len() as u32;
+            }
             let tex = &op.dst;
             let format = tex.format();
             let is_depth = format.is_depth_stencil_format();
@@ -6587,7 +6606,7 @@ impl Drawer {
             });
             emit_draws(&mut pass, &draws);
         }
-        Ok(())
+        failed
     }
 
     fn clear_pipeline(
