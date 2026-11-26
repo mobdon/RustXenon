@@ -53,6 +53,7 @@ See [DATA-RULES.md](DATA-RULES.md).
 | `crates/input` | `xenon-input`: the pad state the game reads: keyboard layout, stick dead zones, merging controller and keyboard. No window or GPU |
 | `crates/window` | `xenon-window`: the game window (`--window`): shows drawn frames, reads an XInput controller and the keyboard |
 | `crates/play` | `xenon-play`: the double-click launcher `rustxenon-play.exe`: lists built game folders (`games/<sha256>/` with `game.exe` and `run.toml`), keeps `recent.txt`, edits `settings.toml`, starts a game and waits for it. The list, files and screen drawing are headless; `--screenshot <out.png>` draws one frame without a window |
+| `crates/icon` | `xenon-icon`: the programs' icon, drawn by code (no picture in git): RGBA at any size, an .ico file and a Win32 .res file that the launcher's and each generated game's build script hand to the linker. `cargo run -p xenon-icon --example preview -- <dir>` writes PNG previews |
 | `crates/compare` | `xenon-compare`: diff two frames with a tolerance (side-by-side sheet) and make a blink image. No window or GPU |
 | `crates/regress` | `xenon-regress`: runs game-level regression tests headless and reports pass or fail per frame with pictures. See `games/README.md` |
 | `games/<sha256>/hooks.toml` | Per-game hook addresses with role names. The only per-game file in git |

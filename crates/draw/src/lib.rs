@@ -33,7 +33,10 @@
 //! Every render target is its own wgpu texture keyed by
 //! [`RenderTargetKey`]: EDRAM base tile, surface pitch and format. A target
 //! is `pitch` pixels wide and [`RENDER_TARGET_HEIGHT`] pixels high (the
-//! EDRAM holds 2048 rows of 1280 32-bit pixels).
+//! EDRAM holds 2048 rows of 1280 32-bit pixels). Its texture holds
+//! [`Drawer::scale`] host pixels per guest pixel on each axis: draws,
+//! clears and transfers address host pixels, resolves and readbacks
+//! decimate them back to guest pixels ([`formats::decimate`]).
 //!
 //! Each target records when it was last written (draw or clear; a transfer
 //! gives the target its source's stamp, so neither is transferred back)
@@ -1619,6 +1622,9 @@ pub struct Drawer {
     uncaptured_any: Arc<std::sync::atomic::AtomicBool>,
     max_dim: u32,
     max_storage: u64,
+    /// Host pixels per guest pixel on each axis of every render target
+    /// (see [`Drawer::set_scale`]).
+    scale: u32,
     /// Last, so it drops after the device and every resource made from it.
     instance: wgpu::Instance,
 }
@@ -2640,11 +2646,63 @@ impl Drawer {
             uncaptured_any,
             max_dim: limits.max_texture_dimension_2d,
             max_storage: limits.max_storage_buffer_binding_size,
+            scale: 1,
         };
         if timestamps {
             d.enable_gpu_timestamps();
         }
+        if let Ok(v) = std::env::var("XENON_SCALE") {
+            let s = v.trim().parse().unwrap_or(0);
+            if d.set_scale(s) != s {
+                eprintln!(
+                    "XENON_SCALE={v:?} is not 1 to 4 or too large for this GPU (2048 x scale rows past its {} texels); drawing at 1",
+                    d.max_dim
+                );
+            }
+        }
         Ok(d)
+    }
+
+    /// Draws render targets at `s` host pixels per guest pixel on each
+    /// axis (1 to 4; default from `XENON_SCALE`, else 1). Everything the
+    /// guest or a caller can see stays at guest size: viewports, scissors
+    /// and clears are scaled up, and every read of a target into guest
+    /// memory or out of [`Drawer::read_render_target_raw`] takes each guest
+    /// pixel from its host pixels ([`formats::decimate`]). A scale outside
+    /// 1..=4, or one whose 2048 x `s` rows the device cannot hold, is
+    /// refused and the scale stays as it was. Drops every render target,
+    /// so set it before replaying. Returns the scale now in use.
+    pub fn set_scale(&mut self, s: u32) -> u32 {
+        if !(1..=4).contains(&s) || RENDER_TARGET_HEIGHT * s > self.max_dim || s == self.scale {
+            return self.scale;
+        }
+        self.scale = s;
+        let s2 = u64::from(s * s);
+        self.target_cap = TARGET_CAP * s2;
+        self.spare_targets = Spares::new(SPARE_TARGETS, SPARE_TARGET_BYTES * s2);
+        self.targets.clear();
+        self.written.clear();
+        self.transfer_setups.clear();
+        self.target_views.clear();
+        for m in &mut self.mirrors {
+            m.groups.clear();
+        }
+        // Pixel shaders that read the pixel position take the scale as a
+        // pipeline constant.
+        self.pipelines.retain(|k, _| k.ps_param_gen.is_none());
+        self.scale
+    }
+
+    /// Host pixels per guest pixel of every render target (see
+    /// [`Drawer::set_scale`]).
+    pub fn scale(&self) -> u32 {
+        self.scale
+    }
+
+    /// Guest rows of every render target: [`RENDER_TARGET_HEIGHT`], fewer
+    /// where the device cannot hold them at the scale.
+    fn target_rows(&self) -> u32 {
+        RENDER_TARGET_HEIGHT.min(self.max_dim / self.scale)
     }
 
     /// Times the batch's draw, clear and resolve passes on the GPU with
@@ -2955,9 +3013,13 @@ impl Drawer {
         self.targets.keys().copied().collect()
     }
 
-    /// Width and height of the host texture behind render target `key`.
+    /// Width and height of render target `key` in guest pixels (its host
+    /// texture is [`Drawer::scale`] times that).
     pub fn render_target_size(&self, key: RenderTargetKey) -> Option<(u32, u32)> {
-        self.targets.get(&key).map(|t| (t.width(), t.height()))
+        let s = self.scale;
+        self.targets
+            .get(&key)
+            .map(|t| (t.width() / s, t.height() / s))
     }
 
     /// Replays `commands` in order. Register writes, shader loads, draws,
@@ -3856,6 +3918,8 @@ impl Drawer {
     /// `Float7e3` and `Rgba16Float` (four halves, R first); the other
     /// formats as their wgpu texels (`Float32` 4, `Rg16Fixed` and
     /// `Rg16Float` 4, `Rgba16Fixed` and `Rg32Float` 8, R first).
+    /// Coordinates are guest pixels; at a [`Drawer::scale`] above 1 each
+    /// is decimated from its host pixels ([`formats::decimate`]).
     pub fn read_render_target_raw(
         &self,
         key: RenderTargetKey,
@@ -3868,7 +3932,32 @@ impl Drawer {
             return Err(Error::Unsupported("depth render target readback".into()));
         }
         let tex = self.targets.get(&key).ok_or(Error::NoRenderTarget(key))?;
-        self.read_texture(tex, x, y, w, h)
+        self.read_target(key.format, tex, x, y, w, h)
+    }
+
+    /// [`Self::read_texture`] of a render target texture of `format` in
+    /// guest pixels, decimated from the host pixels at a scale above 1.
+    fn read_target(
+        &self,
+        format: TargetFormat,
+        tex: &wgpu::Texture,
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
+    ) -> Result<Vec<u8>, Error> {
+        let s = self.scale;
+        if s == 1 {
+            return self.read_texture(tex, x, y, w, h);
+        }
+        let (gw, gh) = (tex.width() / s, tex.height() / s);
+        if x.saturating_add(w) > gw || y.saturating_add(h) > gh {
+            return Err(Error::Unsupported(format!(
+                "readback {w}x{h} at ({x}, {y}) outside the {gw}x{gh} target"
+            )));
+        }
+        let host = self.read_texture(tex, x * s, y * s, w * s, h * s)?;
+        Ok(formats::decimate(format, &host, w, h, s))
     }
 
     /// Waits for all submitted GPU work, bounded by the drawer's timeout.
@@ -4004,7 +4093,8 @@ impl Drawer {
         msaa: u32,
         report: &mut Report,
     ) -> Result<wgpu::Texture, Skip> {
-        if key.pitch == 0 || key.pitch > self.max_dim {
+        let s = self.scale;
+        if key.pitch == 0 || key.pitch > self.max_dim / s {
             return unsupported(format!("surface pitch {}", key.pitch));
         }
         if key.format.is_snorm16() && !self.snorm16 {
@@ -4017,8 +4107,8 @@ impl Drawer {
             Some(t) => t.clone(),
             None => {
                 let format = self.host_format(key.format);
-                let height = RENDER_TARGET_HEIGHT.min(self.max_dim);
-                let spare = (format, key.pitch, height, 1, TARGET_USAGE);
+                let (width, height) = (key.pitch * s, self.target_rows() * s);
+                let spare = (format, width, height, 1, TARGET_USAGE);
                 let tex = if let Some(t) = self.spare_targets.take(&spare) {
                     // A new target starts zeroed, as wgpu makes it.
                     self.clear_target(&t);
@@ -4029,7 +4119,7 @@ impl Drawer {
                     self.device.create_texture(&wgpu::TextureDescriptor {
                         label: Some("render target"),
                         size: wgpu::Extent3d {
-                            width: key.pitch,
+                            width,
                             height,
                             depth_or_array_layers: 1,
                         },
@@ -4094,8 +4184,9 @@ impl Drawer {
             if transferable(src.format, key.format) && same_tiles {
                 // The rows of `key` whose first sample row is in `src`'s.
                 let (src_down, dst_down) = (samples(w.msaa).1, samples(msaa).1);
-                let height = RENDER_TARGET_HEIGHT.min(self.max_dim);
-                let rows = (w.rows * src_down).div_ceil(dst_down).min(height);
+                let rows = (w.rows * src_down)
+                    .div_ceil(dst_down)
+                    .min(self.target_rows());
                 let t = Instant::now();
                 self.transfer((src, w.msaa), (key, msaa), &tex, rows)?;
                 self.timings.transfer += t.elapsed();
@@ -4361,7 +4452,8 @@ impl Drawer {
         dst_tex: &wgpu::Texture,
         rows: u32,
     ) -> Result<(), Skip> {
-        let rows = rows.min(dst_tex.height());
+        // Host rows: the pass works on host pixels.
+        let rows = (rows * self.scale).min(dst_tex.height());
         if rows == 0 {
             return Ok(());
         }
@@ -4446,12 +4538,13 @@ impl Drawer {
             pipelines.push(self.transfer_pipeline(sf, df, bit)?);
         }
         // transfer.wgsl reads the samples per pixel from x0, y0 (`dst`) and
-        // w, h (`src`), `src`'s pitch from pitch; resolve.wgsl's depth_word
-        // reads `src_format`.
+        // w, h (`src`), `src`'s pitch (in host pixels, as the pass
+        // addresses them) from pitch; resolve.wgsl's depth_word reads
+        // `src_format`.
         let mut params = [0u32; 12];
         (params[0], params[1]) = samples(dst_msaa);
         (params[2], params[3]) = samples(src_msaa);
-        params[4] = src.pitch;
+        params[4] = src.pitch * self.scale;
         params[5] = if src.format == TargetFormat::D24FS8 {
             6
         } else {
@@ -5715,7 +5808,7 @@ impl Drawer {
 
         // Every target of a draw has the surface pitch and the same height.
         let t_indices = stamp();
-        let (w, h) = (surface & 0x3FFF, RENDER_TARGET_HEIGHT.min(self.max_dim));
+        let (w, h) = (surface & 0x3FFF, self.target_rows());
         let (sx, sy, sw, sh) = state::scissor(&self.regs, w, h);
         let rows = sy + sh;
         let msaa = (surface >> 16) & 3;
@@ -5798,6 +5891,14 @@ impl Drawer {
                 let ps_mod = self.module(ps.hash, false, ps_extra, ps_variant, param_gen, &ps_t)?;
                 let (g1_layout, layout) = self.texture_layout(tex_mask);
                 let k = key.clone();
+                // Only a pixel shader with parameter generation declares
+                // xe_scale; at scale 1 its default holds.
+                let scale = [("xe_scale", f64::from(self.scale))];
+                let ps_constants: &[(&str, f64)] = if param_gen.is_some() && self.scale != 1 {
+                    &scale
+                } else {
+                    &[]
+                };
                 let cache = self.pipeline_cache();
                 let t0 = Instant::now();
                 let p = self.validated("render pipeline", |dev| {
@@ -5830,7 +5931,10 @@ impl Drawer {
                         fragment: Some(wgpu::FragmentState {
                             module: &ps_mod,
                             entry_point: Some("ps_main"),
-                            compilation_options: Default::default(),
+                            compilation_options: wgpu::PipelineCompilationOptions {
+                                constants: ps_constants,
+                                ..Default::default()
+                            },
                             targets: &k.color.map(|c| {
                                 c.map(|(format, blend, write_mask)| wgpu::ColorTargetState {
                                     format,
@@ -6202,6 +6306,7 @@ impl Drawer {
         if current && !self.pass_open(&pass_key) {
             (color_tex, depth_tex) = self.targets_of(pass_key, rows, msaa, report)?;
         }
+        let s = self.scale;
         let (pass, bound) = self.pass(pass_key, &color_tex, depth_tex.as_ref());
         let t_pass = stamp();
         if bound.pipeline.as_ref() != Some(&pipeline) {
@@ -6224,12 +6329,13 @@ impl Drawer {
             pass.set_index_buffer(arena.slice(..), wgpu::IndexFormat::Uint32);
             bound.index = Some(arena.clone());
         }
+        // Bound in guest pixels, set in host ones.
         if bound.viewport != Some((w, h)) {
-            pass.set_viewport(0.0, 0.0, w as f32, h as f32, 0.0, 1.0);
+            pass.set_viewport(0.0, 0.0, (w * s) as f32, (h * s) as f32, 0.0, 1.0);
             bound.viewport = Some((w, h));
         }
         if bound.scissor != Some((sx, sy, sw, sh)) {
-            pass.set_scissor_rect(sx, sy, sw, sh);
+            pass.set_scissor_rect(sx * s, sy * s, sw * s, sh * s);
             bound.scissor = Some((sx, sy, sw, sh));
         }
         if let Some(&(_, reference)) = stencil.as_ref().filter(|s| bound.stencil != Some(s.1)) {
@@ -6358,11 +6464,14 @@ impl Drawer {
         report: &mut Report,
     ) -> Result<(), Skip> {
         let tex = self.target(key, rect.y1, msaa, report)?;
+        // Clamped in guest pixels, drawn in host ones.
+        let s = self.scale;
+        let (gw, gh) = (tex.width() / s, tex.height() / s);
         let rect = resolve::Rect {
-            x0: rect.x0.min(tex.width()),
-            y0: rect.y0.min(tex.height()),
-            x1: rect.x1.min(tex.width()),
-            y1: rect.y1.min(tex.height()),
+            x0: rect.x0.min(gw),
+            y0: rect.y0.min(gh),
+            x1: rect.x1.min(gw),
+            y1: rect.y1.min(gh),
         };
         if rect.is_empty() {
             return Ok(());
@@ -6436,7 +6545,12 @@ impl Drawer {
             });
             pass.set_pipeline(&pipeline);
             pass.set_bind_group(0, &bg, &[offset]);
-            pass.set_scissor_rect(rect.x0, rect.y0, rect.width(), rect.height());
+            pass.set_scissor_rect(
+                rect.x0 * s,
+                rect.y0 * s,
+                rect.width() * s,
+                rect.height() * s,
+            );
             pass.set_stencil_reference(stencil);
             pass.draw(0..3, 0..1);
         }
@@ -6467,7 +6581,7 @@ impl Drawer {
         if r.msaa_samples != 0 {
             report.warn("MSAA surfaces drawn and resolved single-sampled");
         }
-        let height = RENDER_TARGET_HEIGHT.min(self.max_dim);
+        let height = self.target_rows();
         let (rect, from_vertices) = resolve::rect(r, &self.regs, &*mem, height);
         if !from_vertices {
             report.warn("resolve rectangle taken from the window scissor (vertex fetch 0 is not a 6-dword rectangle)");
@@ -6582,7 +6696,7 @@ impl Drawer {
         let tex = self.target(key, rect.y1, r.msaa_samples, report)?;
         let pitch = xenon_texture::tile::align_to_tile(r.dest_pitch);
         let rect = resolve::Rect {
-            x1: rect.x1.min(pitch).min(tex.width()),
+            x1: rect.x1.min(pitch).min(tex.width() / self.scale),
             ..rect
         };
         if rect.is_empty() {
@@ -6616,7 +6730,7 @@ impl Drawer {
         let mut t = Instant::now();
         self.wait_idle()?;
         self.timings.gpu_wait += lap(&mut t);
-        let px = self.read_texture(&tex, rect.x0, rect.y0, rect.width(), rect.height())?;
+        let px = self.read_target(format, &tex, rect.x0, rect.y0, rect.width(), rect.height())?;
         self.submitted(Site::Resolve);
         self.timings.readback += lap(&mut t);
         self.timings.readback_bytes += px.len() as u64;
@@ -6680,15 +6794,18 @@ impl Drawer {
         tex: &wgpu::Texture,
         mem: &mut Tracked,
     ) -> Result<(), Skip> {
-        if rect.y1 > tex.height() {
+        // `rect` is in guest pixels; resolve.wgsl reads each one's host
+        // pixels at the scale in the last parameter.
+        let s = self.scale;
+        if rect.y1 > tex.height() / s {
             return Err(Error::Unsupported(format!(
                 "readback {}x{} at ({}, {}) outside the {}x{} target",
                 rect.width(),
                 rect.height(),
                 rect.x0,
                 rect.y0,
-                tex.width(),
-                tex.height()
+                tex.width() / s,
+                tex.height() / s
             ))
             .into());
         }
@@ -6743,7 +6860,7 @@ impl Drawer {
             r.dest_endian,
             2f32.powi(r.dest_exp_bias).to_bits(),
             ((lo - self.mirrors[i].lo) / 4) as u32,
-            0,
+            s,
         ];
         let offset = self.stage_uniform(&params)?;
         let device = &self.device;

@@ -17,6 +17,12 @@ jobs:
       - run: cargo test
         env:
           XENON_REQUIRE_GPU: "1"
+      # The drawer suites again with render targets at twice the guest
+      # resolution: what the guest sees must not change.
+      - run: cargo test -p xenon-draw --test draw --test kept --test formats
+        env:
+          XENON_REQUIRE_GPU: "1"
+          XENON_SCALE: "2"
       # Game builds use target-cpu=native, which compiles in the FMA and
       # pshufb VMX paths; a fixed level that has them tests those paths here.
       - run: cargo test -p xenon-rt -p xenon-cpu-tests

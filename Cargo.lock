@@ -3229,6 +3229,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "xenon-icon"
+version = "0.0.0"
+dependencies = [
+ "png 0.17.16",
+]
+
+[[package]]
 name = "xenon-input"
 version = "0.0.0"
 
@@ -3242,7 +3249,9 @@ dependencies = [
  "toml",
  "toml_edit 0.22.27",
  "winit",
+ "xenon-icon",
  "xenon-input",
+ "xenon-window",
 ]
 
 [[package]]
@@ -3292,6 +3301,7 @@ dependencies = [
  "font8x8",
  "softbuffer",
  "winit",
+ "xenon-icon",
  "xenon-input",
 ]
 

@@ -531,7 +531,7 @@ impl ApplicationHandler for App {
             xenon_play::window_size((s.width, s.height))
         });
         let (mw, mh) = xenon_play::MIN_WINDOW;
-        let attrs = Window::default_attributes()
+        let attrs = xenon_window::with_icon(Window::default_attributes())
             .with_title("RustXenon")
             .with_inner_size(winit::dpi::LogicalSize::new(w, h))
             .with_min_inner_size(winit::dpi::LogicalSize::new(mw, mh));
@@ -601,8 +601,10 @@ impl ApplicationHandler for App {
                 if let Some(Hit::Row(r)) = draw::hit(w, h, self.page, self.cursor.0, self.cursor.1)
                 {
                     let i = self.scroll[self.page as usize] + r;
+                    // Hover only selects: a note (say a refused folder) stays
+                    // until a key, button or click moves on.
                     if i < self.len() && self.running.is_none() {
-                        self.pick(i);
+                        self.select(i);
                     }
                 }
             }

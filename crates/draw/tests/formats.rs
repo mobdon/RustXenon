@@ -672,6 +672,77 @@ fn gpu_half4_resolve_matches_cpu_reference() {
     }
 }
 
+/// At scale 2 a guest pixel of a 7e3 target averages its host pixels as
+/// the EDRAM holds them: an additive blend leaves 64.0 in the covered host
+/// pixels of the rectangle's edge, which count as 31.875. The CPU read and
+/// the GPU resolve to k_16_16_16_16_FLOAT agree.
+#[test]
+fn float7e3_blended_edge_decimates_edram_values() {
+    use xenon_draw::{formats, resolve};
+    let Some(mut d) = drawer() else { return };
+    if d.set_scale(2) != 2 {
+        eprintln!("SKIP: the device cannot draw at scale 2");
+        return;
+    }
+    let mut mem = memory();
+    let c = [0; 4];
+    // Edges through guest pixel centres: at scale 2 they fall between host
+    // pixels, so column 10 and row 10 are half covered.
+    mem.write_words(
+        VERTS,
+        &color_verts(&[
+            (10.5, 10.5, 0.0, c),
+            (40.5, 10.5, 0.0, c),
+            (10.5, 40.5, 0.0, c),
+        ]),
+    );
+    let add = 1 | (1 << 8) | (1 << 16) | (1 << 24);
+    let info = dest_info(DEST_16_16_16_16_FLOAT, 0, false);
+    let mut s = Stream::default();
+    s.setup()
+        .regs(RB_COLOR_INFO, &[RT_2_10_10_10_FLOAT_AS_16_16_16_16 << 16])
+        .resolve(&mut mem, W, H, false, Some((0, 0)))
+        .shader(false, &vs_color())
+        .shader(true, &ps_const())
+        .vertex_fetch(0, VERTS, 12)
+        .regs(RB_BLENDCONTROL0, &[add]);
+    c0(&mut s, [64.0, 64.0, 64.0, 1.0])
+        .draw_auto(PRIM_RECT_LIST, 3)
+        .resolve_with(
+            &mut mem,
+            (W, H),
+            COPY_CONVERT,
+            (DEST, W | (H << 16), info),
+            [0; 3],
+        );
+    let report = run(&mut d, &s, &mut mem);
+    assert_eq!((report.draws, report.resolves), (1, 2), "{report:?}");
+    assert!(report.unsupported.is_empty(), "{report:?}");
+    let raw = d
+        .read_render_target_raw(key(TargetFormat::Float7e3), 0, 0, W, H)
+        .unwrap();
+    let red = |x, y| formats::half_to_f32(halves(&texel(&raw, W, 8, x, y))[0]);
+    // Inside: the host bits; half edge: (2 * 31.875) / 4; corner: 31.875 / 4.
+    assert_eq!(red(20, 20), 64.0);
+    assert_eq!(red(10, 20), 15.9375);
+    assert_eq!(red(10, 10), 7.96875);
+    let lut = formats::half_lut(TargetFormat::Float7e3, 0).unwrap();
+    let mut out = vec![0; (W * H * 8) as usize];
+    for (src, dst) in raw.chunks_exact(8).zip(out.chunks_exact_mut(8)) {
+        formats::resolve_half_pixel(&lut, src, false, dst);
+    }
+    let mut expected = memory();
+    let rect = resolve::Rect {
+        x0: 0,
+        y0: 0,
+        x1: W,
+        y1: H,
+    };
+    resolve::write_tiled_texels(&mut expected, DEST, W, rect, &out, 3, info & 7).unwrap();
+    let range = DEST as usize..(DEST + W * H * 8) as usize;
+    assert!(mem.data[range.clone()] == expected.data[range]);
+}
+
 /// Draws a quad over the whole k_16_16_16_16_FLOAT target sampling a 1x1
 /// linear texture of `format` (endian none, swizzle RGBA, point filter)
 /// whose guest bytes are `texel_bytes`, and returns the halves at (8, 8).

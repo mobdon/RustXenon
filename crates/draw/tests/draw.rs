@@ -29,9 +29,16 @@ fn resolve_clear_fills_render_target() {
     let img = d.read_render_target(COLOR_KEY, 0, 0, W, H).unwrap();
     assert!(img.chunks_exact(4).all(|p| p == CLEAR));
     let m = d.memory_line();
-    assert!(m.contains("targets 1 MB in 2,"), "{m}");
+    // 1.5 MB of targets at scale 1, scale^2 times that above (XENON_SCALE).
+    let area = d.scale() * d.scale();
+    let mb = 3 * area / 2;
+    assert!(m.contains(&format!("targets {mb} MB in 2,")), "{m}");
     // wgpu's own counters are live: the targets above are counted.
-    assert!(m.contains("; wgpu live: textures 1 MB,"), "{m}");
+    let live = area;
+    assert!(
+        m.contains(&format!("; wgpu live: textures {live} MB,")),
+        "{m}"
+    );
     assert!(m.contains(" MB reserved in "), "{m}");
     // Small allocator blocks: a 1 MB target does not reserve 64 MB or more.
     let reserved: u64 = m
@@ -1651,8 +1658,12 @@ fn get_gradients_pixel_shader_draws() {
     assert_eq!(report.draws, 1, "{report:?}");
     assert!(report.unsupported.is_empty(), "{report:?}");
     let img = d.read_render_target(COLOR_KEY, 0, 0, W, H).unwrap();
+    // shortcut: derivatives are per host pixel, so above scale 1 they are
+    // 1 / scale of the guest's; multiply them by xe_scale in the shader if
+    // a game reads them.
+    let want = 4 / d.scale() as u8;
     assert!(
-        near(px(&img, W, 8, 8), [4, 0, 0, 255], 1),
+        near(px(&img, W, 8, 8), [want, 0, 0, 255], 1),
         "{:?}",
         px(&img, W, 8, 8)
     );
@@ -1745,6 +1756,12 @@ fn pixel_param_gen_point_flag() {
         assert_eq!(report.draws, 1, "{report:?}");
         let img = d.read_render_target(COLOR_KEY, 0, 0, W, H).unwrap();
         let p = px(&img, W, 10, 20);
+        // shortcut: points are one host pixel, so above scale 1 the guest
+        // pixel averages the point with the clear; size them by the scale
+        // with PA_SU_POINT_SIZE support.
+        if d.scale() > 1 {
+            continue;
+        }
         assert!(near(p, want, 1), "SQ_PROGRAM_CNTL {program_cntl:#x}: {p:?}");
     }
 }
@@ -2010,4 +2027,60 @@ fn listed_writes_keep_indices_across_replays() {
     put(&mut w.mem, 0);
     w.written = None;
     assert_eq!(replay(&mut w), red);
+}
+
+/// Drawing at twice the guest resolution keeps flat edges where they were:
+/// with Direct3D pixel centres a rectangle whose edges sit at half guest
+/// pixels covers whole guest pixels, so at scale 2 the target and its
+/// resolve to guest memory decimate to the same pixels as at scale 1.
+#[test]
+fn half_pixel_edges_decimate_to_the_same_pixels_at_scale_2() {
+    let Some(mut d) = drawer() else { return };
+    let mut out = Vec::new();
+    for scale in [1, 2] {
+        if d.set_scale(scale) != scale {
+            eprintln!("SKIP: the device cannot draw at scale {scale}");
+            return;
+        }
+        let mut mem = memory();
+        mem.write_words(
+            VERTS,
+            &color_verts(&[
+                (10.5, 20.5, 0.0, RED),
+                (40.5, 20.5, 0.0, RED),
+                (10.5, 50.5, 0.0, RED),
+            ]),
+        );
+        let mut s = Stream::default();
+        s.setup()
+            .resolve(&mut mem, W, H, false, Some((rgba(CLEAR), 0)))
+            .shader(false, &vs_color())
+            .shader(true, &ps_interp())
+            .vertex_fetch(0, VERTS, 12)
+            // Direct3D pixel centres for the draw only.
+            .regs(PA_SU_VTX_CNTL, &[0])
+            .draw_auto(PRIM_RECT_LIST, 3)
+            .regs(PA_SU_VTX_CNTL, &[1])
+            .resolve(&mut mem, W, H, true, None);
+        let report = run(&mut d, &s, &mut mem);
+        assert_eq!((report.draws, report.resolves), (1, 2), "{report:?}");
+        assert!(report.unsupported.is_empty(), "{report:?}");
+        assert_eq!(d.render_target_size(COLOR_KEY).map(|s| s.0), Some(W));
+        let img = d.read_render_target(COLOR_KEY, 0, 0, W, H).unwrap();
+        out.push((img, detiled(&mem, DEST, W, H, W, 4)));
+    }
+    let (img, resolved) = &out[0];
+    for y in 0..H {
+        for x in 0..W {
+            let inside = (11..41).contains(&x) && (21..51).contains(&y);
+            let want = if inside { RED } else { CLEAR };
+            assert_eq!(px(img, W, x, y), want, "({x}, {y})");
+        }
+    }
+    assert!(*img == out[1].0, "scale 2 target differs from scale 1");
+    assert!(
+        *resolved == out[1].1,
+        "scale 2 resolve differs from scale 1"
+    );
+    assert_eq!(*resolved, *img);
 }

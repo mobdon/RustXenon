@@ -20,3 +20,7 @@ toml = "0.8"
 toml_edit = "0.22"
 winit = "0.30"
 xenon-input = { path = "../input" }
+xenon-window = { path = "../window" }
+
+[build-dependencies]
+xenon-icon = { path = "../icon" }
