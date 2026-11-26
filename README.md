@@ -92,6 +92,15 @@ Keys are physical positions, so they sit in the same place on any keyboard
 layout. Stick keys push the stick fully; controller sticks use XInput's
 standard dead zones.
 
+Diagnostic sampler flags (environment variables, off by default):
+
+- `XENON_ANISO=N` (2, 4, 8 or 16; anything else warns and stays off) gives
+  that anisotropy, with linear mip filtering, to textures the title samples
+  with linear mag and min filters and no anisotropy of its own. Point
+  filters, base maps and the title's own anisotropy stay as they are.
+- `XENON_FORCE_LINEAR=1` makes every sampler's mag and min filters linear,
+  point ones too. It is for diagnosis only: lookup and data textures break.
+
 ## Plan
 
 | Step | Done when |
