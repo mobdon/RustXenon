@@ -1060,6 +1060,14 @@ fn f32_to_short(w: u32) -> u16 {
     c.to_bits() as u16
 }
 
+/// Low bits of `w` saturated to the floats with bits `lo..=hi`, as
+/// [`f32_to_short`] does (NaN takes `lo`).
+fn f32_to_bits_in(w: u32, lo: u32, hi: u32, mask: u32) -> u32 {
+    let (f, l, h) = (f32::from_bits(w), f32::from_bits(lo), f32::from_bits(hi));
+    let c = if f >= h { hi } else if f >= l { w } else { lo };
+    c & mask
+}
+
 fn f32_to_color(w: u32) -> u32 {
     let f = f32::from_bits(w);
     if f >= f32::from_bits(0x4040_00FF) {
@@ -1071,9 +1079,21 @@ fn f32_to_color(w: u32) -> u32 {
     }
 }
 
+/// Signed 10-bit field as `3.0 + v * 2^-22`, like [`short_to_f32`]; -512
+/// unpacks to NaN.
+fn ten_to_f32(v: u32) -> u32 {
+    let v = v & 0x3FF;
+    if v == 0x200 {
+        DEFAULT_NAN
+    } else {
+        0x4040_0000u32.wrapping_add(((v << 22) as i32 >> 22) as u32)
+    }
+}
+
 /// `vupkd3d128`. Types: 0 colour (ARGB to x=R y=G z=B w=A), 1 two
-/// normalised shorts, 3 two halves, 4 four normalised shorts, 5 four halves.
-/// Returns `None` for types not implemented yet (2 and 6, packed 10/20-bit).
+/// normalised shorts, 2 packed 2-10-10-10 (x bits 0-9, y 10-19, z 20-29
+/// signed, w 30-31 unsigned on 1.0), 3 two halves, 4 four normalised shorts,
+/// 5 four halves. Returns `None` for types not implemented yet (6).
 pub fn vupkd3d(b: V128, typ: u32) -> Option<V128> {
     let one = 0x3F80_0000;
     Some(match typ {
@@ -1092,6 +1112,10 @@ pub fn vupkd3d(b: V128, typ: u32) -> Option<V128> {
             0,
             one,
         ],
+        2 => {
+            let w = b[3];
+            [ten_to_f32(w), ten_to_f32(w >> 10), ten_to_f32(w >> 20), one | w >> 30]
+        }
         3 => [
             half_to_f32((b[3] >> 16) as u16),
             half_to_f32(b[3] as u16),
@@ -1129,6 +1153,11 @@ pub fn vpkd3d(d: V128, b: V128, typ: u32, pack: u32, shift: u32) -> Option<V128>
             0,
             (f32_to_short(b[0]) as u32) << 16 | f32_to_short(b[1]) as u32,
         ],
+        2 => {
+            let ten = |w| f32_to_bits_in(w, 0x403F_FE01, 0x4040_01FF, 0x3FF);
+            let two = f32_to_bits_in(b[3], 0x3F80_0000, 0x3F80_0003, 3);
+            [0, 0, 0, two << 30 | ten(b[2]) << 20 | ten(b[1]) << 10 | ten(b[0])]
+        }
         3 => [
             0,
             0,
