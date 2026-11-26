@@ -4538,18 +4538,19 @@ impl Drawer {
             pipelines.push(self.transfer_pipeline(sf, df, bit)?);
         }
         // transfer.wgsl reads the samples per pixel from x0, y0 (`dst`) and
-        // w, h (`src`), `src`'s pitch (in host pixels, as the pass
-        // addresses them) from pitch; resolve.wgsl's depth_word reads
-        // `src_format`.
+        // w, h (`src`), `src`'s pitch (guest pixels) from pitch and the host
+        // pixels per guest pixel from px_scale; resolve.wgsl's depth_word
+        // reads `src_format`. set_scale drops these setups.
         let mut params = [0u32; 12];
         (params[0], params[1]) = samples(dst_msaa);
         (params[2], params[3]) = samples(src_msaa);
-        params[4] = src.pitch * self.scale;
+        params[4] = src.pitch;
         params[5] = if src.format == TargetFormat::D24FS8 {
             6
         } else {
             5
         };
+        params[11] = self.scale;
         let uniform = self.buffer(
             "transfer params",
             &to_bytes(&params),
@@ -5987,7 +5988,7 @@ impl Drawer {
             }
         };
         let suffix = consts_suffix(&self.regs, window_base, &rebase);
-        let epi = state::epilogue(&self.regs, w, h);
+        let epi = state::epilogue(&self.regs, w, h, self.scale);
         // The indices are staged once and bound again by later draws of
         // them until the arena wraps: a frame draws the same meshes many
         // times, kilobytes of indices each. (Rectangle lists read them in

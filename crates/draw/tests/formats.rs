@@ -686,14 +686,16 @@ fn float7e3_blended_edge_decimates_edram_values() {
     }
     let mut mem = memory();
     let c = [0; 4];
-    // Edges through guest pixel centres: at scale 2 they fall between host
-    // pixels, so column 10 and row 10 are half covered.
+    // Edges an eighth of a pixel before guest pixel centres (edges on the
+    // centres are snapped to whole guest pixels): at scale 2 the left and
+    // top edges cover only the second host pixel of column 10 and row 10,
+    // so those are half covered.
     mem.write_words(
         VERTS,
         &color_verts(&[
-            (10.5, 10.5, 0.0, c),
-            (40.5, 10.5, 0.0, c),
-            (10.5, 40.5, 0.0, c),
+            (10.375, 10.375, 0.0, c),
+            (40.375, 10.375, 0.0, c),
+            (10.375, 40.375, 0.0, c),
         ]),
     );
     let add = 1 | (1 << 8) | (1 << 16) | (1 << 24);

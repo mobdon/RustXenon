@@ -266,8 +266,9 @@ pub fn scissor(r: &RegisterFile, width: u32, height: u32) -> PixelRect {
 
 /// Uniform for the vertex epilogue the drawer appends to every vertex
 /// shader (`XeDraw` in WGSL): guest position -> host clip space for a host
-/// viewport covering the whole render target.
-pub fn epilogue(r: &RegisterFile, width: u32, height: u32) -> [u32; 12] {
+/// viewport covering the whole render target, `width` x `height` guest
+/// pixels drawn at `px_scale` host pixels per guest pixel.
+pub fn epilogue(r: &RegisterFile, width: u32, height: u32, px_scale: u32) -> [u32; 12] {
     let vte = r.get(regs::PA_CL_VTE_CNTL);
     let get = |bit: u32, reg: u32, default: f32| {
         if vte & bit != 0 {
@@ -316,10 +317,14 @@ pub fn epilogue(r: &RegisterFile, width: u32, height: u32) -> [u32; 12] {
         out[i] = scale[i].to_bits();
         out[4 + i] = offset[i].to_bits();
     }
+    // The target's guest size and the scale, for the snap above scale 1.
+    out[3] = w.to_bits();
+    out[7] = h.to_bits();
     // vtx_xy_fmt, vtx_z_fmt, vtx_w0_fmt (bits 8, 9, 10).
     out[8] = (vte >> 8) & 1;
     out[9] = (vte >> 9) & 1;
     out[10] = (vte >> 10) & 1;
+    out[11] = px_scale;
     out
 }
 
@@ -335,7 +340,9 @@ struct XeDraw {
 @group(0) @binding(2) var<uniform> xe_draw: XeDraw;
 
 // Guest position -> host clip space. flags: x = XY already divided by W,
-// y = Z already divided by W, z = W is W (else 1/W), as PA_CL_VTE_CNTL.
+// y = Z already divided by W, z = W is W (else 1/W), as PA_CL_VTE_CNTL;
+// w = host pixels per guest pixel. ndc_scale.w and ndc_offset.w are the
+// target's guest width and height.
 fn xe_epilogue(p: vec4<f32>) -> vec4<f32> {
     var w = p.w;
     if (xe_draw.flags.z == 0u) {
@@ -349,7 +356,26 @@ fn xe_epilogue(p: vec4<f32>) -> vec4<f32> {
     if (xe_draw.flags.y != 0u) {
         z = z * w;
     }
-    let xyz = vec3<f32>(xy, z) * xe_draw.ndc_scale.xyz + xe_draw.ndc_offset.xyz * w;
+    var xyz = vec3<f32>(xy, z) * xe_draw.ndc_scale.xyz + xe_draw.ndc_offset.xyz * w;
+    // Above scale 1 an edge through guest pixel centres would cut each of
+    // those guest pixels' host pixels in half, where the scale 1 tie rule
+    // takes or leaves the whole guest pixel. A vertex on a guest pixel
+    // centre (within half of the 1/256 pixel the rasterizer snaps to at
+    // scale 1) moves to the centre of its guest pixel's first host pixel,
+    // so the tie rule picks the same guest pixels. Edges on guest pixel
+    // boundaries already fall on host pixel boundaries and stay.
+    // shortcut: a snapped vertex keeps its outputs, so they interpolate
+    // half a host pixel off; compensate in the rectangle shader if a pass
+    // shows the shift.
+    let s = f32(xe_draw.flags.w);
+    if (s > 1.0 && w > 0.0) {
+        let size = vec2<f32>(xe_draw.ndc_scale.w, xe_draw.ndc_offset.w);
+        // Window position with pixel centres at k + 0.5.
+        let u = (xyz.xy / w * vec2<f32>(0.5, -0.5) + 0.5) * size;
+        let on = abs(fract(u) - 0.5) < vec2<f32>(1.0 / 512.0);
+        let snapped = ((floor(u) + 0.5 / s) / size - 0.5) * vec2<f32>(2.0, -2.0) * w;
+        xyz = vec3<f32>(select(xyz.xy, snapped, on), xyz.z);
+    }
     return vec4<f32>(xyz, w);
 }
 ";
@@ -454,10 +480,12 @@ mod tests {
         let mut r = RegisterFile::default();
         r.set(regs::PA_SU_VTX_CNTL, 1);
         r.set(regs::PA_CL_VTE_CNTL, 1 << 10);
-        let e = epilogue(&r, 64, 32);
+        let e = epilogue(&r, 64, 32, 1);
         let f = |i: usize| f32::from_bits(e[i]);
         assert_eq!((f(4), f(5)), (-1.0, 1.0));
         assert_eq!((64.0 * f(0) + f(4), 32.0 * f(1) + f(5)), (1.0, -1.0));
         assert_eq!(e[10], 1);
+        // The guest size and scale for the shader's snap; 1 never snaps.
+        assert_eq!((f(3), f(7), e[11]), (64.0, 32.0, 1));
     }
 }
