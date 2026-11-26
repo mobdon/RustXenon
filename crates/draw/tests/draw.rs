@@ -120,6 +120,45 @@ fn indexed_strip_with_dma_16_bit_indices() {
     }
 }
 
+/// Two draws of one guest index buffer with different vertices: the second
+/// binds the indices the first staged, and both land where their vertices
+/// put them.
+#[test]
+fn draws_of_one_index_buffer_share_its_staged_indices() {
+    let Some(mut d) = drawer() else { return };
+    let mut mem = memory();
+    let red = [255, 0, 0, 255];
+    let green = [0, 255, 0, 255];
+    let square = |x: f32, c| {
+        [
+            (x, 0.0, 0.0, c),
+            (x + 16.0, 0.0, 0.0, c),
+            (x, 16.0, 0.0, c),
+            (x + 16.0, 16.0, 0.0, c),
+        ]
+    };
+    mem.write_words(VERTS, &color_verts(&square(0.0, red)));
+    mem.write_words(VERTS + 0x100, &color_verts(&square(32.0, green)));
+    // Big-endian 16-bit indices 3 1 2 0 (k8in16 swaps them back).
+    mem.write_words(INDICES, &[0x0003_0001, 0x0002_0000]);
+    let mut s = Stream::default();
+    s.setup()
+        .resolve(&mut mem, W, H, false, Some((rgba(CLEAR), 0)))
+        .shader(false, &vs_color())
+        .shader(true, &ps_interp())
+        .vertex_fetch(0, VERTS, 16)
+        .draw_dma16(PRIM_TRI_STRIP, 4)
+        .vertex_fetch(0, VERTS + 0x100, 16)
+        .draw_dma16(PRIM_TRI_STRIP, 4);
+    let report = run(&mut d, &s, &mut mem);
+    assert_eq!(report.draws, 2, "{report:?}");
+    assert_eq!(report.timings.indices_reused, 1, "{report:?}");
+    let img = d.read_render_target(COLOR_KEY, 0, 0, W, H).unwrap();
+    assert_eq!(px(&img, W, 8, 8), red);
+    assert_eq!(px(&img, W, 40, 8), green);
+    assert_eq!(px(&img, W, 24, 8), CLEAR);
+}
+
 /// A quad list with a tiled 8_8_8_8 texture, nearest sampling: every
 /// pixel of the quad is exactly its texel.
 #[test]

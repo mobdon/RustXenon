@@ -471,6 +471,9 @@ pub struct Timings {
     /// Draws whose constants block equals the last one staged in the same
     /// batch, bound from there instead of staged again.
     pub consts_reused: u32,
+    /// Draws that bound indices staged earlier (by another draw of the same
+    /// index buffer, in any replay since the arena last wrapped).
+    pub indices_reused: u32,
     /// Draws that bound a texture bind group made earlier in their replay.
     pub texture_groups_reused: u32,
     /// Render passes begun for draws: each target change or flush ends one.
@@ -525,6 +528,7 @@ impl std::ops::AddAssign<&Timings> for Timings {
         self.windows_reused += t.windows_reused;
         self.reused_bytes += t.reused_bytes;
         self.consts_reused += t.consts_reused;
+        self.indices_reused += t.indices_reused;
         self.texture_groups_reused += t.texture_groups_reused;
         self.queue += t.queue;
         self.upload += t.upload;
@@ -1333,6 +1337,9 @@ pub struct Drawer {
     /// bound again by a draw with the same bytes. Cleared with
     /// `window_memo` when the arena wraps or grows.
     staged_consts: Option<(ConstsBlock, (u64, u64))>,
+    /// Counts the arena's wraps (from 1): a slice staged in an earlier
+    /// epoch is overwritten (see [`HostIndices::staged`]).
+    arena_epoch: u64,
     /// Counts the writes to the vertex stage's float constant registers,
     /// and to the pixel stage's.
     float_gens: [u64; 2],
@@ -1657,6 +1664,25 @@ struct HostIndices {
     bytes: Vec<u8>,
     len: u32,
     min_max: Option<(u32, u32)>,
+    /// Where these bytes were staged last: the [`Drawer::arena_epoch`]
+    /// then (0: never) and the arena offset. The slice holds them until
+    /// the arena wraps, so draws of the same indices bind it again.
+    staged: [std::sync::atomic::AtomicU64; 2],
+}
+
+impl HostIndices {
+    /// The arena slice holding these bytes in `epoch`, if one does.
+    fn staged_in(&self, epoch: u64) -> Option<(u64, u64)> {
+        use std::sync::atomic::Ordering::Relaxed;
+        (self.staged[0].load(Relaxed) == epoch)
+            .then(|| (self.staged[1].load(Relaxed), self.bytes.len() as u64))
+    }
+
+    fn set_staged(&self, epoch: u64, offset: u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.staged[1].store(offset, Relaxed);
+        self.staged[0].store(epoch, Relaxed);
+    }
 }
 
 /// [`Drawer::index_memo`] entries and index bytes held before it starts
@@ -2143,6 +2169,7 @@ impl Drawer {
             index_memo_bytes: 0,
             transfer_setups: HashMap::default(),
             staged_consts: None,
+            arena_epoch: 1,
             float_gens: [0; 2],
             staged_floats: [None; 2],
             consts_gen: 0,
@@ -3120,6 +3147,8 @@ impl Drawer {
     /// staged windows and constants are no longer bound by later draws.
     /// Only after a flush, or once nothing will be submitted.
     fn wrap(&mut self) {
+        // Index bytes staged before are overwritten from here.
+        self.arena_epoch += 1;
         self.staged.clear();
         self.staged_base = 0;
         self.window_memo.clear();
@@ -4917,6 +4946,7 @@ impl Drawer {
                     bytes: to_bytes(&idx),
                     len: idx.len() as u32,
                     min_max: min_max(&idx),
+                    staged: Default::default(),
                 });
                 if let Some(k) = key {
                     // Entries dropped by forget_guest still count until
@@ -5082,10 +5112,17 @@ impl Drawer {
             }
         };
         let epi = to_bytes(&state::epilogue(&self.regs, w, h));
-        // Rectangle lists read their guest indices in the vertex shader and
-        // draw 6 host vertices per rectangle without an index buffer.
-        let rect_indices: &[u8] = if rect_list { &idx.bytes } else { &[] };
-        let rest = [&epi[..], rect_indices, &idx.bytes].map(Part::Bytes);
+        // The indices are staged once and bound again by later draws of
+        // them until the arena wraps: a frame draws the same meshes many
+        // times, kilobytes of indices each. (Rectangle lists read them in
+        // the vertex shader, binding 3, and draw without an index buffer.)
+        let mut kept_index = idx.staged_in(self.arena_epoch);
+        let rest = |kept: Option<(u64, u64)>| -> [Option<Part>; 2] {
+            [
+                Some(Part::Bytes(&epi[..])),
+                kept.is_none().then_some(Part::Bytes(&idx.bytes)),
+            ]
+        };
         // The window and constants staged earlier (in this batch or one
         // submitted since) are bound again, unless the arena wrapped since
         // (it is then overwritten) or would wrap to stage the rest.
@@ -5115,12 +5152,12 @@ impl Drawer {
             w: Option<Vec<Part<'a>>>,
             c: Option<&'a [u8]>,
             f: [Option<&'a [u8]>; 2],
-            rest: [Part<'a>; 3],
+            rest: [Option<Part<'a>>; 2],
         ) -> Vec<Part<'a>> {
             (w.into_iter().flatten())
                 .chain(c.map(Part::Bytes))
                 .chain(f.into_iter().flatten().map(Part::Bytes))
-                .chain(rest)
+                .chain(rest.into_iter().flatten())
                 .collect()
         }
         // The window's parts, or one empty part for no window.
@@ -5132,17 +5169,21 @@ impl Drawer {
                 .map(|&(lo, hi)| Part::Guest(lo as u32, (hi - lo) as usize))
                 .collect()
         };
-        if (kept_window.is_some() || kept_consts.is_some() || kept_floats != [None; 2])
+        let any_kept = kept_window.is_some()
+            || kept_consts.is_some()
+            || kept_floats != [None; 2]
+            || kept_index.is_some();
+        if any_kept
             && !self.fits(&parts(
                 kept_window.is_none().then(|| window(&read)),
                 kept_consts.is_none().then_some(consts.as_slice()),
                 floats(&kept_floats),
-                rest,
+                rest(kept_index),
             ))
         {
             // Staging all of it submits the batch in `stage`; a kept window
             // is read again below.
-            (kept_window, kept_consts, kept_floats) = (None, None, [None; 2]);
+            (kept_window, kept_consts, kept_floats, kept_index) = (None, None, [None; 2], None);
         }
         if let (Some(((lo, hi, _), _)), None) = (staged, kept_window) {
             self.sync(mem, lo, hi)?;
@@ -5159,7 +5200,7 @@ impl Drawer {
                 kept_window.is_none().then(|| window(&read)),
                 kept_consts.is_none().then_some(consts.as_slice()),
                 floats(&kept_floats),
-                rest,
+                rest(kept_index),
             ),
         )?)
         .into_iter();
@@ -5216,8 +5257,24 @@ impl Drawer {
                 }
             };
         }
-        let [epilogue_slice, rect_slice, index_slice] =
-            [(); 3].map(|()| fresh.next().expect("staged epilogue and indices"));
+        let epilogue_slice = fresh.next().expect("staged epilogue");
+        let index_slice = match kept_index {
+            Some(s) => {
+                self.timings.indices_reused += 1;
+                s
+            }
+            None => {
+                let s = fresh.next().expect("staged indices");
+                idx.set_staged(self.arena_epoch, s.0);
+                s
+            }
+        };
+        // Binding 3 is unused but for rectangle lists: then the indices.
+        let rect_slice = if rect_list {
+            index_slice
+        } else {
+            epilogue_slice
+        };
         // In binding order.
         let slices = [
             window_slice,
