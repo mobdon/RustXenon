@@ -46,21 +46,20 @@ struct RunToml {
     data: Option<String>,
 }
 
-/// Reads a built game folder, or says why it is not one.
+/// Reads a built game folder, or says why it is not one (without the path:
+/// the caller names the folder as it fits).
 pub fn load_game(dir: &Path) -> Result<Game, String> {
     if !dir.is_dir() {
-        return Err(format!("not a folder: {}", dir.display()));
+        return Err("no such folder".into());
     }
     if !dir.join("game.exe").is_file() {
-        return Err(format!("no game.exe in {}", dir.display()));
+        return Err("no game.exe in it".into());
     }
-    let run = dir.join("run.toml");
-    let text =
-        std::fs::read_to_string(&run).map_err(|_| format!("no run.toml in {}", dir.display()))?;
+    let text = std::fs::read_to_string(dir.join("run.toml")).map_err(|_| "no run.toml in it")?;
     let r: RunToml = toml::from_str(&text).map_err(|e| {
         let first = e.to_string();
         let first = first.lines().next().unwrap_or("").to_string();
-        format!("{}: {first}", run.display())
+        format!("run.toml: {first}")
     })?;
     let title = r.title.filter(|t| !t.trim().is_empty()).unwrap_or_else(|| {
         // No title chosen: the unpacked game folder's name.
@@ -107,19 +106,34 @@ fn key(p: &Path) -> String {
         .to_lowercase()
 }
 
-/// `recent.txt`, keeping only lines that are still built game folders.
+/// `recent.txt`. Lines that are not built game folders now are kept (the
+/// drive may be unplugged): [`merged`] leaves them out. A relative line is
+/// under `home`.
 pub fn load_recent(home: &Path) -> Vec<PathBuf> {
     let text = std::fs::read_to_string(home.join("recent.txt")).unwrap_or_default();
     let list: Vec<PathBuf> = text
+        .trim_start_matches('\u{feff}')
         .lines()
         .map(str::trim)
         .filter(|l| !l.is_empty())
         // A trailing separator would show in the list.
-        .map(|l| PathBuf::from(l.trim_end_matches(['\\', '/'])))
-        .filter(|p| load_game(p).is_ok())
+        .map(|l| home.join(l.trim_end_matches(['\\', '/'])))
         .collect();
     dedupe(list)
 }
+
+/// The launcher window's first size in logical pixels: 1280x720, or 16:9
+/// and smaller so it fits a `screen` of that logical size with room for the
+/// title bar and the taskbar.
+pub fn window_size(screen: (f64, f64)) -> (f64, f64) {
+    let w = (screen.0 * 0.9).min((screen.1 - 120.0) * 16.0 / 9.0);
+    let w = w.clamp(MIN_WINDOW.0, 1280.0).round();
+    (w, (w * 9.0 / 16.0).round())
+}
+
+/// The smallest launcher window, in logical pixels: below this the small
+/// text is not readable.
+pub const MIN_WINDOW: (f64, f64) = (768.0, 432.0);
 
 fn dedupe(list: Vec<PathBuf>) -> Vec<PathBuf> {
     let mut seen = std::collections::HashSet::new();
@@ -254,7 +268,7 @@ pub(crate) mod tests {
         assert!(load_game(&d).unwrap_err().contains("game.exe"));
         assert!(load_game(&home.join("nope"))
             .unwrap_err()
-            .contains("not a folder"));
+            .contains("no such folder"));
     }
 
     #[test]
@@ -281,11 +295,12 @@ pub(crate) mod tests {
         let same = PathBuf::from(format!("{one}{}", std::path::MAIN_SEPARATOR));
         let r = add_recent(&r, &same);
         assert_eq!(r, [same.clone(), elsewhere.clone()]);
-        // A line that is no longer a game is dropped on load.
+        // A line that is not a game now is kept (its drive may be
+        // unplugged), but not listed.
         let mut lines = r.clone();
         lines.push(home.join("gone"));
         save_recent(&home, &lines).unwrap();
-        assert_eq!(load_recent(&home), r);
+        assert_eq!(load_recent(&home), lines);
 
         let titles: Vec<_> = merged(&home)
             .into_iter()
@@ -300,6 +315,13 @@ pub(crate) mod tests {
                 ("Mid".into(), false)
             ]
         );
+        // A byte order mark from a text editor, and a line under home.
+        std::fs::write(
+            home.join("recent.txt"),
+            format!("\u{feff}{}\r\ngames/2\r\n", elsewhere.display()),
+        )
+        .unwrap();
+        assert_eq!(load_recent(&home), [elsewhere.clone(), g.join("2")]);
         // The cap.
         let mut r = Vec::new();
         for i in 0..RECENT_MAX + 5 {
@@ -307,6 +329,18 @@ pub(crate) mod tests {
         }
         assert_eq!(r.len(), RECENT_MAX);
         assert_eq!(r[0], Path::new(&format!("C:\\{}", RECENT_MAX + 4)));
+    }
+
+    #[test]
+    fn window_fits_the_screen() {
+        assert_eq!(window_size((2560.0, 1440.0)), (1280.0, 720.0));
+        // 100% on 1366x768, 150% on 1920x1080: room for the bars.
+        for screen in [(1366.0, 768.0), (1280.0, 720.0)] {
+            let (w, h) = window_size(screen);
+            assert!(h + 120.0 <= screen.1 && w <= screen.0, "{screen:?}");
+            assert_eq!((w * 9.0 / 16.0).round(), h);
+        }
+        assert_eq!(window_size((320.0, 200.0)), MIN_WINDOW);
     }
 
     #[test]
