@@ -1319,6 +1319,9 @@ pub struct Drawer {
     /// drops the constant's memo entry clears them, so only the sets using
     /// that texture go (dropping them all made a third of draws miss).
     texture_set_flags: HashMap<[u32; 6], Vec<Arc<AtomicBool>>>,
+    /// The fetch constants of a draw's texture set, kept so looking a set
+    /// up does not allocate.
+    texture_set_key: Vec<[u32; 6]>,
     /// Counts the changes that drop all [`Drawer::texture_memo`] entries.
     texture_memo_epoch: u64,
     /// Group 0 bind groups over `arena`, by the sizes of the four slices
@@ -2193,6 +2196,7 @@ impl Drawer {
             texture_groups: HashMap::default(),
             texture_sets: HashMap::default(),
             texture_set_flags: HashMap::default(),
+            texture_set_key: Vec::new(),
             texture_memo_epoch: 0,
             arena_groups: HashMap::default(),
             staged: Vec::new(),
@@ -3268,11 +3272,11 @@ impl Drawer {
     }
 
     /// Whether `parts` can be staged without submitting the batch first.
-    fn fits(&self, parts: &[Part]) -> bool {
+    fn fits<'a>(&self, parts: impl IntoIterator<Item = Part<'a>>) -> bool {
         let size = |p: &Part| (p.len() as u64).max(4).next_multiple_of(4);
         let need: u64 = parts
-            .iter()
-            .map(|p| size(p).next_multiple_of(self.arena_align))
+            .into_iter()
+            .map(|p| size(&p).next_multiple_of(self.arena_align))
             .sum();
         self.staged_base + self.staged.len() as u64 + need
             <= self.arena.as_ref().map_or(0, |b| b.size())
@@ -5299,12 +5303,11 @@ impl Drawer {
             c: Option<&'a [u8]>,
             f: [Option<&'a [u8]>; 2],
             rest: [Option<Part<'a>>; 2],
-        ) -> Vec<Part<'a>> {
+        ) -> impl Iterator<Item = Part<'a>> {
             (w.into_iter().flatten())
                 .chain(c.map(Part::Bytes))
                 .chain(f.into_iter().flatten().map(Part::Bytes))
                 .chain(rest.into_iter().flatten())
-                .collect()
         }
         // The window's parts, or one empty part for no window.
         let window = |read: &[(u64, u64)]| -> Vec<Part<'static>> {
@@ -5320,7 +5323,7 @@ impl Drawer {
             || kept_floats != [None; 2]
             || kept_index.is_some();
         if any_kept
-            && !self.fits(&parts(
+            && !self.fits(parts(
                 kept_window.is_none().then(|| window(&read)),
                 kept_consts.is_none().then_some(consts.as_slice()),
                 float_sizes(&kept_floats),
@@ -5352,7 +5355,8 @@ impl Drawer {
                 kept_consts.is_none().then_some(consts.as_slice()),
                 float_bytes.each_ref().map(|b| b.as_deref()),
                 rest(kept_index),
-            ),
+            )
+            .collect::<Vec<_>>(),
         )?)
         .into_iter();
         let window_slice = match kept_window {
@@ -5452,15 +5456,22 @@ impl Drawer {
         // shortcut: a set found here neither reports its textures'
         // warnings again nor marks them used for eviction; the first draw
         // of the set in each memo epoch does both.
-        let constants: Vec<[u32; 6]> = (0..32)
-            .filter(|n| tex_mask & (1 << n) != 0)
-            .map(|n| self.regs.fetch_constant(n))
-            .collect();
-        let set = (self.texture_sets.get(&(tex_mask, constants)))
+        // The key is built in a kept list: a new one only when a set is
+        // recorded below.
+        let mut key = (tex_mask, std::mem::take(&mut self.texture_set_key));
+        key.1.clear();
+        let regs = &self.regs;
+        (key.1).extend(
+            (0..32)
+                .filter(|n| tex_mask & (1 << n) != 0)
+                .map(|n| regs.fetch_constant(n)),
+        );
+        let set = (self.texture_sets.get(&key))
             .filter(|(_, epoch, kept)| {
                 *epoch == self.texture_memo_epoch && kept.load(Ordering::Relaxed)
             })
             .map(|(g, _, _)| g.clone());
+        self.texture_set_key = key.1;
         let mut textures = Vec::new();
         if set.is_none() {
             for n in (0..32).filter(|n| tex_mask & (1 << n) != 0) {
