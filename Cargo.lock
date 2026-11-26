@@ -675,6 +675,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb"
 
 [[package]]
+name = "font8x8"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "875488b8711a968268c7cf5d139578713097ca4635a76044e8fe8eedf831d07e"
+
+[[package]]
 name = "foreign-types"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3211,6 +3217,7 @@ version = "0.0.0"
 dependencies = [
  "sha1",
  "sha2",
+ "toml",
  "xenon-audio",
  "xenon-draw",
  "xenon-gpu",
@@ -3224,6 +3231,18 @@ dependencies = [
 [[package]]
 name = "xenon-input"
 version = "0.0.0"
+
+[[package]]
+name = "xenon-play"
+version = "0.0.0"
+dependencies = [
+ "png 0.17.16",
+ "serde",
+ "softbuffer",
+ "toml",
+ "winit",
+ "xenon-input",
+]
 
 [[package]]
 name = "xenon-recomp"
@@ -3269,6 +3288,7 @@ version = "0.0.0"
 name = "xenon-window"
 version = "0.0.0"
 dependencies = [
+ "font8x8",
  "softbuffer",
  "winit",
  "xenon-input",
