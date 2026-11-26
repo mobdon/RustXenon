@@ -109,7 +109,10 @@ the first controller is read, the same as the Windows path.
 
 ## Screen
 
-- Fullscreen, immersive (no system bars), screen kept on, landscape.
+- Fullscreen, immersive (no system bars), screen kept on, landscape. Done by
+  `org.rustxenon.GameActivity` (`tools/android/java/`), a `NativeActivity`
+  subclass, since `android-activity` has no API for it and the native thread
+  is not the UI thread.
 - Foldables: the inner screen is close to square and the cover screen is tall
   and thin. Letterbox the 16:9 frame to the largest fit. Folding or unfolding
   destroys and recreates the native window (`TerminateWindow` /
@@ -128,7 +131,10 @@ the first controller is read, the same as the Windows path.
 ## Files
 
 - The player's own game files are copied to the app's private folder. For
-  development use `adb push` to `/sdcard/Android/data/<app id>/files/`.
+  development `tools/android/push-game.sh` pushes to a staging folder and
+  copies into `/sdcard/Android/data/<app id>/files/` with `run-as`, because
+  the app cannot read files that `adb push` writes there (they belong to the
+  shell user). `run-as` needs a debuggable (dev) APK.
   Later, an in-app import from a USB stick or Downloads through the system
   file picker (Storage Access Framework). The picker needs touch, so import
   stays a one-off setup step, not part of playing.

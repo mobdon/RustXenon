@@ -16,17 +16,19 @@
 
     <application
         android:label="@LABEL@"
-        android:hasCode="false"
+        android:hasCode="true"
         android:isGame="true"
         android:appCategory="game"
         android:extractNativeLibs="false"
         android:debuggable="@DEBUGGABLE@"
         android:theme="@android:style/Theme.NoTitleBar.Fullscreen">
 
-        <!-- configChanges: folding, rotating or a controller connecting must
+        <!-- org.rustxenon.GameActivity (java/) is NativeActivity plus hiding
+             the system bars and keeping the screen on.
+             configChanges: folding, rotating or a controller connecting must
              not restart the game; the native window is rebuilt instead. -->
         <activity
-            android:name="android.app.NativeActivity"
+            android:name="org.rustxenon.GameActivity"
             android:label="@LABEL@"
             android:exported="true"
             android:screenOrientation="sensorLandscape"

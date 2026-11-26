@@ -14,4 +14,4 @@ apk=$1
 package=${2:-org.rustxenon.player}
 
 "$ADB" install -r "$apk"
-MSYS_NO_PATHCONV=1 "$ADB" shell am start -W -n "$package/android.app.NativeActivity"
+MSYS_NO_PATHCONV=1 "$ADB" shell am start -W -n "$package/org.rustxenon.GameActivity"
