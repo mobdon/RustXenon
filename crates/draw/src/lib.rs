@@ -1352,8 +1352,9 @@ pub struct Drawer {
     /// generation.
     modules: HashMap<ModuleKey, wgpu::ShaderModule>,
     /// With the use that last drew with each, for least recently used
-    /// eviction past `pipeline_cap`.
-    pipelines: HashMap<PipelineKey, (wgpu::RenderPipeline, u64)>,
+    /// eviction past `pipeline_cap`, and the texture bind group layout of
+    /// its key's slots.
+    pipelines: HashMap<PipelineKey, (wgpu::RenderPipeline, u64, wgpu::BindGroupLayout)>,
     pipeline_uses: u64,
     pipeline_cap: usize,
     pipeline_drops: u64,
@@ -2749,7 +2750,7 @@ impl Drawer {
             let Some(old) = self
                 .pipelines
                 .iter()
-                .min_by_key(|(_, (_, used))| *used)
+                .min_by_key(|(_, (_, used, _))| *used)
                 .map(|(k, _)| k.clone())
             else {
                 break;
@@ -5541,10 +5542,7 @@ impl Drawer {
             report.warn("texture fetches of one slot with different filters drawn with one");
         }
         let extra = ps_t.info.interpolators_read & !vs_t.info.interpolators_written;
-        let vs_mod = self.module(vs.hash, true, extra, vs_variant, None, &vs_t)?;
         let ps_extra = u16::from(ps_t.info.writes_depth && depth_format.is_none());
-        let ps_mod = self.module(ps.hash, false, ps_extra, ps_variant, param_gen, &ps_t)?;
-        let (g1_layout, layout) = self.texture_layout(tex_mask);
 
         let key_stencil = stencil
             .as_ref()
@@ -5574,12 +5572,17 @@ impl Drawer {
             textures: tex_mask,
         };
         self.pipeline_uses += 1;
-        let pipeline = match self.pipelines.get_mut(&key) {
-            Some((p, used)) => {
+        // The key names the modules and the texture layout: a cached
+        // pipeline needs neither looked up.
+        let (pipeline, g1_layout) = match self.pipelines.get_mut(&key) {
+            Some((p, used, g1)) => {
                 *used = self.pipeline_uses;
-                p.clone()
+                (p.clone(), g1.clone())
             }
             None => {
+                let vs_mod = self.module(vs.hash, true, extra, vs_variant, None, &vs_t)?;
+                let ps_mod = self.module(ps.hash, false, ps_extra, ps_variant, param_gen, &ps_t)?;
+                let (g1_layout, layout) = self.texture_layout(tex_mask);
                 let k = key.clone();
                 let cache = self.pipeline_cache();
                 let t0 = Instant::now();
@@ -5627,10 +5630,11 @@ impl Drawer {
                     })
                 })?;
                 self.pipeline_made(t0);
-                self.pipelines.insert(key, (p.clone(), self.pipeline_uses));
+                let entry = (p.clone(), self.pipeline_uses, g1_layout.clone());
+                self.pipelines.insert(key, entry);
                 self.timings.pipelines_created += 1;
                 self.drop_pipelines();
-                p
+                (p, g1_layout)
             }
         };
         let setup = &mut self.timings.setup_parts;
