@@ -383,11 +383,12 @@ impl DrawStats {
             ms(self.watch),
         ) + &if t.passes_timed > 0 {
             format!(
-                "; GPU ms per {per} (timestamps, {} passes): draw {:.1}, clear {:.1}, resolve {:.1}",
+                "; GPU ms per {per} (timestamps, {} passes): draw {:.1}, clear {:.1}, resolve {:.1}, transfer {:.1}",
                 t.passes_timed / n,
                 ms(t.gpu_passes[0]),
                 ms(t.gpu_passes[1]),
                 ms(t.gpu_passes[2]),
+                ms(t.gpu_passes[3]),
             )
         } else {
             String::new()
@@ -1062,11 +1063,11 @@ mod tests {
         }
         assert!(!line.contains("GPU ms"), "{line}");
         s.t.passes_timed = 400;
-        s.t.gpu_passes = [ms(100), ms(3), ms(9)];
+        s.t.gpu_passes = [ms(100), ms(3), ms(9), ms(4)];
         let line = s.line(ms(5000));
         assert!(
             line.ends_with(
-                "; GPU ms per frame (timestamps, 200 passes): draw 50.0, clear 1.5, resolve 4.5"
+                "; GPU ms per frame (timestamps, 200 passes): draw 50.0, clear 1.5, resolve 4.5, transfer 2.0"
             ),
             "{line}"
         );
