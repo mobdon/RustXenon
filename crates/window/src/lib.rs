@@ -72,8 +72,8 @@ pub struct Link {
     frame: Mutex<Option<Image>>,
     text: Mutex<Option<Vec<String>>>,
     pad: Mutex<Pad>,
-    /// Set while the app is in the background (Android's Pause until
-    /// Resume); never set on Windows.
+    /// Set while the app is not visible (Android's Stop until Start);
+    /// never set on Windows.
     hidden: AtomicBool,
 }
 

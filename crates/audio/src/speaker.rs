@@ -43,8 +43,8 @@ pub struct Ring {
     /// Muted ([`Ring::set_muted`]): pushes are dropped and pulls play
     /// silence that is not counted as an underflow.
     muted: bool,
-    /// Whether anything was ever pushed: silence before the first push is
-    /// not an underflow.
+    /// Whether it has played since it was made or unmuted: the silence
+    /// while it first gathers [`Ring::target`] is not an underflow.
     started: bool,
     /// Stereo frames of silence played because the ring ran dry.
     pub underflow: u64,
@@ -91,7 +91,6 @@ impl Ring {
         if self.muted {
             return;
         }
-        self.started = true;
         self.buf.extend(stereo);
         if self.buf.len() > self.cap.max(2 * self.max_pull) {
             let over = (self.buf.len() - self.target()) & !1;
@@ -111,6 +110,7 @@ impl Ring {
         self.max_pull = self.max_pull.max(out.len());
         if !self.playing && self.buf.len() >= self.target() {
             self.playing = true;
+            self.started = true;
         }
         let n = if self.playing {
             self.buf.len().min(out.len())
@@ -139,6 +139,7 @@ impl Ring {
         }
         self.muted = on;
         self.playing = false;
+        self.started = false;
     }
 }
 
@@ -514,6 +515,10 @@ mod tests {
         r.push(&[0.25; 40]);
         r.pop_into(&mut out);
         assert!(out.iter().all(|&s| s == 0.0));
+        assert_eq!(
+            r.underflow, 0,
+            "the refill after unmuting is not an underflow"
+        );
         r.push(&[0.25; 100]);
         r.pop_into(&mut out);
         assert!(out.iter().all(|&s| s == 0.25));
