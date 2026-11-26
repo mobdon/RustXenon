@@ -1235,6 +1235,78 @@ fn texture_bytes(t: &wgpu::Texture) -> u64 {
 /// written ones are dropped at the end of a replay.
 const TARGET_CAP: u64 = 256 << 20;
 
+/// Bounds on the spare render target textures kept for reuse (see
+/// [`Spares`]): past either the oldest go.
+const SPARE_TARGETS: usize = 32;
+const SPARE_TARGET_BYTES: u64 = 128 << 20;
+
+/// Usages of every render target texture.
+const TARGET_USAGE: wgpu::TextureUsages = wgpu::TextureUsages::RENDER_ATTACHMENT
+    .union(wgpu::TextureUsages::COPY_SRC)
+    .union(wgpu::TextureUsages::COPY_DST)
+    .union(wgpu::TextureUsages::TEXTURE_BINDING);
+
+/// What a spare render target texture can stand in for: format, width,
+/// height, samples and usages.
+type SpareKey = (wgpu::TextureFormat, u32, u32, u32, wgpu::TextureUsages);
+
+fn spare_key(t: &wgpu::Texture) -> SpareKey {
+    (
+        t.format(),
+        t.width(),
+        t.height(),
+        t.sample_count(),
+        t.usage(),
+    )
+}
+
+/// Textures of dropped render targets, oldest first, kept for a new target
+/// of the same description instead of making one: games drop and remake
+/// several targets a frame. Bounded by count and bytes.
+struct Spares<K, T> {
+    items: std::collections::VecDeque<(K, u64, T)>,
+    bytes: u64,
+    max_count: usize,
+    max_bytes: u64,
+}
+
+impl<K: PartialEq, T> Spares<K, T> {
+    fn new(max_count: usize, max_bytes: u64) -> Self {
+        Self {
+            items: Default::default(),
+            bytes: 0,
+            max_count,
+            max_bytes,
+        }
+    }
+
+    /// Keeps `t` of `bytes` under `key`, freeing the oldest past the caps.
+    fn put(&mut self, key: K, bytes: u64, t: T) {
+        self.items.push_back((key, bytes, t));
+        self.bytes += bytes;
+        self.trim(self.max_count, self.max_bytes);
+    }
+
+    /// Frees the oldest until at most `max_count` of at most `max_bytes`
+    /// are left.
+    fn trim(&mut self, max_count: usize, max_bytes: u64) {
+        while self.items.len() > max_count || self.bytes > max_bytes {
+            let Some((_, b, _)) = self.items.pop_front() else {
+                break;
+            };
+            self.bytes -= b;
+        }
+    }
+
+    /// The newest spare kept under `key`, taken out.
+    fn take(&mut self, key: &K) -> Option<T> {
+        let i = self.items.iter().rposition(|(k, _, _)| k == key)?;
+        let (_, b, t) = self.items.remove(i)?;
+        self.bytes -= b;
+        Some(t)
+    }
+}
+
 /// Replays recorded command lists on a headless wgpu device.
 pub struct Drawer {
     device: wgpu::Device,
@@ -1273,6 +1345,11 @@ pub struct Drawer {
     /// Render targets dropped so far (see [`Drawer::drop_targets`]).
     target_drops: u64,
     target_cap: u64,
+    /// Textures of dropped targets for new ones to reuse, and how many
+    /// target textures were made and reused so far.
+    spare_targets: Spares<SpareKey, wgpu::Texture>,
+    targets_made: u64,
+    targets_reused: u64,
     transfer_module: Option<wgpu::ShaderModule>,
     /// Keyed by source and destination host format and pass (stencil bit
     /// 0..8, or 8 for the depth or colour pass).
@@ -2273,6 +2350,9 @@ impl Drawer {
             written: HashMap::default(),
             target_drops: 0,
             target_cap: TARGET_CAP,
+            spare_targets: Spares::new(SPARE_TARGETS, SPARE_TARGET_BYTES),
+            targets_made: 0,
+            targets_reused: 0,
             clock: 0,
             transfer_module: None,
             transfer_pipelines: HashMap::default(),
@@ -2549,12 +2629,16 @@ impl Drawer {
             .map(|t| t.wgsl.len())
             .collect();
         format!(
-            "draw: textures {} MB in {}, targets {} MB in {}, {} dropped, kept resolves {} MB in {}, arena {} MB, staged {} MB, pipelines {} ({} vs/ps pairs, {} dropped), shaders {}, translated {} ({} KB WGSL)",
+            "draw: textures {} MB in {}, targets {} MB in {}, {} dropped, {} made, {} reused, {} spare ({} MB), kept resolves {} MB in {}, arena {} MB, staged {} MB, pipelines {} ({} vs/ps pairs, {} dropped), shaders {}, translated {} ({} KB WGSL)",
             self.texture_cache_bytes >> 20,
             self.texture_cache.len(),
             rt >> 20,
             self.targets.len(),
             self.target_drops,
+            self.targets_made,
+            self.targets_reused,
+            self.spare_targets.items.len(),
+            self.spare_targets.bytes >> 20,
             kept >> 20,
             self.mirrors.len(),
             self.arena.as_ref().map_or(0, |b| b.size()) >> 20,
@@ -3660,31 +3744,38 @@ impl Drawer {
                 key.format
             ));
         }
-        let host_format = self.host_format(key.format);
-        let (device, height) = (&self.device, RENDER_TARGET_HEIGHT.min(self.max_dim));
-        let tex = self
-            .targets
-            .entry(key)
-            .or_insert_with(|| {
-                device.create_texture(&wgpu::TextureDescriptor {
-                    label: Some("render target"),
-                    size: wgpu::Extent3d {
-                        width: key.pitch,
-                        height,
-                        depth_or_array_layers: 1,
-                    },
-                    mip_level_count: 1,
-                    sample_count: 1,
-                    dimension: wgpu::TextureDimension::D2,
-                    format: host_format,
-                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT
-                        | wgpu::TextureUsages::COPY_SRC
-                        | wgpu::TextureUsages::COPY_DST
-                        | wgpu::TextureUsages::TEXTURE_BINDING,
-                    view_formats: &[],
-                })
-            })
-            .clone();
+        let tex = match self.targets.get(&key) {
+            Some(t) => t.clone(),
+            None => {
+                let format = self.host_format(key.format);
+                let height = RENDER_TARGET_HEIGHT.min(self.max_dim);
+                let spare = (format, key.pitch, height, 1, TARGET_USAGE);
+                let tex = if let Some(t) = self.spare_targets.take(&spare) {
+                    // A new target starts zeroed, as wgpu makes it.
+                    self.clear_target(&t);
+                    self.targets_reused += 1;
+                    t
+                } else {
+                    self.targets_made += 1;
+                    self.device.create_texture(&wgpu::TextureDescriptor {
+                        label: Some("render target"),
+                        size: wgpu::Extent3d {
+                            width: key.pitch,
+                            height,
+                            depth_or_array_layers: 1,
+                        },
+                        mip_level_count: 1,
+                        sample_count: 1,
+                        dimension: wgpu::TextureDimension::D2,
+                        format,
+                        usage: TARGET_USAGE,
+                        view_formats: &[],
+                    })
+                };
+                self.targets.insert(key, tex.clone());
+                tex
+            }
+        };
         let own = self.written.get(&key).copied().unwrap_or_default();
         let range = edram_range(key, rows.max(own.rows), msaa);
         let mut newest: Option<(RenderTargetKey, Written)> = None;
@@ -3755,11 +3846,52 @@ impl Drawer {
         Ok(tex)
     }
 
+    /// Records a clear of every texel of `tex` to zero in the batch, as a
+    /// new texture holds.
+    fn clear_target(&mut self, tex: &wgpu::Texture) {
+        let view = tex.create_view(&Default::default());
+        let f = tex.format();
+        let color_attachment = [Some(wgpu::RenderPassColorAttachment {
+            view: &view,
+            depth_slice: None,
+            resolve_target: None,
+            ops: wgpu::Operations {
+                load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                store: wgpu::StoreOp::Store,
+            },
+        })];
+        let device = &self.device;
+        let batch = self.batch.get_or_insert_with(|| Batch {
+            pass: None,
+            enc: device.create_command_encoder(&Default::default()),
+        });
+        batch.pass = None;
+        let depth = f.is_depth_stencil_format();
+        batch.enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("clear reused target"),
+            color_attachments: if depth { &[] } else { &color_attachment },
+            depth_stencil_attachment: depth.then(|| wgpu::RenderPassDepthStencilAttachment {
+                view: &view,
+                depth_ops: f.has_depth_aspect().then_some(wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(0.0),
+                    store: wgpu::StoreOp::Store,
+                }),
+                stencil_ops: f.has_stencil_aspect().then_some(wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(0),
+                    store: wgpu::StoreOp::Store,
+                }),
+            }),
+            ..Default::default()
+        });
+    }
+
     /// Drops the host textures of render targets that a newer target on
     /// the same EDRAM tiles, one their words transfer to, has written all
     /// the rows of, with no newer alias whose words do not transfer:
     /// their next use takes that target's words (or newer ones) as it
-    /// would without the drop. Then, past the cap, drops the
+    /// would without the drop; their textures are kept as spares for new
+    /// targets. Then frees the oldest spares past the cap on targets and
+    /// spares together, and past it on targets alone drops the
     /// least recently written targets; one still holding the newest
     /// pixels of its tiles comes back cleared, as EDRAM garbage would, and
     /// is reported. Runs with no batch recorded.
@@ -3793,11 +3925,17 @@ impl Drawer {
             .collect();
         for k in dead {
             self.written.remove(&k);
-            self.targets.remove(&k);
+            if let Some(t) = self.targets.remove(&k) {
+                self.spare_targets.put(spare_key(&t), texture_bytes(&t), t);
+            }
             self.transfer_setups.retain(|t, _| t.0 != k && t.2 != k);
             self.target_drops += 1;
         }
         let mut total: u64 = self.targets.values().map(texture_bytes).sum();
+        // The spares count against the cap and go first; targets dropped
+        // below are freed, not kept.
+        let room = self.target_cap.saturating_sub(total);
+        self.spare_targets.trim(usize::MAX, room);
         if total <= self.target_cap {
             return;
         }
@@ -7153,6 +7291,240 @@ mod tests {
         assert!(!d.written.contains_key(&key(0)));
         assert!(d.memory_line().contains("targets 1 MB in 2, 1 dropped,"));
         assert_eq!(report.warnings.len(), 1, "{report:?}");
+    }
+
+    #[test]
+    fn spares_take_the_newest_match_and_free_the_oldest_past_the_caps() {
+        let mut s = Spares::new(3, 10);
+        s.put('a', 2, 1);
+        s.put('b', 2, 2);
+        s.put('a', 2, 3);
+        assert_eq!(s.take(&'a'), Some(3));
+        assert_eq!(s.take(&'c'), None);
+        assert_eq!(s.bytes, 4);
+        // Past the count the oldest goes (1), then past the bytes (2).
+        s.put('c', 2, 4);
+        s.put('c', 2, 5);
+        assert_eq!(s.take(&'a'), None);
+        s.put('d', 6, 6);
+        assert_eq!(s.take(&'b'), None);
+        assert_eq!((s.items.len(), s.bytes), (3, 10));
+        s.put('d', 1, 7);
+        assert_eq!((s.take(&'c'), s.take(&'c')), (Some(5), None));
+        // One bigger than the byte cap is not kept.
+        s.put('e', 11, 7);
+        assert_eq!((s.items.len(), s.bytes), (0, 0));
+        s.put('f', 1, 8);
+        s.put('g', 2, 9);
+        s.trim(usize::MAX, 2);
+        assert_eq!((s.take(&'f'), s.bytes), (None, 2));
+        s.trim(usize::MAX, 0);
+        assert_eq!((s.take(&'g'), s.bytes), (None, 0));
+    }
+
+    /// The spares count against the target cap: past it with the live
+    /// targets under it, the oldest spares go and the targets stay.
+    #[test]
+    fn target_cap_counts_the_spares() {
+        let Some(mut d) = gpu() else { return };
+        let key = |base_tiles| RenderTargetKey {
+            base_tiles,
+            pitch: 64,
+            format: TargetFormat::Rgba8,
+        };
+        let mut report = Report::default();
+        for base in [0, 100, 200, 300, 400] {
+            d.target(key(base), 64, 0, &mut report).unwrap();
+        }
+        for base in [0, 100, 200] {
+            d.mark_written(key(base), 64, 0);
+        }
+        for base in [300, 400] {
+            let tex = d.targets.remove(&key(base)).unwrap();
+            d.spare_targets
+                .put(spare_key(&tex), texture_bytes(&tex), tex);
+        }
+        // 64 x 2048 x 4 bytes each: three live and two spare are 2.5 MB.
+        d.target_cap = 2 << 20;
+        d.drop_targets(&mut report);
+        assert_eq!(d.render_targets().len(), 3);
+        assert_eq!(d.spare_targets.items.len(), 1);
+        let live: u64 = d.targets.values().map(texture_bytes).sum();
+        assert!(live + d.spare_targets.bytes <= d.target_cap);
+        assert!(report.warnings.is_empty(), "{report:?}");
+        d.flush().unwrap();
+    }
+
+    /// A new target that takes a dropped one's texture starts zeroed, as
+    /// a made one does, not with the old pixels.
+    #[test]
+    fn reused_target_texture_starts_cleared() {
+        let Some(mut d) = gpu() else { return };
+        let key = |base_tiles| RenderTargetKey {
+            base_tiles,
+            pitch: 64,
+            format: TargetFormat::Rgba8,
+        };
+        let mut report = Report::default();
+        let tex = d.target(key(0), 64, 0, &mut report).unwrap();
+        d.flush().unwrap();
+        d.queue.write_texture(
+            tex.as_image_copy(),
+            &vec![0xAB; 64 * 4 * tex.height() as usize],
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(64 * 4),
+                rows_per_image: None,
+            },
+            tex.size(),
+        );
+        assert_eq!(d.read_render_target(key(0), 0, 0, 1, 1).unwrap(), [0xAB; 4]);
+        let tex = d.targets.remove(&key(0)).unwrap();
+        d.spare_targets
+            .put(spare_key(&tex), texture_bytes(&tex), tex);
+        d.target(key(100), 64, 0, &mut report).unwrap();
+        d.flush().unwrap();
+        assert!(d.spare_targets.items.is_empty());
+        assert_eq!(d.read_render_target(key(100), 0, 0, 2, 2).unwrap(), [0; 16]);
+        let m = d.memory_line();
+        assert!(m.contains(", 1 made, 1 reused, 0 spare (0 MB),"), "{m}");
+    }
+
+    /// Texel (0, 0) of a depth target: depth (loaded in a compute pass, as
+    /// Depth24PlusStencil8 depth cannot be copied out) and stencil (0
+    /// without a stencil aspect).
+    fn read_depth_stencil(d: &Drawer, tex: &wgpu::Texture) -> (f32, u8) {
+        let module = d.device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: None,
+            source: wgpu::ShaderSource::Wgsl(
+                "@group(0) @binding(0) var depth: texture_depth_2d;\n\
+                 @group(0) @binding(1) var<storage, read_write> out: array<f32>;\n\
+                 @compute @workgroup_size(1)\n\
+                 fn main() { out[0] = textureLoad(depth, vec2<i32>(0, 0), 0); }\n"
+                    .into(),
+            ),
+        });
+        let pipeline = d
+            .device
+            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: None,
+                layout: None,
+                module: &module,
+                entry_point: Some("main"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
+        let buffer = |usage| {
+            d.device.create_buffer(&wgpu::BufferDescriptor {
+                label: None,
+                size: 256 + 256 * u64::from(tex.height()),
+                usage,
+                mapped_at_creation: false,
+            })
+        };
+        let out = buffer(wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC);
+        let read = buffer(wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST);
+        let view = tex.create_view(&wgpu::TextureViewDescriptor {
+            aspect: wgpu::TextureAspect::DepthOnly,
+            ..Default::default()
+        });
+        let group = d.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &pipeline.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: out.as_entire_binding(),
+                },
+            ],
+        });
+        let mut enc = d.device.create_command_encoder(&Default::default());
+        {
+            let mut pass = enc.begin_compute_pass(&Default::default());
+            pass.set_pipeline(&pipeline);
+            pass.set_bind_group(0, &group, &[]);
+            pass.dispatch_workgroups(1, 1, 1);
+        }
+        enc.copy_buffer_to_buffer(&out, 0, &read, 0, Some(4));
+        if tex.format().has_stencil_aspect() {
+            enc.copy_texture_to_buffer(
+                wgpu::TexelCopyTextureInfo {
+                    texture: tex,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::StencilOnly,
+                },
+                wgpu::TexelCopyBufferInfo {
+                    buffer: &read,
+                    layout: wgpu::TexelCopyBufferLayout {
+                        offset: 256,
+                        bytes_per_row: Some(256),
+                        rows_per_image: None,
+                    },
+                },
+                // Depth and stencil copies take the whole texture.
+                tex.size(),
+            );
+        }
+        let scope = d.device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let cmd = enc.finish();
+        if let Some(e) = block_on(scope.pop()) {
+            panic!("{e}");
+        }
+        let data = d.map_read(&read, d.submit_now([cmd])).unwrap();
+        (f32::from_le_bytes(data[..4].try_into().unwrap()), data[256])
+    }
+
+    /// A depth target that takes a dropped one's texture starts with depth
+    /// and stencil 0, and its clear passes validation.
+    #[test]
+    fn reused_depth_target_texture_starts_cleared() {
+        let Some(mut d) = gpu() else { return };
+        for format in [TargetFormat::D24S8, TargetFormat::D24FS8] {
+            let key = |base_tiles| RenderTargetKey {
+                base_tiles,
+                pitch: 64,
+                format,
+            };
+            let mut report = Report::default();
+            let tex = d.target(key(0), 64, 0, &mut report).unwrap();
+            d.flush().unwrap();
+            let stencil = tex.format().has_stencil_aspect();
+            let view = tex.create_view(&Default::default());
+            let mut enc = d.device.create_command_encoder(&Default::default());
+            enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(0.75),
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: stencil.then_some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(0x5A),
+                        store: wgpu::StoreOp::Store,
+                    }),
+                }),
+                ..Default::default()
+            });
+            d.submit_now([enc.finish()]);
+            let want = if stencil { 0x5A } else { 0 };
+            assert_eq!(read_depth_stencil(&d, &tex), (0.75, want), "{format:?}");
+            let tex = d.targets.remove(&key(0)).unwrap();
+            d.spare_targets
+                .put(spare_key(&tex), texture_bytes(&tex), tex);
+            let tex = d.target(key(100), 64, 0, &mut report).unwrap();
+            d.flush().unwrap();
+            assert!(d.spare_targets.items.is_empty(), "{format:?}");
+            assert_eq!(read_depth_stencil(&d, &tex), (0.0, 0), "{format:?}");
+            // A validation error on the submit thread comes out here.
+            d.flush().unwrap();
+            assert!(report.warnings.is_empty(), "{report:?}");
+            d.targets.clear();
+        }
     }
 
     #[test]
