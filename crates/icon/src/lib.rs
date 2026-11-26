@@ -1,6 +1,6 @@
 //! The programs' icon, drawn by code so no picture file lives in git: a disc
-//! of corroded metal inside a glowing green ring, crossed by two bevelled
-//! steel bars. [`rgba`] draws it at any size, [`ico`] packs several sizes into
+//! of corroded metal inside a steel ring with a thin green glow on its inner
+//! edge, crossed by two bevelled steel bars. [`rgba`] draws it at any size, [`ico`] packs several sizes into
 //! an .ico file and [`res`] wraps an .ico in a Win32 .res file that the MSVC
 //! linker takes as an input.
 
@@ -85,7 +85,7 @@ fn oxide(x: f32, y: f32, seed: u32) -> Rgb {
 /// Shapes per size: small icons get a thicker ring and bars and no fine detail.
 #[derive(Clone, Copy)]
 struct Look {
-    /// Ring outer and inner radius; the glow fills from `ro` to the edge.
+    /// Ring outer and inner radius; a soft shadow fills from `ro` to the edge.
     ro: f32,
     ri: f32,
     /// Bar half width and half length.
@@ -95,6 +95,8 @@ struct Look {
     outline: f32,
     rim: f32,
     pits: bool,
+    /// Fine pitting on the disc and rust on the bars, only where it reads.
+    fine: bool,
     rivets: bool,
 }
 
@@ -104,21 +106,24 @@ fn look(size: u32) -> Look {
         0..=24 => Look {
             ro: 0.97,
             ri: 0.72,
-            w: 0.25,
-            l: 0.7,
+            // Short, narrow arms leave rust showing round their ends.
+            w: 0.21,
+            l: 0.62,
             outline: 0.0,
             rim: 0.0,
             pits: false,
+            fine: false,
             rivets: false,
         },
         25..=40 => Look {
             ro: 0.93,
             ri: 0.74,
-            w: 0.21,
-            l: 0.7,
+            w: 0.19,
+            l: 0.64,
             outline: 0.0,
             rim: 0.0,
             pits: true,
+            fine: false,
             rivets: false,
         },
         _ => Look {
@@ -129,6 +134,7 @@ fn look(size: u32) -> Look {
             outline: 0.0,
             rim: 0.0,
             pits: true,
+            fine: size > 64,
             rivets: true,
         },
     };
@@ -163,6 +169,8 @@ fn disc(x: f32, y: f32, q: f32, k: &Look) -> Rgb {
     let mut c = oxide(x, y, 11);
     if k.pits {
         c = pits(c, x, y, 6.0, 21);
+    }
+    if k.fine {
         c = pits(c, x, y, 15.0, 22);
     }
     // A shallow dome, lit from the top left.
@@ -217,8 +225,10 @@ fn bar(x: f32, y: f32, dx: f32, dy: f32, top: bool, edges: bool, k: &Look) -> Op
     let (dist, normal, a, n) = bar_at(x, y, dx, dy, k)?;
     // Brushed steel along the bar, eaten by rust patches.
     let brush = vnoise(a * 2.5, n * 40.0, if top { 31 } else { 41 });
-    let mut c = mix(rgb(STEEL_DARK), rgb(STEEL), 0.35 + 0.5 * brush);
-    if k.rivets {
+    // Small icons get brighter steel so the X stands out from the rust.
+    let base = if k.rivets { 0.35 } else { 0.6 };
+    let mut c = mix(rgb(STEEL_DARK), rgb(STEEL), base + 0.4 * brush);
+    if k.fine {
         let eaten = smooth(
             0.5,
             0.75,
@@ -274,23 +284,33 @@ fn sample(x: f32, y: f32, k: &Look) -> [f32; 4] {
         return px;
     }
     if r >= k.ro - 0.02 {
+        // A soft dark edge, so the ring stands off light backgrounds.
         let t = (1.0 - r) / (1.0 - k.ro + 0.02);
-        px = over(px, rgb(GREEN), 0.65 * t * t);
+        px = over(px, rgb(PIT), 0.45 * t * t);
         if r >= k.ro {
             return px;
         }
     }
     if r >= k.ri {
-        // The ring: a glowing tube, brightest along its middle and top left.
+        // The ring: a steel tube lit from the top left, with a thin green
+        // glow along its inner edge (about a pixel at small sizes).
         let s = (r - k.ri) / (k.ro - k.ri);
         let tube = 1.0 - (2.0 * s - 1.0).powi(2);
         let lit = 0.5 + 0.5 * (x * LIGHT[0] + y * LIGHT[1]) / (r * 0.8);
-        let c = mix(rgb(GREEN_DEEP), rgb(GREEN), smooth(0.0, 0.55, tube));
+        let c = mix(
+            rgb(STEEL_DARK),
+            rgb(STEEL),
+            smooth(0.0, 0.7, tube) * (0.15 + 0.7 * lit),
+        );
+        let c = mix(c, rgb(BONE), 0.7 * smooth(0.75, 1.0, tube) * lit * lit);
+        let glow = (0.5 * k.outline / (k.ro - k.ri)).max(0.1);
         let c = mix(
             c,
-            rgb(GREEN_HI),
-            smooth(0.5, 1.0, tube) * (0.35 + 0.65 * lit),
+            rgb(GREEN_DEEP),
+            0.5 * (1.0 - smooth(glow, 1.6 * glow, s)),
         );
+        let c = mix(c, rgb(GREEN), 1.0 - smooth(0.4 * glow, glow, s));
+        let c = mix(c, rgb(GREEN_HI), 0.6 * (1.0 - smooth(0.0, 0.5 * glow, s)));
         return over(px, c, 1.0);
     }
     let mut c = disc(x, y, r / k.ri, k);

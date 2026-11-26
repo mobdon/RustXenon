@@ -3243,6 +3243,7 @@ dependencies = [
  "winit",
  "xenon-icon",
  "xenon-input",
+ "xenon-window",
 ]
 
 [[package]]

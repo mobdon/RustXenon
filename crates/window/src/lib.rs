@@ -47,6 +47,26 @@ impl Link {
     }
 }
 
+/// Gives a window the program's icon. On Windows the title bar and taskbar
+/// load the exe's icon resource at their own sizes, so the small one is the
+/// image drawn for 16 px; elsewhere, or with no resource, drawn images are used.
+pub fn with_icon(a: winit::window::WindowAttributes) -> winit::window::WindowAttributes {
+    use winit::window::Icon;
+    let drawn = |s: u32| Icon::from_rgba(xenon_icon::rgba(s), s, s).ok();
+    #[cfg(windows)]
+    {
+        use winit::platform::windows::{IconExtWindows, WindowAttributesExtWindows};
+        let res = |s: Option<u32>| {
+            Icon::from_resource(1, s.map(|s| winit::dpi::PhysicalSize::new(s, s))).ok()
+        };
+        // shortcut: the small icon is 16 px at any DPI; ask SM_CXSMICON if it looks soft above 100%.
+        a.with_window_icon(res(Some(16)).or_else(|| drawn(16)))
+            .with_taskbar_icon(res(None).or_else(|| drawn(32)))
+    }
+    #[cfg(not(windows))]
+    a.with_window_icon(drawn(64))
+}
+
 /// Opens the window on a new thread. `on_close` runs on that thread when the
 /// player closes it, or after printing why no window could be opened.
 pub fn spawn(title: String, on_close: impl FnOnce() + Send + 'static) -> Arc<Link> {
@@ -128,9 +148,8 @@ impl ApplicationHandler for App {
         if self.window.is_some() {
             return;
         }
-        let attrs = Window::default_attributes()
+        let attrs = with_icon(Window::default_attributes())
             .with_title(self.title.clone())
-            .with_window_icon(winit::window::Icon::from_rgba(xenon_icon::rgba(64), 64, 64).ok())
             .with_inner_size(winit::dpi::LogicalSize::new(1280.0, 720.0));
         let made = ev
             .create_window(attrs)

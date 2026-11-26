@@ -17,8 +17,8 @@ serde = { version = "1", features = ["derive"] }
 softbuffer = "0.4"
 toml = "0.8"
 winit = "0.30"
-xenon-icon = { path = "../icon" }
 xenon-input = { path = "../input" }
+xenon-window = { path = "../window" }
 
 [build-dependencies]
 xenon-icon = { path = "../icon" }
