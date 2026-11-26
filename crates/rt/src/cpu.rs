@@ -56,7 +56,34 @@ pub struct Context {
     /// Guest calls made through `Runtime::call` (checked against the call
     /// budget).
     pub calls: u64,
+    /// This host thread's [`crate::thread`] state, set by `Runtime::spawn`
+    /// so the per-call suspend check needs no thread-local lookup (each one
+    /// is a libc call on Android). Null: look it up.
+    pub(crate) thread: ThreadSlot,
+    /// Opaque per-thread pointer for the host's call hook (its record of
+    /// what this thread is doing), so the hook needs no thread-local lookup.
+    /// Null until the host sets it; `Runtime::spawn` and `clone` reset it,
+    /// so it never names another host thread's record.
+    pub host: ThreadSlot,
 }
+
+/// A pointer that belongs to one host thread. Cloning gives null, so a
+/// context copied for use elsewhere looks its thread up again.
+#[derive(Debug)]
+pub struct ThreadSlot(pub *const ());
+
+impl ThreadSlot {
+    pub const NULL: Self = Self(std::ptr::null());
+}
+
+impl Clone for ThreadSlot {
+    fn clone(&self) -> Self {
+        Self::NULL
+    }
+}
+
+// SAFETY: only an address; the owners of the slots decide when it is used.
+unsafe impl Send for ThreadSlot {}
 
 impl Default for Context {
     fn default() -> Self {
@@ -77,6 +104,8 @@ impl Default for Context {
             msr: 0x8000_0000_0000_0000,
             reserve: None,
             calls: 0,
+            thread: ThreadSlot::NULL,
+            host: ThreadSlot::NULL,
         }
     }
 }
