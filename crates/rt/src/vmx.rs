@@ -2004,98 +2004,123 @@ mod tests {
         }
     }
 
+    /// `v` with every NaN lane made finite (exponent top bit cleared), so a
+    /// fast path that hands NaN operands to the scalar code does its own work.
+    fn no_nans(v: V128) -> V128 {
+        v.map(|w| if fl(w).is_nan() { w ^ 0x4000_0000 } else { w })
+    }
+
     #[test]
     fn fast_paths_match_scalar() {
-        let mut next = vectors();
         // Millions in a release build (run on every target with a fast path).
         let n = if cfg!(debug_assertions) {
             200_000
         } else {
             4_000_000
         };
+        let mut next = vectors();
         for _ in 0..n {
             let (a, b, c) = (next(), next(), next());
-            assert_eq!(
-                vaddfp(a, b),
-                vaddfp_scalar(a, b),
-                "vaddfp {a:08x?} {b:08x?} {c:08x?}"
-            );
-            assert_eq!(
-                vsubfp(a, b),
-                vsubfp_scalar(a, b),
-                "vsubfp {a:08x?} {b:08x?} {c:08x?}"
-            );
-            assert_eq!(
-                vmulfp(a, b),
-                vmulfp_scalar(a, b),
-                "vmulfp {a:08x?} {b:08x?} {c:08x?}"
-            );
-            assert_eq!(
-                vmaxfp(a, b),
-                vmaxfp_scalar(a, b),
-                "vmaxfp {a:08x?} {b:08x?} {c:08x?}"
-            );
-            assert_eq!(
-                vminfp(a, b),
-                vminfp_scalar(a, b),
-                "vminfp {a:08x?} {b:08x?} {c:08x?}"
-            );
-            assert_eq!(
-                vrefp(b),
-                vrefp_scalar(b),
-                "vrefp {a:08x?} {b:08x?} {c:08x?}"
-            );
-            assert_eq!(
-                vrsqrtefp(b),
-                vrsqrtefp_scalar(b),
-                "vrsqrtefp {a:08x?} {b:08x?} {c:08x?}"
-            );
-            assert_eq!(
-                vmaddfp(a, c, b),
-                vmaddfp_scalar(a, c, b),
-                "vmaddfp {a:08x?} {b:08x?} {c:08x?}"
-            );
-            assert_eq!(
-                vnmsubfp(a, c, b),
-                vnmsubfp_scalar(a, c, b),
-                "vnmsubfp {a:08x?} {b:08x?} {c:08x?}"
-            );
-            assert_eq!(
-                vmsum3fp(a, b),
-                dot(a, b, 3),
-                "vmsum3fp {a:08x?} {b:08x?} {c:08x?}"
-            );
-            assert_eq!(
-                vmsum4fp(a, b),
-                dot(a, b, 4),
-                "vmsum4fp {a:08x?} {b:08x?} {c:08x?}"
-            );
-            assert_eq!(
-                vcmpeqfp(a, b),
-                vcmpeqfp_scalar(a, b),
-                "vcmpeqfp {a:08x?} {b:08x?} {c:08x?}"
-            );
-            assert_eq!(
-                vcmpgefp(a, b),
-                vcmpgefp_scalar(a, b),
-                "vcmpgefp {a:08x?} {b:08x?} {c:08x?}"
-            );
-            assert_eq!(
-                vcmpgtfp(a, b),
-                vcmpgtfp_scalar(a, b),
-                "vcmpgtfp {a:08x?} {b:08x?} {c:08x?}"
-            );
-            assert_eq!(
-                vcmpbfp(a, b),
-                vcmpbfp_scalar(a, b),
-                "vcmpbfp {a:08x?} {b:08x?} {c:08x?}"
-            );
-            assert_eq!(
-                vperm(a, b, c),
-                vperm_scalar(a, b, c),
-                "vperm {a:08x?} {b:08x?} {c:08x?}"
-            );
+            check_fast_path(a, b, c);
         }
+        // Again without NaNs: any NaN lane sends a whole vector to the scalar
+        // code, so most of the first loop compares scalar with scalar.
+        let mut next = vectors();
+        for _ in 0..n {
+            let (a, b, c) = (no_nans(next()), no_nans(next()), no_nans(next()));
+            check_fast_path(a, b, c);
+        }
+    }
+
+    #[test]
+    fn no_nans_clears_every_nan() {
+        let mut next = vectors();
+        for _ in 0..10_000 {
+            assert!(no_nans(next()).iter().all(|&w| !fl(w).is_nan()));
+        }
+    }
+
+    fn check_fast_path(a: V128, b: V128, c: V128) {
+        assert_eq!(
+            vaddfp(a, b),
+            vaddfp_scalar(a, b),
+            "vaddfp {a:08x?} {b:08x?} {c:08x?}"
+        );
+        assert_eq!(
+            vsubfp(a, b),
+            vsubfp_scalar(a, b),
+            "vsubfp {a:08x?} {b:08x?} {c:08x?}"
+        );
+        assert_eq!(
+            vmulfp(a, b),
+            vmulfp_scalar(a, b),
+            "vmulfp {a:08x?} {b:08x?} {c:08x?}"
+        );
+        assert_eq!(
+            vmaxfp(a, b),
+            vmaxfp_scalar(a, b),
+            "vmaxfp {a:08x?} {b:08x?} {c:08x?}"
+        );
+        assert_eq!(
+            vminfp(a, b),
+            vminfp_scalar(a, b),
+            "vminfp {a:08x?} {b:08x?} {c:08x?}"
+        );
+        assert_eq!(
+            vrefp(b),
+            vrefp_scalar(b),
+            "vrefp {a:08x?} {b:08x?} {c:08x?}"
+        );
+        assert_eq!(
+            vrsqrtefp(b),
+            vrsqrtefp_scalar(b),
+            "vrsqrtefp {a:08x?} {b:08x?} {c:08x?}"
+        );
+        assert_eq!(
+            vmaddfp(a, c, b),
+            vmaddfp_scalar(a, c, b),
+            "vmaddfp {a:08x?} {b:08x?} {c:08x?}"
+        );
+        assert_eq!(
+            vnmsubfp(a, c, b),
+            vnmsubfp_scalar(a, c, b),
+            "vnmsubfp {a:08x?} {b:08x?} {c:08x?}"
+        );
+        assert_eq!(
+            vmsum3fp(a, b),
+            dot(a, b, 3),
+            "vmsum3fp {a:08x?} {b:08x?} {c:08x?}"
+        );
+        assert_eq!(
+            vmsum4fp(a, b),
+            dot(a, b, 4),
+            "vmsum4fp {a:08x?} {b:08x?} {c:08x?}"
+        );
+        assert_eq!(
+            vcmpeqfp(a, b),
+            vcmpeqfp_scalar(a, b),
+            "vcmpeqfp {a:08x?} {b:08x?} {c:08x?}"
+        );
+        assert_eq!(
+            vcmpgefp(a, b),
+            vcmpgefp_scalar(a, b),
+            "vcmpgefp {a:08x?} {b:08x?} {c:08x?}"
+        );
+        assert_eq!(
+            vcmpgtfp(a, b),
+            vcmpgtfp_scalar(a, b),
+            "vcmpgtfp {a:08x?} {b:08x?} {c:08x?}"
+        );
+        assert_eq!(
+            vcmpbfp(a, b),
+            vcmpbfp_scalar(a, b),
+            "vcmpbfp {a:08x?} {b:08x?} {c:08x?}"
+        );
+        assert_eq!(
+            vperm(a, b, c),
+            vperm_scalar(a, b, c),
+            "vperm {a:08x?} {b:08x?} {c:08x?}"
+        );
     }
 
     #[test]
@@ -2125,102 +2150,73 @@ mod tests {
     /// Fast path against scalar code for the hot helpers:
     /// `cargo test -p xenon-rt --release vmx_bench -- --ignored --nocapture`
     /// (and with `RUSTFLAGS="-C target-cpu=native"` for the FMA and `pshufb`
-    /// paths a game build uses).
+    /// paths a game build uses). Pin it to one core (`taskset`) on a phone.
+    /// Each op runs inlined over 1024 varied NaN-free vectors; `copy` is the
+    /// loop's own cost, to subtract.
     #[test]
     #[ignore = "micro-benchmark"]
     fn vmx_bench() {
         use std::hint::black_box;
-        fn time(f: impl Fn(V128, V128, V128) -> V128) -> f64 {
-            let (a, b, c) = (
-                [0x3F80_0000, 0x4000_0000, 0xBF00_0000, 0x3E80_0000],
-                [0x3F00_0000, 0xC040_0000, 0x3F80_0000, 0x4080_0000],
-                [0x0302_0100, 0x1716_1514, 0x0B0A_0908, 0x1F1E_1D1C],
-            );
-            let n = 20_000_000u32;
-            let t = std::time::Instant::now();
-            for _ in 0..n {
-                black_box(f(black_box(a), black_box(b), black_box(c)));
-            }
-            t.elapsed().as_secs_f64() * 1e9 / n as f64
+        let mut next = vectors();
+        let buf: Vec<[V128; 3]> = (0..1024)
+            .map(|_| {
+                let ctl = next().map(|w| w & 0x1F1F_1F1F);
+                [no_nans(next()), no_nans(next()), ctl]
+            })
+            .collect();
+        // Inlined loop over the buffer; XOR-folds results so none is dropped.
+        macro_rules! ns {
+            (|$a:ident, $b:ident, $c:ident| $e:expr) => {{
+                let buf = black_box(&buf[..]);
+                let rounds = 20_000u32;
+                let t = std::time::Instant::now();
+                let mut acc = 0u32;
+                for _ in 0..rounds {
+                    for &[$a, $b, $c] in buf {
+                        let r: V128 = $e;
+                        acc ^= r[0] ^ r[1] ^ r[2] ^ r[3];
+                    }
+                }
+                black_box(acc);
+                t.elapsed().as_secs_f64() * 1e9 / (rounds as f64 * buf.len() as f64)
+            }};
         }
-        type Op = fn(V128, V128, V128) -> V128;
-        let ops: [(&str, Op, Op); 16] = [
-            (
-                "vaddfp",
-                |a, b, _| vaddfp(a, b),
-                |a, b, _| vaddfp_scalar(a, b),
-            ),
-            (
-                "vsubfp",
-                |a, b, _| vsubfp(a, b),
-                |a, b, _| vsubfp_scalar(a, b),
-            ),
-            (
-                "vminfp",
-                |a, b, _| vminfp(a, b),
-                |a, b, _| vminfp_scalar(a, b),
-            ),
-            ("vrefp", |a, _, _| vrefp(a), |a, _, _| vrefp_scalar(a)),
-            (
-                "vcmpeqfp",
-                |a, b, _| vcmpeqfp(a, b),
-                |a, b, _| vcmpeqfp_scalar(a, b),
-            ),
-            (
-                "vcmpgefp",
-                |a, b, _| vcmpgefp(a, b),
-                |a, b, _| vcmpgefp_scalar(a, b),
-            ),
-            (
-                "vmulfp",
-                |a, b, _| vmulfp(a, b),
-                |a, b, _| vmulfp_scalar(a, b),
-            ),
-            (
-                "vmaddfp",
-                |a, b, c| vmaddfp(a, b, c),
-                |a, b, c| vmaddfp_scalar(a, b, c),
-            ),
-            (
-                "vnmsubfp",
-                |a, b, c| vnmsubfp(a, b, c),
-                |a, b, c| vnmsubfp_scalar(a, b, c),
-            ),
-            (
-                "vmaxfp",
-                |a, b, _| vmaxfp(a, b),
-                |a, b, _| vmaxfp_scalar(a, b),
-            ),
-            (
-                "vrsqrtefp",
-                |a, _, _| vrsqrtefp(a),
-                |a, _, _| vrsqrtefp_scalar(a),
-            ),
-            ("vmsum3fp", |a, b, _| vmsum3fp(a, b), |a, b, _| dot(a, b, 3)),
-            ("vmsum4fp", |a, b, _| vmsum4fp(a, b), |a, b, _| dot(a, b, 4)),
-            (
-                "vcmpgtfp",
-                |a, b, _| vcmpgtfp(a, b),
-                |a, b, _| vcmpgtfp_scalar(a, b),
-            ),
-            (
-                "vcmpbfp",
-                |a, b, _| vcmpbfp(a, b),
-                |a, b, _| vcmpbfp_scalar(a, b),
-            ),
-            (
-                "vperm",
-                |a, b, c| vperm(a, b, c),
-                |a, b, c| vperm_scalar(a, b, c),
-            ),
-        ];
-        for (name, fast, scalar) in ops {
-            let (f, s) = (time(fast), time(scalar));
-            println!(
-                "[vmx] {name:10} fast {f:5.2} ns  scalar {s:5.2} ns  x{:.1}",
-                s / f
-            );
+        macro_rules! time {
+            ($name:literal, |$a:ident, $b:ident, $c:ident| $fast:expr, $scalar:expr) => {{
+                #[allow(unused_variables)]
+                let (f, s) = (ns!(|$a, $b, $c| $fast), ns!(|$a, $b, $c| $scalar));
+                println!(
+                    "[vmx] {:10} fast {f:5.2} ns  scalar {s:5.2} ns  x{:.1}",
+                    $name,
+                    s / f
+                );
+            }};
         }
+        time!("copy", |a, b, c| a, a);
+        time!("vaddfp", |a, b, c| vaddfp(a, b), vaddfp_scalar(a, b));
+        time!("vsubfp", |a, b, c| vsubfp(a, b), vsubfp_scalar(a, b));
+        time!("vmulfp", |a, b, c| vmulfp(a, b), vmulfp_scalar(a, b));
+        time!(
+            "vmaddfp",
+            |a, b, c| vmaddfp(a, b, c),
+            vmaddfp_scalar(a, b, c)
+        );
+        time!(
+            "vnmsubfp",
+            |a, b, c| vnmsubfp(a, b, c),
+            vnmsubfp_scalar(a, b, c)
+        );
+        time!("vmaxfp", |a, b, c| vmaxfp(a, b), vmaxfp_scalar(a, b));
+        time!("vminfp", |a, b, c| vminfp(a, b), vminfp_scalar(a, b));
+        time!("vrefp", |a, b, c| vrefp(a), vrefp_scalar(a));
+        time!("vrsqrtefp", |a, b, c| vrsqrtefp(a), vrsqrtefp_scalar(a));
+        time!("vmsum3fp", |a, b, c| vmsum3fp(a, b), dot(a, b, 3));
+        time!("vmsum4fp", |a, b, c| vmsum4fp(a, b), dot(a, b, 4));
+        time!("vcmpeqfp", |a, b, c| vcmpeqfp(a, b), vcmpeqfp_scalar(a, b));
+        time!("vcmpgefp", |a, b, c| vcmpgefp(a, b), vcmpgefp_scalar(a, b));
+        time!("vcmpgtfp", |a, b, c| vcmpgtfp(a, b), vcmpgtfp_scalar(a, b));
+        time!("vcmpbfp", |a, b, c| vcmpbfp(a, b), vcmpbfp_scalar(a, b));
+        time!("vperm", |a, b, c| vperm(a, b, c), vperm_scalar(a, b, c));
     }
 
     #[test]
