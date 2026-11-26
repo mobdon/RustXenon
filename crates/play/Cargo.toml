@@ -12,9 +12,12 @@ name = "rustxenon-play"
 path = "src/main.rs"
 
 [dependencies]
-png = "0.17"
 serde = { version = "1", features = ["derive"] }
-softbuffer = "0.4"
 toml = "0.8"
+
+# Only the launcher window uses these; the phone draws through the window crate.
+[target.'cfg(not(target_os = "android"))'.dependencies]
+png = "0.17"
+softbuffer = "0.4"
 winit = "0.30"
 xenon-input = { path = "../input" }
