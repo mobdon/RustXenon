@@ -394,6 +394,8 @@ pub struct Timings {
     pub shaders: Duration,
     /// `shaders` split by step: shader lookup and state decode, guest
     /// indices, render target lookup, then modules and pipeline lookup.
+    /// Sampled: one draw in 32 is timed and counts for 32, so the parts
+    /// only approximate `shaders`.
     pub setup_parts: [Duration; 4],
     /// Guest vertex window, constants and index buffers: reading guest
     /// memory and uploading it, per draw.
@@ -410,10 +412,11 @@ pub struct Timings {
     pub upload: Duration,
     /// Of `submit`, the draws' own recording by step: their bind groups
     /// (looked up or made), beginning their render passes, and the `set_*`
-    /// and draw calls.
+    /// and draw calls. Sampled like `setup_parts`.
     pub submit_parts: [Duration; 3],
     /// Commands other than draws, resolves and swaps (register writes,
-    /// shader loads, MEM_WRITEs), and the upkeep after every command.
+    /// shader loads, MEM_WRITEs), and the upkeep after every command;
+    /// timed by run, between the timed commands, not one by one.
     pub commands: Duration,
     /// The start and end of a replay outside the other phases: memo upkeep
     /// for the guest writes listed, and render target drops.
@@ -1499,6 +1502,9 @@ pub struct Drawer {
     /// Bumped by every register write to the constants a `Consts` block
     /// holds, so a draw rebuilds the block only after one.
     consts_gen: u64,
+    /// Draws through pipeline lookup: those at multiples of
+    /// [`PART_SAMPLE`] time their sub-phases.
+    part_draws: u32,
     /// The last `Consts` block prefix built, by generation: the same
     /// block while its registers hold the same words, so draws compare
     /// blocks by pointer.
@@ -1702,6 +1708,49 @@ fn lap(t: &mut Instant) -> Duration {
     let d = now - *t;
     *t = now;
     d
+}
+
+/// One draw in this many times the sub-phases of `shaders` and `submit`
+/// ([`Timings::setup_parts`], [`Timings::submit_parts`]); their sums are
+/// scaled by it. Each clock read costs tens of nanoseconds, too many per
+/// draw for a split that only shows where a phase goes.
+const PART_SAMPLE: u32 = 32;
+
+/// Adds the spans between consecutive `marks` to `parts`, scaled by
+/// [`PART_SAMPLE`] as only one draw in that many is timed.
+fn add_sampled(parts: &mut [Duration], marks: &[Instant]) {
+    for (p, w) in parts.iter_mut().zip(marks.windows(2)) {
+        *p += (w[1] - w[0]) * PART_SAMPLE;
+    }
+}
+
+/// Times a replay's plain commands (all but draws, resolves and swaps,
+/// which time their own phases) and the upkeep after every command, with
+/// clock reads only at the edges of the timed ones: a run of plain
+/// commands costs no read of its own.
+struct PlainTimer<F: FnMut() -> Instant> {
+    now: F,
+    mark: Instant,
+}
+
+impl<F: FnMut() -> Instant> PlainTimer<F> {
+    fn new(mut now: F) -> Self {
+        let mark = now();
+        Self { now, mark }
+    }
+
+    /// Before a timed command or at the end: charges the run since the
+    /// last timed command to `commands`.
+    fn charge(&mut self, commands: &mut Duration) {
+        let now = (self.now)();
+        *commands += now - self.mark;
+        self.mark = now;
+    }
+
+    /// After a timed command: the next run starts here.
+    fn restart(&mut self) {
+        self.mark = (self.now)();
+    }
 }
 
 fn block_on<F: std::future::Future>(f: F) -> F::Output {
@@ -2519,6 +2568,7 @@ impl Drawer {
             float_gens: [0; 2],
             staged_floats: [None; 2],
             consts_gen: 0,
+            part_draws: 0,
             consts_built: None,
             staged_base: 0,
             watching: false,
@@ -2995,9 +3045,10 @@ impl Drawer {
         tracked: &mut Tracked,
         report: &mut Report,
     ) -> Result<(), Error> {
-        // One clock read per command, two for those timing their own phases:
-        // `mark` carries the end of the previous command forward.
-        let mut mark = Instant::now();
+        // Two clock reads per draw, resolve and swap, none for the commands
+        // between them: a run of those is charged once, before the next
+        // timed command (and at the end).
+        let mut clock = PlainTimer::new(Instant::now);
         for c in commands {
             let mem = &mut *tracked;
             // Draws, resolves and swaps time their own phases; the rest,
@@ -3006,6 +3057,9 @@ impl Drawer {
                 c,
                 Command::Draw(_) | Command::Resolve(_) | Command::Swap { .. }
             );
+            if own {
+                clock.charge(&mut self.timings.commands);
+            }
             let done = match c {
                 Command::WriteRegisters { base, values } => {
                     self.regs.set_many(*base, values);
@@ -3086,8 +3140,11 @@ impl Drawer {
                 _ => Ok(()),
             };
             if own {
-                mark = Instant::now();
+                clock.restart();
             }
+            // Per command, not per run: a MEM_WRITE's `sync` must not find a
+            // kept copy an earlier write in the run made stale, and errors
+            // stop the replay at the command they came after.
             for (lo, hi) in tracked.written.drain(..) {
                 self.forget_guest(lo, hi);
                 // Any write but a resolve's makes a kept copy stale; the
@@ -3103,10 +3160,8 @@ impl Drawer {
                 Err(Skip::Fatal(e)) => return Err(e),
             }
             self.check_uncaptured()?;
-            let now = Instant::now();
-            self.timings.commands += now - mark;
-            mark = now;
         }
+        clock.charge(&mut self.timings.commands);
         Ok(())
     }
 
@@ -5559,7 +5614,9 @@ impl Drawer {
             report.warn("blend uses the constant colour and its alpha in the colour channel; drawn with the colour");
         }
 
-        let t_state = Instant::now();
+        let sample = self.part_draws.is_multiple_of(PART_SAMPLE);
+        let stamp = || sample.then(Instant::now);
+        let t_state = stamp();
         let strip = matches!(
             topology,
             wgpu::PrimitiveTopology::TriangleStrip | wgpu::PrimitiveTopology::LineStrip
@@ -5638,7 +5695,7 @@ impl Drawer {
         }
 
         // Every target of a draw has the surface pitch and the same height.
-        let t_indices = Instant::now();
+        let t_indices = stamp();
         let (w, h) = (surface & 0x3FFF, RENDER_TARGET_HEIGHT.min(self.max_dim));
         let (sx, sy, sw, sh) = state::scissor(&self.regs, w, h);
         let rows = sy + sh;
@@ -5660,7 +5717,7 @@ impl Drawer {
             return Ok(false);
         }
 
-        let t_targets = Instant::now();
+        let t_targets = stamp();
         let info = |a: &ShaderInfo, b: &ShaderInfo| {
             (
                 a.vertex_fetch_consts | b.vertex_fetch_consts,
@@ -5775,12 +5832,12 @@ impl Drawer {
                 (p, g1_layout)
             }
         };
-        let setup = &mut self.timings.setup_parts;
-        setup[0] += t_state - t;
-        setup[1] += t_indices - t_state;
-        setup[2] += t_targets - t_indices;
-        setup[3] += t_targets.elapsed();
+        let t0 = t;
         self.timings.shaders += lap(&mut t);
+        self.part_draws = self.part_draws.wrapping_add(1);
+        if let (Some(a), Some(b), Some(c)) = (t_state, t_indices, t_targets) {
+            add_sampled(&mut self.timings.setup_parts, &[t0, a, b, c, t]);
+        }
 
         let reach = &mut self.window_scratch.reach;
         reach.clear();
@@ -6117,14 +6174,14 @@ impl Drawer {
             }
             g
         };
-        let t_groups = Instant::now();
+        let t_groups = stamp();
         // Staging may have flushed the batch, ending the pass: then it
         // begins again and needs the textures.
         if current && !self.pass_open(&pass_key) {
             (color_tex, depth_tex) = self.targets_of(pass_key, rows, msaa, report)?;
         }
         let (pass, bound) = self.pass(pass_key, &color_tex, depth_tex.as_ref());
-        let t_pass = Instant::now();
+        let t_pass = stamp();
         if bound.pipeline.as_ref() != Some(&pipeline) {
             pass.set_pipeline(&pipeline);
             bound.pipeline = Some(pipeline);
@@ -6185,11 +6242,11 @@ impl Drawer {
         if let Some(k) = depth_key.filter(|_| depth.write || stencil.is_some()) {
             self.stamp_written(k, rows, msaa);
         }
-        let parts = &mut self.timings.submit_parts;
-        parts[0] += t_groups - t;
-        parts[1] += t_pass - t_groups;
-        parts[2] += t_pass.elapsed();
+        let t0 = t;
         self.timings.submit += lap(&mut t);
+        if let (Some(a), Some(b)) = (t_groups, t_pass) {
+            add_sampled(&mut self.timings.submit_parts, &[t0, a, b, t]);
+        }
         Ok(true)
     }
 
@@ -7206,6 +7263,51 @@ fn host_texture_format(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Plain commands are charged by run, timed ones not at all, with two
+    /// clock reads per timed command and none per plain one.
+    #[test]
+    fn plain_timer_charges_runs_between_timed_commands() {
+        use std::cell::Cell;
+        let base = Instant::now();
+        let (now, reads) = (Cell::new(0u64), Cell::new(0u32));
+        let clock = || {
+            reads.set(reads.get() + 1);
+            base + Duration::from_micros(now.get())
+        };
+        let mut timer = PlainTimer::new(clock);
+        let mut commands = Duration::ZERO;
+        // (timed, microseconds of work): runs of plain commands between
+        // draws, as the replay loop sees them.
+        let list = [(false, 3), (false, 4), (true, 100), (false, 5), (true, 200)];
+        for (timed, work) in list {
+            if timed {
+                timer.charge(&mut commands);
+            }
+            now.set(now.get() + work);
+            if timed {
+                timer.restart();
+            }
+            // Upkeep after the command, charged as plain.
+            now.set(now.get() + 1);
+        }
+        timer.charge(&mut commands);
+        assert_eq!(commands, Duration::from_micros(3 + 4 + 5 + 5));
+        assert_eq!(reads.get(), 1 + 2 * 2 + 1);
+    }
+
+    #[test]
+    fn sampled_parts_scale_by_the_sample_rate() {
+        let t = Instant::now();
+        let us = |n| t + Duration::from_micros(n);
+        let mut parts = [Duration::ZERO; 3];
+        add_sampled(&mut parts, &[t, us(1), us(3), us(6)]);
+        let n = PART_SAMPLE;
+        assert_eq!(
+            parts.map(|p| p.as_micros()),
+            [1, 2, 3].map(|p| p * u128::from(n))
+        );
+    }
 
     /// A fetch constant with clamp modes, filters (mag, min, mip, aniso)
     /// and border colour.
