@@ -8,8 +8,24 @@
 //! Frames are copied to the window with the CPU (bilinear scaling,
 //! letterboxed, rows split over a few threads); no GPU work happens here.
 
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
+use std::thread::ThreadId;
 use xenon_input::Pad;
+
+/// The thread that pumps the window (there is only ever one).
+static PUMP: OnceLock<ThreadId> = OnceLock::new();
+
+/// Marks this thread as the one that pumps the window.
+fn mark_pump_thread() {
+    let _ = PUMP.set(std::thread::current().id());
+}
+
+/// Whether this thread pumps the window (and so must never park): the
+/// desktop's window thread or Android's `android_main` thread. Android
+/// starts that one unnamed, so a thread name cannot tell.
+pub fn is_pump_thread() -> bool {
+    PUMP.get() == Some(&std::thread::current().id())
+}
 
 #[cfg(target_os = "android")]
 pub mod android;
@@ -250,6 +266,18 @@ fn taps(src: u32, dst: u32) -> Vec<(usize, usize, u32)> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn pump_thread_is_only_the_marked_one() {
+        std::thread::spawn(|| {
+            assert!(!super::is_pump_thread());
+            super::mark_pump_thread();
+            assert!(super::is_pump_thread());
+        })
+        .join()
+        .unwrap();
+        assert!(!super::is_pump_thread());
+    }
+
     use super::*;
 
     #[test]

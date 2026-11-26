@@ -20,6 +20,7 @@ pub fn spawn(title: String, cfg: Config, on_close: impl FnOnce() + Send + 'stati
     std::thread::Builder::new()
         .name("window".into())
         .spawn(move || {
+            crate::mark_pump_thread();
             match event_loop() {
                 Ok(ev) => {
                     if let Err(e) = ev.run_app(&mut App::new(title, cfg, l)) {

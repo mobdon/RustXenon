@@ -114,6 +114,13 @@ the first controller is read, the same as the Windows path.
   and thin. Letterbox the 16:9 frame to the largest fit. Folding or unfolding
   destroys and recreates the native window (`TerminateWindow` /
   `InitWindow`), so the surface must be rebuilt without stopping the game.
+- The APK manifest's NativeActivity must declare
+  `android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|density|keyboard|keyboardHidden|navigation"`
+  and `android:screenOrientation="sensorLandscape"`. Without them a fold or
+  unfold restarts the activity: `Destroy` arrives, and the player exits on
+  `Destroy`. With them it arrives as `ConfigChanged` / `WindowResized`.
+- The player does not pause on `Pause` or `Stop` yet: the game and its sound
+  keep running in the background until the activity is destroyed.
 - Present through a wgpu surface on the drawer's device instead of
   softbuffer's CPU copy. The phone's memory bandwidth is shared with the GPU,
   so the per-frame RGBA copy that is cheap on a PC costs more here.

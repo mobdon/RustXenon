@@ -84,26 +84,25 @@ fn draw(win: &NativeWindow, lines: Option<&[String]>, last: Option<&Image>) {
         (None, Some(img)) => (img.width, img.height),
         (None, None) => return,
     };
-    let (ww, wh) = (win.width().max(0) as u32, win.height().max(0) as u32);
-    let (bw, bh) = buffer_size(ww, wh, pw, ph);
-    if bw == 0
-        || win
-            .set_buffers_geometry(
-                bw as i32,
-                bh as i32,
-                Some(HardwareBufferFormat::R8G8B8X8_UNORM),
-            )
-            .is_err()
-    {
+    let fmt = Some(HardwareBufferFormat::R8G8B8X8_UNORM);
+    // Once a buffer size is set, width() and height() report it instead of
+    // the window's; 0 x 0 drops it, so a resize is seen with its new shape.
+    if win.set_buffers_geometry(0, 0, fmt).is_err() {
         return;
     }
-    let Ok(mut g) = win.lock(None) else { return };
+    let (ww, wh) = (win.width().max(0) as u32, win.height().max(0) as u32);
+    let (bw, bh) = buffer_size(ww, wh, pw, ph);
+    if bw == 0 || win.set_buffers_geometry(bw as i32, bh as i32, fmt).is_err() {
+        return;
+    }
+    // Checked before locking: a locked buffer is posted even if unwritten.
     if !matches!(
-        g.format(),
+        win.format(),
         HardwareBufferFormat::R8G8B8X8_UNORM | HardwareBufferFormat::R8G8B8A8_UNORM
     ) {
         return;
     }
+    let Ok(mut g) = win.lock(None) else { return };
     let (w, h, stride) = (g.width() as u32, g.height() as u32, g.stride());
     // SAFETY: a locked 4-byte-per-pixel buffer is stride x height pixels,
     // aligned for u32, and ours until the guard drops (which posts it).
@@ -121,6 +120,7 @@ fn draw(win: &NativeWindow, lines: Option<&[String]>, last: Option<&Image>) {
 /// game keeps running meanwhile), controller input to the [`Link`] pad,
 /// frames and stop screens to the window. The activity's end exits.
 pub fn run(app: AndroidApp) -> ! {
+    crate::mark_pump_thread();
     // shortcut: FULLSCREEN hides the status bar only; hiding the navigation
     // bar needs JNI (WindowInsetsController), add it if the bar gets in the way.
     app.set_window_flags(

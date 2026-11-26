@@ -463,7 +463,7 @@ fn claim_stop(code: i32) {
         .is_err()
     {
         if on_window_thread() {
-            std::process::exit(STOPPED.load(Ordering::SeqCst));
+            quit(STOPPED.load(Ordering::SeqCst));
         }
         loop {
             std::thread::park();
@@ -477,13 +477,9 @@ fn tail() -> Vec<String> {
     t.iter().cloned().collect()
 }
 
-/// Whether this is the thread that pumps the window, which must not park:
-/// the desktop's "window" thread, or Android's "android_main".
+/// Whether this is the thread that pumps the window, which must not park.
 fn on_window_thread() -> bool {
-    matches!(
-        std::thread::current().name(),
-        Some("window" | "android_main")
-    )
+    xenon_window::is_pump_thread()
 }
 
 /// Ends the run with `code` (see [`show`]).
@@ -505,7 +501,22 @@ fn show(code: i32, lines: Vec<String>) -> ! {
             }
         }
     }
-    std::process::exit(code);
+    quit(code);
+}
+
+/// Ends the process with `code`. On Android with `_exit`: exit() would run
+/// C++ static destructors while ART and the game's threads still run.
+/// shortcut: the activity is not finished first (android-activity only
+/// finishes it when `android_main` returns); do that if Android restarts it.
+fn quit(code: i32) -> ! {
+    #[cfg(target_os = "android")]
+    {
+        let _ = std::io::stdout().flush();
+        // SAFETY: ends the process at once; the log file is unbuffered.
+        unsafe { libc::_exit(code) }
+    }
+    #[cfg(not(target_os = "android"))]
+    std::process::exit(code)
 }
 
 /// Logs why the run cannot go on and ends it (see [`hold`]).
@@ -611,7 +622,7 @@ pub fn android_main(app: AndroidApp, sha256: &'static str, regs: &'static [fn(&m
         .stack_size(16 << 20)
         .spawn(move || {
             let code = run_with(sha256, regs, args, me);
-            std::process::exit(if code == ExitCode::SUCCESS { 0 } else { 1 });
+            quit(if code == ExitCode::SUCCESS { 0 } else { 1 });
         })
         .expect("game thread");
     xenon_window::android::run(app)
@@ -713,7 +724,7 @@ pub fn run_with(
             if code == 0 {
                 report();
             }
-            std::process::exit(code);
+            quit(code);
         });
         let _ = kernel::input::WINDOW.set(link);
     }
