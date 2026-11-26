@@ -378,6 +378,16 @@ fn swizzle_texels<T: Copy>(texels: &mut [T], swizzle: u16, zero: T, one: T) {
     if sel == [0, 1, 2, 3] {
         return;
     }
+    // No constants: a plain reorder, which the compiler makes a shuffle
+    // (a 1280x720 front buffer goes through here every frame).
+    if sel.iter().all(|&s| s < 4) {
+        let i = sel.map(usize::from);
+        for t in texels.chunks_exact_mut(4) {
+            let src = [t[0], t[1], t[2], t[3]];
+            t.copy_from_slice(&[src[i[0]], src[i[1]], src[i[2]], src[i[3]]]);
+        }
+        return;
+    }
     for t in texels.chunks_exact_mut(4) {
         let src = [t[0], t[1], t[2], t[3]];
         for (dst, &s) in t.iter_mut().zip(&sel) {
