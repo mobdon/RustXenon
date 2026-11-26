@@ -3280,6 +3280,35 @@ impl Drawer {
 
     /// The batch's render pass, begun on `key`'s targets unless the current
     /// pass already draws to them.
+    /// Whether the batch's render pass is open on `key`'s targets.
+    fn pass_open(&self, key: &PassKey) -> bool {
+        (self.batch.as_ref())
+            .and_then(|b| b.pass.as_ref())
+            .is_some_and(|p| p.0 == *key)
+    }
+
+    /// The textures of a draw's colour and depth targets, made current
+    /// (see [`Self::target`]).
+    #[allow(clippy::type_complexity)]
+    fn targets_of(
+        &mut self,
+        (color, depth): PassKey,
+        rows: u32,
+        msaa: u32,
+        report: &mut Report,
+    ) -> Result<([Option<wgpu::Texture>; 4], Option<wgpu::Texture>), Skip> {
+        let mut color_tex: [Option<wgpu::Texture>; 4] = Default::default();
+        for rt in 0..4 {
+            color_tex[rt] = color[rt]
+                .map(|k| self.target(k, rows, msaa, report))
+                .transpose()?;
+        }
+        let depth_tex = depth
+            .map(|k| self.target(k, rows, msaa, report))
+            .transpose()?;
+        Ok((color_tex, depth_tex))
+    }
+
     fn pass(
         &mut self,
         key: PassKey,
@@ -5114,15 +5143,19 @@ impl Drawer {
         let (sx, sy, sw, sh) = state::scissor(&self.regs, w, h);
         let rows = sy + sh;
         let msaa = (surface >> 16) & 3;
+        // The open pass draws to these targets and they were written last:
+        // `target` would transfer and make nothing, and the pass needs no
+        // textures, so the lookups and handle copies are skipped (most draws
+        // follow one to the same targets).
+        let pass_key = (color, depth_key);
+        let current = self.pass_open(&pass_key)
+            && (color.iter().flatten().chain(&depth_key))
+                .all(|k| self.written.get(k).is_some_and(|w| w.stamp == self.clock));
         let mut color_tex: [Option<wgpu::Texture>; 4] = Default::default();
-        for rt in 0..4 {
-            color_tex[rt] = color[rt]
-                .map(|k| self.target(k, rows, msaa, report))
-                .transpose()?;
+        let mut depth_tex = None;
+        if !current {
+            (color_tex, depth_tex) = self.targets_of(pass_key, rows, msaa, report)?;
         }
-        let depth_tex = depth_key
-            .map(|k| self.target(k, rows, msaa, report))
-            .transpose()?;
         if sw == 0 || sh == 0 {
             return Ok(false);
         }
@@ -5553,7 +5586,12 @@ impl Drawer {
             }
             g
         };
-        let (pass, bound) = self.pass((color, depth_key), &color_tex, depth_tex.as_ref());
+        // Staging may have flushed the batch, ending the pass: then it
+        // begins again and needs the textures.
+        if current && !self.pass_open(&pass_key) {
+            (color_tex, depth_tex) = self.targets_of(pass_key, rows, msaa, report)?;
+        }
+        let (pass, bound) = self.pass(pass_key, &color_tex, depth_tex.as_ref());
         if bound.pipeline.as_ref() != Some(&pipeline) {
             pass.set_pipeline(&pipeline);
             bound.pipeline = Some(pipeline);
