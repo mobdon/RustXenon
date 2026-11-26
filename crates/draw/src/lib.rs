@@ -1398,9 +1398,10 @@ pub struct Drawer {
     /// [`Drawer::late_front_buffer`].
     late_front: Option<LateFront>,
     /// Records kept-texture decodes after a resolve in the open batch
-    /// instead of flushing it first (`XENON_DECODE_IN_BATCH=1`). Off by
-    /// default: with it, a frame went in a few batches of thousands of
-    /// draws, and a machine's GPU driver hung.
+    /// instead of flushing it first: about a tenth of the drawer's time in
+    /// a frame of thousands of draws. `XENON_DECODE_IN_BATCH=0` turns it
+    /// off (it was off for a time: a machine hung twice with it on, and
+    /// also hung the same way without it).
     decode_in_batch: bool,
     late: Option<(Vec<Vec<Option<u64>>>, WriteBack)>,
     /// Bytes of decoded guest textures the texture cache keeps before
@@ -2131,7 +2132,7 @@ impl Drawer {
             late_writeback: std::env::var("XENON_RESOLVE_WRITEBACK").as_deref() == Ok("late"),
             late_front_buffer: std::env::var("XENON_LATE_FRAME").as_deref() == Ok("1"),
             late_front: None,
-            decode_in_batch: std::env::var("XENON_DECODE_IN_BATCH").as_deref() == Ok("1"),
+            decode_in_batch: std::env::var("XENON_DECODE_IN_BATCH").as_deref() != Ok("0"),
             late: None,
             texture_cache_limit: TEXTURE_CACHE_LIMIT,
             texture_cache_count: TEXTURE_CACHE_COUNT,
@@ -4278,11 +4279,10 @@ impl Drawer {
             self.pipeline_made(t0);
         }
         // After a resolve recorded in the batch, the decode runs after it:
-        // by default the batch is flushed and the decode runs before the
-        // next one (`pre`). With `decode_in_batch` it is recorded in the
-        // batch instead, after the resolve, so the batch's earlier draws
-        // still sample the old texels first; batches then grow to a whole
-        // frame, which hung a whole machine's GPU driver.
+        // with `decode_in_batch` (the default) it is recorded in the batch,
+        // after the resolve, so the batch's earlier draws still sample the
+        // old texels first; without, the batch is flushed and the decode
+        // runs before the next one (`pre`).
         if self.resolve_pending && !self.decode_in_batch {
             self.flush()?;
         }
