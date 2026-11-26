@@ -4,7 +4,8 @@
 //! carry (CA) comes from the low word, as titles see it on the console. Where the architecture leaves result bits undefined (the
 //! high word of `mulhw` or `divw`, results of division by zero) these helpers
 //! give the same value as the reference CPU emulator the tests were checked
-//! against, so behaviour is at least repeatable.
+//! against, so behaviour is at least repeatable; `mulhw` sign-extends its
+//! high word instead, as the translators that run titles do.
 
 /// `a + b + cin` over all 64 bits, with the carry out of the low word (into
 /// bit 32 in PowerPC numbering): titles see CA, like CR0 of record forms,
@@ -133,7 +134,7 @@ pub fn mullw(a: u64, b: u64) -> (u64, bool) {
 #[inline]
 pub fn mulhw(a: u64, b: u64) -> u64 {
     let p = (a as i32 as i64) * (b as i32 as i64);
-    (p >> 32) as u32 as u64
+    (p >> 32) as u64
 }
 
 #[inline]

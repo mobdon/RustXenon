@@ -648,6 +648,16 @@ CARRY_XO = {
 }
 
 
+def console_mulhw(word, out):
+    """mulhw leaves the high word undefined; the reference CPU zero-extends,
+    and both reference translators that run titles sign-extend. Rewrites rD
+    in `out` to the sign-extended high product."""
+    if word >> 26 == 31 and (word >> 1) & 0x1FF == 75:
+        rd = (word >> 21) & 31
+        v = out.get(f"r{rd}", 0) & 0xFFFF_FFFF
+        out[f"r{rd}"] = v | (0xFFFF_FFFF_0000_0000 if v >> 31 else 0)
+
+
 def console_ca(word, st, out):
     """The console's titles see CA as the carry out of the low 32 bits (the
     reference CPU carries out of all 64), as with CR0. Rewrites CA in `out`
@@ -695,6 +705,7 @@ def main():
             words = [next(std_words) for _ in lines]
         if len(words) == 1:
             console_ca(words[0], oracle_input(st, ren), out)
+            console_mulhw(words[0], out)
             console_cr0(words[0], out)
         oin = harness.full_state(oracle_input(st, ren))
         diff = {k: v for k, v in out.items() if oin[k] != v and k not in scrub}

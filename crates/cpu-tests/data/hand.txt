@@ -185,3 +185,5 @@ vupkd3d128_2101010_min_is_nan | 18481ff9 | v35=cdcdcdcdcdcdcdcdcdcdcdcd20000200 
 vpkd3d128_2101010 | 18891e13 | v99=40400001403fffff404001ff3f800003 v4=cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd | v4=cdcdcdcdcdcdcdcdcdcdcdcddffffc01 | 
 # vpkd3d128 type 2: x=10.0 and y=-10.0 saturate to 511 and -511, z=3.0 is 0, w=5.0 saturates to 3
 vpkd3d128_2101010_saturates | 18891e13 | v99=41200000c12000004040000040a00000 v4=cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd | v4=cdcdcdcdcdcdcdcdcdcdcdcdc00805ff | 
+# mulhw: the high word is sign-extended, as the reference translators do
+mulhw_sign_extends | 7c642896 | r4=ffffffff r5=1 vscr=10000 | r3=ffffffffffffffff | 
