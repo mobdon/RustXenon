@@ -6,7 +6,9 @@
 //!   keeps its timestamp and Cargo does not rebuild it.
 //! - Functions longer than `max_part` instructions are split (see
 //!   [`crate::emit::block_function`]).
-//! - Parallel compile jobs are capped by a memory budget (`.cargo/config.toml`).
+//! - Parallel compile jobs are capped by a memory budget (`.cargo/config.toml`),
+//!   which also builds for the building machine's CPU (`target-cpu=native`):
+//!   a built game is for that machine.
 //!
 //! The output is derived from the player's game and never goes in git.
 
@@ -188,7 +190,11 @@ pub fn write(img: &Image, a: &Analysis, out: &Path, o: &Options) -> io::Result<S
     put(
         &out.join(".cargo/config.toml"),
         &format!(
-            "# Memory guard: about {GB_PER_JOB} GB per job.\n[build]\njobs = {}\n",
+            "# Memory guard: about {GB_PER_JOB} GB per job.\n[build]\njobs = {}\n\n\
+             # The build runs on the machine that built it: code for its CPU\n\
+             # (fused multiply-add and wide vectors instead of library calls\n\
+             # took about a sixth off a game's render thread).\n\
+             rustflags = [\"-C\", \"target-cpu=native\"]\n",
             o.jobs
         ),
         &mut st,
