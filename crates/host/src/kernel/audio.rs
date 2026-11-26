@@ -100,7 +100,7 @@ fn drain(rt: &Runtime, ctx: u32) {
         let words: [u32; 10] = std::array::from_fn(|i| rt.mem.read_u32(ctx + 4 * i as u32));
         let mut l = LAST.lock().unwrap();
         let prev = l.iter_mut().find(|x| x.0 == ctx);
-        let changed = prev.as_ref().map_or(true, |p| p.1 != words);
+        let changed = prev.as_ref().is_none_or(|p| p.1 != words);
         if changed {
             crate::log(&format!(
                 "[xma] {ctx:#x}: {}",

@@ -761,7 +761,7 @@ pub fn run_with(
     // Write watch is on unless XENON_WRITE_WATCH=0; where the OS cannot
     // watch, memory is allocated as before.
     let watch_env = std::env::var_os("XENON_WRITE_WATCH");
-    let watch = watch_env.as_ref().map_or(true, |v| v != "0");
+    let watch = watch_env.as_ref().is_none_or(|v| v != "0");
     let mem = if guarded {
         log("guarded guest memory: a never-allocated address stops the run");
         if watch_env.is_some() && watch {

@@ -634,7 +634,7 @@ pub fn analyze(img: &Image, hooks: &Hooks) -> Analysis {
                 ));
             }
         }
-        if last.map_or(true, |l| f.end() > l.end()) {
+        if last.is_none_or(|l| f.end() > l.end()) {
             last = Some(f);
         }
     }
