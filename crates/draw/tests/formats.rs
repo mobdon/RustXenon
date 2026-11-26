@@ -421,6 +421,18 @@ fn synthetic_frame(endian: u32, every_pixel: bool) {
     for (x, y) in [(100, 100), (150, 150), (298, 100), (100, 298)] {
         assert_eq!(px(&frame.rgba8, fw, x, y), red, "({x}, {y})");
     }
+    // Late front buffers are decoded on the GPU: the same frame, a swap
+    // later, in every byte.
+    let sync = frame.rgba8.clone();
+    d.late_front_buffer = true;
+    assert!(run(&mut d, &s, &mut mem).frames.is_empty());
+    let late = run(&mut d, &s, &mut mem);
+    assert_eq!(late.frames.len(), 1, "{late:?}");
+    assert!(
+        late.frames[0].rgba8 == sync,
+        "late frame differs, endian {endian}"
+    );
+    d.late_front_buffer = false;
     if !every_pixel {
         return;
     }
