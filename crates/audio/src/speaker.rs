@@ -12,7 +12,7 @@
 //! runs a little fast or slow does not drift into either.
 //!
 //! Everything but [`Speaker::open`] is pure and tests anywhere. The device
-//! side uses `cpal` on Windows only; elsewhere [`Speaker::open`] reports that
+//! side uses `cpal` on Windows and Android only; elsewhere [`Speaker::open`] reports that
 //! no output is available.
 
 use crate::{Sink, SAMPLE_RATE};
@@ -182,16 +182,20 @@ struct Shared {
     ring: Mutex<Ring>,
     /// Set by the device's error callback: the stream has stopped.
     dead: AtomicBool,
+    /// Why it stopped, for the error [`Speaker::write`] returns (the host
+    /// logs that; an APK's stderr goes nowhere).
+    why: Mutex<String>,
     /// Stereo frames of silence played because the mixer held the ring.
     busy: AtomicU64,
 }
 
 impl Shared {
-    #[cfg_attr(not(windows), allow(dead_code))] // only open and tests make one
+    #[cfg_attr(not(any(windows, target_os = "android")), allow(dead_code))] // only open and tests make one
     fn new(rate: u32) -> Arc<Self> {
         Arc::new(Self {
             ring: Mutex::new(Ring::new(rate)),
             dead: AtomicBool::new(false),
+            why: Mutex::new(String::new()),
             busy: AtomicU64::new(0),
         })
     }
@@ -214,7 +218,7 @@ fn lock(r: &Mutex<Ring>) -> std::sync::MutexGuard<'_, Ring> {
 }
 
 impl Speaker {
-    #[cfg_attr(not(windows), allow(dead_code))] // only open and tests make one
+    #[cfg_attr(not(any(windows, target_os = "android")), allow(dead_code))] // only open and tests make one
     fn new(shared: Arc<Shared>, rate: u32) -> Self {
         let resampler = Resampler::new(SAMPLE_RATE, rate);
         Self {
@@ -243,7 +247,7 @@ impl Speaker {
     }
 
     /// Opens the default output device and starts it playing silence.
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "android"))]
     pub fn open() -> Result<Self, String> {
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::Builder::new()
@@ -264,14 +268,16 @@ impl Speaker {
                 }
             })
             .map_err(|e| e.to_string())?;
-        let (rate, shared) = rx.recv().map_err(|e| e.to_string())??;
+        let (rate, shared) = rx.recv().map_err(|_| {
+            "the speaker thread panicked (on Android, is ndk_context initialised?)".to_string()
+        })??;
         Ok(Self::new(shared, rate))
     }
 
     /// No output device support on this platform.
-    #[cfg(not(windows))]
+    #[cfg(not(any(windows, target_os = "android")))]
     pub fn open() -> Result<Self, String> {
-        Err("live sound is only built for Windows".into())
+        Err("live sound is only built for Windows and Android".into())
     }
 }
 
@@ -280,7 +286,10 @@ impl Sink for Speaker {
     /// counts instead.
     fn write(&mut self, stereo: &[f32]) -> std::io::Result<()> {
         if self.shared.dead.load(Ordering::Relaxed) {
-            return Err(std::io::Error::other("the output device stopped"));
+            let why = self.shared.why.lock().unwrap_or_else(|e| e.into_inner());
+            return Err(std::io::Error::other(format!(
+                "the output device stopped: {why}"
+            )));
         }
         self.scratch.clear();
         self.resampler.process(stereo, &mut self.scratch);
@@ -298,7 +307,7 @@ impl Sink for Speaker {
     }
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "android"))]
 mod device {
     use super::{to_channels, Shared, MAX_MS};
     use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -307,6 +316,15 @@ mod device {
 
     type Started = (cpal::Stream, u32, Arc<Shared>);
 
+    /// Whether a stream error means the stream has stopped. cpal also sends
+    /// warnings through the error callback: an xrun (one late period, which
+    /// WASAPI and AAudio both report), a reroute to a new default device,
+    /// or a refused real-time priority all leave the stream playing.
+    pub fn fatal(kind: cpal::ErrorKind) -> bool {
+        use cpal::ErrorKind as K;
+        !matches!(kind, K::Xrun | K::DeviceChanged | K::RealtimeDenied)
+    }
+
     pub fn start() -> Result<Started, String> {
         let dev = cpal::default_host()
             .default_output_device()
@@ -314,12 +332,12 @@ mod device {
         let supported = dev.default_output_config().map_err(|e| e.to_string())?;
         let format = supported.sample_format();
         let config: cpal::StreamConfig = supported.into();
-        let rate = config.sample_rate.0;
+        let rate = config.sample_rate;
         let shared = Shared::new(rate);
         let stream = match format {
-            cpal::SampleFormat::F32 => build::<f32>(&dev, &config, shared.clone()),
-            cpal::SampleFormat::I16 => build::<i16>(&dev, &config, shared.clone()),
-            cpal::SampleFormat::U16 => build::<u16>(&dev, &config, shared.clone()),
+            cpal::SampleFormat::F32 => build::<f32>(&dev, config, shared.clone()),
+            cpal::SampleFormat::I16 => build::<i16>(&dev, config, shared.clone()),
+            cpal::SampleFormat::U16 => build::<u16>(&dev, config, shared.clone()),
             f => return Err(format!("device sample format {f} is not handled")),
         }?;
         stream.play().map_err(|e| e.to_string())?;
@@ -328,13 +346,13 @@ mod device {
 
     fn build<T: cpal::SizedSample + cpal::FromSample<f32>>(
         dev: &cpal::Device,
-        config: &cpal::StreamConfig,
+        config: cpal::StreamConfig,
         shared: Arc<Shared>,
     ) -> Result<cpal::Stream, String> {
         let channels = config.channels as usize;
         // Allocated here, never in the callback: pulls go in chunks of at
         // most this many frames.
-        let frames = (config.sample_rate.0 as usize * MAX_MS / 1000).max(1);
+        let frames = (config.sample_rate as usize * MAX_MS / 1000).max(1);
         let mut stereo = Vec::with_capacity(frames * 2);
         let on_error = shared.clone();
         dev.build_output_stream(
@@ -368,8 +386,11 @@ mod device {
                 }
             },
             move |e| {
+                if fatal(e.kind()) {
+                    *on_error.why.lock().unwrap_or_else(|p| p.into_inner()) = e.to_string();
+                    on_error.dead.store(true, Ordering::Relaxed);
+                }
                 eprintln!("audio: speaker: {e}");
-                on_error.dead.store(true, Ordering::Relaxed);
             },
             None,
         )
@@ -579,6 +600,18 @@ mod tests {
             "{}",
             sp.resampler.step
         );
+    }
+
+    #[cfg(any(windows, target_os = "android"))]
+    #[test]
+    fn only_stopping_errors_are_fatal() {
+        use cpal::ErrorKind as K;
+        for k in [K::Xrun, K::DeviceChanged, K::RealtimeDenied] {
+            assert!(!device::fatal(k), "{k:?}");
+        }
+        for k in [K::DeviceNotAvailable, K::StreamInvalidated, K::BackendError] {
+            assert!(device::fatal(k), "{k:?}");
+        }
     }
 
     #[test]
