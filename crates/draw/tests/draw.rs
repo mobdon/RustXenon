@@ -253,16 +253,83 @@ fn textured_quad_samples_tiled_texture() {
 fn guest_mip_level_is_sampled() {
     let Some(mut d) = drawer() else { return };
     let mut mem = memory();
-    let n = 32u32;
-    let level = |mem: &mut xenon_gpu::SliceMemory, at: u32, n: u32, c: [u8; 4]| {
-        let linear: Vec<u8> = (0..n * n).flat_map(|_| c).collect();
-        let mut tiled = tile::tile_2d(&linear, n, n, 32, 4).unwrap();
-        endian::swap_in_place(&mut tiled, xenon_texture::Endian::K8in32);
-        mem.data[at as usize..][..tiled.len()].copy_from_slice(&tiled);
-    };
     let (red, green, blue) = ([255, 0, 0, 255], [0, 255, 0, 255], [0, 0, 255, 255]);
-    level(&mut mem, TEXTURE, n, red);
-    level(&mut mem, TEXTURE + 0x1000, n / 2, green);
+    solid_level(&mut mem, TEXTURE, 32, red);
+    solid_level(&mut mem, TEXTURE + 0x1000, 16, green);
+    let s = mip_stream(&mut mem, TEXTURE, 0, TEXTURE + 0x1000);
+    let report = run(&mut d, &s, &mut mem);
+    assert_eq!(report.draws, 2, "{report:?}");
+    assert_eq!(report.timings.textures_uploaded, 1, "{report:?}");
+    assert_eq!(report.timings.texture_bytes, (32 * 32 + 16 * 16) * 4);
+    let img = d.read_render_target(COLOR_KEY, 0, 0, W, H).unwrap();
+    assert_eq!(px(&img, W, 5, 5), red);
+    assert_eq!(px(&img, W, 44, 4), green);
+
+    // New level 1 bytes, same base: decoded again.
+    solid_level(&mut mem, TEXTURE + 0x1000, 16, blue);
+    let report = run(&mut d, &s, &mut mem);
+    assert_eq!(report.timings.textures_uploaded, 1, "{report:?}");
+    let img = d.read_render_target(COLOR_KEY, 0, 0, W, H).unwrap();
+    assert_eq!(px(&img, W, 5, 5), red);
+    assert_eq!(px(&img, W, 44, 4), blue);
+}
+
+/// A fetch sampling from level 1 whose base page is valid but whose mip
+/// page cannot be read draws its base, as without mips: neither the
+/// skipped base nor the unread mip page turns it to zeros.
+#[test]
+fn guest_mip_chain_falls_back_to_base() {
+    let Some(mut d) = drawer() else { return };
+    let mut mem = memory();
+    let red = [255, 0, 0, 255];
+    solid_level(&mut mem, TEXTURE, 32, red);
+    let s = mip_stream(&mut mem, TEXTURE, 1, 0x40_0000);
+    let report = run(&mut d, &s, &mut mem);
+    assert_eq!(report.timings.textures_uploaded, 1, "{report:?}");
+    assert_eq!(report.timings.texture_bytes, 32 * 32 * 4);
+    let img = d.read_render_target(COLOR_KEY, 0, 0, W, H).unwrap();
+    assert_eq!(px(&img, W, 5, 5), red);
+    assert_eq!(px(&img, W, 44, 4), red);
+}
+
+/// A fetch with base page 0 and a mip page: the base is neither read,
+/// hashed nor uploaded, every LOD samples level 1, and new level 1 bytes
+/// decode it again.
+#[test]
+fn guest_mip_chain_without_base_page() {
+    let Some(mut d) = drawer() else { return };
+    let mut mem = memory();
+    let (green, blue) = ([0, 255, 0, 255], [0, 0, 255, 255]);
+    solid_level(&mut mem, TEXTURE + 0x1000, 16, green);
+    let s = mip_stream(&mut mem, 0, 0, TEXTURE + 0x1000);
+    let report = run(&mut d, &s, &mut mem);
+    assert_eq!(report.timings.textures_uploaded, 1, "{report:?}");
+    assert_eq!(report.timings.texture_bytes, 16 * 16 * 4);
+    assert_eq!(report.timings.hashed_bytes, 0x1000, "{report:?}");
+    let img = d.read_render_target(COLOR_KEY, 0, 0, W, H).unwrap();
+    assert_eq!(px(&img, W, 5, 5), green);
+    assert_eq!(px(&img, W, 44, 4), green);
+
+    solid_level(&mut mem, TEXTURE + 0x1000, 16, blue);
+    let report = run(&mut d, &s, &mut mem);
+    assert_eq!(report.timings.textures_uploaded, 1, "{report:?}");
+    let img = d.read_render_target(COLOR_KEY, 0, 0, W, H).unwrap();
+    assert_eq!(px(&img, W, 44, 4), blue);
+}
+
+/// Writes a tiled k8in32 8_8_8_8 `n`x`n` level of colour `c` at `at`.
+fn solid_level(mem: &mut xenon_gpu::SliceMemory, at: u32, n: u32, c: [u8; 4]) {
+    let linear: Vec<u8> = (0..n * n).flat_map(|_| c).collect();
+    let mut tiled = tile::tile_2d(&linear, n, n, 32, 4).unwrap();
+    endian::swap_in_place(&mut tiled, xenon_texture::Endian::K8in32);
+    mem.data[at as usize..][..tiled.len()].copy_from_slice(&tiled);
+}
+
+/// Two draws of a tiled 32x32 8_8_8_8 texture at `base` with mip levels up
+/// to 1 from `min` at `mip`: texel for texel at (0, 0), and at 8x8 (LOD 2,
+/// clamped to the last level) at (40, 0).
+fn mip_stream(mem: &mut xenon_gpu::SliceMemory, base: u32, min: u32, mip: u32) -> Stream {
+    let n = 32u32;
     let quad = |x0: f32, q: f32| -> Vec<u32> {
         [
             (0.0, 0.0, 0.0, 0.0),
@@ -278,15 +345,15 @@ fn guest_mip_level_is_sampled() {
     mem.write_words(VERTS + 0x100, &quad(40.0, 8.0));
     let fetch = [
         2 | (2 << 10) | (2 << 13) | ((n >> 5) << 22) | (1 << 31), // clamp, tiled
-        6 | (2 << 6) | TEXTURE,                                   // 8_8_8_8, k8in32
+        6 | (2 << 6) | base,                                      // 8_8_8_8, k8in32
         (n - 1) | ((n - 1) << 13),
         ((1 << 3) | (2 << 6) | (3 << 9)) << 1, // swizzle RGBA, point filters
-        1 << 6,                                // mip_max_level 1
-        (TEXTURE + 0x1000) | (1 << 9),         // mip page, 2D
+        (min << 2) | (1 << 6),                 // mip_min_level, mip_max_level 1
+        mip | (1 << 9),                        // mip page, 2D
     ];
     let mut s = Stream::default();
     s.setup()
-        .resolve(&mut mem, W, H, false, Some((rgba(CLEAR), 0)))
+        .resolve(mem, W, H, false, Some((rgba(CLEAR), 0)))
         .shader(false, &vs_uv())
         .shader(true, &ps_texture(1))
         .regs(SHADER_CONSTANT_FETCH + 6, &fetch)
@@ -294,21 +361,7 @@ fn guest_mip_level_is_sampled() {
         .draw_auto(PRIM_QUAD_LIST, 4)
         .vertex_fetch(0, VERTS + 0x100, 20)
         .draw_auto(PRIM_QUAD_LIST, 4);
-    let report = run(&mut d, &s, &mut mem);
-    assert_eq!(report.draws, 2, "{report:?}");
-    assert_eq!(report.timings.textures_uploaded, 1, "{report:?}");
-    assert_eq!(report.timings.texture_bytes, (32 * 32 + 16 * 16) * 4);
-    let img = d.read_render_target(COLOR_KEY, 0, 0, W, H).unwrap();
-    assert_eq!(px(&img, W, 5, 5), red);
-    assert_eq!(px(&img, W, 44, 4), green);
-
-    // New level 1 bytes, same base: decoded again.
-    level(&mut mem, TEXTURE + 0x1000, n / 2, blue);
-    let report = run(&mut d, &s, &mut mem);
-    assert_eq!(report.timings.textures_uploaded, 1, "{report:?}");
-    let img = d.read_render_target(COLOR_KEY, 0, 0, W, H).unwrap();
-    assert_eq!(px(&img, W, 5, 5), red);
-    assert_eq!(px(&img, W, 44, 4), blue);
+    s
 }
 
 /// Draws a `w`x`h` DXT `format` (k8in16, nearest sampling, tiled or linear
