@@ -990,13 +990,14 @@ mod tests {
         let mut span = Span::new(&rt, Vec::new());
         rt.mem.write_u32(0xA000_3000, 2);
         let mut taken = Taken(&rt, span.written.take());
-        assert_eq!(
-            xenon_draw::GuestMemory::take_written(&mut taken),
-            Some(vec![(0x1000, 0x2000)])
-        );
+        let first = xenon_draw::GuestMemory::take_written(&mut taken).unwrap();
+        // The OS page: 4 KB, or more on some Linux and Android machines.
+        let pg = first[0].1 - first[0].0;
+        let page = |a: u64| (a / pg * pg, a / pg * pg + pg);
+        assert_eq!(first, [page(0x1000)]);
         assert_eq!(xenon_draw::GuestMemory::take_written(&mut taken), None);
         let next = Span::new(&rt, Vec::new());
-        assert_eq!(next.written, Some(vec![(0x3000, 0x4000)]));
+        assert_eq!(next.written, Some(vec![page(0x3000)]));
     }
 
     /// The stats line divides by the frames of the window, or by one window

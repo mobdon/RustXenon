@@ -425,10 +425,13 @@ mod tests {
         m.write_u32(0x1000, 1);
         m.write_u32(0x8_0000, 2);
         let inside = m.take_written_in(0x4_0000, 0xC_0000).unwrap();
-        assert_eq!(inside, [(0x8_0000, 0x8_1000)]);
+        // The OS page: 4 KB, or more on some Linux and Android machines.
+        let pg = inside[0].1 - inside[0].0;
+        assert_eq!(inside, [(0x8_0000, 0x8_0000 + pg)]);
         assert_eq!(m.take_written_in(0x4_0000, 0xC_0000), Some(vec![]));
         // The write outside the range is still listed.
-        assert_eq!(m.take_written(), Some(vec![(0x1000, 0x2000)]));
+        let at = 0x1000 / pg * pg;
+        assert_eq!(m.take_written(), Some(vec![(at, at + pg)]));
         assert_eq!(m.take_written_in(0x4_0000, 0x4_0000), Some(vec![]));
     }
 
