@@ -162,6 +162,10 @@ fn lib_names(base: &str, major: u32) -> String {
         format!("{base}-{major}.dll")
     } else if cfg!(target_os = "macos") {
         format!("lib{base}.{major}.dylib")
+    } else if cfg!(target_os = "android") {
+        // An APK ships only unversioned names in lib/<abi>/, where
+        // dlopen("lib<name>.so") finds them, so every major tries the same file.
+        format!("lib{base}.so")
     } else {
         format!("lib{base}.so.{major}")
     }
@@ -190,7 +194,10 @@ impl Ffmpeg {
                 path(lib_names("avutil", major - 2)),
                 path(lib_names("avcodec", major)),
             );
-            tried.push(pc.to_string_lossy().into_owned());
+            let name = pc.to_string_lossy().into_owned();
+            if !tried.contains(&name) {
+                tried.push(name);
+            }
             let Ok(avutil) = open(&pu) else {
                 continue;
             };

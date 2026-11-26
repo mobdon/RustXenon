@@ -12,7 +12,9 @@ license.workspace = true
 # into our binaries (LGPL condition, see CREDITS.md).
 libloading = "0.8"
 
-# Live output to the default device. Windows only, so Linux builds need no
-# ALSA headers; elsewhere the speaker reports it is unavailable.
-[target."cfg(windows)".dependencies]
-cpal = "0.15"
+# Live output to the default device: WASAPI on Windows, AAudio on Android
+# (0.17 and later reach AAudio through the ndk crate, so an APK needs no
+# libc++_shared.so as the older oboe backend did). Not on Linux, so builds
+# there need no ALSA headers; elsewhere the speaker reports it is unavailable.
+[target.'cfg(any(windows, target_os = "android"))'.dependencies]
+cpal = "0.18"

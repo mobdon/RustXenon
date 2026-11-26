@@ -12,7 +12,7 @@
 //! runs a little fast or slow does not drift into either.
 //!
 //! Everything but [`Speaker::open`] is pure and tests anywhere. The device
-//! side uses `cpal` on Windows only; elsewhere [`Speaker::open`] reports that
+//! side uses `cpal` on Windows and Android only; elsewhere [`Speaker::open`] reports that
 //! no output is available.
 
 use crate::{Sink, SAMPLE_RATE};
@@ -187,7 +187,7 @@ struct Shared {
 }
 
 impl Shared {
-    #[cfg_attr(not(windows), allow(dead_code))] // only open and tests make one
+    #[cfg_attr(not(any(windows, target_os = "android")), allow(dead_code))] // only open and tests make one
     fn new(rate: u32) -> Arc<Self> {
         Arc::new(Self {
             ring: Mutex::new(Ring::new(rate)),
@@ -214,7 +214,7 @@ fn lock(r: &Mutex<Ring>) -> std::sync::MutexGuard<'_, Ring> {
 }
 
 impl Speaker {
-    #[cfg_attr(not(windows), allow(dead_code))] // only open and tests make one
+    #[cfg_attr(not(any(windows, target_os = "android")), allow(dead_code))] // only open and tests make one
     fn new(shared: Arc<Shared>, rate: u32) -> Self {
         let resampler = Resampler::new(SAMPLE_RATE, rate);
         Self {
@@ -243,7 +243,7 @@ impl Speaker {
     }
 
     /// Opens the default output device and starts it playing silence.
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "android"))]
     pub fn open() -> Result<Self, String> {
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::Builder::new()
@@ -269,9 +269,9 @@ impl Speaker {
     }
 
     /// No output device support on this platform.
-    #[cfg(not(windows))]
+    #[cfg(not(any(windows, target_os = "android")))]
     pub fn open() -> Result<Self, String> {
-        Err("live sound is only built for Windows".into())
+        Err("live sound is only built for Windows and Android".into())
     }
 }
 
@@ -298,7 +298,7 @@ impl Sink for Speaker {
     }
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "android"))]
 mod device {
     use super::{to_channels, Shared, MAX_MS};
     use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -314,12 +314,12 @@ mod device {
         let supported = dev.default_output_config().map_err(|e| e.to_string())?;
         let format = supported.sample_format();
         let config: cpal::StreamConfig = supported.into();
-        let rate = config.sample_rate.0;
+        let rate = config.sample_rate;
         let shared = Shared::new(rate);
         let stream = match format {
-            cpal::SampleFormat::F32 => build::<f32>(&dev, &config, shared.clone()),
-            cpal::SampleFormat::I16 => build::<i16>(&dev, &config, shared.clone()),
-            cpal::SampleFormat::U16 => build::<u16>(&dev, &config, shared.clone()),
+            cpal::SampleFormat::F32 => build::<f32>(&dev, config, shared.clone()),
+            cpal::SampleFormat::I16 => build::<i16>(&dev, config, shared.clone()),
+            cpal::SampleFormat::U16 => build::<u16>(&dev, config, shared.clone()),
             f => return Err(format!("device sample format {f} is not handled")),
         }?;
         stream.play().map_err(|e| e.to_string())?;
@@ -328,13 +328,13 @@ mod device {
 
     fn build<T: cpal::SizedSample + cpal::FromSample<f32>>(
         dev: &cpal::Device,
-        config: &cpal::StreamConfig,
+        config: cpal::StreamConfig,
         shared: Arc<Shared>,
     ) -> Result<cpal::Stream, String> {
         let channels = config.channels as usize;
         // Allocated here, never in the callback: pulls go in chunks of at
         // most this many frames.
-        let frames = (config.sample_rate.0 as usize * MAX_MS / 1000).max(1);
+        let frames = (config.sample_rate as usize * MAX_MS / 1000).max(1);
         let mut stereo = Vec::with_capacity(frames * 2);
         let on_error = shared.clone();
         dev.build_output_stream(
