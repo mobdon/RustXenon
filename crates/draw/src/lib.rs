@@ -1625,23 +1625,6 @@ struct Bound {
     blend: Option<[u32; 4]>,
 }
 
-/// One buffer of a draw's staged data: bytes, or `len` guest bytes at
-/// `addr` read straight into the staging area.
-#[derive(Clone, Copy)]
-enum Part<'a> {
-    Bytes(&'a [u8]),
-    Guest(u32, usize),
-}
-
-impl Part<'_> {
-    fn len(&self) -> usize {
-        match *self {
-            Part::Bytes(b) => b.len(),
-            Part::Guest(_, len) => len,
-        }
-    }
-}
-
 /// What [`Drawer::transfer`] records for one pair of targets.
 struct TransferSetup {
     pipelines: Vec<wgpu::RenderPipeline>,
@@ -1875,21 +1858,26 @@ const _: () = assert!(xenon_shader::PIXEL_FLOAT_CONST_BASE * 4 == FLOAT_STAGE_RE
 type StagedFloats = Option<((u64, [u64; 4]), (u64, u64))>;
 
 /// The float constants of `stage` (0 vertex, 1 pixel) that `mask` names,
-/// in ascending order, as the bytes of a stage's `fc` binding.
-fn float_consts(r: &regs::RegisterFile, stage: u32, mask: &[u64; 4]) -> Vec<u8> {
+/// in ascending order, written to `out` (16 bytes each) as the bytes of a
+/// stage's `fc` binding.
+fn float_consts(r: &regs::RegisterFile, stage: u32, mask: &[u64; 4], out: &mut [u8]) {
     let all = r.slice(
         regs::SHADER_CONSTANT_FLOAT + FLOAT_STAGE_REGS * stage,
         FLOAT_STAGE_REGS,
     );
-    let count: u32 = mask.iter().map(|w| w.count_ones()).sum();
-    let mut out = vec![0; 16 * count as usize];
     let read = (0..256).filter(|i| mask[i / 64] >> (i % 64) & 1 != 0);
     for (o, i) in out.chunks_exact_mut(16).zip(read) {
         for (o, w) in o.chunks_exact_mut(4).zip(&all[4 * i..4 * i + 4]) {
             o.copy_from_slice(&w.to_le_bytes());
         }
     }
-    out
+}
+
+/// `words` as little-endian bytes into `out`, which holds them all.
+fn words_into(words: &[u32], out: &mut [u8]) {
+    for (o, w) in out.chunks_exact_mut(4).zip(words) {
+        o.copy_from_slice(&w.to_le_bytes());
+    }
 }
 
 /// The registers a `Consts` block is built from (see [`consts`]).
@@ -3440,15 +3428,19 @@ impl Drawer {
         self.staged_floats = [None; 2];
     }
 
-    /// Copies `parts` into the batch's staging area, each at an offset
-    /// aligned for uniform and storage bindings, and returns their
-    /// (offset, size) in the arena. Submits the batch and wraps the arena
+    /// Arena bytes a part of `len` bytes takes when [`Self::push`]ed: its
+    /// size, then padding to the next part's alignment.
+    fn staged_size(&self, len: u64) -> u64 {
+        len.max(4)
+            .next_multiple_of(4)
+            .next_multiple_of(self.arena_align)
+    }
+
+    /// Makes room for `need` bytes of parts (see [`Self::staged_size`]) in
+    /// the batch's staging area: submits the batch and wraps the arena
     /// first when it is full, and grows the arena when one draw does not
     /// fit. A grown arena is a new buffer: submitted draws keep the old one.
-    fn stage(&mut self, mem: &dyn GuestRead, parts: &[Part]) -> Result<Vec<(u64, u64)>, Skip> {
-        let size = |p: &Part| (p.len() as u64).max(4).next_multiple_of(4);
-        let align = self.arena_align;
-        let need: u64 = parts.iter().map(|p| size(p).next_multiple_of(align)).sum();
+    fn reserve(&mut self, need: u64) -> Result<(), Skip> {
         let have = self.arena.as_ref().map_or(0, |b| b.size());
         if self.staged_base + self.staged.len() as u64 + need > have {
             self.flush()?;
@@ -3480,37 +3472,39 @@ impl Drawer {
                 }));
             }
         }
-        let mut out = Vec::with_capacity(parts.len());
-        for p in parts {
-            let off = self.staged.len() as u64;
-            match *p {
-                Part::Bytes(b) => self.staged.extend_from_slice(b),
-                Part::Guest(addr, len) => {
-                    self.staged.resize(off as usize + len, 0);
-                    if !mem.read_into(addr, &mut self.staged[off as usize..]) {
-                        self.staged.truncate(off as usize);
-                        let end = u64::from(addr) + len as u64;
-                        return unsupported(format!(
-                            "vertex data at 0x{addr:08X}..0x{end:08X} not readable"
-                        ));
-                    }
-                }
-            }
-            self.staged.resize((off + size(p)) as usize, 0);
-            out.push((self.staged_base + off, size(p)));
-            let end = self.staged.len() as u64;
-            self.staged.resize(end.next_multiple_of(align) as usize, 0);
-        }
-        Ok(out)
+        Ok(())
     }
 
-    /// Whether `parts` can be staged without submitting the batch first.
-    fn fits<'a>(&self, parts: impl IntoIterator<Item = Part<'a>>) -> bool {
-        let size = |p: &Part| (p.len() as u64).max(4).next_multiple_of(4);
-        let need: u64 = parts
-            .into_iter()
-            .map(|p| size(&p).next_multiple_of(self.arena_align))
-            .sum();
+    /// Appends a part of `len` bytes, which `fill` writes over zeros, to
+    /// the staging area at an offset aligned for uniform and storage
+    /// bindings, and returns its (offset, size) in the arena; `None`, with
+    /// nothing appended, when `fill` fails. Only after [`Self::reserve`]
+    /// made room for it.
+    fn push(&mut self, len: usize, fill: impl FnOnce(&mut [u8]) -> bool) -> Option<(u64, u64)> {
+        let off = self.staged.len();
+        let size = (len as u64).max(4).next_multiple_of(4);
+        self.staged.resize(off + size as usize, 0);
+        if !fill(&mut self.staged[off..off + len]) {
+            self.staged.truncate(off);
+            return None;
+        }
+        let end = (off as u64 + size).next_multiple_of(self.arena_align);
+        self.staged.resize(end as usize, 0);
+        Some((self.staged_base + off as u64, size))
+    }
+
+    /// [`Self::push`] of `bytes`.
+    fn push_bytes(&mut self, bytes: &[u8]) -> (u64, u64) {
+        self.push(bytes.len(), |b| {
+            b.copy_from_slice(bytes);
+            true
+        })
+        .expect("bytes staged")
+    }
+
+    /// Whether `need` bytes of parts can be staged without submitting the
+    /// batch first.
+    fn fits(&self, need: u64) -> bool {
         self.staged_base + self.staged.len() as u64 + need
             <= self.arena.as_ref().map_or(0, |b| b.size())
     }
@@ -5655,18 +5649,12 @@ impl Drawer {
                 c
             }
         };
-        let epi = to_bytes(&state::epilogue(&self.regs, w, h));
+        let epi = state::epilogue(&self.regs, w, h);
         // The indices are staged once and bound again by later draws of
         // them until the arena wraps: a frame draws the same meshes many
         // times, kilobytes of indices each. (Rectangle lists read them in
         // the vertex shader, binding 3, and draw without an index buffer.)
         let mut kept_index = idx.staged_in(self.arena_epoch);
-        let rest = |kept: Option<(u64, u64)>| -> [Option<Part>; 2] {
-            [
-                Some(Part::Bytes(&epi[..])),
-                kept.is_none().then_some(Part::Bytes(&idx.bytes)),
-            ]
-        };
         // The window and constants staged earlier (in this batch or one
         // submitted since) are bound again, unless the arena wrapped since
         // (it is then overwritten) or would wrap to stage the rest.
@@ -5685,52 +5673,48 @@ impl Drawer {
                 .map(|((_, s), _)| s)
         });
         // Whether all of it fits is decided on the sizes alone: a stage's
-        // float constants are built only once it is known to stage them.
-        static ZEROS: [u8; 4096] = [0; 4096];
+        // float constants are written only once it is known to stage them.
         let float_len = [0, 1].map(|i| {
             float_masks[i].map(|m| 16 * m.iter().map(|w| w.count_ones() as usize).sum::<usize>())
         });
-        let float_sizes = |kept: &[Option<(u64, u64)>; 2]| -> [Option<&[u8]>; 2] {
-            [0, 1].map(|i| {
-                float_len[i]
-                    .filter(|_| kept[i].is_none())
-                    .map(|n| &ZEROS[..n])
-            })
+        // The arena bytes of each part, staged in this order: the window
+        // (its parts, the kept window read again, or one empty part for no
+        // window), constants, float constants, epilogue and indices.
+        let window_need = match staged {
+            Some(((lo, hi, _), _)) => self.staged_size(hi - lo),
+            None if read.is_empty() => self.staged_size(0),
+            None => (read.iter())
+                .map(|&(lo, hi)| self.staged_size(hi - lo))
+                .sum(),
         };
-        fn parts<'a>(
-            w: Option<Vec<Part<'a>>>,
-            c: Option<&'a [u8]>,
-            f: [Option<&'a [u8]>; 2],
-            rest: [Option<Part<'a>>; 2],
-        ) -> impl Iterator<Item = Part<'a>> {
-            (w.into_iter().flatten())
-                .chain(c.map(Part::Bytes))
-                .chain(f.into_iter().flatten().map(Part::Bytes))
-                .chain(rest.into_iter().flatten())
-        }
-        // The window's parts, or one empty part for no window.
-        let window = |read: &[(u64, u64)]| -> Vec<Part<'static>> {
-            if read.is_empty() {
-                return vec![Part::Bytes(&[])];
-            }
-            (read.iter())
-                .map(|&(lo, hi)| Part::Guest(lo as u32, (hi - lo) as usize))
-                .collect()
+        let consts_need = self.staged_size(consts.len() as u64);
+        let float_need = float_len.map(|n| n.map_or(0, |n| self.staged_size(n as u64)));
+        let epi_need = self.staged_size(4 * epi.len() as u64);
+        let index_need = self.staged_size(idx.bytes.len() as u64);
+        // Of the parts, those staged (not kept).
+        let need = |window: bool, consts: bool, floats: [bool; 2], index: bool| {
+            let part = |staged: bool, n: u64| if staged { n } else { 0 };
+            part(window, window_need)
+                + part(consts, consts_need)
+                + part(floats[0], float_need[0])
+                + part(floats[1], float_need[1])
+                + epi_need
+                + part(index, index_need)
         };
         let any_kept = kept_window.is_some()
             || kept_consts.is_some()
             || kept_floats != [None; 2]
             || kept_index.is_some();
         if any_kept
-            && !self.fits(parts(
-                kept_window.is_none().then(|| window(&read)),
-                kept_consts.is_none().then_some(consts.as_slice()),
-                float_sizes(&kept_floats),
-                rest(kept_index),
+            && !self.fits(need(
+                kept_window.is_none(),
+                kept_consts.is_none(),
+                kept_floats.map(|k| k.is_none()),
+                kept_index.is_none(),
             ))
         {
-            // Staging all of it submits the batch in `stage`; a kept window
-            // is read again below.
+            // Staging all of it submits the batch in `reserve`; a kept
+            // window is read again below.
             (kept_window, kept_consts, kept_floats, kept_index) = (None, None, [None; 2], None);
         }
         if let (Some(((lo, hi, _), _)), None) = (staged, kept_window) {
@@ -5740,24 +5724,15 @@ impl Drawer {
         if kept_window.is_none() {
             report.timings.guest_bytes += read.iter().map(|(lo, hi)| hi - lo).sum::<u64>();
         }
-        // The float constants of the stages that stage them.
-        let float_bytes = [0, 1].map(|i| {
-            (float_masks[i].filter(|_| kept_floats[i].is_none()))
-                .map(|mask| float_consts(&self.regs, i as u32, &mask))
-        });
-        // A full arena submits the batch in `stage`: submit time, not guest data.
+        // A full arena submits the batch in `reserve`: submit time, not
+        // guest data.
         let submit = self.timings.submit;
-        let mut fresh = (self.stage(
-            &*mem,
-            &parts(
-                kept_window.is_none().then(|| window(&read)),
-                kept_consts.is_none().then_some(consts.as_slice()),
-                float_bytes.each_ref().map(|b| b.as_deref()),
-                rest(kept_index),
-            )
-            .collect::<Vec<_>>(),
-        )?)
-        .into_iter();
+        self.reserve(need(
+            kept_window.is_none(),
+            kept_consts.is_none(),
+            kept_floats.map(|k| k.is_none()),
+            kept_index.is_none(),
+        ))?;
         let window_slice = match kept_window {
             Some((w, len)) => {
                 self.timings.windows_reused += 1;
@@ -5765,12 +5740,22 @@ impl Drawer {
                 w.2
             }
             None => {
-                let first = fresh.next().expect("staged window");
-                // The parts after the first end the window's binding.
-                let last = (read.iter().skip(1))
-                    .map(|_| fresh.next().expect("staged window part"))
-                    .last()
-                    .unwrap_or(first);
+                // The window's parts are read straight into the staging
+                // area; the parts after the first end the window's binding.
+                let mut first_last = None;
+                for &(lo, hi) in &read {
+                    let Some(s) = self.push((hi - lo) as usize, |b| mem.read_into(lo as u32, b))
+                    else {
+                        return unsupported(format!(
+                            "vertex data at 0x{lo:08X}..0x{hi:08X} not readable"
+                        ));
+                    };
+                    first_last = Some((first_last.map_or(s, |(f, _)| f), s));
+                }
+                let (first, last) = first_last.unwrap_or_else(|| {
+                    let s = self.push_bytes(&[]);
+                    (s, s)
+                });
                 if let [(lo, hi)] = read[..] {
                     // None holds this window (it was read), so those it
                     // holds are the ones from `lo` that end by `hi`.
@@ -5792,7 +5777,7 @@ impl Drawer {
                 s
             }
             None => {
-                let s = fresh.next().expect("staged constants");
+                let s = self.push_bytes(&consts);
                 self.staged_consts = Some((consts, s));
                 s
             }
@@ -5805,20 +5790,27 @@ impl Drawer {
             float_slices[i] = match kept_floats[i] {
                 Some(s) => s,
                 None => {
-                    let s = fresh.next().expect("staged float constants");
+                    let len = float_len[i].expect("float constants read");
+                    let s = self.push(len, |_| true).expect("float constants staged");
+                    let at = (s.0 - self.staged_base) as usize;
+                    float_consts(&self.regs, i as u32, &key.1, &mut self.staged[at..at + len]);
                     self.staged_floats[i] = Some((key, s));
                     s
                 }
             };
         }
-        let epilogue_slice = fresh.next().expect("staged epilogue");
+        let epilogue_slice = (self.push(4 * epi.len(), |b| {
+            words_into(&epi, b);
+            true
+        }))
+        .expect("epilogue staged");
         let index_slice = match kept_index {
             Some(s) => {
                 self.timings.indices_reused += 1;
                 s
             }
             None => {
-                let s = fresh.next().expect("staged indices");
+                let s = self.push_bytes(&idx.bytes);
                 idx.set_staged(self.arena_epoch, s.0);
                 s
             }
@@ -7308,11 +7300,13 @@ mod tests {
     #[test]
     fn staged_capacity_stays_within_the_arena() {
         let Some(mut d) = gpu() else { return };
-        let mem = SliceMemory::default();
+        let stage = |d: &mut Drawer, part: &[u8]| {
+            d.reserve(d.staged_size(part.len() as u64)).unwrap();
+            d.push_bytes(part)
+        };
         let part = vec![7u8; 3 << 20];
-        let part = [Part::Bytes(&part)];
         for _ in 0..12 {
-            d.stage(&mem, &part).unwrap();
+            stage(&mut d, &part);
             let arena = d.arena.as_ref().unwrap().size();
             assert!(
                 d.staged.capacity() as u64 <= arena,
@@ -7321,11 +7315,35 @@ mod tests {
             );
         }
         let big = vec![1u8; 20 << 20];
-        d.stage(&mem, &[Part::Bytes(&big)]).unwrap();
-        d.stage(&mem, &part).unwrap();
+        stage(&mut d, &big);
+        stage(&mut d, &part);
         assert_eq!(d.arena.as_ref().unwrap().size(), 32 << 20);
         assert!(d.staged.capacity() <= 32 << 20, "{}", d.staged.capacity());
         d.flush().unwrap();
+    }
+
+    /// Each part is padded with zeros to a multiple of 4 (at least 4) and
+    /// starts at the arena's alignment; a part whose fill fails leaves
+    /// nothing behind.
+    #[test]
+    fn pushed_parts_are_padded_and_aligned() {
+        let Some(mut d) = gpu() else { return };
+        d.wrap();
+        let align = d.arena_align as usize;
+        assert_eq!(d.push_bytes(&[1, 2, 3, 4, 5]), (0, 8));
+        assert_eq!(d.staged.len(), align);
+        assert_eq!(d.staged[..8], [1, 2, 3, 4, 5, 0, 0, 0]);
+        assert_eq!(d.push(12, |_| false), None);
+        assert_eq!(d.staged.len(), align);
+        assert_eq!(d.push_bytes(&[]), (align as u64, 4));
+        let s = d.push(3, |b| {
+            b.copy_from_slice(&[9; 3]);
+            true
+        });
+        assert_eq!(s, Some((2 * align as u64, 4)));
+        assert_eq!(d.staged[2 * align..2 * align + 4], [9, 9, 9, 0]);
+        assert_eq!(d.staged_size(5), align as u64);
+        d.wrap();
     }
 
     /// Past the cap the least recently written targets go first, and
