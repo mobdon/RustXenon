@@ -75,26 +75,55 @@ fn input(pad: &mut Gamepad, ev: &InputEvent) -> InputStatus {
     }
 }
 
+/// The native window with its own size (read before any buffer size is
+/// set: after that, width() and height() report the buffer's) and the
+/// buffer size last set.
+struct Win {
+    win: NativeWindow,
+    size: (u32, u32),
+    buf: (u32, u32),
+}
+
+const FMT: Option<HardwareBufferFormat> = Some(HardwareBufferFormat::R8G8B8X8_UNORM);
+
+impl Win {
+    /// Takes a new or resized window. 0 x 0 drops any buffer size set
+    /// earlier, so its own (new) shape is seen.
+    fn new(win: NativeWindow) -> Option<Win> {
+        win.set_buffers_geometry(0, 0, FMT).ok()?;
+        let size = (win.width().max(0) as u32, win.height().max(0) as u32);
+        Some(Win {
+            win,
+            size,
+            buf: (0, 0),
+        })
+    }
+}
+
 /// Fills the window with the stop screen's text, else the newest frame:
 /// a buffer with the window's shape at about the picture's size, which the
-/// compositor scales to the screen.
-fn draw(win: &NativeWindow, lines: Option<&[String]>, last: Option<&Image>) {
+/// compositor scales to the screen. The buffer size is set only when it
+/// changes, so frames do not reallocate the window's buffers.
+fn draw(w: &mut Win, lines: Option<&[String]>, last: Option<&Image>) {
     let (pw, ph) = match (lines, last) {
         (Some(_), _) => TEXT_SIZE,
         (None, Some(img)) => (img.width, img.height),
         (None, None) => return,
     };
-    let fmt = Some(HardwareBufferFormat::R8G8B8X8_UNORM);
-    // Once a buffer size is set, width() and height() report it instead of
-    // the window's; 0 x 0 drops it, so a resize is seen with its new shape.
-    if win.set_buffers_geometry(0, 0, fmt).is_err() {
+    let (bw, bh) = buffer_size(w.size.0, w.size.1, pw, ph);
+    if bw == 0 {
         return;
     }
-    let (ww, wh) = (win.width().max(0) as u32, win.height().max(0) as u32);
-    let (bw, bh) = buffer_size(ww, wh, pw, ph);
-    if bw == 0 || win.set_buffers_geometry(bw as i32, bh as i32, fmt).is_err() {
-        return;
+    if w.buf != (bw, bh) {
+        if w.win
+            .set_buffers_geometry(bw as i32, bh as i32, FMT)
+            .is_err()
+        {
+            return;
+        }
+        w.buf = (bw, bh);
     }
+    let win = &w.win;
     // Checked before locking: a locked buffer is posted even if unwritten.
     if !matches!(
         win.format(),
@@ -128,7 +157,7 @@ pub fn run(app: AndroidApp) -> ! {
         WindowManagerFlags::empty(),
     );
     let mut pad = Gamepad::default();
-    let mut window: Option<NativeWindow> = None;
+    let mut window: Option<Win> = None;
     let mut last: Option<Image> = None;
     // Text shown instead of frames, and whether B and Back have been seen
     // up since (so a button held at the stop does not close it).
@@ -143,7 +172,7 @@ pub fn run(app: AndroidApp) -> ! {
                     | MainEvent::WindowResized { .. }
                     | MainEvent::ConfigChanged { .. }
                     | MainEvent::RedrawNeeded { .. } => {
-                        window = app.native_window();
+                        window = app.native_window().and_then(Win::new);
                         redraw = true;
                     }
                     MainEvent::TerminateWindow { .. } => window = None,
@@ -179,7 +208,7 @@ pub fn run(app: AndroidApp) -> ! {
             last = Some(img);
             redraw = true;
         }
-        if let (true, Some(w)) = (redraw, window.as_ref()) {
+        if let (true, Some(w)) = (redraw, window.as_mut()) {
             draw(w, shown.as_ref().map(|s| s.0.as_slice()), last.as_ref());
         }
     }
