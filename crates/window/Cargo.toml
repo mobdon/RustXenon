@@ -10,4 +10,5 @@ license.workspace = true
 [dependencies]
 softbuffer = "0.4"
 winit = "0.30"
+xenon-icon = { path = "../icon" }
 xenon-input = { path = "../input" }
