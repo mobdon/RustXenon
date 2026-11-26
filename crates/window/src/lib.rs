@@ -3,7 +3,8 @@
 //!
 //! The event loop runs on its own thread so the host's main thread keeps its
 //! headless watch loop. Frames are copied to the window with the CPU
-//! (nearest-neighbour scaling, letterboxed); no GPU work happens here.
+//! (bilinear scaling, letterboxed, rows split over a few threads); no GPU
+//! work happens here.
 
 use std::num::NonZeroU32;
 use std::rc::Rc;
@@ -179,7 +180,8 @@ impl ApplicationHandler for App {
 }
 
 /// Scales `img` to fit `w` x `h` keeping its shape, black bars around it,
-/// into 0RGB pixels.
+/// into 0RGB pixels. Bilinear: a 720p frame stretched to a large window with
+/// nearest-neighbour scaling showed every frame pixel as a hard block.
 fn blit(img: &Image, out: &mut [u32], w: u32, h: u32) {
     out.fill(0);
     if img.width == 0 || img.height == 0 || img.rgba8.len() < (img.width * img.height * 4) as usize
@@ -192,16 +194,54 @@ fn blit(img: &Image, out: &mut [u32], w: u32, h: u32) {
     } else {
         (w, (w as u64 * img.height as u64 / img.width as u64) as u32)
     };
-    let (ox, oy) = ((w - fw) / 2, (h - fh) / 2);
-    for y in 0..fh {
-        let sy = (y as u64 * img.height as u64 / fh as u64) as usize;
-        let row = &mut out[((oy + y) * w + ox) as usize..][..fw as usize];
-        for (x, px) in row.iter_mut().enumerate() {
-            let sx = (x as u64 * img.width as u64 / fw as u64) as usize;
-            let p = &img.rgba8[(sy * img.width as usize + sx) * 4..][..3];
-            *px = (p[0] as u32) << 16 | (p[1] as u32) << 8 | p[2] as u32;
-        }
+    if fw == 0 || fh == 0 {
+        return;
     }
+    let (ox, oy) = ((w - fw) / 2, (h - fh) / 2);
+    let xs = taps(img.width, fw);
+    let ys = taps(img.height, fh);
+    let rows = &mut out[(oy * w) as usize..][..(fh * w) as usize];
+    // A 4K window is 8 million pixels a frame: rows in a few threads.
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get().min(8));
+    let per = (fh as usize).div_ceil(threads).max(1);
+    std::thread::scope(|scope| {
+        for (i, chunk) in rows.chunks_mut(per * w as usize).enumerate() {
+            let (xs, ys) = (&xs, &ys[i * per..]);
+            scope.spawn(move || {
+                for (row, &(y0, y1, wy)) in chunk.chunks_mut(w as usize).zip(ys) {
+                    let row = &mut row[ox as usize..][..fw as usize];
+                    let (r0, r1) = (y0 * img.width as usize, y1 * img.width as usize);
+                    for (px, &(x0, x1, wx)) in row.iter_mut().zip(xs) {
+                        let at = |r: usize, x: usize| &img.rgba8[(r + x) * 4..][..3];
+                        let (a, b, c, d) = (at(r0, x0), at(r0, x1), at(r1, x0), at(r1, x1));
+                        let mut v = 0;
+                        for k in 0..3 {
+                            let top = a[k] as u32 * (256 - wx) + b[k] as u32 * wx;
+                            let bottom = c[k] as u32 * (256 - wx) + d[k] as u32 * wx;
+                            let mix = (top * (256 - wy) + bottom * wy + (1 << 15)) >> 16;
+                            v |= mix << (16 - 8 * k);
+                        }
+                        *px = v;
+                    }
+                }
+            });
+        }
+    });
+}
+
+/// For each of `dst` output pixels across `src` source ones: the two
+/// source pixels around its centre and the second's weight in 256ths.
+fn taps(src: u32, dst: u32) -> Vec<(usize, usize, u32)> {
+    (0..dst)
+        .map(|i| {
+            // Centre of output pixel i in source pixels, in 256ths, less half
+            // a pixel so whole positions land on source pixel centres.
+            let c = ((2 * i as u64 + 1) * src as u64 * 128 / dst as u64) as i64 - 128;
+            let c = c.clamp(0, (src as i64 - 1) * 256);
+            let x0 = (c >> 8) as usize;
+            (x0, (x0 + 1).min(src as usize - 1), (c & 255) as u32)
+        })
+        .collect()
 }
 
 #[cfg(windows)]
@@ -296,7 +336,9 @@ mod tests {
     #[test]
     fn letterbox_and_scale() {
         // 2x1 frame, red then blue, into a 4x4 window: a black row on
-        // top, the 4x2 picture, a black row below.
+        // top, the 4x2 picture, a black row below. Bilinear: the outer
+        // pixels are the frame's, the inner two a quarter and three
+        // quarters of the way from red to blue.
         let img = Image {
             width: 2,
             height: 1,
@@ -305,7 +347,29 @@ mod tests {
         let mut out = vec![7; 16];
         blit(&img, &mut out, 4, 4);
         let (r, b) = (0xFF0000, 0x0000FF);
-        assert_eq!(out, [0, 0, 0, 0, r, r, b, b, r, r, b, b, 0, 0, 0, 0]);
+        let (rb, br) = (0xBF0040, 0x4000BF);
+        assert_eq!(out, [0, 0, 0, 0, r, rb, br, b, r, rb, br, b, 0, 0, 0, 0]);
+        // At its own size the frame is copied exactly.
+        let mut out = vec![7; 2];
+        blit(&img, &mut out, 2, 1);
+        assert_eq!(out, [r, b]);
+        // A 720p frame into a 1440p window stays well inside a frame's time
+        // (checked here in release builds only).
+        let big = Image {
+            width: 1280,
+            height: 720,
+            rgba8: vec![128; 1280 * 720 * 4],
+        };
+        let mut out = vec![0; 2560 * 1440];
+        let t = std::time::Instant::now();
+        for _ in 0..10 {
+            blit(&big, &mut out, 2560, 1440);
+        }
+        let per = t.elapsed() / 10;
+        eprintln!("blit 720p to 1440p: {per:?}");
+        if !cfg!(debug_assertions) {
+            assert!(per < std::time::Duration::from_millis(8), "{per:?}");
+        }
         // Wide window, side bars: 1x1 frame into 3x1.
         let one = Image {
             width: 1,
