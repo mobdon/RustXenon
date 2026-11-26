@@ -1293,11 +1293,14 @@ pub struct Drawer {
     /// Draws recorded but not yet submitted (see [`Batch`]).
     batch: Option<Batch>,
     /// Texture bind groups by texture slot mask and the slots' views and
-    /// samplers. Kept across flushes (a new texture has a new view, so a
-    /// stale entry never matches); cleared at the end of a replay, when
-    /// textures are evicted and past [`TEXTURE_GROUP_CAP`], so they keep
-    /// evicted textures alive no longer than that.
-    texture_groups: HashMap<TextureGroupKey, wgpu::BindGroup>,
+    /// samplers, with the replay that last bound each. Kept across flushes
+    /// and replays (a new texture has a new view, so a stale entry never
+    /// matches); at the end of a replay those not bound in it or the one
+    /// before go, and all go when textures are evicted and past
+    /// [`TEXTURE_GROUP_CAP`], so they keep dropped textures alive no longer
+    /// than that. (Cleared at every replay's end, a frame made its
+    /// thousands again: a tenth of the draw thread.)
+    texture_groups: HashMap<TextureGroupKey, (wgpu::BindGroup, u64)>,
     /// Group 0 bind groups over `arena`, by the sizes of the four slices
     /// they bind (at dynamic offsets). Cleared when the arena is replaced.
     arena_groups: HashMap<[u64; 6], wgpu::BindGroup>,
@@ -2601,7 +2604,8 @@ impl Drawer {
         let done = done.and(flushed);
         self.batch = None;
         self.pre = None;
-        self.texture_groups.clear();
+        let replay = self.replays;
+        (self.texture_groups).retain(|_, &mut (_, used)| used + 1 >= replay);
         if !self.watching || done.is_err() {
             self.wrap();
         }
@@ -5346,9 +5350,10 @@ impl Drawer {
             self.texture_groups.clear();
         }
         let g1 = match self.texture_groups.entry((tex_mask, textures)) {
-            Entry::Occupied(g) => {
+            Entry::Occupied(mut g) => {
                 self.timings.texture_groups_reused += 1;
-                g.get().clone()
+                g.get_mut().1 = self.replays;
+                g.get().0.clone()
             }
             Entry::Vacant(v) => {
                 let slots = (0..32).filter(|n| tex_mask & (1 << n) != 0);
@@ -5368,7 +5373,7 @@ impl Drawer {
                     layout: &g1_layout,
                     entries: &entries,
                 });
-                v.insert(g).clone()
+                v.insert((g, self.replays)).0.clone()
             }
         };
         let (pass, bound) = self.pass((color, depth_key), &color_tex, depth_tex.as_ref());

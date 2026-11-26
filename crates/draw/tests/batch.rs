@@ -637,6 +637,30 @@ fn cpu_resolve_readback_counts_as_resolve_submit() {
     assert_eq!(t.submits_by_site[0], 1, "{t:?}");
 }
 
+/// A texture bind group outlives the replay: the next replay drawing the
+/// same texture binds it again, and draws the same.
+#[test]
+fn texture_bind_group_is_reused_by_the_next_replay() {
+    let Some(mut d) = drawer() else { return };
+    let mut mem = memory();
+    let green = green_texture_quad(&mut mem);
+    let mut s = Stream::default();
+    s.setup()
+        .shader(false, &vs_uv())
+        .shader(true, &ps_texture(1))
+        .regs(SHADER_CONSTANT_FETCH + 6, &green)
+        .vertex_fetch(0, VERTS + 0x100, 20)
+        .draw_auto(PRIM_QUAD_LIST, 4);
+    let first = run(&mut d, &s, &mut mem);
+    assert_eq!(first.timings.texture_groups_reused, 0, "{first:?}");
+    let second = run(&mut d, &s, &mut mem);
+    assert_eq!(second.draws, 1, "{second:?}");
+    assert!(second.unsupported.is_empty(), "{second:?}");
+    assert_eq!(second.timings.texture_groups_reused, 1, "{second:?}");
+    let img = d.read_render_target(COLOR_KEY, 0, 0, W, H).unwrap();
+    assert_eq!(px(&img, W, 40, 40), GREEN);
+}
+
 /// A texture bind group outlives the batch: draws on either side of a
 /// resolve that sample the same texture share it.
 #[test]
