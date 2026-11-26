@@ -57,8 +57,10 @@
 //!   it uploads the texture, so the host filters signed values; the texture
 //!   the shader samples holds those swizzled, signed-converted texels.
 //!   Format and filtering are also the drawer's. The shader reads the sign
-//!   (dword 0), swizzle and exponent bias (dword 3) and LOD bias (dword 4) of
-//!   the fetch constant, and applies only the biased sign (2), gamma (3) and
+//!   (dword 0), size (dwords 2 and 5, for unnormalized coordinates and
+//!   offsets, so the host texture may have another resolution), swizzle and
+//!   exponent bias (dword 3) and LOD bias (dword 4) of the fetch constant,
+//!   and applies only the biased sign (2), gamma (3) and
 //!   exponent bias to the sampled value; it reads the swizzle just to find
 //!   which source component's sign each output component takes.
 //! - Vertex stage: entry `vs_main`, input `@builtin(vertex_index)`. r0.x
@@ -76,7 +78,10 @@
 //!   [`translate_with`] and a
 //!   [`ParamGen`], the pixel parameters (position, facing, primitive flags)
 //!   are written to their register on entry from `@builtin(position)` and
-//!   `@builtin(front_facing)`, after the interpolators are copied.
+//!   `@builtin(front_facing)`, after the interpolators are copied. Such a
+//!   module declares `override xe_scale: f32 = 1.0`, the host pixels per
+//!   guest pixel, which divides the host position before it is rounded
+//!   down; the drawer can set it per pipeline.
 //!
 //! Memory export fails with [`Error::Unsupported`]; the
 //! point size / kill-vertex export is dropped and reported in

@@ -364,6 +364,18 @@ fn xe_tfetch_sign_bias(v: vec4<f32>, w0: u32, w3: u32) -> vec4<f32> {
     }
     return r * ldexp(1.0, extractBits(bitcast<i32>(w3), 13u, 6u));
 }
+
+// The guest base level size of fetch constant dwords 2 and 5 (size by
+// dimension, as xe_gpu_texture_fetch_t), not the host texture's, so a host
+// texture at another resolution keeps the guest texel coordinates.
+fn xe_tfetch_size(w2: u32, w5: u32) -> vec2<f32> {
+    let dim = extractBits(w5, 9u, 2u);
+    if (dim == 0u) {
+        return vec2<f32>(f32(extractBits(w2, 0u, 24u) + 1u), 1.0);
+    }
+    let b = select(13u, 11u, dim == 2u);
+    return vec2<f32>(vec2<u32>(extractBits(w2, 0u, b), extractBits(w2, b, b)) + 1u);
+}
 ";
 
 /// Translates one vertex or pixel program to a WGSL module with entry point
@@ -419,7 +431,8 @@ pub fn translate_with(
 
 /// The statement writing the pixel parameters to their register. The host
 /// fragment position is the pixel centre (x.5), so rounding down gives
-/// Xenia's .0 position. The flags are set as sign bits with bitcasts so a
+/// Xenia's .0 position; dividing by `xe_scale` first gives the guest pixel
+/// of a host pixel at a scaled resolution (at 1 the division is exact). The flags are set as sign bits with bitcasts so a
 /// zero coordinate keeps its sign.
 fn param_gen_wgsl(p: ParamGen) -> String {
     const SIGN: &str = "0x80000000u";
@@ -440,7 +453,7 @@ fn param_gen_wgsl(p: ParamGen) -> String {
         _ => "0.0".into(),
     };
     format!(
-        "    {{\n        let xy = floor(input.xe_frag_coord.xy);\n        r[{}] = vec4<f32>({x}, {y}, {z}, 0.0);\n    }}\n",
+        "    {{\n        let xy = floor(input.xe_frag_coord.xy / xe_scale);\n        r[{}] = vec4<f32>({x}, {y}, {z}, 0.0);\n    }}\n",
         p.register
     )
 }
@@ -1309,7 +1322,9 @@ impl Gen {
         let needs_size = t.unnormalized || t.offset[0] != 0 || t.offset[1] != 0;
         if needs_size {
             self.line(&format!(
-                "let size = vec2<f32>(textureDimensions(tex{n}, 0));"
+                "let size = xe_tfetch_size({}, {});",
+                fetch_dword(n * 6 + 2),
+                fetch_dword(n * 6 + 5)
             ));
         }
         if t.unnormalized {
@@ -1458,6 +1473,11 @@ fn cnst(i: i32) -> vec4<f32> {
                 let reads = self.info.interpolators_read;
                 let pg = self.param_gen;
                 let has_input = reads != 0 || pg.is_some();
+                if pg.is_some() {
+                    s.push_str(
+                        "// Host pixels per guest pixel on each axis; 1 draws at guest resolution.\noverride xe_scale: f32 = 1.0;\n\n",
+                    );
+                }
                 if has_input {
                     s.push_str("struct PsIn {\n");
                     for i in 0..16 {

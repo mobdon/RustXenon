@@ -17,6 +17,11 @@ jobs:
       - run: cargo test
         env:
           XENON_REQUIRE_GPU: "1"
+      # Game builds use target-cpu=native, which compiles in the FMA and
+      # pshufb VMX paths; a fixed level that has them tests those paths here.
+      - run: cargo test -p xenon-rt -p xenon-cpu-tests
+        env:
+          RUSTFLAGS: "-C target-cpu=x86-64-v3"
   ffmpeg:
     # Runs the audio tests against a freshly built LGPL-only FFmpeg, so the
     # decoder path is tested rather than skipped.

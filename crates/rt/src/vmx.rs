@@ -127,6 +127,7 @@ pub fn vaddubm(a: V128, b: V128) -> V128 {
 pub fn vadduhm(a: V128, b: V128) -> V128 {
     map_h(a, b, u16::wrapping_add)
 }
+#[inline]
 pub fn vadduwm(a: V128, b: V128) -> V128 {
     map_w(a, b, u32::wrapping_add)
 }
@@ -136,6 +137,7 @@ pub fn vsububm(a: V128, b: V128) -> V128 {
 pub fn vsubuhm(a: V128, b: V128) -> V128 {
     map_h(a, b, u16::wrapping_sub)
 }
+#[inline]
 pub fn vsubuwm(a: V128, b: V128) -> V128 {
     map_w(a, b, u32::wrapping_sub)
 }
@@ -224,13 +226,16 @@ lane_op!(vsrah, map_h, i16, u16, |x, y| x >> (y as u16 & 15));
 lane_op!(vsraw, map_w, i32, u32, |x, y| x >> (y as u32 & 31));
 
 /// `vsl`: whole vector left by the low 3 bits of the last byte of `b`.
+#[inline]
 pub fn vsl(a: V128, b: V128) -> V128 {
     from_u128(to_u128(a) << (b[3] & 7))
 }
+#[inline]
 pub fn vsr(a: V128, b: V128) -> V128 {
     from_u128(to_u128(a) >> (b[3] & 7))
 }
 /// `vslo`: whole vector left by whole bytes, count in bits 1..4 of the last byte of `b`.
+#[inline]
 pub fn vslo(a: V128, b: V128) -> V128 {
     let n = (b[3] >> 3) & 0xF;
     from_u128(if n == 0 {
@@ -239,6 +244,7 @@ pub fn vslo(a: V128, b: V128) -> V128 {
         to_u128(a) << (8 * n)
     })
 }
+#[inline]
 pub fn vsro(a: V128, b: V128) -> V128 {
     let n = (b[3] >> 3) & 0xF;
     from_u128(if n == 0 {
@@ -249,6 +255,7 @@ pub fn vsro(a: V128, b: V128) -> V128 {
 }
 
 /// `vsldoi`: bytes `sh..sh+16` of `a || b`.
+#[inline]
 pub fn vsldoi(a: V128, b: V128, sh: u32) -> V128 {
     let sh = sh & 15;
     if sh == 0 {
@@ -260,27 +267,48 @@ pub fn vsldoi(a: V128, b: V128, sh: u32) -> V128 {
 
 // ---------------------------------------------------------------- logical, select, permute
 
+#[inline]
 pub fn vand(a: V128, b: V128) -> V128 {
     map_w(a, b, |x, y| x & y)
 }
+#[inline]
 pub fn vandc(a: V128, b: V128) -> V128 {
     map_w(a, b, |x, y| x & !y)
 }
+#[inline]
 pub fn vor(a: V128, b: V128) -> V128 {
     map_w(a, b, |x, y| x | y)
 }
+#[inline]
 pub fn vnor(a: V128, b: V128) -> V128 {
     map_w(a, b, |x, y| !(x | y))
 }
+#[inline]
 pub fn vxor(a: V128, b: V128) -> V128 {
     map_w(a, b, |x, y| x ^ y)
 }
 /// `vsel`: bits of `b` where `c` is set, else bits of `a`.
+#[inline]
 pub fn vsel(a: V128, b: V128, c: V128) -> V128 {
     [0, 1, 2, 3].map(|i| (a[i] & !c[i]) | (b[i] & c[i]))
 }
 /// `vperm`: byte `i` is byte `c[i] & 31` of `a || b`.
+#[inline]
 pub fn vperm(a: V128, b: V128, c: V128) -> V128 {
+    #[cfg(all(target_arch = "x86_64", target_feature = "ssse3"))]
+    {
+        sse::perm(a, b, c)
+    }
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "ssse3")))]
+    {
+        vperm_scalar(a, b, c)
+    }
+}
+#[cfg_attr(
+    all(target_arch = "x86_64", target_feature = "ssse3"),
+    allow(dead_code)
+)]
+fn vperm_scalar(a: V128, b: V128, c: V128) -> V128 {
     let (a, b, c) = (bytes(a), bytes(b), bytes(c));
     let mut o = [0u8; 16];
     for i in 0..16 {
@@ -332,31 +360,39 @@ pub fn vmrglh(a: V128, b: V128) -> V128 {
         }
     }))
 }
+#[inline]
 pub fn vmrghw(a: V128, b: V128) -> V128 {
     [a[0], b[0], a[1], b[1]]
 }
+#[inline]
 pub fn vmrglw(a: V128, b: V128) -> V128 {
     [a[2], b[2], a[3], b[3]]
 }
+#[inline]
 pub fn vspltb(b: V128, i: u32) -> V128 {
     let x = bytes(b)[(i & 15) as usize] as u32;
     [x * 0x0101_0101; 4]
 }
+#[inline]
 pub fn vsplth(b: V128, i: u32) -> V128 {
     let x = halves(b)[(i & 7) as usize] as u32;
     [x << 16 | x; 4]
 }
+#[inline]
 pub fn vspltw(b: V128, i: u32) -> V128 {
     [b[(i & 3) as usize]; 4]
 }
 /// Splat of a 5-bit signed immediate (already sign-extended by the caller).
+#[inline]
 pub fn vspltisb(simm: i32) -> V128 {
     [(simm as u8 as u32) * 0x0101_0101; 4]
 }
+#[inline]
 pub fn vspltish(simm: i32) -> V128 {
     let x = simm as u16 as u32;
     [x << 16 | x; 4]
 }
+#[inline]
 pub fn vspltisw(simm: i32) -> V128 {
     [simm as u32; 4]
 }
@@ -657,6 +693,7 @@ pub fn vsumsws(a: V128, b: V128, vscr: &mut u32) -> V128 {
 // ---------------------------------------------------------------- integer compares
 
 /// CR6 value for a record-form compare: all lanes true (LT bit) or all false (EQ bit).
+#[inline]
 pub fn cr6(v: V128) -> u32 {
     if v == [u32::MAX; 4] {
         0b1000
@@ -768,14 +805,46 @@ fn f1(b: V128, f: impl Fn(f32) -> f32) -> V128 {
     })
 }
 
+// The float helpers below that translated code calls most have an SSE path
+// (module `sse`) that gives bit for bit the scalar result. The scalar code
+// stays the definition: it is the only path off x86-64, and on x86-64 it runs
+// out of line (cold) for the cases the SSE path hands back, a NaN operand.
+
+#[inline]
 pub fn vaddfp(a: V128, b: V128) -> V128 {
+    #[cfg(target_arch = "x86_64")]
+    if let Some(r) = sse::add(a, b) {
+        return r;
+    }
+    vaddfp_scalar(a, b)
+}
+#[cfg_attr(target_arch = "x86_64", cold, inline(never))]
+fn vaddfp_scalar(a: V128, b: V128) -> V128 {
     f2(a, b, |x, y| x + y)
 }
+#[inline]
 pub fn vsubfp(a: V128, b: V128) -> V128 {
+    #[cfg(target_arch = "x86_64")]
+    if let Some(r) = sse::sub(a, b) {
+        return r;
+    }
+    vsubfp_scalar(a, b)
+}
+#[cfg_attr(target_arch = "x86_64", cold, inline(never))]
+fn vsubfp_scalar(a: V128, b: V128) -> V128 {
     f2(a, b, |x, y| x - y)
 }
 /// VMX128 `vmulfp128` (standard VMX has no plain multiply).
+#[inline]
 pub fn vmulfp(a: V128, b: V128) -> V128 {
+    #[cfg(target_arch = "x86_64")]
+    if let Some(r) = sse::mul(a, b) {
+        return r;
+    }
+    vmulfp_scalar(a, b)
+}
+#[cfg_attr(target_arch = "x86_64", cold, inline(never))]
+fn vmulfp_scalar(a: V128, b: V128) -> V128 {
     f2(a, b, |x, y| x * y)
 }
 
@@ -795,15 +864,50 @@ fn f3(a: V128, b: V128, c: V128, f: impl Fn(f32, f32, f32) -> f32) -> V128 {
 }
 
 /// `vmaddfp vD,vA,vC,vB`: `a * c + b`, fused. NaN priority A, B, C.
+#[inline]
 pub fn vmaddfp(a: V128, c: V128, b: V128) -> V128 {
+    #[cfg(all(target_arch = "x86_64", target_feature = "fma"))]
+    if let Some(r) = sse::madd(a, c, b) {
+        return r;
+    }
+    vmaddfp_scalar(a, c, b)
+}
+#[cfg_attr(
+    all(target_arch = "x86_64", target_feature = "fma"),
+    cold,
+    inline(never)
+)]
+fn vmaddfp_scalar(a: V128, c: V128, b: V128) -> V128 {
     f3(a, b, c, |x, y, z| x.mul_add(z, y))
 }
 /// `vnmsubfp vD,vA,vC,vB`: `-(a * c - b)`, fused.
+#[inline]
 pub fn vnmsubfp(a: V128, c: V128, b: V128) -> V128 {
+    #[cfg(all(target_arch = "x86_64", target_feature = "fma"))]
+    if let Some(r) = sse::nmsub(a, c, b) {
+        return r;
+    }
+    vnmsubfp_scalar(a, c, b)
+}
+#[cfg_attr(
+    all(target_arch = "x86_64", target_feature = "fma"),
+    cold,
+    inline(never)
+)]
+fn vnmsubfp_scalar(a: V128, c: V128, b: V128) -> V128 {
     f3(a, b, c, |x, y, z| -(x.mul_add(z, -y)))
 }
 
+#[inline]
 pub fn vmaxfp(a: V128, b: V128) -> V128 {
+    #[cfg(target_arch = "x86_64")]
+    if let Some(r) = sse::max(a, b) {
+        return r;
+    }
+    vmaxfp_scalar(a, b)
+}
+#[cfg_attr(target_arch = "x86_64", cold, inline(never))]
+fn vmaxfp_scalar(a: V128, b: V128) -> V128 {
     f2(a, b, |x, y| {
         if x == y {
             // +0 beats -0.
@@ -815,7 +919,16 @@ pub fn vmaxfp(a: V128, b: V128) -> V128 {
         }
     })
 }
+#[inline]
 pub fn vminfp(a: V128, b: V128) -> V128 {
+    #[cfg(target_arch = "x86_64")]
+    if let Some(r) = sse::min(a, b) {
+        return r;
+    }
+    vminfp_scalar(a, b)
+}
+#[cfg_attr(target_arch = "x86_64", cold, inline(never))]
+fn vminfp_scalar(a: V128, b: V128) -> V128 {
     f2(a, b, |x, y| {
         if x == y {
             f32::from_bits(x.to_bits() | y.to_bits())
@@ -827,12 +940,30 @@ pub fn vminfp(a: V128, b: V128) -> V128 {
     })
 }
 
+#[inline]
 pub fn vrefp(b: V128) -> V128 {
+    #[cfg(target_arch = "x86_64")]
+    if let Some(r) = sse::refp(b) {
+        return r;
+    }
+    vrefp_scalar(b)
+}
+#[cfg_attr(target_arch = "x86_64", cold, inline(never))]
+fn vrefp_scalar(b: V128) -> V128 {
     f1(b, |x| 1.0 / x)
+}
+#[inline]
+pub fn vrsqrtefp(b: V128) -> V128 {
+    #[cfg(target_arch = "x86_64")]
+    if let Some(r) = sse::rsqrte(b) {
+        return r;
+    }
+    vrsqrtefp_scalar(b)
 }
 // Negative inputs are checked explicitly: the optimiser assumes `sqrt` of a
 // non-NaN is never NaN, so testing the result afterwards is not reliable.
-pub fn vrsqrtefp(b: V128) -> V128 {
+#[cfg_attr(target_arch = "x86_64", cold, inline(never))]
+fn vrsqrtefp_scalar(b: V128) -> V128 {
     f1(b, |x| if x < 0.0 { f32::NAN } else { 1.0 / x.sqrt() })
 }
 pub fn vexptefp(b: V128) -> V128 {
@@ -911,17 +1042,66 @@ pub fn vctsxs(b: V128, uimm: u32, vscr: &mut u32) -> V128 {
 fn fcmp(a: V128, b: V128, f: impl Fn(f32, f32) -> bool) -> V128 {
     map_w(a, b, |x, y| if f(fl(x), fl(y)) { u32::MAX } else { 0 })
 }
+// The SSE compares need no scalar fallback: a NaN compares false either way.
+#[inline]
 pub fn vcmpeqfp(a: V128, b: V128) -> V128 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        sse::cmpeq(a, b)
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        vcmpeqfp_scalar(a, b)
+    }
+}
+#[cfg_attr(target_arch = "x86_64", allow(dead_code))]
+fn vcmpeqfp_scalar(a: V128, b: V128) -> V128 {
     fcmp(a, b, |x, y| x == y)
 }
+#[inline]
 pub fn vcmpgefp(a: V128, b: V128) -> V128 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        sse::cmpge(a, b)
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        vcmpgefp_scalar(a, b)
+    }
+}
+#[cfg_attr(target_arch = "x86_64", allow(dead_code))]
+fn vcmpgefp_scalar(a: V128, b: V128) -> V128 {
     fcmp(a, b, |x, y| x >= y)
 }
+#[inline]
 pub fn vcmpgtfp(a: V128, b: V128) -> V128 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        sse::cmpgt(a, b)
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        vcmpgtfp_scalar(a, b)
+    }
+}
+#[cfg_attr(target_arch = "x86_64", allow(dead_code))]
+fn vcmpgtfp_scalar(a: V128, b: V128) -> V128 {
     fcmp(a, b, |x, y| x > y)
 }
 /// `vcmpbfp`: bit 0 set when `a > b` fails `a <= b`, bit 1 when `a >= -b` fails.
+#[inline]
 pub fn vcmpbfp(a: V128, b: V128) -> V128 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        sse::cmpb(a, b)
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        vcmpbfp_scalar(a, b)
+    }
+}
+#[cfg_attr(target_arch = "x86_64", allow(dead_code))]
+fn vcmpbfp_scalar(a: V128, b: V128) -> V128 {
     map_w(a, b, |x, y| {
         let (p, q) = (fl(x), fl(y));
         let le = p <= q;
@@ -930,6 +1110,7 @@ pub fn vcmpbfp(a: V128, b: V128) -> V128 {
     })
 }
 /// CR6 for `vcmpbfp.`: EQ when every element is within bounds.
+#[inline]
 pub fn cr6_bounds(v: V128) -> u32 {
     if v == [0; 4] {
         0b0010
@@ -941,13 +1122,24 @@ pub fn cr6_bounds(v: V128) -> u32 {
 // ---------------------------------------------------------------- VMX128 extras
 
 /// `vmsum3fp128`: dot product of elements 0..3, in every element.
+#[inline]
 pub fn vmsum3fp(a: V128, b: V128) -> V128 {
+    #[cfg(target_arch = "x86_64")]
+    if let Some(r) = sse::dot(a, b, 3) {
+        return r;
+    }
     dot(a, b, 3)
 }
 /// `vmsum4fp128`: dot product of all four elements, in every element.
+#[inline]
 pub fn vmsum4fp(a: V128, b: V128) -> V128 {
+    #[cfg(target_arch = "x86_64")]
+    if let Some(r) = sse::dot(a, b, 4) {
+        return r;
+    }
     dot(a, b, 4)
 }
+#[cfg_attr(target_arch = "x86_64", cold, inline(never))]
 fn dot(a: V128, b: V128, n: usize) -> V128 {
     let mut nan = None;
     for i in 0..n {
@@ -967,13 +1159,220 @@ fn dot(a: V128, b: V128, n: usize) -> V128 {
     [out(s); 4]
 }
 
+/// SSE paths for the hot helpers, bit for bit the scalar results: inputs
+/// and results are flushed and a NaN result becomes the default NaN without
+/// a branch. A NaN operand, which must come out quieted in operand order,
+/// returns `None` so the caller runs the scalar code. Lane `i` of an SSE
+/// register is word `i` of a [`V128`].
+///
+/// The `unsafe` blocks only call intrinsics: SSE and SSE2 are part of every
+/// x86-64 CPU, and the FMA and SSSE3 paths are compiled only when the build
+/// enables those features.
+#[cfg(target_arch = "x86_64")]
+mod sse {
+    use super::{DEFAULT_NAN, V128};
+    use core::arch::x86_64::*;
+
+    #[inline(always)]
+    fn ps(v: V128) -> __m128 {
+        // SAFETY: both are 16 bytes of plain data.
+        unsafe { core::mem::transmute::<V128, __m128>(v) }
+    }
+    #[inline(always)]
+    fn words(x: __m128) -> V128 {
+        // SAFETY: as in `ps`.
+        unsafe { core::mem::transmute::<__m128, V128>(x) }
+    }
+    #[inline(always)]
+    fn splat(w: u32) -> __m128 {
+        unsafe { _mm_castsi128_ps(_mm_set1_epi32(w as i32)) }
+    }
+    /// Bits of `x` where `m` is set, else bits of `y`.
+    #[inline(always)]
+    fn select(m: __m128, x: __m128, y: __m128) -> __m128 {
+        unsafe { _mm_or_ps(_mm_and_ps(m, x), _mm_andnot_ps(m, y)) }
+    }
+    /// [`super::ftz`] per lane.
+    #[inline(always)]
+    fn ftz(x: __m128) -> __m128 {
+        unsafe {
+            let mag = _mm_and_si128(_mm_castps_si128(x), _mm_set1_epi32(0x7FFF_FFFF));
+            let small = _mm_castsi128_ps(_mm_cmplt_epi32(mag, _mm_set1_epi32(0x0080_0000)));
+            _mm_andnot_ps(_mm_and_ps(small, splat(0x7FFF_FFFF)), x)
+        }
+    }
+    /// Lanes where `x` or `y` is a NaN, one bit per lane.
+    #[inline(always)]
+    fn nans(x: __m128, y: __m128) -> i32 {
+        unsafe { _mm_movemask_ps(_mm_cmpunord_ps(x, y)) }
+    }
+    /// [`super::out`] per lane.
+    #[inline(always)]
+    fn out(r: __m128) -> V128 {
+        unsafe {
+            let r = ftz(r);
+            words(select(_mm_cmpunord_ps(r, r), splat(DEFAULT_NAN), r))
+        }
+    }
+    #[inline(always)]
+    fn bin(a: V128, b: V128, f: impl FnOnce(__m128, __m128) -> __m128) -> Option<V128> {
+        let (x, y) = (ps(a), ps(b));
+        if nans(x, y) != 0 {
+            return None;
+        }
+        Some(out(f(ftz(x), ftz(y))))
+    }
+    #[inline(always)]
+    fn un(b: V128, f: impl FnOnce(__m128) -> __m128) -> Option<V128> {
+        let x = ps(b);
+        if nans(x, x) != 0 {
+            return None;
+        }
+        Some(out(f(ftz(x))))
+    }
+    #[inline(always)]
+    fn cmp(a: V128, b: V128, f: impl FnOnce(__m128, __m128) -> __m128) -> V128 {
+        words(f(ftz(ps(a)), ftz(ps(b))))
+    }
+
+    #[inline(always)]
+    pub fn add(a: V128, b: V128) -> Option<V128> {
+        unsafe { bin(a, b, |x, y| _mm_add_ps(x, y)) }
+    }
+    #[inline(always)]
+    pub fn sub(a: V128, b: V128) -> Option<V128> {
+        unsafe { bin(a, b, |x, y| _mm_sub_ps(x, y)) }
+    }
+    #[inline(always)]
+    pub fn mul(a: V128, b: V128) -> Option<V128> {
+        unsafe { bin(a, b, |x, y| _mm_mul_ps(x, y)) }
+    }
+    // `maxps` / `minps` give the second operand on equality; the scalar code
+    // picks +0 (max) or -0 (min) there, which is the AND / OR of the bits.
+    #[inline(always)]
+    pub fn max(a: V128, b: V128) -> Option<V128> {
+        unsafe {
+            bin(a, b, |x, y| {
+                select(_mm_cmpeq_ps(x, y), _mm_and_ps(x, y), _mm_max_ps(x, y))
+            })
+        }
+    }
+    #[inline(always)]
+    pub fn min(a: V128, b: V128) -> Option<V128> {
+        unsafe {
+            bin(a, b, |x, y| {
+                select(_mm_cmpeq_ps(x, y), _mm_or_ps(x, y), _mm_min_ps(x, y))
+            })
+        }
+    }
+    #[inline(always)]
+    pub fn refp(b: V128) -> Option<V128> {
+        unsafe { un(b, |x| _mm_div_ps(_mm_set1_ps(1.0), x)) }
+    }
+    /// `sqrtps` of a negative lane gives a NaN, which `out` makes the default NaN.
+    #[inline(always)]
+    pub fn rsqrte(b: V128) -> Option<V128> {
+        unsafe { un(b, |x| _mm_div_ps(_mm_set1_ps(1.0), _mm_sqrt_ps(x))) }
+    }
+    /// `a * c + b`, one rounding.
+    #[cfg(target_feature = "fma")]
+    #[inline(always)]
+    pub fn madd(a: V128, c: V128, b: V128) -> Option<V128> {
+        unsafe {
+            let (x, y, z) = (ps(a), ps(b), ps(c));
+            if nans(x, y) | nans(z, z) != 0 {
+                return None;
+            }
+            Some(out(_mm_fmadd_ps(ftz(x), ftz(z), ftz(y))))
+        }
+    }
+    /// `-(a * c - b)`: the sign flip comes after rounding, so an exact zero
+    /// is -0 as in the scalar code (`fnmadd` would give +0).
+    #[cfg(target_feature = "fma")]
+    #[inline(always)]
+    pub fn nmsub(a: V128, c: V128, b: V128) -> Option<V128> {
+        unsafe {
+            let (x, y, z) = (ps(a), ps(b), ps(c));
+            if nans(x, y) | nans(z, z) != 0 {
+                return None;
+            }
+            let r = _mm_fmsub_ps(ftz(x), ftz(z), ftz(y));
+            Some(out(_mm_xor_ps(r, splat(0x8000_0000))))
+        }
+    }
+    /// Products in parallel, then the scalar code's left-to-right sum, each
+    /// step flushed, in lane 0.
+    #[inline(always)]
+    pub fn dot(a: V128, b: V128, n: usize) -> Option<V128> {
+        unsafe {
+            let (x, y) = (ps(a), ps(b));
+            if nans(x, y) & ((1 << n) - 1) != 0 {
+                return None;
+            }
+            let p = ftz(_mm_mul_ps(ftz(x), ftz(y)));
+            let mut s = ftz(_mm_add_ss(_mm_setzero_ps(), p));
+            s = ftz(_mm_add_ss(s, _mm_shuffle_ps::<0x55>(p, p)));
+            s = ftz(_mm_add_ss(s, _mm_shuffle_ps::<0xAA>(p, p)));
+            if n == 4 {
+                s = ftz(_mm_add_ss(s, _mm_shuffle_ps::<0xFF>(p, p)));
+            }
+            Some(out(_mm_shuffle_ps::<0>(s, s)))
+        }
+    }
+    #[inline(always)]
+    pub fn cmpeq(a: V128, b: V128) -> V128 {
+        unsafe { cmp(a, b, |x, y| _mm_cmpeq_ps(x, y)) }
+    }
+    #[inline(always)]
+    pub fn cmpge(a: V128, b: V128) -> V128 {
+        unsafe { cmp(a, b, |x, y| _mm_cmpge_ps(x, y)) }
+    }
+    #[inline(always)]
+    pub fn cmpgt(a: V128, b: V128) -> V128 {
+        unsafe { cmp(a, b, |x, y| _mm_cmpgt_ps(x, y)) }
+    }
+    #[inline(always)]
+    pub fn cmpb(a: V128, b: V128) -> V128 {
+        unsafe {
+            cmp(a, b, |p, q| {
+                let le = _mm_cmple_ps(p, q);
+                let ge = _mm_cmpge_ps(p, _mm_xor_ps(q, splat(0x8000_0000)));
+                _mm_or_ps(
+                    _mm_andnot_ps(le, splat(0x8000_0000)),
+                    _mm_andnot_ps(ge, splat(0x4000_0000)),
+                )
+            })
+        }
+    }
+
+    /// `vperm` with `pshufb`: bytes swapped to big-endian order within each
+    /// word, picked from `a` or `b` by bit 4 of the index, swapped back.
+    #[cfg(target_feature = "ssse3")]
+    #[inline(always)]
+    pub fn perm(a: V128, b: V128, c: V128) -> V128 {
+        unsafe {
+            let swap = _mm_setr_epi8(3, 2, 1, 0, 7, 6, 5, 4, 11, 10, 9, 8, 15, 14, 13, 12);
+            let be = |v: V128| _mm_shuffle_epi8(_mm_castps_si128(ps(v)), swap);
+            let k = _mm_and_si128(be(c), _mm_set1_epi8(31));
+            let hi = _mm_cmpgt_epi8(k, _mm_set1_epi8(15));
+            let r = _mm_or_si128(
+                _mm_and_si128(hi, _mm_shuffle_epi8(be(b), k)),
+                _mm_andnot_si128(hi, _mm_shuffle_epi8(be(a), k)),
+            );
+            words(_mm_castsi128_ps(_mm_shuffle_epi8(r, swap)))
+        }
+    }
+}
+
 /// `vpermwi128`: element `i` is `b[(imm >> (6 - 2i)) & 3]`.
+#[inline]
 pub fn vpermwi(b: V128, imm: u32) -> V128 {
     core::array::from_fn(|i| b[(imm >> (6 - 2 * i) & 3) as usize])
 }
 
 /// `vrlimi128`: rotate `b` left by `rot` elements, then insert into `d` the
 /// elements whose mask bit is set (mask bit 8 is element 0).
+#[inline]
 pub fn vrlimi(d: V128, b: V128, mask: u32, rot: u32) -> V128 {
     core::array::from_fn(|i| {
         if mask & (8 >> i) != 0 {
@@ -1208,21 +1607,26 @@ pub fn vpkd3d(d: V128, b: V128, typ: u32, pack: u32, shift: u32) -> Option<V128>
 // ---------------------------------------------------------------- loads, stores, VSCR
 
 /// `lvsl`: permute control for a left shift by `ea & 15`.
+#[inline]
 pub fn lvsl(ea: u32) -> V128 {
-    let sh = (ea & 15) as u8;
-    from_bytes(core::array::from_fn(|i| sh + i as u8))
+    // Word-wise so inlined unoptimised callers stay small; bytes never carry.
+    let sh = (ea & 15) * 0x0101_0101;
+    [0x0001_0203, 0x0405_0607, 0x0809_0A0B, 0x0C0D_0E0F].map(|w| w + sh)
 }
 /// `lvsr`: permute control for a right shift by `ea & 15`.
+#[inline]
 pub fn lvsr(ea: u32) -> V128 {
-    let sh = (ea & 15) as u8;
-    from_bytes(core::array::from_fn(|i| 16 - sh + i as u8))
+    let sh = (ea & 15) * 0x0101_0101;
+    [0x1011_1213, 0x1415_1617, 0x1819_1A1B, 0x1C1D_1E1F].map(|w| w - sh)
 }
 
 /// `lvx` and the element loads (`lvebx`, `lvehx`, `lvewx`), which load the
 /// whole aligned quadword so the addressed element lands in its slot.
+#[inline]
 pub fn lvx(m: &GuestMemory, ea: u32) -> V128 {
     m.read_v128(ea & !15)
 }
+#[inline]
 pub fn stvx(m: &GuestMemory, ea: u32, v: V128) {
     m.write_v128(ea & !15, v)
 }
@@ -1275,6 +1679,7 @@ pub fn stvrx(m: &GuestMemory, ea: u32, v: V128) {
     }
 }
 
+#[inline]
 pub fn mfvscr(vscr: u32) -> V128 {
     [0, 0, 0, vscr]
 }
@@ -1291,6 +1696,192 @@ mod tests {
         assert_eq!(halves(v)[1], 0x0203);
         assert_eq!(from_bytes(bytes(v)), v);
         assert_eq!(from_halves(halves(v)), v);
+    }
+
+    /// Lane values at the edges: zeros, denormals, the smallest and largest
+    /// normals, infinities, quiet and signalling NaNs of both signs.
+    const EDGES: [u32; 18] = [
+        0x0000_0000,
+        0x8000_0000,
+        0x0000_0001,
+        0x807F_FFFF,
+        0x0080_0000,
+        0x8080_0001,
+        0x00FF_FFFF,
+        0x7F7F_FFFF,
+        0xFF7F_FFFF,
+        0x7F80_0000,
+        0xFF80_0000,
+        0x7FC0_0000,
+        0xFFC0_0001,
+        0x7F80_0001,
+        0x3F80_0000,
+        0xBF80_0000,
+        0x4040_0000,
+        0x1F80_0000,
+    ];
+
+    /// Deterministic vectors: each lane an edge value or random bits (whose
+    /// spread of exponents gives under- and overflowing results).
+    fn vectors() -> impl FnMut() -> V128 {
+        let mut s = 0x9E37_79B9_7F4A_7C15u64;
+        move || {
+            core::array::from_fn(|_| {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                if s & 1 == 0 {
+                    EDGES[(s >> 8) as usize % EDGES.len()]
+                } else {
+                    (s >> 32) as u32
+                }
+            })
+        }
+    }
+
+    #[test]
+    fn lvsl_lvsr_match_bytewise() {
+        for sh in 0..16u8 {
+            let l = from_bytes(core::array::from_fn(|i| sh + i as u8));
+            let r = from_bytes(core::array::from_fn(|i| 16 - sh + i as u8));
+            // Low bits only, as an address.
+            let ea = 0x8000_0010 | sh as u32;
+            assert_eq!(lvsl(ea), l, "lvsl {sh}");
+            assert_eq!(lvsr(ea), r, "lvsr {sh}");
+        }
+    }
+
+    #[test]
+    fn fast_paths_match_scalar() {
+        let mut next = vectors();
+        for _ in 0..200_000 {
+            let (a, b, c) = (next(), next(), next());
+            let ctx = format!("{a:08x?} {b:08x?} {c:08x?}");
+            assert_eq!(vaddfp(a, b), vaddfp_scalar(a, b), "vaddfp {ctx}");
+            assert_eq!(vsubfp(a, b), vsubfp_scalar(a, b), "vsubfp {ctx}");
+            assert_eq!(vmulfp(a, b), vmulfp_scalar(a, b), "vmulfp {ctx}");
+            assert_eq!(vmaxfp(a, b), vmaxfp_scalar(a, b), "vmaxfp {ctx}");
+            assert_eq!(vminfp(a, b), vminfp_scalar(a, b), "vminfp {ctx}");
+            assert_eq!(vrefp(b), vrefp_scalar(b), "vrefp {ctx}");
+            assert_eq!(vrsqrtefp(b), vrsqrtefp_scalar(b), "vrsqrtefp {ctx}");
+            assert_eq!(vmaddfp(a, c, b), vmaddfp_scalar(a, c, b), "vmaddfp {ctx}");
+            assert_eq!(
+                vnmsubfp(a, c, b),
+                vnmsubfp_scalar(a, c, b),
+                "vnmsubfp {ctx}"
+            );
+            assert_eq!(vmsum3fp(a, b), dot(a, b, 3), "vmsum3fp {ctx}");
+            assert_eq!(vmsum4fp(a, b), dot(a, b, 4), "vmsum4fp {ctx}");
+            assert_eq!(vcmpeqfp(a, b), vcmpeqfp_scalar(a, b), "vcmpeqfp {ctx}");
+            assert_eq!(vcmpgefp(a, b), vcmpgefp_scalar(a, b), "vcmpgefp {ctx}");
+            assert_eq!(vcmpgtfp(a, b), vcmpgtfp_scalar(a, b), "vcmpgtfp {ctx}");
+            assert_eq!(vcmpbfp(a, b), vcmpbfp_scalar(a, b), "vcmpbfp {ctx}");
+            assert_eq!(vperm(a, b, c), vperm_scalar(a, b, c), "vperm {ctx}");
+        }
+    }
+
+    #[test]
+    fn edge_results() {
+        let one = [0x3F80_0000; 4];
+        // An exact zero from vnmsubfp is -0: the sign flips after rounding.
+        assert_eq!(vnmsubfp(one, one, one), [0x8000_0000; 4]);
+        assert_eq!(vmaddfp(one, one, [0xBF80_0000; 4]), [0; 4]);
+        // Equal zeros: max takes +0, min takes -0.
+        let (p, n) = ([0; 4], [0x8000_0000; 4]);
+        assert_eq!(vmaxfp(n, p), p);
+        assert_eq!(vminfp(p, n), n);
+        // Invalid operations give the default NaN; NaN operands come out
+        // quieted, the first one in operand order.
+        let inf = [0x7F80_0000; 4];
+        assert_eq!(vsubfp(inf, inf), [DEFAULT_NAN; 4]);
+        assert_eq!(vrsqrtefp(one.map(|w| w | 0x8000_0000)), [DEFAULT_NAN; 4]);
+        let snan = [0x7F80_0001, 0x3F80_0000, 0x3F80_0000, 0x3F80_0000];
+        assert_eq!(vaddfp(one, snan)[0], 0x7FC0_0001);
+        assert_eq!(vmsum4fp(one, snan), [0x7FC0_0001; 4]);
+        // A NaN in element 3 does not reach vmsum3fp.
+        assert_eq!(vmsum3fp(one, [0x3F80_0000, 0, 0, 0x7FC0_0000]), one);
+        // Denormal products are flushed.
+        assert_eq!(vmulfp([0x0080_0000; 4], [0x3F00_0000; 4]), [0; 4]);
+    }
+
+    /// Fast path against scalar code for the hot helpers:
+    /// `cargo test -p xenon-rt --release vmx_bench -- --ignored --nocapture`
+    /// (and with `RUSTFLAGS="-C target-cpu=native"` for the FMA and `pshufb`
+    /// paths a game build uses).
+    #[test]
+    #[ignore = "micro-benchmark"]
+    fn vmx_bench() {
+        use std::hint::black_box;
+        fn time(f: impl Fn(V128, V128, V128) -> V128) -> f64 {
+            let (a, b, c) = (
+                [0x3F80_0000, 0x4000_0000, 0xBF00_0000, 0x3E80_0000],
+                [0x3F00_0000, 0xC040_0000, 0x3F80_0000, 0x4080_0000],
+                [0x0302_0100, 0x1716_1514, 0x0B0A_0908, 0x1F1E_1D1C],
+            );
+            let n = 20_000_000u32;
+            let t = std::time::Instant::now();
+            for _ in 0..n {
+                black_box(f(black_box(a), black_box(b), black_box(c)));
+            }
+            t.elapsed().as_secs_f64() * 1e9 / n as f64
+        }
+        type Op = fn(V128, V128, V128) -> V128;
+        let ops: [(&str, Op, Op); 11] = [
+            (
+                "vaddfp",
+                |a, b, _| vaddfp(a, b),
+                |a, b, _| vaddfp_scalar(a, b),
+            ),
+            (
+                "vmulfp",
+                |a, b, _| vmulfp(a, b),
+                |a, b, _| vmulfp_scalar(a, b),
+            ),
+            (
+                "vmaddfp",
+                |a, b, c| vmaddfp(a, b, c),
+                |a, b, c| vmaddfp_scalar(a, b, c),
+            ),
+            (
+                "vnmsubfp",
+                |a, b, c| vnmsubfp(a, b, c),
+                |a, b, c| vnmsubfp_scalar(a, b, c),
+            ),
+            (
+                "vmaxfp",
+                |a, b, _| vmaxfp(a, b),
+                |a, b, _| vmaxfp_scalar(a, b),
+            ),
+            (
+                "vrsqrtefp",
+                |a, _, _| vrsqrtefp(a),
+                |a, _, _| vrsqrtefp_scalar(a),
+            ),
+            ("vmsum3fp", |a, b, _| vmsum3fp(a, b), |a, b, _| dot(a, b, 3)),
+            ("vmsum4fp", |a, b, _| vmsum4fp(a, b), |a, b, _| dot(a, b, 4)),
+            (
+                "vcmpgtfp",
+                |a, b, _| vcmpgtfp(a, b),
+                |a, b, _| vcmpgtfp_scalar(a, b),
+            ),
+            (
+                "vcmpbfp",
+                |a, b, _| vcmpbfp(a, b),
+                |a, b, _| vcmpbfp_scalar(a, b),
+            ),
+            (
+                "vperm",
+                |a, b, c| vperm(a, b, c),
+                |a, b, c| vperm_scalar(a, b, c),
+            ),
+        ];
+        for (name, fast, scalar) in ops {
+            let (f, s) = (time(fast), time(scalar));
+            println!(
+                "[vmx] {name:10} fast {f:5.2} ns  scalar {s:5.2} ns  x{:.1}",
+                s / f
+            );
+        }
     }
 
     #[test]

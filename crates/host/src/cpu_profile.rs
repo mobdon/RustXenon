@@ -7,7 +7,11 @@
 //! kernel time, and imports that block (waits, sleeps, lock entry) are
 //! counted as waiting. Interrupt callbacks the `gpu` host thread runs are
 //! timed as a whole. Guest code that spins on memory (a GPU fence, say)
-//! shows as guest code.
+//! shows as guest code, unless the spin yields through a waiting import:
+//! guest code shorter than [`SPIN_NS`] between two calls of the same waiting
+//! import (a loop of `KeDelayExecutionThread(0)` polling a frame counter,
+//! say) is the wait loop itself and counts as waiting. That needs no
+//! per-title data; a spin that never calls out cannot be told from work.
 //!
 //! Run without `--render` to read guest time with drawing off: the command
 //! ring still runs and frames are still counted, nothing is drawn.
@@ -33,7 +37,17 @@ struct Totals {
     depth: AtomicU32,
     /// Per import thunk: (ns, calls).
     imports: Mutex<HashMap<u32, (u64, u64)>>,
+    /// Import that last returned (at depth 0), for spotting a spin.
+    last: AtomicU32,
+    /// Per import thunk: guest ns spent between back-to-back calls of it
+    /// (gaps under [`SPIN_NS`]), still counted in `guest`; the report moves
+    /// it to waiting for waiting imports.
+    spin: Mutex<HashMap<u32, u64>>,
 }
+
+/// Longest guest stretch between two calls of the same waiting import that
+/// still counts as a spin on it rather than work.
+pub const SPIN_NS: u64 = 50_000;
 
 static THREADS: Mutex<Vec<(String, Arc<Totals>)>> = Mutex::new(Vec::new());
 /// Interrupt callbacks on the `gpu` thread: ns, calls.
@@ -69,8 +83,12 @@ pub fn enter(addr: u32) {
         if m.depth.fetch_add(1, Ordering::Relaxed) == 0 {
             let t = now();
             let s = m.seg.swap(t, Ordering::Relaxed);
-            m.guest.fetch_add(t.saturating_sub(s), Ordering::Relaxed);
+            let gap = t.saturating_sub(s);
+            m.guest.fetch_add(gap, Ordering::Relaxed);
             m.cur.store(addr, Ordering::Relaxed);
+            if gap < SPIN_NS && m.last.load(Ordering::Relaxed) == addr {
+                *m.spin.lock().unwrap().entry(addr).or_default() += gap;
+            }
         }
     });
 }
@@ -86,8 +104,10 @@ pub fn leave(addr: u32) {
             let t = now();
             let s = m.seg.swap(t, Ordering::Relaxed);
             let e = m.cur.swap(0, Ordering::Relaxed);
+            let e = if e != 0 { e } else { addr };
+            m.last.store(e, Ordering::Relaxed);
             let mut i = m.imports.lock().unwrap();
-            let x = i.entry(if e != 0 { e } else { addr }).or_default();
+            let x = i.entry(e).or_default();
             x.0 += t.saturating_sub(s);
             x.1 += 1;
         }
@@ -126,12 +146,23 @@ pub fn is_wait(name: &str) -> bool {
 struct Snap {
     guest: u64,
     imports: HashMap<u32, (u64, u64)>,
+    spin: HashMap<u32, u64>,
+}
+
+/// Guest ns between `o` and `s` that was spin on a waiting import.
+fn spin_on_waits(s: &Snap, o: &Snap, is_wait: impl Fn(u32) -> bool) -> u64 {
+    s.spin
+        .iter()
+        .filter(|(a, _)| is_wait(**a))
+        .map(|(a, ns)| ns.saturating_sub(o.spin.get(a).copied().unwrap_or_default()))
+        .sum()
 }
 
 fn snap(t: &Totals, at: u64) -> Snap {
     let mut s = Snap {
         guest: t.guest.load(Ordering::Relaxed),
         imports: t.imports.lock().unwrap().clone(),
+        spin: t.spin.lock().unwrap().clone(),
     };
     // The stretch in progress, so a thread that never calls out still shows.
     let open = at.saturating_sub(t.seg.load(Ordering::Relaxed));
@@ -148,6 +179,43 @@ struct Row {
     guest: f64,
     kernel: f64,
     wait: f64,
+}
+
+/// Fixed integer work: `n` dependent multiply-adds.
+fn fixed_work(n: u64) -> u64 {
+    let mut x = 1u64;
+    for i in 0..n {
+        x = std::hint::black_box(x.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(i));
+    }
+    x
+}
+
+/// Fastest of three runs of `fixed_work(n)`, in ns, so one preemption does
+/// not read as a slow machine.
+fn time_work(n: u64) -> u64 {
+    (0..3)
+        .map(|_| {
+            let s = Instant::now();
+            std::hint::black_box(fixed_work(n));
+            s.elapsed().as_nanos() as u64
+        })
+        .min()
+        .unwrap_or(0)
+}
+
+/// The fixed work's size and its time at the first tick, from [`calibrate`].
+static CAL: OnceLock<(u64, u64)> = OnceLock::new();
+
+/// Iteration count that takes about 1 ms now, and its time in ns.
+fn calibrate() -> (u64, u64) {
+    let mut n = 1024;
+    loop {
+        let t = time_work(n);
+        if t >= 1_000_000 || n >= 1 << 40 {
+            return (n, t.max(1));
+        }
+        n *= 2;
+    }
 }
 
 /// Lines for one window of `frames` frames over `secs` seconds, from the
@@ -202,6 +270,7 @@ fn lines(
     ));
     // A thread busy for the whole frame at any frame rate is polling (a
     // spin on a fence or the vertical blank), not doing that much work.
+    // Spin on a waiting import is already counted as wait, not busy.
     let frame_ms = secs * 1e3 / n;
     let (spin, work): (Vec<&Row>, Vec<&Row>) =
         rows.iter().partition(|r| busy(r) / n >= 0.95 * frame_ms);
@@ -243,6 +312,7 @@ pub fn tick(swaps: u64) {
     );
     let mut prev = PREV.lock().unwrap();
     let Some((t_prev, s_prev, old, irq_prev)) = prev.as_ref() else {
+        CAL.get_or_init(calibrate);
         *prev = Some((at, swaps, cur, irq));
         return;
     };
@@ -267,11 +337,15 @@ pub fn tick(swaps: u64) {
             e.0 += d.0;
             e.1 += d.1;
         }
+        // Spin between calls of a waiting import moves from guest code to
+        // waiting (and so to kernel calls, which waiting is part of).
+        let guest = s.guest.saturating_sub(o.guest);
+        let spin = spin_on_waits(s, &o, |a| is_wait(&name(a))).min(guest);
         rows.push(Row {
             name: n.clone(),
-            guest: ms(s.guest.saturating_sub(o.guest)),
-            kernel: ms(kernel),
-            wait: ms(wait),
+            guest: ms(guest - spin),
+            kernel: ms(kernel + spin),
+            wait: ms(wait + spin),
         });
     }
     let mut imports: Vec<_> = by
@@ -289,6 +363,15 @@ pub fn tick(swaps: u64) {
     ) {
         crate::log(&l);
     }
+    // Same work every window, best of 3 runs on the run-loop thread: it sees
+    // only that core's clock, not the drawer's core, cache or memory contention.
+    let (n, base) = *CAL.get_or_init(calibrate);
+    let t = time_work(n);
+    crate::log(&format!(
+        "[cpu]   fixed work {:.2} ms on the run-loop thread, {:.2}x the start (core clock only; a high ratio suggests throttling or boost loss)",
+        ms(t),
+        t as f64 / base as f64
+    ));
     *prev = Some((at, swaps, cur, irq));
 }
 
@@ -343,6 +426,32 @@ mod tests {
                 && last.contains("likely polling: guest-5"),
             "{last}"
         );
+
+        // 50 frames in 5 s. guest-3's 3000 ms of import spin is already wait,
+        // so its remaining 40 ms a frame is real work and caps the rate.
+        let l = lines(
+            5.0,
+            50,
+            vec![
+                row("guest-3", 2000.0, 3000.0, 3000.0),
+                row("guest-1", 1000.0, 600.0, 100.0),
+            ],
+            vec![],
+            (0.0, 0),
+        );
+        let last = l.last().unwrap();
+        assert!(
+            last.contains("busiest thread guest-3 40.00 ms") && last.contains("about 25 fps"),
+            "{last}"
+        );
+    }
+
+    #[test]
+    fn fixed_work_is_calibrated_to_about_a_millisecond() {
+        let (n, base) = calibrate();
+        assert!(n >= 1024 && base >= 1_000_000, "{n} {base}");
+        assert!(time_work(n) > 0);
+        assert_ne!(fixed_work(n), fixed_work(n / 2));
     }
 
     #[test]
@@ -365,5 +474,34 @@ mod tests {
         assert!(s.guest >= 20_000_000 && s.guest < ns, "{} {ns}", s.guest);
         assert!(ns >= 60_000_000 && calls == 1, "{ns} {calls}");
         assert!(!s.imports.contains_key(&0x20));
+        assert!(s.spin.is_empty(), "{:?}", s.spin);
+    }
+
+    #[test]
+    fn back_to_back_calls_of_one_import_are_spin() {
+        let t = std::thread::Builder::new()
+            .name("guest-spin".into())
+            .spawn(|| {
+                // A yield loop on 0x30, then one call of 0x40 after it.
+                for _ in 0..1000 {
+                    enter(0x30);
+                    leave(0x30);
+                }
+                enter(0x40);
+                leave(0x40);
+                // Work longer than a spin gap before the same import again.
+                std::thread::sleep(std::time::Duration::from_nanos(2 * SPIN_NS));
+                enter(0x40);
+                leave(0x40);
+                MINE.with(|m| snap(m.as_ref().unwrap(), now()))
+            })
+            .unwrap();
+        let s = t.join().unwrap();
+        assert!(s.spin[&0x30] > 0 && s.spin[&0x30] <= s.guest);
+        assert!(!s.spin.contains_key(&0x40), "{:?}", s.spin);
+        let none = Snap::default();
+        assert_eq!(spin_on_waits(&s, &none, |a| a == 0x30), s.spin[&0x30]);
+        assert_eq!(spin_on_waits(&s, &none, |_| false), 0);
+        assert_eq!(spin_on_waits(&s, &s, |_| true), 0);
     }
 }

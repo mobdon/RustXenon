@@ -1591,6 +1591,12 @@ pub struct Drawer {
     /// hash in hex); off without it. Draws whose shaders fail translation
     /// (such as a cube or 3D fetch) do not log.
     pub texture_log: Option<Option<u64>>,
+    /// Diagnostic: anisotropy for linear/linear fetches without any, 1 off
+    /// (see [`sampler_diagnostics`]). Default from `XENON_ANISO`.
+    pub force_aniso: u16,
+    /// Diagnostic: every sampler's mag and min filters linear. Default from
+    /// `XENON_FORCE_LINEAR=1`.
+    pub force_linear: bool,
     timings: Timings,
     /// GPU timestamps around the batch's passes, when enabled.
     gpu_clock: Option<GpuClock>,
@@ -2201,6 +2207,39 @@ fn sampler_key(
     }
 }
 
+/// The diagnostic overrides on a guest sampler. `force_linear` makes mag
+/// and min linear even for point fetches (diagnosis only: it breaks lookup
+/// and data textures). `force_aniso` (1 is off) gives that anisotropy, with
+/// linear mip filtering, to linear/linear fetches without any; it never
+/// touches point filters, base maps or the guest's own anisotropy.
+fn sampler_diagnostics(mut k: SamplerKey, force_aniso: u16, force_linear: bool) -> SamplerKey {
+    if force_linear {
+        (k.mag, k.min) = (wgpu::FilterMode::Linear, wgpu::FilterMode::Linear);
+    }
+    if force_aniso > 1
+        && k.anisotropy == 1
+        && k.mag == wgpu::FilterMode::Linear
+        && k.min == wgpu::FilterMode::Linear
+        && !k.base_map
+    {
+        k.anisotropy = force_aniso;
+        k.mip = wgpu::MipmapFilterMode::Linear;
+    }
+    k
+}
+
+/// `XENON_ANISO`: 2, 4, 8 or 16; anything else warns and is off (1).
+fn force_aniso_from(v: Option<&str>) -> u16 {
+    match v.map(str::trim) {
+        None => 1,
+        Some(s @ ("2" | "4" | "8" | "16")) => s.parse().unwrap_or(1),
+        Some(s) => {
+            eprintln!("XENON_ANISO={s:?} is not 2, 4, 8 or 16; forced anisotropy off");
+            1
+        }
+    }
+}
+
 fn filter(f: u8) -> wgpu::FilterMode {
     if f == 1 {
         wgpu::FilterMode::Linear
@@ -2532,6 +2571,11 @@ impl Drawer {
                         r
                     }
                 }),
+            force_aniso: force_aniso_from(std::env::var("XENON_ANISO").ok().as_deref()),
+            force_linear: std::env::var("XENON_FORCE_LINEAR").as_deref() == Ok("1") && {
+                eprintln!("XENON_FORCE_LINEAR=1: every sampler linear (diagnostic only; breaks lookup textures)");
+                true
+            },
             timings: Timings::default(),
             gpu_clock: None,
             cache_key: required_features
@@ -5308,7 +5352,11 @@ impl Drawer {
                 report.warn(format!("texture clamp mode {c} drawn as {m:?}"));
             }
         }
-        let k = sampler_key(fetch, overrides, self.clamp_to_border);
+        let k = sampler_diagnostics(
+            sampler_key(fetch, overrides, self.clamp_to_border),
+            self.force_aniso,
+            self.force_linear,
+        );
         let device = &self.device;
         // As Xenia's sampler: LODs from the first mip level the fetch
         // samples; base map mip filtering is point at that level (+0.25
@@ -7243,6 +7291,35 @@ mod tests {
         // The instruction turns the constant's anisotropy off.
         let f = sampler_fetch([0; 3], [1, 1, 1, 5], 0);
         assert_eq!(sampler_key(&f, Some([3, 3, 3, 0]), false).anisotropy, 1);
+
+        // Diagnostic overrides: forced anisotropy reaches linear/linear
+        // fetches only; off keeps every key.
+        let linear = sampler_key(&sampler_fetch([0; 3], [1, 1, 0, 0], 0), None, false);
+        let k = sampler_diagnostics(linear, 8, false);
+        assert_eq!((k.anisotropy, k.mip), (8, M::Linear));
+        let base = sampler_key(&point, Some([1, 1, 2, 0]), false);
+        let guest = sampler_key(&sampler_fetch([0; 3], [1, 1, 1, 3], 0), None, false);
+        let mixed = sampler_key(&point, Some([1, 3, 3, 7]), false);
+        for k in [
+            k,
+            linear,
+            base,
+            guest,
+            mixed,
+            sampler_key(&point, None, false),
+        ] {
+            assert_eq!(sampler_diagnostics(k, 1, false), k);
+        }
+        for k in [base, guest, mixed, sampler_key(&point, None, false)] {
+            assert_eq!(sampler_diagnostics(k, 16, false), k);
+        }
+        // Forced linear turns point filters linear, and then forced
+        // anisotropy applies.
+        let k = sampler_diagnostics(sampler_key(&point, None, false), 4, true);
+        assert_eq!((k.mag, k.min, k.anisotropy), (Linear, Linear, 4));
+        assert_eq!(force_aniso_from(None), 1);
+        assert_eq!(force_aniso_from(Some("16")), 16);
+        assert_eq!(force_aniso_from(Some("3")), 1);
     }
 
     /// Packed filter overrides tell no override from all-zero ones and
