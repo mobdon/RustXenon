@@ -227,7 +227,11 @@ impl DrawSide {
                 true
             }
             Err(e) => {
-                crate::log(&format!("[draw] stopped: {e}"));
+                // The only line saying why the picture froze: the caller
+                // turns the drawer off, so this prints once.
+                crate::log(&format!(
+                    "[draw] the drawer stopped: {e}; the picture will not update"
+                ));
                 false
             }
         }

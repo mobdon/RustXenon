@@ -1120,6 +1120,16 @@ fn saves_are_created_listed_and_reopened() {
         files::nt_write_file,
         &[h as u64, 0, 0, 0, 0xF700, 0xF800, 8, 0],
     );
+    // A flush of the written save reaches the disk and succeeds.
+    assert_eq!(
+        call(
+            rt,
+            &mut c,
+            files::nt_flush_buffers_file,
+            &[h as u64, 0xF700]
+        ),
+        0
+    );
     call(rt, &mut c, objects::nt_close, &[h as u64]);
     call(rt, &mut c, xam::xam_content_close, &[0xF000, 0]);
     // Create new of an existing save fails; open existing finds it.
@@ -1201,16 +1211,70 @@ fn saves_are_created_listed_and_reopened() {
         &[en, 0, 0xFA00, 0x134, 0xF908, 0],
     );
     assert_eq!(r, 18);
-    // Create always empties the save.
+    // Create always empties the save, keeping the old one aside until the
+    // next create always.
+    let data = e.game.parent().unwrap().join("data");
     assert_eq!(create(&mut c, 2), 0);
     assert_eq!(rt.mem.read_u32(0xF400), 1);
+    assert!(!data.join("content/SLOT1/data.bin").exists());
+    let bak = data.join("content.bak/SLOT1");
+    assert_eq!(std::fs::read(bak.join("data.bin")).unwrap(), b"progress");
+    // The kept copy is not a save: the listing still has the one record.
+    let r = call(
+        rt,
+        &mut c,
+        xam::xam_content_create_enumerator,
+        &[0, 1, 1, 0, 4, 0xF900, 0xF904],
+    );
+    assert_eq!(r, 0);
+    let en = rt.mem.read_u32(0xF904) as u64;
+    call(
+        rt,
+        &mut c,
+        xam::xam_enumerate,
+        &[en, 0, 0xFA00, 4 * 0x134, 0xF908, 0],
+    );
+    assert_eq!(rt.mem.read_u32(0xF908), 1);
+    rt.mem.read_bytes(0xFA00, &mut got);
+    assert_eq!(got, xam::content_record(1, "Slot 1", "SLOT1"));
+    // A newer save written and replaced again takes the old copy's place.
+    std::fs::write(data.join("content/SLOT1/new.bin"), b"newer").unwrap();
     call(rt, &mut c, xam::xam_content_close, &[0xF000, 0]);
-    assert!(!e
-        .game
-        .parent()
-        .unwrap()
-        .join("data/content/SLOT1/data.bin")
-        .exists());
+    assert_eq!(create(&mut c, 2), 0);
+    call(rt, &mut c, xam::xam_content_close, &[0xF000, 0]);
+    assert_eq!(std::fs::read(bak.join("new.bin")).unwrap(), b"newer");
+    assert!(!bak.join("data.bin").exists());
+    assert!(!data.join("content/SLOT1/new.bin").exists());
+}
+
+#[test]
+fn message_box_reads_its_result_and_request_from_the_stack() {
+    use xenon_host::kernel::xam;
+    let e = env();
+    let rt = &e.rt;
+    let mut c = ctx(0x2_B000);
+    // Arguments 8 and 9 (result out, request block) at sp+0x54 and sp+0x5c.
+    rt.mem.write_u32(0x2_B054, 0xFD00);
+    rt.mem.write_u32(0x2_B05C, 0xFD10);
+    rt.mem.write_u32(0xFD00, 7);
+    rt.mem.write_bytes(0xFD10, &[0xCC; 0x1C]);
+    rt.mem.write_u32(0xFD1C, 0); // no event
+    let r = call(
+        rt,
+        &mut c,
+        xam::xam_show_message_box_ui_ex,
+        &[0, 0, 0, 1, 0, 0, 0, 0xFE00],
+    );
+    assert_eq!(r, 997, "pending, completed through the request block");
+    assert_eq!(rt.mem.read_u32(0xFD00), 0, "first button");
+    assert_eq!(
+        (
+            rt.mem.read_u32(0xFD10),
+            rt.mem.read_u32(0xFD14),
+            rt.mem.read_u32(0xFD28)
+        ),
+        (0, 0, 0)
+    );
 }
 
 #[test]
