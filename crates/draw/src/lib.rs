@@ -2632,9 +2632,7 @@ impl Drawer {
             let mem = &mut *tracked;
             let done = match c {
                 Command::WriteRegisters { base, values } => {
-                    for (i, &v) in values.iter().enumerate() {
-                        self.regs.set(base.wrapping_add(i as u32), v);
-                    }
+                    self.regs.set_many(*base, values);
                     let end = base.saturating_add(values.len() as u32);
                     if CONSTS_REGS.iter().any(|r| *base < r.end && r.start < end) {
                         self.consts_gen += 1;
