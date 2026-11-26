@@ -63,16 +63,22 @@ impl xenon_draw::GuestMemory for Physical<'_> {
     }
 
     fn take_written(&mut self) -> Option<Vec<(u64, u64)>> {
-        Some(physical_ranges(&self.0.mem.take_written()?))
+        // Only the physical view: the OS walks its pages alone, an eighth
+        // of the whole guest range, and writes elsewhere were dropped.
+        let (lo, hi) = (PHYSICAL_VIEW.0 as usize, PHYSICAL_VIEW.1 as usize);
+        Some(physical_ranges(&self.0.mem.take_written_in(lo, hi)?))
     }
 }
+
+/// The guest range every physical view aliases to (see [`physical_ranges`]).
+const PHYSICAL_VIEW: (u64, u64) = (0xA000_0000, 0xC000_0000);
 
 /// Written guest memory ranges ([`xenon_rt::mem::GuestMemory::take_written`]
 /// offsets) as the physical ranges the GPU reads them at: the
 /// `0xA000_0000` view, which every physical view aliases to.
 fn physical_ranges(written: &[(u64, u64)]) -> Vec<(u64, u64)> {
-    const LO: u64 = 0xA000_0000;
-    const HI: u64 = 0xC000_0000;
+    const LO: u64 = PHYSICAL_VIEW.0;
+    const HI: u64 = PHYSICAL_VIEW.1;
     written
         .iter()
         .filter(|&&(a, b)| a < HI && LO < b)
