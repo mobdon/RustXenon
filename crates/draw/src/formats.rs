@@ -365,7 +365,9 @@ pub fn box_averaged(format: TargetFormat) -> bool {
 /// them; else unorm and snorm channels take the mean of their integers,
 /// rounded to nearest with halves away from zero, and float channels the
 /// f32 sum in row order times the f32 `1 / (s * s)`, rounded to the
-/// texel's precision.
+/// texel's precision. A 7e3 target sums its host texels as [`edram_rgba`]
+/// quantises them (7e3 RGB, 2-bit alpha), since a blended half can lie
+/// outside what the EDRAM holds.
 pub fn decimate(format: TargetFormat, host: &[u8], w: u32, h: u32, s: u32) -> Vec<u8> {
     let (w, h, s) = (w as usize, h as usize, s as usize);
     if s <= 1 || w == 0 || h == 0 {
@@ -412,11 +414,18 @@ pub fn decimate(format: TargetFormat, host: &[u8], w: u32, h: u32, s: u32) -> Ve
                     out.extend_from_slice(&p.to_le_bytes());
                 }
                 TargetFormat::Float7e3 | TargetFormat::Rgba16Float | TargetFormat::Rg16Float => {
+                    // A 7e3 sub-pixel counts as the EDRAM holds it: blending
+                    // leaves its half unclamped.
+                    let value = |t: &[u8], c: usize| {
+                        if format == TargetFormat::Float7e3 {
+                            edram_rgba(format, t)[c]
+                        } else {
+                            half_to_f32(u16_at(t, c))
+                        }
+                    };
                     for c in 0..texel / 2 {
-                        let h = same(&|t| u32::from(u16_at(t, c))).map_or_else(
-                            || f32_to_half(mean(&|t| half_to_f32(u16_at(t, c)))),
-                            |h| h as u16,
-                        );
+                        let h = same(&|t| u32::from(u16_at(t, c)))
+                            .map_or_else(|| f32_to_half(mean(&|t| value(t, c))), |h| h as u16);
                         out.extend_from_slice(&h.to_le_bytes());
                     }
                 }
@@ -685,6 +694,20 @@ mod tests {
         assert_eq!(
             decimate(TargetFormat::Rg16Float, &rg16f, 1, 1, 2),
             halves([0x3400, 0])
+        );
+        // 7e3: blended halves outside the EDRAM range count as the EDRAM
+        // holds them (31.875, 0; alpha 1) before the mean.
+        let h4 = |v: [f32; 4]| v.map(|c| f32_to_half(c).to_le_bytes()).concat();
+        let f7e3 = [
+            h4([64.0, -4.0, 0.5, 2.0]),
+            h4([0.0, 1.0, 0.5, 0.0]),
+            h4([0.0, 1.0, 0.5, 0.0]),
+            h4([0.0, 1.0, 0.5, 0.0]),
+        ]
+        .concat();
+        assert_eq!(
+            decimate(TargetFormat::Float7e3, &f7e3, 1, 1, 2),
+            h4([31.875 / 4.0, 0.75, 0.5, 0.25])
         );
         // Snorm: signed mean, rounded to nearest.
         let sn = |v: i16| [v.to_le_bytes(), 0i16.to_le_bytes()].concat();

@@ -66,6 +66,17 @@ fn q7e3(f: f32) -> f32 {
     return from_7e3(to_7e3(f));
 }
 
+// A 7e3 host texel as the EDRAM holds it (formats::edram_rgba): 7e3 RGB,
+// 2-bit alpha.
+fn edram_7e3(c: vec4<f32>) -> vec4<f32> {
+    var a = 0.0;
+    if c.a > 0.0 {
+        a = min(c.a, 1.0);
+    }
+    let a2 = u32(a * 3.0 + 0.5);
+    return vec4<f32>(q7e3(c.r), q7e3(c.g), q7e3(c.b), f32(a2) * (1.0 / 3.0));
+}
+
 // Saturate (NaN to 0), scale, +0.5 and truncate.
 fn to_unorm(c: f32, max_value: f32) -> u32 {
     var s = 0.0;
@@ -202,7 +213,8 @@ fn mean_recip(s: u32) -> f32 {
 // from its p.px_scale x p.px_scale host pixels: a channel that is the same
 // bits in all keeps them; else unorm and snorm channels are the mean of
 // their integers (halves away from zero), float ones the f32 sum in row
-// order times mean_recip, rounded to half for the half-float formats.
+// order times mean_recip, rounded to half for the half-float formats; 7e3
+// sums its texels through edram_7e3.
 fn load_guest(x: u32, y: u32) -> vec4<f32> {
     let s = p.px_scale;
     let c0 = textureLoad(src, vec2<u32>(x, y) * s, 0);
@@ -217,7 +229,12 @@ fn load_guest(x: u32, y: u32) -> vec4<f32> {
         for (var i = 0u; i < s; i++) {
             let c = textureLoad(src, vec2<u32>(x * s + i, y * s + j), 0);
             same = same & (bitcast<vec4<u32>>(c) == bitcast<vec4<u32>>(c0));
-            sum += c;
+            if p.src_format == 2u {
+                // Blending leaves a 7e3 half unclamped; average EDRAM values.
+                sum += edram_7e3(c);
+            } else {
+                sum += c;
+            }
             k += vec4<i32>(round(c * q));
         }
     }
@@ -252,12 +269,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     let y = p.y0 + id.y;
     var c = load_guest(x, y);
     if p.src_format == 2u {
-        var a = 0.0;
-        if c.a > 0.0 {
-            a = min(c.a, 1.0);
-        }
-        let a2 = u32(a * 3.0 + 0.5);
-        c = vec4<f32>(q7e3(c.r), q7e3(c.g), q7e3(c.b), f32(a2) * (1.0 / 3.0));
+        c = edram_7e3(c);
     } else if p.src_format == 4u {
         c = vec4<f32>(c.r, 0.0, 0.0, 0.0);
     } else if p.src_format == 7u || p.src_format == 8u {
