@@ -406,28 +406,29 @@ fn float_constants() {
     mul.const0_relative = true;
     let words = assemble(&[exec(0, 2, true)], &[alu(add), alu(mul)]);
     let t = ok(&words, Vertex);
-    has(&t, "let v0 = fc[3u - FC_LO];");
+    has(&t, "let v0 = fc[FC3];");
     has(&t, "let v1 = cnst(5 + a0);");
     has(&t, "let v1 = cnst(2 + al()).wzyx;");
     has(&t, "return fc[u32(i)];");
     assert_eq!(t.info.float_consts_used, Some((3, 3)));
     assert!(t.info.float_consts_dynamic);
     // A dynamic index may read any of the stage's 256: all are bound.
-    assert_eq!(t.info.float_consts_span(), Some((0, 256)));
-    has(&t, "const FC_LO: u32 = 0u;");
+    assert_eq!(t.info.float_consts_bound(), Some([u64::MAX; 4]));
+    has(&t, "const FC3: u32 = 3u;");
     has(
         &t,
         "@group(0) @binding(4) var<uniform> fc: array<vec4<f32>, 256>;",
     );
 
-    // The pixel stage binds its own span, c7 alone here, at binding 5.
+    // The pixel stage binds the constants it reads, c7 alone here, at
+    // binding 5.
     let mut a = mov(0, mask("xyzw"), AluSrc::constant(7, SWZ_XYZW)).exported(0);
     a.abs_constants = true;
     let words = assemble(&[exec(0, 1, true)], &[alu(a)]);
     let t = ok(&words, Pixel);
-    has(&t, "abs(fc[7u - FC_LO])");
-    assert_eq!(t.info.float_consts_span(), Some((7, 1)));
-    has(&t, "const FC_LO: u32 = 7u;");
+    has(&t, "abs(fc[FC7])");
+    assert_eq!(t.info.float_consts_bound(), Some([1 << 7, 0, 0, 0]));
+    has(&t, "const FC7: u32 = 0u;");
     has(
         &t,
         "@group(0) @binding(5) var<uniform> fc: array<vec4<f32>, 1>;",
@@ -795,7 +796,7 @@ fn every_scalar_opcode() {
                 // Constant `a` from c9.w, temporary `b` from the register
                 // number packed into the opcode and swizzle bits.
                 let reg = (op as u32 & 1) | (swz("xyzw") & 0x3C);
-                has(&t, "let sa = fc[9u - FC_LO].w;");
+                has(&t, "let sa = fc[FC9].w;");
                 has(&t, &format!("let sb = r[{reg}].x;"));
             }
             _ => {}

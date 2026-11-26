@@ -245,9 +245,10 @@ fn a_full_upload_arena_submits_and_continues() {
     s.setup()
         .shader(false, &vs_color_all_consts())
         .shader(true, &ps_interp_all_consts());
-    // Both stages read c0 and c255, so a draw after a write to each
-    // stage's constants stages all 256 of both: about 10 KiB per draw
-    // with the other constants, and 2001 draws need two arena fills.
+    // Both stages read a float constant by a dynamic index, so a draw after
+    // a write to each stage's constants stages all 256 of both: about 10
+    // KiB per draw with the other constants, and 2001 draws need two arena
+    // fills.
     for i in 0..2001 {
         s.regs(SHADER_CONSTANT_FLOAT, &[i])
             .regs(SHADER_CONSTANT_FLOAT + 1024, &[i])

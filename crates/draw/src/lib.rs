@@ -1336,8 +1336,8 @@ pub struct Drawer {
     /// Counts the writes to the vertex stage's float constant registers,
     /// and to the pixel stage's.
     float_gens: [u64; 2],
-    /// The float constant span of each stage staged last, bound again by
-    /// draws that read the same span of unchanged registers.
+    /// The float constants of each stage staged last, bound again by
+    /// draws that read the same ones of unchanged registers.
     staged_floats: [StagedFloats; 2],
     /// Bumped by every register write to the constants a `Consts` block
     /// holds, so a draw rebuilds the block only after one.
@@ -1699,9 +1699,27 @@ type ConstsKey = (u64, u32, [i32; 96]);
 const FLOAT_STAGE_REGS: u32 = 1024;
 const _: () = assert!(xenon_shader::PIXEL_FLOAT_CONST_BASE * 4 == FLOAT_STAGE_REGS);
 
-/// A stage's float constant span staged in the arena: the generation of
-/// its registers, the span's first constant and count, and the slice.
-type StagedFloats = Option<((u64, u32, u32), (u64, u64))>;
+/// A stage's float constants staged in the arena: the generation of its
+/// registers, the mask of the constants staged, and the slice.
+type StagedFloats = Option<((u64, [u64; 4]), (u64, u64))>;
+
+/// The float constants of `stage` (0 vertex, 1 pixel) that `mask` names,
+/// in ascending order, as the bytes of a stage's `fc` binding.
+fn float_consts(r: &regs::RegisterFile, stage: u32, mask: &[u64; 4]) -> Vec<u8> {
+    let all = r.slice(
+        regs::SHADER_CONSTANT_FLOAT + FLOAT_STAGE_REGS * stage,
+        FLOAT_STAGE_REGS,
+    );
+    let count: u32 = mask.iter().map(|w| w.count_ones()).sum();
+    let mut out = vec![0; 16 * count as usize];
+    let read = (0..256).filter(|i| mask[i / 64] >> (i % 64) & 1 != 0);
+    for (o, i) in out.chunks_exact_mut(16).zip(read) {
+        for (o, w) in o.chunks_exact_mut(4).zip(&all[4 * i..4 * i + 4]) {
+            o.copy_from_slice(&w.to_le_bytes());
+        }
+    }
+    out
+}
 
 /// The registers a `Consts` block is built from (see [`consts`]).
 const CONSTS_REGS: [std::ops::Range<u32>; 3] = [
@@ -5076,22 +5094,21 @@ impl Drawer {
         let mut kept_consts = (self.staged_consts.as_ref())
             .filter(|(b, _)| Arc::ptr_eq(b, &consts) || **b == *consts)
             .map(|&(_, s)| s);
-        // Each stage's float constants: the span it reads, staged again
-        // only when one of the stage's registers was written since.
-        let float_spans = [&vs_t.info, &ps_t.info].map(|info| info.float_consts_span());
-        let float_keys = [0, 1].map(|i| float_spans[i].map(|(a, n)| (self.float_gens[i], a, n)));
+        // Each stage's float constants: those it reads, staged again only
+        // when one of the stage's registers was written since.
+        let float_masks = [&vs_t.info, &ps_t.info].map(|info| info.float_consts_bound());
+        let float_keys = [0, 1].map(|i| float_masks[i].map(|m| (self.float_gens[i], m)));
         let mut kept_floats = [0, 1].map(|i| {
             (self.staged_floats[i].zip(float_keys[i]))
                 .filter(|((k, _), key)| k == key)
                 .map(|((_, s), _)| s)
         });
         let float_bytes = [0, 1].map(|i| {
-            float_keys[i].map(|(_, first, count)| {
-                let at = regs::SHADER_CONSTANT_FLOAT + FLOAT_STAGE_REGS * i as u32 + 4 * first;
-                to_bytes(self.regs.slice(at, 4 * count))
-            })
+            // Not built for a stage whose staged ones are bound again.
+            (float_masks[i].filter(|_| kept_floats[i].is_none()))
+                .map(|mask| float_consts(&self.regs, i as u32, &mask))
         });
-        // The float spans to stage: those read and not kept.
+        // The stages' float constants to stage: those read and not kept.
         let floats = |kept: &[Option<(u64, u64)>; 2]| -> [Option<&[u8]>; 2] {
             [0, 1].map(|i| float_bytes[i].as_deref().filter(|_| kept[i].is_none()))
         };

@@ -42,10 +42,10 @@
 //!   (count in bits 0..8, aL start in 8..16, signed aL step in 16..24).
 //! - `@group(0) @binding(4)` in the vertex stage and `@binding(5)` in the
 //!   pixel stage is `var<uniform> fc: array<vec4<f32>, count>`: the float
-//!   constants `first..first + count` of that stage, as
-//!   [`ShaderInfo::float_consts_span`] gives them, declared only when it is
-//!   `Some`. A draw changes a few of the 512 float constants and a stage
-//!   reads a few dozen, so the drawer uploads these spans, not all of them.
+//!   constants of that stage that [`ShaderInfo::float_consts_bound`] names,
+//!   in ascending order, declared only when it is `Some`. A draw changes a
+//!   few of the 512 float constants and a stage reads a few dozen, so the
+//!   drawer uploads only those.
 //!   The vertex shader's c0..c255 are float constant registers 0..256 and
 //!   the pixel shader's are 256..512 ([`PIXEL_FLOAT_CONST_BASE`]; SQ_VS_CONST
 //!   base 0 and SQ_PS_CONST base 256, as the console's D3D runtime sets them
