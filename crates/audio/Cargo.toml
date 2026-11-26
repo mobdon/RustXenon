@@ -1,6 +1,6 @@
 [package]
 name = "xenon-audio"
-description = "Headless audio: decodes the console's compressed audio through a run-time loaded LGPL FFmpeg, mixes render-client frames and writes .wav files."
+description = "Headless audio: decodes the console's compressed audio through a run-time loaded LGPL FFmpeg, mixes render-client frames, writes .wav files and plays them live."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -11,3 +11,8 @@ license.workspace = true
 # Opens FFmpeg's shared libraries at run time, so nothing of FFmpeg is linked
 # into our binaries (LGPL condition, see CREDITS.md).
 libloading = "0.8"
+
+# Live output to the default device. Windows only, so Linux builds need no
+# ALSA headers; elsewhere the speaker reports it is unavailable.
+[target."cfg(windows)".dependencies]
+cpal = "0.15"

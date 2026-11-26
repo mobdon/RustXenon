@@ -2,7 +2,8 @@
 //!
 //! The first milestone is headless: load the player's own executable and
 //! unpacked game folder, run the title with the system calls replaced
-//! ([`kernel`]), and report how far it got. No window, no sound.
+//! ([`kernel`]), and report how far it got. The default run is headless:
+//! no window or sound unless `--window` or `--sound` is given.
 //!
 //! A generated game crate calls [`run`] with the SHA-256 it was built from
 //! and the register functions of its code crates.
@@ -401,7 +402,7 @@ USAGE: game --exe <patched executable> --game <unpacked game folder>
             [--seconds <n>] [--press <ms>:<button>[+<button>],...]
             [--no-controller] [--window] [--capture <dir> [--capture-at <s>,<s>...] [--capture-bundle]] [--render]
             [--capture-frames <n>,<n>... --capture-dir <dir>] [--audio-wav <file>]
-            [--guard-memory]
+            [--sound] [--mute] [--guard-memory]
 
 Runs the title headless for --seconds (default 30) and reports how far it
 got: frames presented, threads, imports called, memory in use. A
@@ -421,7 +422,9 @@ frames (counted from 1, one per swap) as <dir>/frame-<n>.png; it implies
 (or for --seconds when given). --audio-wav writes the game's sound (the
 render clients' frames mixed to 48 kHz stereo) to a .wav file; compressed
 sound is decoded through an LGPL FFmpeg found at run time (XENON_FFMPEG_DIR),
-silence without one. Nothing is ever played. --guard-memory (or
+silence without one. --window also plays the sound on the default output
+device (Windows only), as does --sound without a window; --mute keeps it
+silent. --guard-memory (or
 XENON_GUARD_MEMORY=1) reserves guest memory without access and commits only
 what the kernel hands out, so a wild pointer stops the run with its address
 and every thread's last calls instead of reading zeros. XENON_CPU_PROFILE=1
@@ -588,6 +591,9 @@ pub fn run(sha256: &str, regs: &[fn(&mut Runtime)]) -> ExitCode {
             eprintln!("{w}: {e}");
             return ExitCode::FAILURE;
         }
+    }
+    if (window || args.iter().any(|a| a == "--sound")) && !args.iter().any(|a| a == "--mute") {
+        kernel::sound::start_speaker();
     }
     start_clock(rt.clone());
     start_memwatch(rt.clone());

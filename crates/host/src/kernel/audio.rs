@@ -1,6 +1,6 @@
-//! Audio calls, headless: render clients are asked for frames at the
-//! console's rate, and nothing is played. Decoding, mixing and the .wav
-//! are in [`super::sound`].
+//! Audio calls: render clients are asked for frames at the console's rate,
+//! paced by a host timer and never by the output device. Decoding, mixing,
+//! the .wav and live playback are in [`super::sound`].
 
 use super::*;
 

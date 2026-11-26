@@ -4,17 +4,21 @@
 //!   one stereo stream, one 256-sample frame at a time (the console's audio
 //!   tick: 48 kHz, 256 samples, every 5.33 ms).
 //! - [`wav::WavWriter`] is a [`Sink`] that writes that stream to a .wav
-//!   file. Nothing here ever plays sound.
+//!   file.
+//! - [`speaker::Speaker`] is a [`Sink`] that plays it on the default
+//!   output device (Windows only, through `cpal`).
 //! - [`ffmpeg`] decodes the console's compressed audio (XMA) through an
 //!   LGPL FFmpeg that is loaded at run time, never linked in.
 //! - [`xma`] holds the pure XMA packet facts the decoder path needs.
 //! - [`compare::correlation`] checks a written .wav against the original.
 //!
-//! Everything except [`ffmpeg`] is pure and tests anywhere; [`ffmpeg`] only
-//! needs the shared libraries, which tests skip when absent.
+//! Everything except [`ffmpeg`] and the device side of [`speaker`] is pure
+//! and tests anywhere; [`ffmpeg`] only needs the shared libraries, which
+//! tests skip when absent.
 
 pub mod compare;
 pub mod ffmpeg;
+pub mod speaker;
 pub mod wav;
 pub mod xma;
 
