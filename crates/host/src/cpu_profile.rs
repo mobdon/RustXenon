@@ -179,8 +179,6 @@ struct Row {
     guest: f64,
     kernel: f64,
     wait: f64,
-    /// Of `wait`, the guest spin between calls of a waiting import.
-    spin: f64,
 }
 
 /// Fixed integer work: `n` dependent multiply-adds.
@@ -271,14 +269,11 @@ fn lines(
         top.join(", ")
     ));
     // A thread busy for the whole frame at any frame rate is polling (a
-    // spin on a fence or the vertical blank), not doing that much work. So is
-    // one that spends most of its time spinning on a waiting import: at a low
-    // frame rate the loop around the spin can still look like the busiest.
+    // spin on a fence or the vertical blank), not doing that much work.
+    // Spin on a waiting import is already counted as wait, not busy.
     let frame_ms = secs * 1e3 / n;
-    let (spin, work): (Vec<&Row>, Vec<&Row>) = rows.iter().partition(|r| {
-        busy(r) / n >= 0.95 * frame_ms
-            || r.spin >= 0.5 * (r.guest + r.kernel).max(f64::MIN_POSITIVE)
-    });
+    let (spin, work): (Vec<&Row>, Vec<&Row>) =
+        rows.iter().partition(|r| busy(r) / n >= 0.95 * frame_ms);
     if let Some(r) = work.first().filter(|_| frames > 0) {
         let b = busy(r) / n;
         let spin: Vec<&str> = spin.iter().map(|r| r.name.as_str()).collect();
@@ -351,7 +346,6 @@ pub fn tick(swaps: u64) {
             guest: ms(guest - spin),
             kernel: ms(kernel + spin),
             wait: ms(wait + spin),
-            spin: ms(spin),
         });
     }
     let mut imports: Vec<_> = by
@@ -369,12 +363,12 @@ pub fn tick(swaps: u64) {
     ) {
         crate::log(&l);
     }
-    // Same work every window: a higher ratio is a slower machine (heat, boost,
-    // other load), not more work.
+    // Same work every window, best of 3 runs on the run-loop thread: it sees
+    // only that core's clock, not the drawer's core, cache or memory contention.
     let (n, base) = *CAL.get_or_init(calibrate);
     let t = time_work(n);
     crate::log(&format!(
-        "[cpu]   fixed work {:.2} ms, {:.2}x the first window (above 1: the machine, not the guest, got slower)",
+        "[cpu]   fixed work {:.2} ms on the run-loop thread, {:.2}x the start (core clock only; a high ratio suggests throttling or boost loss)",
         ms(t),
         t as f64 / base as f64
     ));
@@ -402,7 +396,6 @@ mod tests {
             guest,
             kernel,
             wait,
-            spin: 0.0,
         };
         // 300 frames in 5 s; guest-1 is busy 3000 ms of guest code plus
         // 600 ms of kernel calls, 300 ms of which waiting: 11 ms a frame.
@@ -434,25 +427,21 @@ mod tests {
             "{last}"
         );
 
-        // 50 frames in 5 s (100 ms a frame). guest-3 spins 3000 of its 5000 ms
-        // on a waiting import; the loop around the spin leaves it 40 ms a
-        // frame busy, under the whole-frame bar, but it is polling, not work.
-        let spinner = Row {
-            spin: 3000.0,
-            ..row("guest-3", 2000.0, 3000.0, 3000.0)
-        };
+        // 50 frames in 5 s. guest-3's 3000 ms of import spin is already wait,
+        // so its remaining 40 ms a frame is real work and caps the rate.
         let l = lines(
             5.0,
             50,
-            vec![spinner, row("guest-1", 1000.0, 600.0, 100.0)],
+            vec![
+                row("guest-3", 2000.0, 3000.0, 3000.0),
+                row("guest-1", 1000.0, 600.0, 100.0),
+            ],
             vec![],
             (0.0, 0),
         );
         let last = l.last().unwrap();
         assert!(
-            last.contains("busiest thread guest-1 30.00 ms")
-                && last.contains("about 33 fps")
-                && last.contains("likely polling: guest-3"),
+            last.contains("busiest thread guest-3 40.00 ms") && last.contains("about 25 fps"),
             "{last}"
         );
     }
