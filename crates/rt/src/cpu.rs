@@ -145,20 +145,12 @@ impl Context {
         self.set_cr_field(n, v | self.so as u32);
     }
 
-    /// Record form of a word or width-neutral instruction: CR0 from the low
-    /// 32 bits of the result compared with zero, as titles expect (a C
-    /// runtime stream count stored as -1 and reloaded zero-extended must
-    /// still test negative after `addic.`).
+    /// Record form: CR0 from the low 32 bits of the result compared with
+    /// zero, as titles expect (a C runtime stream count stored as -1 and
+    /// reloaded zero-extended must still test negative after `addic.`).
     #[inline]
     pub fn rec(&mut self, v: u64) {
         self.cmp_s(0, v as i32 as i64, 0);
-    }
-
-    /// Record form of a doubleword instruction (`rld*`, `sld`, `srd`,
-    /// `srad`, `sradi`, `mulld`, `divd`...): CR0 from all 64 bits.
-    #[inline]
-    pub fn rec64(&mut self, v: u64) {
-        self.cmp_s(0, v as i64, 0);
     }
 
     /// XER as the 32-bit register `mfxer` reads.
@@ -220,19 +212,6 @@ mod tests {
         // 0xFFFFFFFF loaded by lwz, minus one.
         c.rec(0x0000_0000_FFFF_FFFE);
         assert_eq!(c.cr_field(0), LT);
-    }
-
-    #[test]
-    fn doubleword_record_compares_all_64_bits() {
-        let mut c = Context::new();
-        c.rec64(0x8000_0000_0000_0000);
-        assert_eq!(c.cr_field(0), LT);
-        c.rec64(0x0000_0000_FFFF_FFFE);
-        assert_eq!(c.cr_field(0), GT);
-        c.rec64(0xFFFF_FFFF_0000_0000);
-        assert_eq!(c.cr_field(0), LT);
-        c.rec64(0);
-        assert_eq!(c.cr_field(0), EQ);
     }
 
     #[test]

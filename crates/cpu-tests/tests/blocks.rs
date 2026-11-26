@@ -18,6 +18,17 @@ fn loop_crosses_part_boundaries() {
     assert_eq!(c.r[3], 10);
 }
 
+/// `bdnz` tests only the low 32 bits of CTR, as the console does: a C
+/// library memset counted with a negated `lwz` value (upper half all ones)
+/// otherwise kept going and wrote zeros off the top of a thread's stack.
+#[test]
+fn bdnz_tests_the_low_word_of_ctr() {
+    let mut c = Context::new();
+    c.r[4] = 0x1_0000_0003;
+    count_loop_r4(&rt(), &mut c);
+    assert_eq!(c.r[3], 3);
+}
+
 #[test]
 fn falling_off_the_end_calls_the_next_function() {
     fn next(_: &Runtime, c: &mut Context) {
