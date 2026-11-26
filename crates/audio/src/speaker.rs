@@ -182,6 +182,9 @@ struct Shared {
     ring: Mutex<Ring>,
     /// Set by the device's error callback: the stream has stopped.
     dead: AtomicBool,
+    /// Why it stopped, for the error [`Speaker::write`] returns (the host
+    /// logs that; an APK's stderr goes nowhere).
+    why: Mutex<String>,
     /// Stereo frames of silence played because the mixer held the ring.
     busy: AtomicU64,
 }
@@ -192,6 +195,7 @@ impl Shared {
         Arc::new(Self {
             ring: Mutex::new(Ring::new(rate)),
             dead: AtomicBool::new(false),
+            why: Mutex::new(String::new()),
             busy: AtomicU64::new(0),
         })
     }
@@ -264,7 +268,9 @@ impl Speaker {
                 }
             })
             .map_err(|e| e.to_string())?;
-        let (rate, shared) = rx.recv().map_err(|e| e.to_string())??;
+        let (rate, shared) = rx.recv().map_err(|_| {
+            "the speaker thread panicked (on Android, is ndk_context initialised?)".to_string()
+        })??;
         Ok(Self::new(shared, rate))
     }
 
@@ -280,7 +286,10 @@ impl Sink for Speaker {
     /// counts instead.
     fn write(&mut self, stereo: &[f32]) -> std::io::Result<()> {
         if self.shared.dead.load(Ordering::Relaxed) {
-            return Err(std::io::Error::other("the output device stopped"));
+            let why = self.shared.why.lock().unwrap_or_else(|e| e.into_inner());
+            return Err(std::io::Error::other(format!(
+                "the output device stopped: {why}"
+            )));
         }
         self.scratch.clear();
         self.resampler.process(stereo, &mut self.scratch);
@@ -306,6 +315,15 @@ mod device {
     use std::sync::{Arc, TryLockError};
 
     type Started = (cpal::Stream, u32, Arc<Shared>);
+
+    /// Whether a stream error means the stream has stopped. cpal also sends
+    /// warnings through the error callback: an xrun (one late period, which
+    /// WASAPI and AAudio both report), a reroute to a new default device,
+    /// or a refused real-time priority all leave the stream playing.
+    pub fn fatal(kind: cpal::ErrorKind) -> bool {
+        use cpal::ErrorKind as K;
+        !matches!(kind, K::Xrun | K::DeviceChanged | K::RealtimeDenied)
+    }
 
     pub fn start() -> Result<Started, String> {
         let dev = cpal::default_host()
@@ -368,8 +386,11 @@ mod device {
                 }
             },
             move |e| {
+                if fatal(e.kind()) {
+                    *on_error.why.lock().unwrap_or_else(|p| p.into_inner()) = e.to_string();
+                    on_error.dead.store(true, Ordering::Relaxed);
+                }
                 eprintln!("audio: speaker: {e}");
-                on_error.dead.store(true, Ordering::Relaxed);
             },
             None,
         )
@@ -579,6 +600,18 @@ mod tests {
             "{}",
             sp.resampler.step
         );
+    }
+
+    #[cfg(any(windows, target_os = "android"))]
+    #[test]
+    fn only_stopping_errors_are_fatal() {
+        use cpal::ErrorKind as K;
+        for k in [K::Xrun, K::DeviceChanged, K::RealtimeDenied] {
+            assert!(!device::fatal(k), "{k:?}");
+        }
+        for k in [K::DeviceNotAvailable, K::StreamInvalidated, K::BackendError] {
+            assert!(device::fatal(k), "{k:?}");
+        }
     }
 
     #[test]
