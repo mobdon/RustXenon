@@ -295,17 +295,26 @@ pub fn vsel(a: V128, b: V128, c: V128) -> V128 {
 /// `vperm`: byte `i` is byte `c[i] & 31` of `a || b`.
 #[inline]
 pub fn vperm(a: V128, b: V128, c: V128) -> V128 {
-    #[cfg(all(target_arch = "x86_64", target_feature = "ssse3"))]
+    #[cfg(any(
+        all(target_arch = "x86_64", target_feature = "ssse3"),
+        target_arch = "aarch64"
+    ))]
     {
-        sse::perm(a, b, c)
+        simd::perm(a, b, c)
     }
-    #[cfg(not(all(target_arch = "x86_64", target_feature = "ssse3")))]
+    #[cfg(not(any(
+        all(target_arch = "x86_64", target_feature = "ssse3"),
+        target_arch = "aarch64"
+    )))]
     {
         vperm_scalar(a, b, c)
     }
 }
 #[cfg_attr(
-    all(target_arch = "x86_64", target_feature = "ssse3"),
+    any(
+        all(target_arch = "x86_64", target_feature = "ssse3"),
+        target_arch = "aarch64"
+    ),
     allow(dead_code)
 )]
 fn vperm_scalar(a: V128, b: V128, c: V128) -> V128 {
@@ -806,44 +815,61 @@ fn f1(b: V128, f: impl Fn(f32) -> f32) -> V128 {
 }
 
 // The float helpers below that translated code calls most have an SSE path
-// (module `sse`) that gives bit for bit the scalar result. The scalar code
-// stays the definition: it is the only path off x86-64, and on x86-64 it runs
-// out of line (cold) for the cases the SSE path hands back, a NaN operand.
+// (module `sse`) on x86-64 and a NEON path (module `neon`) on AArch64, each
+// giving bit for bit the scalar result. The scalar code stays the definition:
+// it is the only path elsewhere, and with a fast path it runs out of line
+// (cold) for the cases the fast path hands back, a NaN operand.
+#[cfg(target_arch = "aarch64")]
+use neon as simd;
+#[cfg(target_arch = "x86_64")]
+use sse as simd;
 
 #[inline]
 pub fn vaddfp(a: V128, b: V128) -> V128 {
-    #[cfg(target_arch = "x86_64")]
-    if let Some(r) = sse::add(a, b) {
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    if let Some(r) = simd::add(a, b) {
         return r;
     }
     vaddfp_scalar(a, b)
 }
-#[cfg_attr(target_arch = "x86_64", cold, inline(never))]
+#[cfg_attr(
+    any(target_arch = "x86_64", target_arch = "aarch64"),
+    cold,
+    inline(never)
+)]
 fn vaddfp_scalar(a: V128, b: V128) -> V128 {
     f2(a, b, |x, y| x + y)
 }
 #[inline]
 pub fn vsubfp(a: V128, b: V128) -> V128 {
-    #[cfg(target_arch = "x86_64")]
-    if let Some(r) = sse::sub(a, b) {
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    if let Some(r) = simd::sub(a, b) {
         return r;
     }
     vsubfp_scalar(a, b)
 }
-#[cfg_attr(target_arch = "x86_64", cold, inline(never))]
+#[cfg_attr(
+    any(target_arch = "x86_64", target_arch = "aarch64"),
+    cold,
+    inline(never)
+)]
 fn vsubfp_scalar(a: V128, b: V128) -> V128 {
     f2(a, b, |x, y| x - y)
 }
 /// VMX128 `vmulfp128` (standard VMX has no plain multiply).
 #[inline]
 pub fn vmulfp(a: V128, b: V128) -> V128 {
-    #[cfg(target_arch = "x86_64")]
-    if let Some(r) = sse::mul(a, b) {
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    if let Some(r) = simd::mul(a, b) {
         return r;
     }
     vmulfp_scalar(a, b)
 }
-#[cfg_attr(target_arch = "x86_64", cold, inline(never))]
+#[cfg_attr(
+    any(target_arch = "x86_64", target_arch = "aarch64"),
+    cold,
+    inline(never)
+)]
 fn vmulfp_scalar(a: V128, b: V128) -> V128 {
     f2(a, b, |x, y| x * y)
 }
@@ -866,14 +892,20 @@ fn f3(a: V128, b: V128, c: V128, f: impl Fn(f32, f32, f32) -> f32) -> V128 {
 /// `vmaddfp vD,vA,vC,vB`: `a * c + b`, fused. NaN priority A, B, C.
 #[inline]
 pub fn vmaddfp(a: V128, c: V128, b: V128) -> V128 {
-    #[cfg(all(target_arch = "x86_64", target_feature = "fma"))]
-    if let Some(r) = sse::madd(a, c, b) {
+    #[cfg(any(
+        all(target_arch = "x86_64", target_feature = "fma"),
+        target_arch = "aarch64"
+    ))]
+    if let Some(r) = simd::madd(a, c, b) {
         return r;
     }
     vmaddfp_scalar(a, c, b)
 }
 #[cfg_attr(
-    all(target_arch = "x86_64", target_feature = "fma"),
+    any(
+        all(target_arch = "x86_64", target_feature = "fma"),
+        target_arch = "aarch64"
+    ),
     cold,
     inline(never)
 )]
@@ -883,14 +915,20 @@ fn vmaddfp_scalar(a: V128, c: V128, b: V128) -> V128 {
 /// `vnmsubfp vD,vA,vC,vB`: `-(a * c - b)`, fused.
 #[inline]
 pub fn vnmsubfp(a: V128, c: V128, b: V128) -> V128 {
-    #[cfg(all(target_arch = "x86_64", target_feature = "fma"))]
-    if let Some(r) = sse::nmsub(a, c, b) {
+    #[cfg(any(
+        all(target_arch = "x86_64", target_feature = "fma"),
+        target_arch = "aarch64"
+    ))]
+    if let Some(r) = simd::nmsub(a, c, b) {
         return r;
     }
     vnmsubfp_scalar(a, c, b)
 }
 #[cfg_attr(
-    all(target_arch = "x86_64", target_feature = "fma"),
+    any(
+        all(target_arch = "x86_64", target_feature = "fma"),
+        target_arch = "aarch64"
+    ),
     cold,
     inline(never)
 )]
@@ -900,13 +938,17 @@ fn vnmsubfp_scalar(a: V128, c: V128, b: V128) -> V128 {
 
 #[inline]
 pub fn vmaxfp(a: V128, b: V128) -> V128 {
-    #[cfg(target_arch = "x86_64")]
-    if let Some(r) = sse::max(a, b) {
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    if let Some(r) = simd::max(a, b) {
         return r;
     }
     vmaxfp_scalar(a, b)
 }
-#[cfg_attr(target_arch = "x86_64", cold, inline(never))]
+#[cfg_attr(
+    any(target_arch = "x86_64", target_arch = "aarch64"),
+    cold,
+    inline(never)
+)]
 fn vmaxfp_scalar(a: V128, b: V128) -> V128 {
     f2(a, b, |x, y| {
         if x == y {
@@ -921,13 +963,17 @@ fn vmaxfp_scalar(a: V128, b: V128) -> V128 {
 }
 #[inline]
 pub fn vminfp(a: V128, b: V128) -> V128 {
-    #[cfg(target_arch = "x86_64")]
-    if let Some(r) = sse::min(a, b) {
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    if let Some(r) = simd::min(a, b) {
         return r;
     }
     vminfp_scalar(a, b)
 }
-#[cfg_attr(target_arch = "x86_64", cold, inline(never))]
+#[cfg_attr(
+    any(target_arch = "x86_64", target_arch = "aarch64"),
+    cold,
+    inline(never)
+)]
 fn vminfp_scalar(a: V128, b: V128) -> V128 {
     f2(a, b, |x, y| {
         if x == y {
@@ -942,27 +988,35 @@ fn vminfp_scalar(a: V128, b: V128) -> V128 {
 
 #[inline]
 pub fn vrefp(b: V128) -> V128 {
-    #[cfg(target_arch = "x86_64")]
-    if let Some(r) = sse::refp(b) {
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    if let Some(r) = simd::refp(b) {
         return r;
     }
     vrefp_scalar(b)
 }
-#[cfg_attr(target_arch = "x86_64", cold, inline(never))]
+#[cfg_attr(
+    any(target_arch = "x86_64", target_arch = "aarch64"),
+    cold,
+    inline(never)
+)]
 fn vrefp_scalar(b: V128) -> V128 {
     f1(b, |x| 1.0 / x)
 }
 #[inline]
 pub fn vrsqrtefp(b: V128) -> V128 {
-    #[cfg(target_arch = "x86_64")]
-    if let Some(r) = sse::rsqrte(b) {
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    if let Some(r) = simd::rsqrte(b) {
         return r;
     }
     vrsqrtefp_scalar(b)
 }
 // Negative inputs are checked explicitly: the optimiser assumes `sqrt` of a
 // non-NaN is never NaN, so testing the result afterwards is not reliable.
-#[cfg_attr(target_arch = "x86_64", cold, inline(never))]
+#[cfg_attr(
+    any(target_arch = "x86_64", target_arch = "aarch64"),
+    cold,
+    inline(never)
+)]
 fn vrsqrtefp_scalar(b: V128) -> V128 {
     f1(b, |x| if x < 0.0 { f32::NAN } else { 1.0 / x.sqrt() })
 }
@@ -1045,62 +1099,62 @@ fn fcmp(a: V128, b: V128, f: impl Fn(f32, f32) -> bool) -> V128 {
 // The SSE compares need no scalar fallback: a NaN compares false either way.
 #[inline]
 pub fn vcmpeqfp(a: V128, b: V128) -> V128 {
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     {
-        sse::cmpeq(a, b)
+        simd::cmpeq(a, b)
     }
-    #[cfg(not(target_arch = "x86_64"))]
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     {
         vcmpeqfp_scalar(a, b)
     }
 }
-#[cfg_attr(target_arch = "x86_64", allow(dead_code))]
+#[cfg_attr(any(target_arch = "x86_64", target_arch = "aarch64"), allow(dead_code))]
 fn vcmpeqfp_scalar(a: V128, b: V128) -> V128 {
     fcmp(a, b, |x, y| x == y)
 }
 #[inline]
 pub fn vcmpgefp(a: V128, b: V128) -> V128 {
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     {
-        sse::cmpge(a, b)
+        simd::cmpge(a, b)
     }
-    #[cfg(not(target_arch = "x86_64"))]
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     {
         vcmpgefp_scalar(a, b)
     }
 }
-#[cfg_attr(target_arch = "x86_64", allow(dead_code))]
+#[cfg_attr(any(target_arch = "x86_64", target_arch = "aarch64"), allow(dead_code))]
 fn vcmpgefp_scalar(a: V128, b: V128) -> V128 {
     fcmp(a, b, |x, y| x >= y)
 }
 #[inline]
 pub fn vcmpgtfp(a: V128, b: V128) -> V128 {
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     {
-        sse::cmpgt(a, b)
+        simd::cmpgt(a, b)
     }
-    #[cfg(not(target_arch = "x86_64"))]
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     {
         vcmpgtfp_scalar(a, b)
     }
 }
-#[cfg_attr(target_arch = "x86_64", allow(dead_code))]
+#[cfg_attr(any(target_arch = "x86_64", target_arch = "aarch64"), allow(dead_code))]
 fn vcmpgtfp_scalar(a: V128, b: V128) -> V128 {
     fcmp(a, b, |x, y| x > y)
 }
 /// `vcmpbfp`: bit 0 set when `a > b` fails `a <= b`, bit 1 when `a >= -b` fails.
 #[inline]
 pub fn vcmpbfp(a: V128, b: V128) -> V128 {
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     {
-        sse::cmpb(a, b)
+        simd::cmpb(a, b)
     }
-    #[cfg(not(target_arch = "x86_64"))]
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     {
         vcmpbfp_scalar(a, b)
     }
 }
-#[cfg_attr(target_arch = "x86_64", allow(dead_code))]
+#[cfg_attr(any(target_arch = "x86_64", target_arch = "aarch64"), allow(dead_code))]
 fn vcmpbfp_scalar(a: V128, b: V128) -> V128 {
     map_w(a, b, |x, y| {
         let (p, q) = (fl(x), fl(y));
@@ -1124,8 +1178,8 @@ pub fn cr6_bounds(v: V128) -> u32 {
 /// `vmsum3fp128`: dot product of elements 0..3, in every element.
 #[inline]
 pub fn vmsum3fp(a: V128, b: V128) -> V128 {
-    #[cfg(target_arch = "x86_64")]
-    if let Some(r) = sse::dot(a, b, 3) {
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    if let Some(r) = simd::dot(a, b, 3) {
         return r;
     }
     dot(a, b, 3)
@@ -1133,13 +1187,17 @@ pub fn vmsum3fp(a: V128, b: V128) -> V128 {
 /// `vmsum4fp128`: dot product of all four elements, in every element.
 #[inline]
 pub fn vmsum4fp(a: V128, b: V128) -> V128 {
-    #[cfg(target_arch = "x86_64")]
-    if let Some(r) = sse::dot(a, b, 4) {
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    if let Some(r) = simd::dot(a, b, 4) {
         return r;
     }
     dot(a, b, 4)
 }
-#[cfg_attr(target_arch = "x86_64", cold, inline(never))]
+#[cfg_attr(
+    any(target_arch = "x86_64", target_arch = "aarch64"),
+    cold,
+    inline(never)
+)]
 fn dot(a: V128, b: V128, n: usize) -> V128 {
     let mut nan = None;
     for i in 0..n {
@@ -1360,6 +1418,200 @@ mod sse {
                 _mm_andnot_si128(hi, _mm_shuffle_epi8(be(a), k)),
             );
             words(_mm_castsi128_ps(_mm_shuffle_epi8(r, swap)))
+        }
+    }
+}
+
+/// NEON paths for the same helpers, built the same way as module `sse`:
+/// inputs and results are flushed explicitly (FPCR.FZ is not set on Android),
+/// a NaN result becomes the default NaN, and a NaN operand returns `None` so
+/// the caller runs the scalar code. Lane `i` is word `i` of a [`V128`].
+///
+/// The `unsafe` blocks only call intrinsics: NEON, FMA included, is part of
+/// every AArch64 CPU.
+#[cfg(target_arch = "aarch64")]
+#[allow(unused_unsafe)]
+mod neon {
+    use super::{DEFAULT_NAN, V128};
+    use core::arch::aarch64::*;
+
+    #[inline(always)]
+    fn u(v: V128) -> uint32x4_t {
+        // SAFETY: both are 16 bytes of plain data.
+        unsafe { core::mem::transmute::<V128, uint32x4_t>(v) }
+    }
+    #[inline(always)]
+    fn words(x: uint32x4_t) -> V128 {
+        // SAFETY: as in `u`.
+        unsafe { core::mem::transmute::<uint32x4_t, V128>(x) }
+    }
+    #[inline(always)]
+    fn f(x: uint32x4_t) -> float32x4_t {
+        unsafe { vreinterpretq_f32_u32(x) }
+    }
+    #[inline(always)]
+    fn w(x: float32x4_t) -> uint32x4_t {
+        unsafe { vreinterpretq_u32_f32(x) }
+    }
+    /// [`super::ftz`] per lane.
+    #[inline(always)]
+    fn ftz(x: float32x4_t) -> float32x4_t {
+        unsafe {
+            let x = w(x);
+            let mag = vandq_u32(x, vdupq_n_u32(0x7FFF_FFFF));
+            let small = vcltq_u32(mag, vdupq_n_u32(0x0080_0000));
+            f(vbicq_u32(x, vandq_u32(small, vdupq_n_u32(0x7FFF_FFFF))))
+        }
+    }
+    /// All ones in the lanes of `x` that are not NaNs.
+    #[inline(always)]
+    fn ordered(x: uint32x4_t) -> uint32x4_t {
+        unsafe { vceqq_f32(f(x), f(x)) }
+    }
+    /// True when any lane of `x` or `y` is a NaN.
+    #[inline(always)]
+    fn nans(x: uint32x4_t, y: uint32x4_t) -> bool {
+        unsafe { vminvq_u32(vandq_u32(ordered(x), ordered(y))) == 0 }
+    }
+    /// [`super::out`] per lane.
+    #[inline(always)]
+    fn out(r: float32x4_t) -> V128 {
+        unsafe {
+            let r = ftz(r);
+            words(vbslq_u32(vceqq_f32(r, r), w(r), vdupq_n_u32(DEFAULT_NAN)))
+        }
+    }
+    #[inline(always)]
+    fn bin(
+        a: V128,
+        b: V128,
+        op: impl FnOnce(float32x4_t, float32x4_t) -> float32x4_t,
+    ) -> Option<V128> {
+        let (x, y) = (u(a), u(b));
+        if nans(x, y) {
+            return None;
+        }
+        Some(out(op(ftz(f(x)), ftz(f(y)))))
+    }
+    #[inline(always)]
+    fn un(b: V128, op: impl FnOnce(float32x4_t) -> float32x4_t) -> Option<V128> {
+        let x = u(b);
+        if nans(x, x) {
+            return None;
+        }
+        Some(out(op(ftz(f(x)))))
+    }
+    #[inline(always)]
+    fn cmp(a: V128, b: V128, op: impl FnOnce(float32x4_t, float32x4_t) -> uint32x4_t) -> V128 {
+        words(op(ftz(f(u(a))), ftz(f(u(b)))))
+    }
+
+    #[inline(always)]
+    pub fn add(a: V128, b: V128) -> Option<V128> {
+        unsafe { bin(a, b, |x, y| vaddq_f32(x, y)) }
+    }
+    #[inline(always)]
+    pub fn sub(a: V128, b: V128) -> Option<V128> {
+        unsafe { bin(a, b, |x, y| vsubq_f32(x, y)) }
+    }
+    #[inline(always)]
+    pub fn mul(a: V128, b: V128) -> Option<V128> {
+        unsafe { bin(a, b, |x, y| vmulq_f32(x, y)) }
+    }
+    // `fmax` / `fmin` order +0 above -0, the scalar code's choice for equal zeros.
+    #[inline(always)]
+    pub fn max(a: V128, b: V128) -> Option<V128> {
+        unsafe { bin(a, b, |x, y| vmaxq_f32(x, y)) }
+    }
+    #[inline(always)]
+    pub fn min(a: V128, b: V128) -> Option<V128> {
+        unsafe { bin(a, b, |x, y| vminq_f32(x, y)) }
+    }
+    #[inline(always)]
+    pub fn refp(b: V128) -> Option<V128> {
+        unsafe { un(b, |x| vdivq_f32(vdupq_n_f32(1.0), x)) }
+    }
+    /// `fsqrt` of a negative lane gives a NaN, which `out` makes the default NaN.
+    #[inline(always)]
+    pub fn rsqrte(b: V128) -> Option<V128> {
+        unsafe { un(b, |x| vdivq_f32(vdupq_n_f32(1.0), vsqrtq_f32(x))) }
+    }
+    /// `a * c + b`, one rounding.
+    #[inline(always)]
+    pub fn madd(a: V128, c: V128, b: V128) -> Option<V128> {
+        unsafe {
+            let (x, y, z) = (u(a), u(b), u(c));
+            if nans(x, y) || nans(z, z) {
+                return None;
+            }
+            Some(out(vfmaq_f32(ftz(f(y)), ftz(f(x)), ftz(f(z)))))
+        }
+    }
+    /// `-(a * c - b)`: rounded as `a * c + -b`, then negated, so an exact
+    /// zero is -0 as in the scalar code (`fmls`, `b - a * c`, would give +0).
+    #[inline(always)]
+    pub fn nmsub(a: V128, c: V128, b: V128) -> Option<V128> {
+        unsafe {
+            let (x, y, z) = (u(a), u(b), u(c));
+            if nans(x, y) || nans(z, z) {
+                return None;
+            }
+            let r = vfmaq_f32(vnegq_f32(ftz(f(y))), ftz(f(x)), ftz(f(z)));
+            Some(out(vnegq_f32(r)))
+        }
+    }
+    /// Products in parallel, then the scalar code's left-to-right sum, each
+    /// step flushed. Only the first `n` lanes are checked for NaNs.
+    #[inline(always)]
+    pub fn dot(a: V128, b: V128, n: usize) -> Option<V128> {
+        unsafe {
+            let (x, y) = (u(a), u(b));
+            if words(vandq_u32(ordered(x), ordered(y)))[..n].contains(&0) {
+                return None;
+            }
+            let p = words(w(ftz(vmulq_f32(ftz(f(x)), ftz(f(y))))));
+            let mut s = 0.0f32;
+            for &q in &p[..n] {
+                s = super::ftz(s + f32::from_bits(q));
+            }
+            Some(out(vdupq_n_f32(s)))
+        }
+    }
+    #[inline(always)]
+    pub fn cmpeq(a: V128, b: V128) -> V128 {
+        unsafe { cmp(a, b, |x, y| vceqq_f32(x, y)) }
+    }
+    #[inline(always)]
+    pub fn cmpge(a: V128, b: V128) -> V128 {
+        unsafe { cmp(a, b, |x, y| vcgeq_f32(x, y)) }
+    }
+    #[inline(always)]
+    pub fn cmpgt(a: V128, b: V128) -> V128 {
+        unsafe { cmp(a, b, |x, y| vcgtq_f32(x, y)) }
+    }
+    #[inline(always)]
+    pub fn cmpb(a: V128, b: V128) -> V128 {
+        unsafe {
+            cmp(a, b, |p, q| {
+                let le = vcleq_f32(p, q);
+                let ge = vcgeq_f32(p, vnegq_f32(q));
+                vorrq_u32(
+                    vbicq_u32(vdupq_n_u32(0x8000_0000), le),
+                    vbicq_u32(vdupq_n_u32(0x4000_0000), ge),
+                )
+            })
+        }
+    }
+
+    /// `vperm` with `tbl` over `a || b`: bytes swapped to big-endian order
+    /// within each word, looked up by the low five bits, swapped back.
+    #[inline(always)]
+    pub fn perm(a: V128, b: V128, c: V128) -> V128 {
+        unsafe {
+            let be = |v: V128| vrev32q_u8(vreinterpretq_u8_u32(u(v)));
+            let k = vandq_u8(be(c), vdupq_n_u8(31));
+            let r = vqtbl2q_u8(uint8x16x2_t(be(a), be(b)), k);
+            words(vreinterpretq_u32_u8(vrev32q_u8(r)))
         }
     }
 }
@@ -1730,10 +1982,11 @@ mod tests {
                 s ^= s << 13;
                 s ^= s >> 7;
                 s ^= s << 17;
-                if s & 1 == 0 {
-                    EDGES[(s >> 8) as usize % EDGES.len()]
-                } else {
-                    (s >> 32) as u32
+                match s & 3 {
+                    0 | 2 => EDGES[(s >> 8) as usize % EDGES.len()],
+                    // Random denormals, or infinities and NaNs with random payloads.
+                    1 => (s >> 32) as u32 & 0x807F_FFFF | if s & 4 == 0 { 0 } else { 0x7F80_0000 },
+                    _ => (s >> 32) as u32,
                 }
             })
         }
@@ -1754,29 +2007,94 @@ mod tests {
     #[test]
     fn fast_paths_match_scalar() {
         let mut next = vectors();
-        for _ in 0..200_000 {
+        // Millions in a release build (run on every target with a fast path).
+        let n = if cfg!(debug_assertions) {
+            200_000
+        } else {
+            4_000_000
+        };
+        for _ in 0..n {
             let (a, b, c) = (next(), next(), next());
-            let ctx = format!("{a:08x?} {b:08x?} {c:08x?}");
-            assert_eq!(vaddfp(a, b), vaddfp_scalar(a, b), "vaddfp {ctx}");
-            assert_eq!(vsubfp(a, b), vsubfp_scalar(a, b), "vsubfp {ctx}");
-            assert_eq!(vmulfp(a, b), vmulfp_scalar(a, b), "vmulfp {ctx}");
-            assert_eq!(vmaxfp(a, b), vmaxfp_scalar(a, b), "vmaxfp {ctx}");
-            assert_eq!(vminfp(a, b), vminfp_scalar(a, b), "vminfp {ctx}");
-            assert_eq!(vrefp(b), vrefp_scalar(b), "vrefp {ctx}");
-            assert_eq!(vrsqrtefp(b), vrsqrtefp_scalar(b), "vrsqrtefp {ctx}");
-            assert_eq!(vmaddfp(a, c, b), vmaddfp_scalar(a, c, b), "vmaddfp {ctx}");
+            assert_eq!(
+                vaddfp(a, b),
+                vaddfp_scalar(a, b),
+                "vaddfp {a:08x?} {b:08x?} {c:08x?}"
+            );
+            assert_eq!(
+                vsubfp(a, b),
+                vsubfp_scalar(a, b),
+                "vsubfp {a:08x?} {b:08x?} {c:08x?}"
+            );
+            assert_eq!(
+                vmulfp(a, b),
+                vmulfp_scalar(a, b),
+                "vmulfp {a:08x?} {b:08x?} {c:08x?}"
+            );
+            assert_eq!(
+                vmaxfp(a, b),
+                vmaxfp_scalar(a, b),
+                "vmaxfp {a:08x?} {b:08x?} {c:08x?}"
+            );
+            assert_eq!(
+                vminfp(a, b),
+                vminfp_scalar(a, b),
+                "vminfp {a:08x?} {b:08x?} {c:08x?}"
+            );
+            assert_eq!(
+                vrefp(b),
+                vrefp_scalar(b),
+                "vrefp {a:08x?} {b:08x?} {c:08x?}"
+            );
+            assert_eq!(
+                vrsqrtefp(b),
+                vrsqrtefp_scalar(b),
+                "vrsqrtefp {a:08x?} {b:08x?} {c:08x?}"
+            );
+            assert_eq!(
+                vmaddfp(a, c, b),
+                vmaddfp_scalar(a, c, b),
+                "vmaddfp {a:08x?} {b:08x?} {c:08x?}"
+            );
             assert_eq!(
                 vnmsubfp(a, c, b),
                 vnmsubfp_scalar(a, c, b),
-                "vnmsubfp {ctx}"
+                "vnmsubfp {a:08x?} {b:08x?} {c:08x?}"
             );
-            assert_eq!(vmsum3fp(a, b), dot(a, b, 3), "vmsum3fp {ctx}");
-            assert_eq!(vmsum4fp(a, b), dot(a, b, 4), "vmsum4fp {ctx}");
-            assert_eq!(vcmpeqfp(a, b), vcmpeqfp_scalar(a, b), "vcmpeqfp {ctx}");
-            assert_eq!(vcmpgefp(a, b), vcmpgefp_scalar(a, b), "vcmpgefp {ctx}");
-            assert_eq!(vcmpgtfp(a, b), vcmpgtfp_scalar(a, b), "vcmpgtfp {ctx}");
-            assert_eq!(vcmpbfp(a, b), vcmpbfp_scalar(a, b), "vcmpbfp {ctx}");
-            assert_eq!(vperm(a, b, c), vperm_scalar(a, b, c), "vperm {ctx}");
+            assert_eq!(
+                vmsum3fp(a, b),
+                dot(a, b, 3),
+                "vmsum3fp {a:08x?} {b:08x?} {c:08x?}"
+            );
+            assert_eq!(
+                vmsum4fp(a, b),
+                dot(a, b, 4),
+                "vmsum4fp {a:08x?} {b:08x?} {c:08x?}"
+            );
+            assert_eq!(
+                vcmpeqfp(a, b),
+                vcmpeqfp_scalar(a, b),
+                "vcmpeqfp {a:08x?} {b:08x?} {c:08x?}"
+            );
+            assert_eq!(
+                vcmpgefp(a, b),
+                vcmpgefp_scalar(a, b),
+                "vcmpgefp {a:08x?} {b:08x?} {c:08x?}"
+            );
+            assert_eq!(
+                vcmpgtfp(a, b),
+                vcmpgtfp_scalar(a, b),
+                "vcmpgtfp {a:08x?} {b:08x?} {c:08x?}"
+            );
+            assert_eq!(
+                vcmpbfp(a, b),
+                vcmpbfp_scalar(a, b),
+                "vcmpbfp {a:08x?} {b:08x?} {c:08x?}"
+            );
+            assert_eq!(
+                vperm(a, b, c),
+                vperm_scalar(a, b, c),
+                "vperm {a:08x?} {b:08x?} {c:08x?}"
+            );
         }
     }
 
@@ -1826,11 +2144,32 @@ mod tests {
             t.elapsed().as_secs_f64() * 1e9 / n as f64
         }
         type Op = fn(V128, V128, V128) -> V128;
-        let ops: [(&str, Op, Op); 11] = [
+        let ops: [(&str, Op, Op); 16] = [
             (
                 "vaddfp",
                 |a, b, _| vaddfp(a, b),
                 |a, b, _| vaddfp_scalar(a, b),
+            ),
+            (
+                "vsubfp",
+                |a, b, _| vsubfp(a, b),
+                |a, b, _| vsubfp_scalar(a, b),
+            ),
+            (
+                "vminfp",
+                |a, b, _| vminfp(a, b),
+                |a, b, _| vminfp_scalar(a, b),
+            ),
+            ("vrefp", |a, _, _| vrefp(a), |a, _, _| vrefp_scalar(a)),
+            (
+                "vcmpeqfp",
+                |a, b, _| vcmpeqfp(a, b),
+                |a, b, _| vcmpeqfp_scalar(a, b),
+            ),
+            (
+                "vcmpgefp",
+                |a, b, _| vcmpgefp(a, b),
+                |a, b, _| vcmpgefp_scalar(a, b),
             ),
             (
                 "vmulfp",
