@@ -120,6 +120,45 @@ fn indexed_strip_with_dma_16_bit_indices() {
     }
 }
 
+/// Two draws of one guest index buffer with different vertices: the second
+/// binds the indices the first staged, and both land where their vertices
+/// put them.
+#[test]
+fn draws_of_one_index_buffer_share_its_staged_indices() {
+    let Some(mut d) = drawer() else { return };
+    let mut mem = memory();
+    let red = [255, 0, 0, 255];
+    let green = [0, 255, 0, 255];
+    let square = |x: f32, c| {
+        [
+            (x, 0.0, 0.0, c),
+            (x + 16.0, 0.0, 0.0, c),
+            (x, 16.0, 0.0, c),
+            (x + 16.0, 16.0, 0.0, c),
+        ]
+    };
+    mem.write_words(VERTS, &color_verts(&square(0.0, red)));
+    mem.write_words(VERTS + 0x100, &color_verts(&square(32.0, green)));
+    // Big-endian 16-bit indices 3 1 2 0 (k8in16 swaps them back).
+    mem.write_words(INDICES, &[0x0003_0001, 0x0002_0000]);
+    let mut s = Stream::default();
+    s.setup()
+        .resolve(&mut mem, W, H, false, Some((rgba(CLEAR), 0)))
+        .shader(false, &vs_color())
+        .shader(true, &ps_interp())
+        .vertex_fetch(0, VERTS, 16)
+        .draw_dma16(PRIM_TRI_STRIP, 4)
+        .vertex_fetch(0, VERTS + 0x100, 16)
+        .draw_dma16(PRIM_TRI_STRIP, 4);
+    let report = run(&mut d, &s, &mut mem);
+    assert_eq!(report.draws, 2, "{report:?}");
+    assert_eq!(report.timings.indices_reused, 1, "{report:?}");
+    let img = d.read_render_target(COLOR_KEY, 0, 0, W, H).unwrap();
+    assert_eq!(px(&img, W, 8, 8), red);
+    assert_eq!(px(&img, W, 40, 8), green);
+    assert_eq!(px(&img, W, 24, 8), CLEAR);
+}
+
 /// A quad list with a tiled 8_8_8_8 texture, nearest sampling: every
 /// pixel of the quad is exactly its texel.
 #[test]
@@ -481,6 +520,50 @@ fn pixel_shader_float_constant() {
     assert_eq!(px(&img, W, 60, 60), CLEAR);
 }
 
+/// A stage is bound only the span of float constants it reads (c7 alone
+/// here, not c0): each draw gets the values at its time, and a draw after
+/// no write to them binds the span staged before.
+#[test]
+fn float_constant_span_follows_each_draw() {
+    let Some(mut d) = drawer() else { return };
+    let mut mem = memory();
+    let black = [0, 0, 0, 255];
+    let tri = |x: f32, y: f32| {
+        color_verts(&[
+            (x, y, 0.0, black),
+            (x + 32.0, y, 0.0, black),
+            (x, y + 32.0, 0.0, black),
+        ])
+    };
+    mem.write_words(VERTS, &tri(0.0, 0.0));
+    mem.write_words(VERTS + 0x100, &tri(32.0, 32.0));
+    mem.write_words(VERTS + 0x200, &tri(0.0, 32.0));
+    let c = |v: u32| f(v as f32 / 255.0);
+    // Pixel c7 is float constant 256 + 7.
+    let c7 = SHADER_CONSTANT_FLOAT + (256 + 7) * 4;
+    let mut s = Stream::default();
+    s.setup()
+        .resolve(&mut mem, W, H, false, Some((rgba(CLEAR), 0)))
+        .shader(false, &vs_color())
+        .shader(true, &ps_const_n(7))
+        .regs(c7, &[c(51), c(102), c(204), c(255)])
+        .vertex_fetch(0, VERTS, 12)
+        .draw_auto(PRIM_TRI_LIST, 3)
+        .regs(c7, &[c(255), c(153), c(0), c(255)])
+        .vertex_fetch(0, VERTS + 0x100, 12)
+        .draw_auto(PRIM_TRI_LIST, 3)
+        .vertex_fetch(0, VERTS + 0x200, 12)
+        .draw_auto(PRIM_TRI_LIST, 3);
+    let report = run(&mut d, &s, &mut mem);
+    assert_eq!(report.draws, 3, "{report:?}");
+    assert!(report.unsupported.is_empty(), "{report:?}");
+    let img = d.read_render_target(COLOR_KEY, 0, 0, W, H).unwrap();
+    assert_eq!(px(&img, W, 4, 4), [51, 102, 204, 255]);
+    assert_eq!(px(&img, W, 40, 36), [255, 153, 0, 255]);
+    assert_eq!(px(&img, W, 4, 36), [255, 153, 0, 255]);
+    assert_eq!(px(&img, W, 60, 60), CLEAR);
+}
+
 /// Depth test hides a farther triangle drawn later; an alpha-blended
 /// triangle without depth test mixes with what is below.
 #[test]
@@ -663,6 +746,28 @@ fn late_front_buffer_is_one_swap_behind() {
     plain.swap_at(DEST + 0x4_0000, W, H);
     assert_eq!(run(&mut d, &plain, &mut mem).frames.len(), 1);
     assert!(run(&mut d, &next, &mut mem).frames.is_empty());
+}
+
+/// The late copy is shown through fetch constant 0's swizzle too. The host
+/// turns late front buffers on, so this is the path a game's frames take.
+#[test]
+fn late_front_buffer_applies_fetch_constant_0_swizzle() {
+    let Some(mut d) = drawer() else { return };
+    let mut mem = memory();
+    let mut s = Stream::default();
+    draw_pattern(&mut mem, &mut s);
+    let zyxw = 2 | (1 << 3) | (3 << 9);
+    s.regs(SHADER_CONSTANT_FETCH, &[2, DEST, 0, zyxw << 1, 0, 0])
+        .swap(W, H);
+    let sync = run(&mut d, &s, &mut mem).frames.remove(0);
+    let rt = d.read_render_target(COLOR_KEY, 0, 0, W, H).unwrap();
+    assert_ne!(sync.rgba8, rt);
+
+    d.late_front_buffer = true;
+    assert!(run(&mut d, &s, &mut mem).frames.is_empty());
+    let r = run(&mut d, &s, &mut mem);
+    assert_eq!(r.frames.len(), 1, "{r:?}");
+    assert_eq!(r.frames[0].rgba8, sync.rgba8);
 }
 
 /// A frame bundle of two frames, saved and read back, replays to the same

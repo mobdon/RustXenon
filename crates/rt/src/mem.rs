@@ -159,11 +159,25 @@ impl GuestMemory {
     /// record reset; `None` when writes are not recorded or were too many
     /// to list: then any byte may have changed.
     pub fn take_written(&self) -> Option<Vec<(u64, u64)>> {
-        if !self.watched {
-            return None;
+        self.take_written_in(0, self.len)
+    }
+
+    /// [`Self::take_written`] for the offsets `[lo, hi)` alone (page
+    /// aligned): the OS walks only those pages, and writes elsewhere stay
+    /// recorded. The offsets it gives are still from the start.
+    pub fn take_written_in(&self, lo: usize, hi: usize) -> Option<Vec<(u64, u64)>> {
+        let hi = hi.min(self.len);
+        if !self.watched || lo >= hi {
+            return self.watched.then(Vec::new);
         }
-        let (pages, size) = crate::watch::take_written(self.base.as_ptr(), self.len)?;
-        Some(merge_pages(&pages, size))
+        // SAFETY: lo < hi <= len, inside the allocation.
+        let p = unsafe { self.base.as_ptr().add(lo) };
+        let (pages, size) = crate::watch::take_written(p, hi - lo)?;
+        let mut out = merge_pages(&pages, size);
+        for r in &mut out {
+            *r = (r.0 + lo as u64, r.1 + lo as u64);
+        }
+        Some(out)
     }
 
     /// Reserves `size` bytes with no access: only ranges passed to
@@ -397,6 +411,25 @@ mod tests {
             }
             None => assert!(!m.watched()),
         }
+    }
+
+    /// A query of part of the memory lists the writes there, at offsets
+    /// from the start, and leaves those elsewhere for a later query.
+    #[test]
+    fn written_in_a_range_lists_that_range_alone() {
+        let m = GuestMemory::new_watched(1 << 20);
+        if !m.watched() {
+            return;
+        }
+        let _ = m.take_written();
+        m.write_u32(0x1000, 1);
+        m.write_u32(0x8_0000, 2);
+        let inside = m.take_written_in(0x4_0000, 0xC_0000).unwrap();
+        assert_eq!(inside, [(0x8_0000, 0x8_1000)]);
+        assert_eq!(m.take_written_in(0x4_0000, 0xC_0000), Some(vec![]));
+        // The write outside the range is still listed.
+        assert_eq!(m.take_written(), Some(vec![(0x1000, 0x2000)]));
+        assert_eq!(m.take_written_in(0x4_0000, 0x4_0000), Some(vec![]));
     }
 
     #[test]

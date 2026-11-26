@@ -272,6 +272,15 @@ pub fn export(reg: u32, src: AluSrc) -> Instr {
     Instr::Alu(AluInstr::vector(VectorOp::Max, reg, mask("xyzw"), &[src, src]).exported(reg))
 }
 
+/// Exports float constant c`n` read relative to aL (0 outside a loop): a
+/// dynamic index, so the stage binds all 256 of its float constants.
+fn export_dynamic(reg: u32, n: u32) -> Instr {
+    let c = AluSrc::constant(n, SWZ_XYZW);
+    let mut a = AluInstr::vector(VectorOp::Max, reg, mask("xyzw"), &[c, c]).exported(reg);
+    a.const0_relative = true;
+    Instr::Alu(a)
+}
+
 /// Vertex shader: vertex = 4 dwords at vf0 (x, y, z float, 8_8_8_8
 /// colour); oPos = (x, y, z, 1), o0 = colour.
 pub fn vs_color() -> Vec<u32> {
@@ -319,11 +328,44 @@ pub fn ps_interp() -> Vec<u32> {
     assemble(&[exec(0, 1, true)], &[export(0, r(0))])
 }
 
+/// `vs_color` that also reads a float constant by a dynamic index (into an
+/// interpolator nothing reads), so it binds all 256 of the vertex stage.
+pub fn vs_color_all_consts() -> Vec<u32> {
+    let mut pos = VertexFetch::full(1, 0, 0, VertexFormat::F32_32_32_FLOAT, 4, 0);
+    pos.dest_swizzle = fetch_dest_swz("xyz1");
+    let mut col = VertexFetch::full(2, 0, 0, VertexFormat::F8_8_8_8, 4, 3);
+    col.mini = true;
+    assemble(
+        &[exec(0, 5, true)],
+        &[
+            Instr::Fetch(FetchInstr::Vertex(pos)),
+            Instr::Fetch(FetchInstr::Vertex(col)),
+            export(62, r(1)),
+            export_dynamic(1, 0),
+            export(0, r(2)),
+        ],
+    )
+}
+
+/// `ps_interp` that first reads a float constant by a dynamic index, so
+/// it binds all 256 of the pixel stage; the colour is still interpolator 0.
+pub fn ps_interp_all_consts() -> Vec<u32> {
+    assemble(
+        &[exec(0, 2, true)],
+        &[export_dynamic(0, 0), export(0, r(0))],
+    )
+}
+
 /// Pixel shader: oC0 = pixel constant c0.
 pub fn ps_const() -> Vec<u32> {
+    ps_const_n(0)
+}
+
+/// Pixel shader: oC0 = pixel constant c`n`.
+pub fn ps_const_n(n: u32) -> Vec<u32> {
     assemble(
         &[exec(0, 1, true)],
-        &[export(0, AluSrc::constant(0, SWZ_XYZW))],
+        &[export(0, AluSrc::constant(n, SWZ_XYZW))],
     )
 }
 

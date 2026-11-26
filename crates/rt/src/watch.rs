@@ -51,7 +51,21 @@ mod os {
     }
 
     pub fn take_written(p: *mut u8, len: usize) -> Option<(Vec<usize>, usize)> {
-        let mut addrs = vec![std::ptr::null_mut(); MAX_PAGES];
+        // Kept per thread: at 512 KiB the heap hands a new one to the OS
+        // and back on every call, a frame's worth of page faults each time.
+        thread_local! {
+            static ADDRS: std::cell::RefCell<Vec<*mut core::ffi::c_void>> =
+                const { std::cell::RefCell::new(Vec::new()) };
+        }
+        ADDRS.with_borrow_mut(|addrs| take_written_into(addrs, p, len))
+    }
+
+    fn take_written_into(
+        addrs: &mut Vec<*mut core::ffi::c_void>,
+        p: *mut u8,
+        len: usize,
+    ) -> Option<(Vec<usize>, usize)> {
+        addrs.resize(MAX_PAGES, std::ptr::null_mut());
         let mut count = addrs.len();
         let mut page = 0u32;
         // SAFETY: p..p+len is the watched allocation; `addrs` holds `count`.

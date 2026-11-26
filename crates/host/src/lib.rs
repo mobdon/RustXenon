@@ -52,6 +52,9 @@ struct Activity {
     sp: AtomicU32,
     /// First argument of the last import call.
     arg0: AtomicU32,
+    /// r3 at the last guest call: `this` of a virtual call, so a stop at a
+    /// wild call target can show the object the pointer came from.
+    r3: AtomicU32,
     /// The last call targets, written only by the owning thread at
     /// `head % 8`, so any thread can print them on a stop.
     ring: [AtomicU32; 8],
@@ -182,6 +185,16 @@ fn backtrace_from(rt: &Runtime, mut sp: u32) -> Vec<u32> {
         sp = prev;
     }
     out
+}
+
+/// The eight words at `a`, as far as guest memory is readable there.
+fn words_at(rt: &Runtime, a: u32) -> Vec<u32> {
+    use xenon_rt::guard::readable;
+    (0..8)
+        .map(|i| a.wrapping_add(4 * i))
+        .take_while(|&p| p % 4 == 0 && p as usize + 4 <= GUEST_MEMORY && readable(p, 4))
+        .map(|p| rt.mem.read_u32(p))
+        .collect()
 }
 
 pub fn runtime() -> Arc<Runtime> {
@@ -349,6 +362,7 @@ fn trace(c: &Context, addr: u32) {
         m.head.store(h.wrapping_add(1), Ordering::Relaxed);
         m.call.store(addr, Ordering::Relaxed);
         m.sp.store(c.r[1] as u32, Ordering::Relaxed);
+        m.r3.store(c.r[3] as u32, Ordering::Relaxed);
     });
     if is_thunk(addr) {
         if cpu_profile::on() {
@@ -736,6 +750,16 @@ fn stop(why: &str) -> ! {
             "guest return addresses: {}",
             hex_list(&backtrace(rt))
         ));
+        // For a virtual call: the object, then its vtable.
+        let r3 = MINE.with(|m| m.r3.load(Ordering::Relaxed));
+        let object = words_at(rt, r3);
+        log(&format!("last call's r3 {r3:#010x}: {}", hex_list(&object)));
+        if let Some(&v) = object.first() {
+            log(&format!(
+                "words at {v:#010x}: {}",
+                hex_list(&words_at(rt, v))
+            ));
+        }
     }
     report();
     std::process::exit(101);
@@ -861,10 +885,15 @@ mod tests {
 
     #[test]
     fn ring_keeps_the_last_eight_calls_and_wait_marker_clears() {
-        let c = xenon_rt::Context::new();
+        let mut c = xenon_rt::Context::new();
         for a in 1..=10u32 {
+            c.r[3] = u64::from(0x4000_0000 + a);
             super::trace(&c, 0x8200_0000 + 4 * a);
         }
+        assert_eq!(
+            super::MINE.with(|m| m.r3.load(super::Ordering::Relaxed)),
+            0x4000_000A
+        );
         let want: Vec<u32> = (3..=10).map(|a| 0x8200_0000 + 4 * a).collect();
         assert_eq!(super::MINE.with(|m| m.recent()), want);
         assert_eq!(super::last_call(), 0x8200_0028);
