@@ -6,8 +6,10 @@
 //! device's channels ([`to_channels`]). The ring never blocks either side
 //! for longer than a copy: when the callback asks for more than is queued
 //! it plays silence (an underflow), and when the mix arrives faster than the
-//! device plays it the oldest samples go (an overflow), so latency stays
-//! under [`MAX_MS`].
+//! device plays it the ring cuts back once to its target level (an
+//! overflow). Between those, [`Speaker::write`] steers the resampling rate
+//! by up to [`MAX_STEER`] from how full the ring is, so a host clock that
+//! runs a little fast or slow does not drift into either.
 //!
 //! Everything but [`Speaker::open`] is pure and tests anywhere. The device
 //! side uses `cpal` on Windows only; elsewhere [`Speaker::open`] reports that
@@ -15,19 +17,28 @@
 
 use crate::{Sink, SAMPLE_RATE};
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-/// Most sound the ring holds; older samples are dropped past it.
+/// Sound the ring may hold before it cuts back to its target, unless the
+/// device pulls more than half of this at once.
 pub const MAX_MS: usize = 100;
 /// Sound the ring gathers before it plays, at start and after an underflow,
 /// so the 5.33 ms mix ticks and the device's larger pulls do not collide.
+/// It is also the level [`Speaker::write`] steers towards.
 pub const START_MS: usize = 50;
+/// Largest change to the resampling rate the fill level may make (0.5%).
+pub const MAX_STEER: f64 = 0.005;
+/// Rate change per unit of fill error ((fill - target) / target).
+const STEER_GAIN: f64 = 0.01;
 
 /// Interleaved stereo at the device rate, between the mixer and the device.
 pub struct Ring {
     buf: VecDeque<f32>,
     cap: usize,
     start: usize,
+    /// Largest pull seen, in samples.
+    max_pull: usize,
     playing: bool,
     /// Whether anything was ever pushed: silence before the first push is
     /// not an underflow.
@@ -46,6 +57,7 @@ impl Ring {
             buf: VecDeque::with_capacity(samples(MAX_MS)),
             cap: samples(MAX_MS),
             start: samples(START_MS),
+            max_pull: 0,
             playing: false,
             started: false,
             underflow: 0,
@@ -62,20 +74,31 @@ impl Ring {
         self.buf.is_empty()
     }
 
-    /// Queues interleaved stereo, dropping the oldest past the cap.
+    /// The level, in samples, to start playing at and to steer towards:
+    /// [`START_MS`], or the largest pull if that is more.
+    pub fn target(&self) -> usize {
+        self.start.max(self.max_pull)
+    }
+
+    /// Queues interleaved stereo. Past the cap (or twice the largest pull)
+    /// it drops the oldest down to [`Ring::target`] in one cut, so a burst
+    /// costs one jump rather than a trim on every later push.
     pub fn push(&mut self, stereo: &[f32]) {
         self.started = true;
         self.buf.extend(stereo);
-        let over = self.buf.len().saturating_sub(self.cap) & !1;
-        self.buf.drain(..over);
-        self.overflow += over as u64 / 2;
+        if self.buf.len() > self.cap.max(2 * self.max_pull) {
+            let over = (self.buf.len() - self.target()) & !1;
+            self.buf.drain(..over);
+            self.overflow += over as u64 / 2;
+        }
     }
 
     /// Fills `out` (interleaved stereo) from the ring, silence for what is
-    /// missing. After running dry it stays silent until [`START_MS`] is
-    /// queued again.
+    /// missing. It starts, and after running dry starts again, only once
+    /// [`Ring::target`] is queued, so a whole pull is there to play.
     pub fn pop_into(&mut self, out: &mut [f32]) {
-        if !self.playing && self.buf.len() >= self.start {
+        self.max_pull = self.max_pull.max(out.len());
+        if !self.playing && self.buf.len() >= self.target() {
             self.playing = true;
         }
         let n = if self.playing {
@@ -115,12 +138,9 @@ impl Resampler {
         }
     }
 
-    /// Appends `input` resampled to `out`.
+    /// Appends `input` resampled to `out`. Output runs one frame behind the
+    /// input, also at equal rates, so the rate can be steered at any time.
     pub fn process(&mut self, input: &[f32], out: &mut Vec<f32>) {
-        if self.step == 1.0 {
-            out.extend_from_slice(input);
-            return;
-        }
         let n = input.len() / 2;
         let at = |i: usize| match i {
             0 => self.prev,
@@ -157,12 +177,36 @@ pub fn to_channels(stereo: &[f32], channels: usize, mut put: impl FnMut(f32)) {
     }
 }
 
+/// What the mixer and the device callback share.
+struct Shared {
+    ring: Mutex<Ring>,
+    /// Set by the device's error callback: the stream has stopped.
+    dead: AtomicBool,
+    /// Stereo frames of silence played because the mixer held the ring.
+    busy: AtomicU64,
+}
+
+impl Shared {
+    #[cfg_attr(not(windows), allow(dead_code))] // only open and tests make one
+    fn new(rate: u32) -> Arc<Self> {
+        Arc::new(Self {
+            ring: Mutex::new(Ring::new(rate)),
+            dead: AtomicBool::new(false),
+            busy: AtomicU64::new(0),
+        })
+    }
+}
+
 /// A [`Sink`] that plays on the default output device.
 pub struct Speaker {
-    ring: Arc<Mutex<Ring>>,
+    shared: Arc<Shared>,
     resampler: Resampler,
     scratch: Vec<f32>,
     rate: u32,
+    /// The unsteered resampling step.
+    base: f64,
+    /// Ring level after each write, smoothed, in samples.
+    fill: f64,
 }
 
 fn lock(r: &Mutex<Ring>) -> std::sync::MutexGuard<'_, Ring> {
@@ -171,12 +215,15 @@ fn lock(r: &Mutex<Ring>) -> std::sync::MutexGuard<'_, Ring> {
 
 impl Speaker {
     #[cfg_attr(not(windows), allow(dead_code))] // only open and tests make one
-    fn new(ring: Arc<Mutex<Ring>>, rate: u32) -> Self {
+    fn new(shared: Arc<Shared>, rate: u32) -> Self {
+        let resampler = Resampler::new(SAMPLE_RATE, rate);
         Self {
-            ring,
-            resampler: Resampler::new(SAMPLE_RATE, rate),
+            shared,
+            base: resampler.step,
+            resampler,
             scratch: Vec::new(),
             rate,
+            fill: 0.0,
         }
     }
 
@@ -187,9 +234,12 @@ impl Speaker {
 
     /// (underflow, overflow) so far, in milliseconds of sound.
     pub fn counts_ms(&self) -> (u64, u64) {
-        let r = lock(&self.ring);
+        let (u, o) = {
+            let r = lock(&self.shared.ring);
+            (r.underflow, r.overflow)
+        };
         let ms = |f: u64| f * 1000 / self.rate as u64;
-        (ms(r.underflow), ms(r.overflow))
+        (ms(u + self.shared.busy.load(Ordering::Relaxed)), ms(o))
     }
 
     /// Opens the default output device and starts it playing silence.
@@ -199,13 +249,14 @@ impl Speaker {
         std::thread::Builder::new()
             .name("speaker".into())
             .spawn(move || match device::start() {
-                Ok((stream, rate, ring)) => {
-                    let _ = tx.send(Ok((rate, ring)));
+                Ok((stream, rate, shared)) => {
+                    let _ = tx.send(Ok((rate, shared.clone())));
                     // The stream plays while it lives, and it may not move
-                    // to another thread, so this one keeps it.
+                    // to another thread, so this one keeps it until the
+                    // device is lost.
                     let _stream = stream;
-                    loop {
-                        std::thread::park();
+                    while !shared.dead.load(Ordering::Relaxed) {
+                        std::thread::park_timeout(std::time::Duration::from_secs(1));
                     }
                 }
                 Err(e) => {
@@ -213,8 +264,8 @@ impl Speaker {
                 }
             })
             .map_err(|e| e.to_string())?;
-        let (rate, ring) = rx.recv().map_err(|e| e.to_string())??;
-        Ok(Self::new(ring, rate))
+        let (rate, shared) = rx.recv().map_err(|e| e.to_string())??;
+        Ok(Self::new(shared, rate))
     }
 
     /// No output device support on this platform.
@@ -225,21 +276,36 @@ impl Speaker {
 }
 
 impl Sink for Speaker {
+    /// Fails once the device is lost; until then a full ring drops and
+    /// counts instead.
     fn write(&mut self, stereo: &[f32]) -> std::io::Result<()> {
+        if self.shared.dead.load(Ordering::Relaxed) {
+            return Err(std::io::Error::other("the output device stopped"));
+        }
         self.scratch.clear();
         self.resampler.process(stereo, &mut self.scratch);
-        lock(&self.ring).push(&self.scratch);
+        let (len, target) = {
+            let mut r = lock(&self.shared.ring);
+            r.push(&self.scratch);
+            (r.len(), r.target())
+        };
+        // The level swings by a device pull between writes, so steer on an
+        // average rather than on each reading.
+        self.fill += (len as f64 - self.fill) / 32.0;
+        let err = (self.fill - target as f64) / target as f64;
+        self.resampler.step = self.base * (1.0 + (STEER_GAIN * err).clamp(-MAX_STEER, MAX_STEER));
         Ok(())
     }
 }
 
 #[cfg(windows)]
 mod device {
-    use super::{lock, to_channels, Ring};
+    use super::{to_channels, Shared, MAX_MS};
     use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-    use std::sync::{Arc, Mutex};
+    use std::sync::atomic::Ordering;
+    use std::sync::{Arc, TryLockError};
 
-    type Started = (cpal::Stream, u32, Arc<Mutex<Ring>>);
+    type Started = (cpal::Stream, u32, Arc<Shared>);
 
     pub fn start() -> Result<Started, String> {
         let dev = cpal::default_host()
@@ -249,37 +315,62 @@ mod device {
         let format = supported.sample_format();
         let config: cpal::StreamConfig = supported.into();
         let rate = config.sample_rate.0;
-        let ring = Arc::new(Mutex::new(Ring::new(rate)));
+        let shared = Shared::new(rate);
         let stream = match format {
-            cpal::SampleFormat::F32 => build::<f32>(&dev, &config, ring.clone()),
-            cpal::SampleFormat::I16 => build::<i16>(&dev, &config, ring.clone()),
-            cpal::SampleFormat::U16 => build::<u16>(&dev, &config, ring.clone()),
+            cpal::SampleFormat::F32 => build::<f32>(&dev, &config, shared.clone()),
+            cpal::SampleFormat::I16 => build::<i16>(&dev, &config, shared.clone()),
+            cpal::SampleFormat::U16 => build::<u16>(&dev, &config, shared.clone()),
             f => return Err(format!("device sample format {f} is not handled")),
         }?;
         stream.play().map_err(|e| e.to_string())?;
-        Ok((stream, rate, ring))
+        Ok((stream, rate, shared))
     }
 
     fn build<T: cpal::SizedSample + cpal::FromSample<f32>>(
         dev: &cpal::Device,
         config: &cpal::StreamConfig,
-        ring: Arc<Mutex<Ring>>,
+        shared: Arc<Shared>,
     ) -> Result<cpal::Stream, String> {
         let channels = config.channels as usize;
-        let mut stereo = Vec::new();
+        // Allocated here, never in the callback: pulls go in chunks of at
+        // most this many frames.
+        let frames = (config.sample_rate.0 as usize * MAX_MS / 1000).max(1);
+        let mut stereo = Vec::with_capacity(frames * 2);
+        let on_error = shared.clone();
         dev.build_output_stream(
             config,
             move |data: &mut [T], _: &cpal::OutputCallbackInfo| {
-                stereo.resize(data.len() / channels * 2, 0.0);
-                lock(&ring).pop_into(&mut stereo);
-                let mut out = data.iter_mut();
-                to_channels(&stereo, channels, |v| {
-                    if let Some(o) = out.next() {
-                        *o = T::from_sample(v);
+                for part in data.chunks_mut(frames * channels) {
+                    stereo.clear();
+                    stereo.resize(part.len() / channels * 2, 0.0);
+                    // Never wait on the mixer from the device thread: if it
+                    // holds the ring (it is preempted mid-copy), this pull
+                    // plays silence and is counted, rather than the device
+                    // missing its period behind a lower-priority thread.
+                    let ring = match shared.ring.try_lock() {
+                        Ok(r) => Some(r),
+                        Err(TryLockError::Poisoned(e)) => Some(e.into_inner()),
+                        Err(TryLockError::WouldBlock) => None,
+                    };
+                    match ring {
+                        Some(mut r) => r.pop_into(&mut stereo),
+                        None => {
+                            let n = stereo.len() as u64 / 2;
+                            shared.busy.fetch_add(n, Ordering::Relaxed);
+                        }
                     }
-                });
+                    let mut out = part.iter_mut();
+                    to_channels(&stereo, channels, |v| {
+                        if let Some(o) = out.next() {
+                            *o = T::from_sample(v);
+                        }
+                    });
+                }
             },
-            |e| eprintln!("audio: speaker: {e}"),
+            move |e| {
+                eprintln!("audio: speaker: {e}");
+                on_error.dead.store(true, Ordering::Relaxed);
+            },
             None,
         )
         .map_err(|e| e.to_string())
@@ -312,14 +403,17 @@ mod tests {
     }
 
     #[test]
-    fn ring_overflow_drops_oldest() {
+    fn ring_overflow_cuts_once_to_target() {
         let mut r = Ring::new(1000);
         let v: Vec<f32> = (0..250).map(|i| i as f32).collect();
         r.push(&v);
-        assert_eq!((r.len(), r.overflow), (200, 25));
+        assert_eq!((r.len(), r.overflow), (100, 75));
         let mut out = [0.0; 4];
         r.pop_into(&mut out);
-        assert_eq!(out, [50.0, 51.0, 52.0, 53.0]);
+        assert_eq!(out, [150.0, 151.0, 152.0, 153.0]);
+        // Below the cap again, later pushes are not trimmed.
+        r.push(&[0.0; 90]);
+        assert_eq!((r.len(), r.overflow), (186, 75));
     }
 
     #[test]
@@ -341,6 +435,45 @@ mod tests {
         r.pop_into(&mut out);
         assert!(out.iter().all(|&s| s == 0.0));
         assert_eq!(r.underflow, 15);
+    }
+
+    #[test]
+    fn ring_waits_for_a_whole_pull() {
+        // Start level 100 samples, but the device pulls 120 at a time.
+        let mut r = Ring::new(1000);
+        let mut out = [1.0; 120];
+        r.pop_into(&mut out);
+        r.push(&[0.5; 110]);
+        r.pop_into(&mut out);
+        assert!(out.iter().all(|&s| s == 0.0), "110 queued is not a pull");
+        assert_eq!(r.len(), 110);
+        r.push(&[0.5; 10]);
+        r.pop_into(&mut out);
+        assert!(out.iter().all(|&s| s == 0.5));
+        // From here, a pull's worth a pull plays without a gap.
+        let u = r.underflow;
+        for _ in 0..10 {
+            r.push(&[0.5; 60]);
+            r.push(&[0.5; 60]);
+            r.pop_into(&mut out);
+        }
+        assert_eq!((r.underflow, r.overflow), (u, 0));
+    }
+
+    #[test]
+    fn ring_serves_pulls_larger_than_the_cap() {
+        // Cap 200 samples; the device pulls 240.
+        let mut r = Ring::new(1000);
+        let mut out = [1.0; 240];
+        let mut counts = Vec::new();
+        for _ in 0..10 {
+            r.push(&[0.5; 120]);
+            r.push(&[0.5; 120]);
+            r.pop_into(&mut out);
+            counts.push((r.underflow, r.overflow));
+        }
+        assert!(out.iter().all(|&s| s == 0.5));
+        assert!(counts[1..].iter().all(|&c| c == counts[1]), "{counts:?}");
     }
 
     #[test]
@@ -381,10 +514,12 @@ mod tests {
     }
 
     #[test]
-    fn resample_same_rate_passes_through() {
+    fn resample_same_rate_keeps_samples_one_frame_late() {
+        let mut rs = Resampler::new(48_000, 48_000);
         let mut out = Vec::new();
-        Resampler::new(48_000, 48_000).process(&[0.1, 0.2, 0.3, 0.4], &mut out);
-        assert_eq!(out, [0.1, 0.2, 0.3, 0.4]);
+        rs.process(&[0.1, 0.2, 0.3, 0.4], &mut out);
+        rs.process(&[0.5, 0.6], &mut out);
+        assert_eq!(out, [0.0, 0.0, 0.1, 0.2, 0.3, 0.4]);
     }
 
     #[test]
@@ -405,13 +540,53 @@ mod tests {
 
     #[test]
     fn speaker_resamples_into_ring() {
-        let ring = Arc::new(Mutex::new(Ring::new(44_100)));
-        let mut sp = Speaker::new(ring.clone(), 44_100);
+        let shared = Shared::new(44_100);
+        let mut sp = Speaker::new(shared.clone(), 44_100);
         for _ in 0..10 {
             sp.write(&[0.1; 512]).unwrap();
         }
-        let frames = lock(&ring).len() / 2;
-        assert!(frames.abs_diff(2560 * 441 / 480) <= 1, "{frames}");
+        let frames = lock(&shared.ring).len() / 2;
+        // Within the steering range of 2560 frames at 44.1 kHz.
+        let want = 2560 * 441 / 480;
+        assert!(frames.abs_diff(want) <= want / 100, "{frames}");
         assert_eq!(sp.counts_ms(), (0, 0));
+    }
+
+    #[test]
+    fn speaker_steers_rate_from_fill() {
+        let shared = Shared::new(48_000);
+        let mut sp = Speaker::new(shared.clone(), 48_000);
+        // Nearly empty: play slower than the mix arrives, to fill up.
+        sp.write(&[0.1; 512]).unwrap();
+        assert!((sp.resampler.step - (1.0 - MAX_STEER)).abs() < 1e-9);
+        // Nobody pulls, so the ring stays above its target: speed up.
+        for _ in 0..500 {
+            sp.write(&[0.1; 512]).unwrap();
+        }
+        let step = sp.resampler.step;
+        assert!(step > 1.0 && step <= 1.0 + MAX_STEER + 1e-9, "{step}");
+        // Drained so each write lands on the target, the rate settles back
+        // to the device's own.
+        for _ in 0..2000 {
+            sp.write(&[0.1; 512]).unwrap();
+            let mut r = lock(&shared.ring);
+            let keep = r.target() - 512;
+            let extra = r.len().saturating_sub(keep) & !1;
+            r.buf.drain(..extra);
+        }
+        assert!(
+            (sp.resampler.step - 1.0).abs() < 1e-4,
+            "{}",
+            sp.resampler.step
+        );
+    }
+
+    #[test]
+    fn speaker_fails_once_device_is_lost() {
+        let shared = Shared::new(48_000);
+        let mut sp = Speaker::new(shared.clone(), 48_000);
+        sp.write(&[0.1; 512]).unwrap();
+        shared.dead.store(true, Ordering::Relaxed);
+        assert!(sp.write(&[0.1; 512]).is_err());
     }
 }

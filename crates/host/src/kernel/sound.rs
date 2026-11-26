@@ -224,7 +224,10 @@ pub fn tick() {
         }
     }
     if let Some(s) = o.speaker.as_mut() {
-        let _ = s.write(&mix); // never fails: a full ring drops and counts
+        if let Err(e) = s.write(&mix) {
+            crate::log(&format!("audio: speaker stopped: {e}"));
+            o.speaker = None;
+        }
     }
     o.frames += 1;
 }

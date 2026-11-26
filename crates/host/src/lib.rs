@@ -2,7 +2,8 @@
 //!
 //! The first milestone is headless: load the player's own executable and
 //! unpacked game folder, run the title with the system calls replaced
-//! ([`kernel`]), and report how far it got. No window, no sound.
+//! ([`kernel`]), and report how far it got. The default run is headless:
+//! no window or sound unless `--window` or `--sound` is given.
 //!
 //! A generated game crate calls [`run`] with the SHA-256 it was built from
 //! and the register functions of its code crates.
