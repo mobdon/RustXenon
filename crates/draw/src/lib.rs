@@ -287,6 +287,12 @@ struct Mirror {
     checked: Vec<bool>,
     /// Textures decoded from the buffer, by fetch constant.
     views: HashMap<[u32; 6], Kept>,
+    /// Resolve bind groups writing into the buffer, by source texture and
+    /// `resolve_pipelines` entry, the parameters in the arena at a dynamic
+    /// offset. They hold the buffer, so they go when it does; also dropped
+    /// when the arena is replaced, and at the end of a replay for textures
+    /// no longer kept.
+    groups: HashMap<(wgpu::Texture, usize), wgpu::BindGroup>,
 }
 
 /// A texture decoded from a [`Mirror`].
@@ -1441,11 +1447,6 @@ pub struct Drawer {
     /// The clear bind group over `arena`, its value at a dynamic offset.
     /// Dropped when the arena is replaced.
     clear_group: Option<wgpu::BindGroup>,
-    /// Resolve bind groups by kept resolve buffer, source texture and
-    /// [`Self::resolve_pipelines`] entry, the parameters in `arena` at a
-    /// dynamic offset. Dropped when the arena is replaced, and at the end
-    /// of a replay for buffers and textures no longer kept.
-    resolve_groups: HashMap<(wgpu::Buffer, wgpu::Texture, usize), wgpu::BindGroup>,
     /// Views of render target textures for clears, kept as long as the
     /// target.
     target_views: HashMap<wgpu::Texture, wgpu::TextureView>,
@@ -1672,7 +1673,7 @@ const ARENA_GROUP_CAP: usize = 4096;
 /// Texture bind groups kept between evictions and replay ends.
 const TEXTURE_GROUP_CAP: usize = 4096;
 
-/// Resolve bind groups kept between replay ends.
+/// Resolve bind groups one kept resolve buffer keeps between replay ends.
 const RESOLVE_GROUP_CAP: usize = 1024;
 
 /// Bytes of each upload staging chunk, and the most one belt write takes.
@@ -2467,7 +2468,6 @@ impl Drawer {
             texture_memo_epoch: 0,
             arena_groups: HashMap::default(),
             clear_group: None,
-            resolve_groups: HashMap::default(),
             target_views: HashMap::default(),
             staged: Vec::new(),
             arena: None,
@@ -2930,11 +2930,12 @@ impl Drawer {
         self.drop_targets(&mut report);
         // Views and resolve groups hold their textures and buffers: only
         // those of kept targets and kept resolves stay.
-        let (targets, mirrors) = (&self.targets, &self.mirrors);
+        let targets = &self.targets;
         let live = |tex: &wgpu::Texture| targets.values().any(|t| t == tex);
         self.target_views.retain(|t, _| live(t));
-        (self.resolve_groups)
-            .retain(|(buf, tex, _), _| live(tex) && mirrors.iter().any(|m| m.buf == *buf));
+        for m in &mut self.mirrors {
+            m.groups.retain(|(tex, _), _| live(tex));
+        }
         self.timings.edges += t.elapsed();
         // Counts made where only the report is mutable (durations there
         // are zero).
@@ -2950,6 +2951,9 @@ impl Drawer {
         tracked: &mut Tracked,
         report: &mut Report,
     ) -> Result<(), Error> {
+        // One clock read per command, two for those timing their own phases:
+        // `mark` carries the end of the previous command forward.
+        let mut mark = Instant::now();
         for c in commands {
             let mem = &mut *tracked;
             // Draws, resolves and swaps time their own phases; the rest,
@@ -2958,7 +2962,6 @@ impl Drawer {
                 c,
                 Command::Draw(_) | Command::Resolve(_) | Command::Swap { .. }
             );
-            let mut t = Instant::now();
             let done = match c {
                 Command::WriteRegisters { base, values } => {
                     self.regs.set_many(*base, values);
@@ -3039,7 +3042,7 @@ impl Drawer {
                 _ => Ok(()),
             };
             if own {
-                t = Instant::now();
+                mark = Instant::now();
             }
             for (lo, hi) in tracked.written.drain(..) {
                 self.forget_guest(lo, hi);
@@ -3056,7 +3059,9 @@ impl Drawer {
                 Err(Skip::Fatal(e)) => return Err(e),
             }
             self.check_uncaptured()?;
-            self.timings.commands += t.elapsed();
+            let now = Instant::now();
+            self.timings.commands += now - mark;
+            mark = now;
         }
         Ok(())
     }
@@ -3368,6 +3373,7 @@ impl Drawer {
             hashes,
             checked,
             views: HashMap::default(),
+            groups: HashMap::default(),
         });
         Ok(Some(self.mirrors.len() - 1))
     }
@@ -3543,7 +3549,7 @@ impl Drawer {
                 self.staged = Vec::with_capacity(size.min(STAGED_RESERVE) as usize);
                 self.arena_groups.clear();
                 self.clear_group = None;
-                self.resolve_groups.clear();
+                self.mirrors.iter_mut().for_each(|m| m.groups.clear());
                 self.arena = Some(self.device.create_buffer(&wgpu::BufferDescriptor {
                     label: Some("draw arena"),
                     size,
@@ -6638,13 +6644,13 @@ impl Drawer {
         }
         // The source's aspect views and the buffer, made once for each
         // pair: a frame resolves the same targets into the same buffers.
-        if self.resolve_groups.len() >= RESOLVE_GROUP_CAP {
-            self.resolve_groups.clear();
-        }
         let (device, layouts) = (&self.device, &self.resolve_layouts[entry]);
         let arena = self.arena.as_ref().expect("staged");
-        let buf = &self.mirrors[i].buf;
-        let bg = (self.resolve_groups.entry((buf.clone(), tex.clone(), entry)))
+        let Mirror { buf, groups, .. } = &mut self.mirrors[i];
+        if groups.len() >= RESOLVE_GROUP_CAP {
+            groups.clear();
+        }
+        let bg = (groups.entry((tex.clone(), entry)))
             .or_insert_with(|| {
                 let aspect = |aspect| {
                     tex.create_view(&wgpu::TextureViewDescriptor {
