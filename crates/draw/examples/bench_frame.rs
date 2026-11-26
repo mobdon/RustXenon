@@ -61,7 +61,7 @@ fn main() {
             ms(t.pipeline),
         );
         println!(
-            "  render passes {} transfers {} transfer passes {} submits {} {:?} readback {} KiB writebacks {} | attachments loaded {} cleared {} stored {} discarded {}",
+            "  render passes {} transfers {} transfer passes {} submits {} {:?} readback {} KiB writebacks {} | attachments loaded {} cleared {} stored {} discarded {} | passes merged {}",
             t.render_passes,
             t.transfers,
             t.transfer_passes,
@@ -73,6 +73,7 @@ fn main() {
             t.attachment_ops[1],
             t.attachment_ops[2],
             t.attachment_ops[3],
+            t.passes_merged,
         );
         if t.passes_timed > 0 {
             let g = t.gpu_passes;
