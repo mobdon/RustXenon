@@ -562,8 +562,17 @@ struct Submitter {
 }
 
 /// Finish time, submit time, the first validation error and the
-/// submission of one batch.
-type SubmitDone = (Duration, Duration, Option<String>, wgpu::SubmissionIndex);
+/// submission of one batch, and its staged bytes' buffer to use again.
+type SubmitDone = (
+    Duration,
+    Duration,
+    Option<String>,
+    wgpu::SubmissionIndex,
+    Option<Vec<u8>>,
+);
+
+/// Staged-byte buffers kept to use again.
+const SPARE_STAGED: usize = 8;
 
 /// Staged bytes to write to `arena` at an offset before the encoders run,
 /// and the encoders.
@@ -582,6 +591,8 @@ struct SubmitState {
     finish: Duration,
     error: Option<String>,
     last: Option<wgpu::SubmissionIndex>,
+    /// Buffers of staged bytes the submit thread has written out.
+    spare: Vec<Vec<u8>>,
 }
 
 impl Submitter {
@@ -628,6 +639,7 @@ impl Submitter {
                     let mut cmds = Vec::new();
                     let mut dones = Vec::with_capacity(jobs.len());
                     for (upload, bufs, finish, finish_error) in jobs {
+                        let mut used = None;
                         if let Some((arena, base, bytes)) = upload {
                             let mut enc = device.create_command_encoder(&Default::default());
                             // In chunk-sized pieces: the belt makes a chunk
@@ -644,9 +656,10 @@ impl Submitter {
                             // Each upload ahead of its own batch, after the
                             // batches before it read the arena.
                             cmds.push(enc.finish());
+                            used = Some(bytes);
                         }
                         cmds.extend(bufs);
-                        dones.push((finish, finish_error));
+                        dones.push((finish, finish_error, used));
                     }
                     belt.finish();
                     let index = queue.submit(cmds);
@@ -654,10 +667,15 @@ impl Submitter {
                     let error = block_on(scope.pop()).map(|e| e.to_string());
                     // The submit time goes to the first batch of the merge.
                     let mut busy = t.elapsed();
-                    for (i, (finish, finish_error)) in dones.into_iter().enumerate() {
+                    for (i, (finish, finish_error, used)) in dones.into_iter().enumerate() {
                         let error = finish_error.or(if i == 0 { error.clone() } else { None });
-                        let sent =
-                            done.send((finish, std::mem::take(&mut busy), error, index.clone()));
+                        let sent = done.send((
+                            finish,
+                            std::mem::take(&mut busy),
+                            error,
+                            index.clone(),
+                            used,
+                        ));
                         if sent.is_err() {
                             return;
                         }
@@ -694,8 +712,16 @@ impl Submitter {
     fn drain_to(&self, n: usize) {
         let mut st = self.state.lock().expect("submit state");
         let rx = self.rx.lock().expect("submit results");
-        while st.pending > n {
-            let (f, e, error, index) = rx.recv().expect("submit thread alive");
+        loop {
+            // Past `n`, only what is done already: its buffers come back.
+            let got = match st.pending > n {
+                true => rx.recv().expect("submit thread alive"),
+                false => match rx.try_recv() {
+                    Ok(got) => got,
+                    Err(_) => break,
+                },
+            };
+            let (f, e, error, index, used) = got;
             st.pending -= 1;
             st.done += 1;
             st.finish += f;
@@ -704,6 +730,24 @@ impl Submitter {
                 st.error = error;
             }
             st.last = Some(index);
+            if let Some(mut used) = used.filter(|_| st.spare.len() < SPARE_STAGED) {
+                used.clear();
+                st.spare.push(used);
+            }
+        }
+    }
+
+    /// An empty buffer for staged bytes holding at least `capacity`: one
+    /// the submit thread is done with (its pages are mapped already), or
+    /// a new one.
+    fn spare(&self, capacity: usize) -> Vec<u8> {
+        let mut st = self.state.lock().expect("submit state");
+        match st.spare.iter().position(|v| v.capacity() >= capacity) {
+            Some(i) => st.spare.swap_remove(i),
+            None => {
+                st.spare.pop();
+                Vec::with_capacity(capacity)
+            }
         }
     }
 
@@ -2439,8 +2483,11 @@ impl Drawer {
                         }
                     }
                 }
-                for (lo, hi) in written {
-                    self.forget_guest(lo, hi);
+                // One pass over the memos for all of them: a frame lists
+                // thousands of written pages.
+                let written = merge_ranges(written);
+                self.forget_guest_in(&written);
+                for &(lo, hi) in &written {
                     self.uncheck(lo, hi);
                 }
             }
@@ -2598,12 +2645,21 @@ impl Drawer {
     /// Drops the textures looked up this replay from guest bytes in
     /// `[lo, hi)`, which just changed.
     fn forget_guest(&mut self, lo: u64, hi: u64) {
+        self.forget_guest_in(&[(lo, hi)]);
+    }
+
+    /// [`Self::forget_guest`] for every range of `ranges`, which
+    /// [`merge_ranges`] made.
+    fn forget_guest_in(&mut self, ranges: &[(u64, u64)]) {
+        if ranges.is_empty() {
+            return;
+        }
         self.texture_memo
-            .retain(|_, &mut (_, a, b, _)| b <= lo || hi <= a);
+            .retain(|_, &mut (_, a, b, _)| !meets(ranges, a, b));
         self.window_memo
-            .retain(|&a, &mut (b, _)| b <= lo || hi <= a);
+            .retain(|&a, &mut (b, _)| !meets(ranges, a, b));
         self.index_memo
-            .retain(|_, &mut (a, b, _)| b <= lo || hi <= a);
+            .retain(|_, &mut (a, b, _)| !meets(ranges, a, b));
     }
 
     /// Marks the kept resolve blocks over `[lo, hi)` unchecked: guest
@@ -2903,11 +2959,13 @@ impl Drawer {
         self.submitter.drain_to(self.submits_in_flight);
         let mut upload = None;
         if let (Some(arena), false) = (&self.arena, self.staged.is_empty()) {
-            // A copy goes to the submit thread, which writes it to the arena
-            // ahead of this batch; `staged` keeps its reserve.
-            upload = Some((arena.clone(), self.staged_base, self.staged.clone()));
-            self.staged_base += self.staged.len() as u64;
-            self.staged.clear();
+            // The bytes go to the submit thread, which writes them to the
+            // arena ahead of this batch and hands the buffer back: no copy
+            // here, and `staged` keeps a reserve of the same size.
+            let next = self.submitter.spare(self.staged.capacity());
+            let bytes = std::mem::replace(&mut self.staged, next);
+            self.staged_base += bytes.len() as u64;
+            upload = Some((arena.clone(), self.staged_base - bytes.len() as u64, bytes));
         }
         self.timings.upload += t.elapsed();
         self.resolve_pending = false;
@@ -5891,6 +5949,27 @@ impl Drawer {
     }
 }
 
+/// `ranges` sorted by start, with those that touch or overlap made one.
+fn merge_ranges(mut ranges: Vec<(u64, u64)>) -> Vec<(u64, u64)> {
+    ranges.sort_unstable();
+    let mut out: Vec<(u64, u64)> = Vec::with_capacity(ranges.len());
+    for (lo, hi) in ranges {
+        match out.last_mut() {
+            Some(last) if lo <= last.1 => last.1 = last.1.max(hi),
+            _ => out.push((lo, hi)),
+        }
+    }
+    out
+}
+
+/// Whether `[a, b)` shares a byte with one of `ranges`, which
+/// [`merge_ranges`] made (or is a single range).
+fn meets(ranges: &[(u64, u64)], a: u64, b: u64) -> bool {
+    // Ends are sorted like starts: the first range ending past `a`.
+    let i = ranges.partition_point(|&(_, hi)| hi <= a);
+    ranges.get(i).is_some_and(|&(lo, _)| lo < b)
+}
+
 /// A tiled front buffer's bytes as a frame.
 fn detile_front(
     mut raw: Vec<u8>,
@@ -6063,6 +6142,22 @@ fn host_texture_format(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `meets` over merged ranges agrees with checking every range.
+    #[test]
+    fn merged_ranges_meet_what_any_range_overlaps() {
+        let raw = vec![(40, 50), (0, 4), (4, 8), (20, 30), (25, 35), (90, 91)];
+        let merged = merge_ranges(raw.clone());
+        assert_eq!(merged, [(0, 8), (20, 35), (40, 50), (90, 91)]);
+        for a in 0..100u64 {
+            for b in a + 1..=100 {
+                let any = raw.iter().any(|&(lo, hi)| lo < b && a < hi);
+                assert_eq!(meets(&merged, a, b), any, "[{a}, {b})");
+            }
+        }
+        assert!(!meets(&[], 0, 10));
+        assert!(merge_ranges(Vec::new()).is_empty());
+    }
 
     /// Every byte, in every lane and in the tail, and the length change
     /// the hash.
