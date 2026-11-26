@@ -1,0 +1,24 @@
+[package]
+name = "xenon-play"
+description = "The double-click launcher: lists built games, starts one and waits for it. The list, recent file, command line, settings and screen drawing are headless."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "rustxenon-play"
+path = "src/main.rs"
+
+[dependencies]
+png = "0.17"
+serde = { version = "1", features = ["derive"] }
+softbuffer = "0.4"
+toml = "0.8"
+winit = "0.30"
+xenon-input = { path = "../input" }
+xenon-window = { path = "../window" }
+
+[build-dependencies]
+xenon-icon = { path = "../icon" }

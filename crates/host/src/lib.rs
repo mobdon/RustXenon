@@ -11,13 +11,16 @@
 pub mod cpu_profile;
 pub mod heap;
 pub mod kernel;
+pub mod settings;
 
 use sha2::{Digest, Sha256};
 use std::cell::Cell;
+use std::collections::VecDeque;
+use std::io::Write;
 use std::path::PathBuf;
 use std::process::ExitCode;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use xenon_rt::{Context, GuestMemory, Runtime};
 
@@ -416,10 +419,87 @@ fn log_call(c: &Context, name: &str) {
     ));
 }
 
-/// A line on stderr with the time since start.
+/// A line on stderr and in the log file with the time since start.
 pub fn log(s: &str) {
     let t = START.get_or_init(Instant::now).elapsed();
-    eprintln!("[{:8.3}] {s}", t.as_secs_f64());
+    say(&format!("[{:8.3}] {s}", t.as_secs_f64()));
+}
+
+/// `rustxenon-play.log` beside the program, once opened.
+static LOG_FILE: OnceLock<Mutex<std::fs::File>> = OnceLock::new();
+/// The newest log lines, for the stop screen.
+static TAIL: Mutex<VecDeque<String>> = Mutex::new(VecDeque::new());
+const TAIL_LINES: usize = 40;
+
+/// Text on stderr and in the log file. Locks are taken even if poisoned:
+/// this runs inside the panic hook.
+fn say(s: &str) {
+    eprintln!("{s}");
+    if let Some(f) = LOG_FILE.get() {
+        let _ = writeln!(f.lock().unwrap_or_else(|e| e.into_inner()), "{s}");
+    }
+    let mut t = TAIL.lock().unwrap_or_else(|e| e.into_inner());
+    for line in s.lines() {
+        if t.len() == TAIL_LINES {
+            t.pop_front();
+        }
+        t.push_back(line.into());
+    }
+}
+
+/// Exit code of a run that stopped (0 while running), for the window's
+/// close handler.
+static STOPPED: AtomicI32 = AtomicI32::new(0);
+
+/// Marks the run stopped with `code`. Only the first stop goes on: a
+/// later one (another thread faulting behind the stop screen) parks for
+/// good, so the first reason stays on screen.
+fn claim_stop(code: i32) {
+    if STOPPED
+        .compare_exchange(0, code, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        if std::thread::current().name() == Some("window") {
+            std::process::exit(STOPPED.load(Ordering::SeqCst));
+        }
+        loop {
+            std::thread::park();
+        }
+    }
+}
+
+/// The log's newest lines.
+fn tail() -> Vec<String> {
+    let t = TAIL.lock().unwrap_or_else(|e| e.into_inner());
+    t.iter().cloned().collect()
+}
+
+/// Ends the run with `code` (see [`show`]).
+fn hold(code: i32) -> ! {
+    claim_stop(code);
+    show(code, tail())
+}
+
+/// Ends a claimed stop. With a window open (and this not its thread) the
+/// sound stops and the window shows `lines` until the player closes it;
+/// its close handler then exits.
+fn show(code: i32, lines: Vec<String>) -> ! {
+    if let Some(w) = kernel::input::WINDOW.get() {
+        if std::thread::current().name() != Some("window") {
+            kernel::sound::silence();
+            w.show_text(lines);
+            loop {
+                std::thread::park();
+            }
+        }
+    }
+    std::process::exit(code);
+}
+
+/// Logs why the run cannot go on and ends it (see [`hold`]).
+fn fail(why: &str) -> ExitCode {
+    log(why);
+    hold(1)
 }
 
 const USAGE: &str = "\
@@ -428,7 +508,7 @@ USAGE: game --exe <patched executable> --game <unpacked game folder>
             [--seconds <n>] [--press <ms>:<button>[+<button>],...]
             [--no-controller] [--window] [--capture <dir> [--capture-at <s>,<s>...] [--capture-bundle]] [--render]
             [--capture-frames <n>,<n>... --capture-dir <dir>] [--audio-wav <file>]
-            [--sound] [--mute] [--guard-memory]
+            [--sound] [--mute] [--guard-memory] [--home <dir>]
 
 Runs the title headless for --seconds (default 30) and reports how far it
 got: frames presented, threads, imports called, memory in use. A
@@ -459,7 +539,17 @@ in kernel calls and waiting, the top kernel calls by time, and a frame rate
 bound with drawing free; run it without --render to keep drawing off.
 With --render, drawing runs on a thread of its own and the GPU command
 processor runs up to XENON_DRAW_AHEAD=<frames> frames ahead of it (default
-1); XENON_DRAW_AHEAD=0 draws inline.";
+1); XENON_DRAW_AHEAD=0 draws inline.
+
+Everything logged also goes to rustxenon-play.log beside this program;
+with a window open, a stop shows the log's last lines in it until it is
+closed (Esc, B or Back). --home is the player's folder (default: the folder
+above games\\<sha256>\\ when this program is game.exe there, else its own
+folder). Its settings.toml, then this game's run.toml (beside this program,
+else <home>\\games\\<sha256>\\run.toml), give [window] width, height,
+fullscreen and refresh, and [draw] aniso, force_linear and scale
+(XENON_ANISO, XENON_FORCE_LINEAR and XENON_SCALE when set win); run.toml
+also gives exe, game, update and data when the options do not.";
 
 fn opt(args: &[String], name: &str) -> Option<String> {
     args.iter()
@@ -471,13 +561,40 @@ fn opt(args: &[String], name: &str) -> Option<String> {
 /// Entry point of a generated game crate.
 pub fn run(sha256: &str, regs: &[fn(&mut Runtime)]) -> ExitCode {
     START.get_or_init(Instant::now);
-    log(&format!("build {BUILD}"));
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let (Some(exe), Some(game)) = (opt(&args, "--exe"), opt(&args, "--game")) else {
-        eprintln!("{USAGE}");
+    let me = std::env::current_exe().unwrap_or_default();
+    let me_dir = me
+        .parent()
+        .unwrap_or(std::path::Path::new("."))
+        .to_path_buf();
+    let opened = std::fs::File::create(me_dir.join("rustxenon-play.log"))
+        .map(|f| LOG_FILE.set(Mutex::new(f)));
+    log(&format!("build {BUILD}"));
+    // Early, so a panic while starting up reaches the log and the stop screen.
+    std::panic::set_hook(Box::new(|info| stop(&info.to_string())));
+    if let Err(e) = opened {
+        log(&format!("rustxenon-play.log: {e}; logging to stderr only"));
+    }
+    let home = settings::home(opt(&args, "--home").as_deref(), &me);
+    let mut warn = Vec::new();
+    let conf = settings::load(&home, &me_dir, sha256, &mut warn);
+    for w in &warn {
+        log(w);
+    }
+    // Before any thread starts: the drawer reads these when it opens.
+    for (k, v) in conf
+        .layer
+        .draw_env(|k| std::env::var_os(k).is_some_and(|v| !v.is_empty()))
+    {
+        log(&format!("{k}={v} from the settings files"));
+        std::env::set_var(k, v);
+    }
+    let arg_or = |name: &str, file: &Option<String>| opt(&args, name).or_else(|| file.clone());
+    let (Some(exe), Some(game)) = (arg_or("--exe", &conf.exe), arg_or("--game", &conf.game)) else {
+        say(USAGE);
         return ExitCode::FAILURE;
     };
-    let data = opt(&args, "--data").map_or_else(
+    let data = arg_or("--data", &conf.data).map_or_else(
         || PathBuf::from(&game).with_extension("data"),
         PathBuf::from,
     );
@@ -513,9 +630,12 @@ pub fn run(sha256: &str, regs: &[fn(&mut Runtime)]) -> ExitCode {
         if opt(&args, "--press").is_none() && !args.iter().any(|a| a == "--no-controller") {
             kernel::input::set_script(kernel::input::Script::Live);
         }
-        let link = xenon_window::spawn(format!("RustXenon {BUILD}"), || {
-            report();
-            std::process::exit(0);
+        let link = xenon_window::spawn(format!("RustXenon {BUILD}"), conf.layer.window(), || {
+            let code = STOPPED.load(Ordering::SeqCst);
+            if code == 0 {
+                report();
+            }
+            std::process::exit(code);
         });
         let _ = kernel::input::WINDOW.set(link);
     }
@@ -524,19 +644,13 @@ pub fn run(sha256: &str, regs: &[fn(&mut Runtime)]) -> ExitCode {
     } else if let Some(p) = opt(&args, "--press") {
         match kernel::input::parse(&p) {
             Ok(s) => kernel::input::set_script(s),
-            Err(e) => {
-                eprintln!("--press: {e}");
-                return ExitCode::FAILURE;
-            }
+            Err(e) => return fail(&format!("--press: {e}")),
         }
     }
 
     let file = match std::fs::read(&exe) {
         Ok(f) => f,
-        Err(e) => {
-            eprintln!("{exe}: {e}");
-            return ExitCode::FAILURE;
-        }
+        Err(e) => return fail(&format!("{exe}: {e}")),
     };
     let got: String = Sha256::digest(&file)
         .iter()
@@ -544,15 +658,13 @@ pub fn run(sha256: &str, regs: &[fn(&mut Runtime)]) -> ExitCode {
         .collect();
     log(&format!("executable sha256 {got}"));
     if !got.eq_ignore_ascii_case(sha256) {
-        eprintln!("this build is for executable {sha256}; refusing a different one");
-        return ExitCode::FAILURE;
+        return fail(&format!(
+            "this build is for executable {sha256}; refusing a different one"
+        ));
     }
     let image = match xenon_recomp::xex::load(&file, &[]) {
         Ok(i) => i,
-        Err(e) => {
-            eprintln!("{exe}: {e}");
-            return ExitCode::FAILURE;
-        }
+        Err(e) => return fail(&format!("{exe}: {e}")),
     };
 
     let guarded = args.iter().any(|a| a == "--guard-memory")
@@ -597,14 +709,13 @@ pub fn run(sha256: &str, regs: &[fn(&mut Runtime)]) -> ExitCode {
             image: &image,
             game_dir: game.into(),
             data_dir: data,
-            update_dir: opt(&args, "--update").map(PathBuf::from),
+            update_dir: arg_or("--update", &conf.update).map(PathBuf::from),
         },
     );
     let rt = rt.share();
     set_runtime(rt.clone());
     log(&format!("call table: {} MB", rt.table_bytes() >> 20));
 
-    std::panic::set_hook(Box::new(|info| stop(&info.to_string())));
     xenon_rt::guard::on_wild_access(|a| {
         stop(&format!(
             "wild guest access at {a:#010x}, never allocated{}",
@@ -614,8 +725,7 @@ pub fn run(sha256: &str, regs: &[fn(&mut Runtime)]) -> ExitCode {
 
     if let Some(w) = opt(&args, "--audio-wav") {
         if let Err(e) = kernel::audio::start_wav(w.as_ref()) {
-            eprintln!("{w}: {e}");
-            return ExitCode::FAILURE;
+            return fail(&format!("{w}: {e}"));
         }
     }
     if (window || args.iter().any(|a| a == "--sound")) && !args.iter().any(|a| a == "--mute") {
@@ -732,7 +842,7 @@ fn growth_line() -> String {
 }
 
 /// Resident memory of this process in bytes.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 fn host_rss() -> Option<u64> {
     let s = std::fs::read_to_string("/proc/self/statm").ok()?;
     Some(s.split_whitespace().nth(1)?.parse::<u64>().ok()? * 4096)
@@ -763,7 +873,7 @@ fn host_rss() -> Option<u64> {
     (ok != 0).then_some(c.working_set as u64)
 }
 
-#[cfg(not(any(target_os = "linux", windows)))]
+#[cfg(not(any(target_os = "linux", target_os = "android", windows)))]
 fn host_rss() -> Option<u64> {
     None
 }
@@ -771,6 +881,7 @@ fn host_rss() -> Option<u64> {
 /// Stops the run: the reason, this thread's last calls and guest return
 /// addresses, then the full report (every thread). Never returns.
 fn stop(why: &str) -> ! {
+    claim_stop(101);
     let name = std::thread::current().name().unwrap_or("?").to_string();
     log(&format!("STOP in {name}: {why}"));
     log(&format!(
@@ -793,8 +904,15 @@ fn stop(why: &str) -> ! {
             ));
         }
     }
-    report();
-    std::process::exit(101);
+    // Taken before the report, whose lines would push these off the screen.
+    let mut lines = tail();
+    lines.push("The full report follows in rustxenon-play.log.".into());
+    // The kernel is installed before RT is set; without it there is
+    // nothing to report.
+    if RT.get().is_some() {
+        report();
+    }
+    show(101, lines)
 }
 
 fn report() {

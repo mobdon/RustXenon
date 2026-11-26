@@ -10,6 +10,7 @@ license.workspace = true
 [dependencies]
 sha1 = { version = "0.10", features = ["compress"] }
 sha2 = "0.10"
+toml = "0.8"
 xenon-audio = { path = "../audio" }
 xenon-draw = { path = "../draw" }
 xenon-gpu = { path = "../gpu", features = ["bundle"] }

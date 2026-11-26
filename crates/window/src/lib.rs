@@ -14,7 +14,7 @@ use winit::application::ApplicationHandler;
 use winit::event::{ElementState, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::PhysicalKey;
-use winit::window::{Window, WindowId};
+use winit::window::{Fullscreen, Window, WindowId};
 use xenon_input::{filtered, merge, Keyboard, Pad};
 
 /// One frame to show: rows top to bottom, 8-bit RGBA.
@@ -24,10 +24,33 @@ pub struct Image {
     pub rgba8: Vec<u8>,
 }
 
+/// How the window opens.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Config {
+    pub width: u32,
+    pub height: u32,
+    /// Exclusive full screen at width x height and `refresh` Hz when the
+    /// monitor has that mode, else borderless full screen.
+    pub fullscreen: bool,
+    pub refresh: u32,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Config {
+            width: 1280,
+            height: 720,
+            fullscreen: false,
+            refresh: 60,
+        }
+    }
+}
+
 /// Shared between the host and the window thread.
 #[derive(Default)]
 pub struct Link {
     frame: Mutex<Option<Image>>,
+    text: Mutex<Option<Vec<String>>>,
     pad: Mutex<Pad>,
 }
 
@@ -41,15 +64,42 @@ impl Link {
         });
     }
 
+    /// Replaces the picture with these lines of text (green on dark, the
+    /// newest at the bottom) for good: later frames are ignored, and Esc, B
+    /// or Back closes the window.
+    pub fn show_text(&self, lines: Vec<String>) {
+        *self.text.lock().unwrap() = Some(lines);
+    }
+
     /// The controller and keyboard together, as last read.
     pub fn pad(&self) -> Pad {
         *self.pad.lock().unwrap()
     }
 }
 
+/// Gives a window the program's icon. On Windows the title bar and taskbar
+/// load the exe's icon resource at their own sizes, so the small one is the
+/// image drawn for 16 px; elsewhere, or with no resource, drawn images are used.
+pub fn with_icon(a: winit::window::WindowAttributes) -> winit::window::WindowAttributes {
+    use winit::window::Icon;
+    let drawn = |s: u32| Icon::from_rgba(xenon_icon::rgba(s), s, s).ok();
+    #[cfg(windows)]
+    {
+        use winit::platform::windows::{IconExtWindows, WindowAttributesExtWindows};
+        let res = |s: Option<u32>| {
+            Icon::from_resource(1, s.map(|s| winit::dpi::PhysicalSize::new(s, s))).ok()
+        };
+        // shortcut: the small icon is 16 px at any DPI; ask SM_CXSMICON if it looks soft above 100%.
+        a.with_window_icon(res(Some(16)).or_else(|| drawn(16)))
+            .with_taskbar_icon(res(None).or_else(|| drawn(32)))
+    }
+    #[cfg(not(windows))]
+    a.with_window_icon(drawn(64))
+}
+
 /// Opens the window on a new thread. `on_close` runs on that thread when the
 /// player closes it, or after printing why no window could be opened.
-pub fn spawn(title: String, on_close: impl FnOnce() + Send + 'static) -> Arc<Link> {
+pub fn spawn(title: String, cfg: Config, on_close: impl FnOnce() + Send + 'static) -> Arc<Link> {
     let link = Arc::new(Link::default());
     let l = link.clone();
     std::thread::Builder::new()
@@ -57,7 +107,7 @@ pub fn spawn(title: String, on_close: impl FnOnce() + Send + 'static) -> Arc<Lin
         .spawn(move || {
             match event_loop() {
                 Ok(ev) => {
-                    if let Err(e) = ev.run_app(&mut App::new(title, l)) {
+                    if let Err(e) = ev.run_app(&mut App::new(title, cfg, l)) {
                         eprintln!("window: {e}");
                     }
                 }
@@ -85,30 +135,39 @@ type Surface = softbuffer::Surface<Rc<Window>, Rc<Window>>;
 
 struct App {
     title: String,
+    cfg: Config,
     link: Arc<Link>,
     keys: Keyboard,
     pad: xinput::Reader,
     window: Option<(Rc<Window>, Surface)>,
     /// Kept so a resize can redraw it.
     last: Option<Image>,
+    /// Text shown instead of frames, and whether the close buttons have
+    /// been seen up since (so a button held at the stop does not close it).
+    text: Option<(Vec<String>, bool)>,
 }
 
 impl App {
-    fn new(title: String, link: Arc<Link>) -> Self {
+    fn new(title: String, cfg: Config, link: Arc<Link>) -> Self {
         App {
             title,
+            cfg,
             link,
             keys: Keyboard::default(),
             pad: xinput::Reader::default(),
             window: None,
             last: None,
+            text: None,
         }
     }
 
     fn draw(&mut self) {
-        let (Some((w, s)), Some(img)) = (self.window.as_mut(), self.last.as_ref()) else {
+        let Some((w, s)) = self.window.as_mut() else {
             return;
         };
+        if self.last.is_none() && self.text.is_none() {
+            return;
+        }
         let size = w.inner_size();
         let (Some(dw), Some(dh)) = (NonZeroU32::new(size.width), NonZeroU32::new(size.height))
         else {
@@ -118,7 +177,11 @@ impl App {
             return;
         }
         let Ok(mut buf) = s.buffer_mut() else { return };
-        blit(img, &mut buf, size.width, size.height);
+        match (&self.text, &self.last) {
+            (Some((lines, _)), _) => text(lines, &mut buf, size.width, size.height),
+            (None, Some(img)) => blit(img, &mut buf, size.width, size.height),
+            (None, None) => {}
+        }
         let _ = buf.present();
     }
 }
@@ -128,9 +191,26 @@ impl ApplicationHandler for App {
         if self.window.is_some() {
             return;
         }
-        let attrs = Window::default_attributes()
+        let c = self.cfg;
+        let fullscreen = c.fullscreen.then(|| {
+            let mon = ev
+                .primary_monitor()
+                .or_else(|| ev.available_monitors().next());
+            let mode = mon.as_ref().and_then(|m| {
+                m.video_modes().find(|v| {
+                    v.size() == winit::dpi::PhysicalSize::new(c.width, c.height)
+                        && (v.refresh_rate_millihertz() + 500) / 1000 == c.refresh
+                })
+            });
+            mode.map_or(Fullscreen::Borderless(mon), Fullscreen::Exclusive)
+        });
+        let attrs = with_icon(Window::default_attributes())
             .with_title(self.title.clone())
-            .with_inner_size(winit::dpi::LogicalSize::new(1280.0, 720.0));
+            .with_inner_size(winit::dpi::LogicalSize::new(
+                c.width as f64,
+                c.height as f64,
+            ))
+            .with_fullscreen(fullscreen);
         let made = ev
             .create_window(attrs)
             .map_err(|e| e.to_string())
@@ -156,6 +236,9 @@ impl ApplicationHandler for App {
             WindowEvent::KeyboardInput { event, .. } => {
                 if let PhysicalKey::Code(code) = event.physical_key {
                     let down = event.state == ElementState::Pressed;
+                    if down && self.text.is_some() && code == winit::keyboard::KeyCode::Escape {
+                        ev.exit();
+                    }
                     self.keys.key(&format!("{code:?}"), down);
                 }
             }
@@ -167,8 +250,21 @@ impl ApplicationHandler for App {
     fn about_to_wait(&mut self, ev: &ActiveEventLoop) {
         let pad = merge(filtered(self.pad.read()), self.keys.pad());
         *self.link.pad.lock().unwrap() = pad;
+        let lines = self.link.text.lock().unwrap().take();
+        if let Some(lines) = lines {
+            self.text = Some((lines, false));
+            self.draw();
+        }
+        if let Some((_, armed)) = self.text.as_mut() {
+            // B or Back.
+            let held = pad.buttons & 0x2020 != 0;
+            if *armed && held {
+                ev.exit();
+            }
+            *armed |= !held;
+        }
         let fresh = self.link.frame.lock().unwrap().take();
-        if let Some(img) = fresh {
+        if let Some(img) = fresh.filter(|_| self.text.is_none()) {
             self.last = Some(img);
             self.draw();
         }
@@ -228,6 +324,55 @@ fn blit(img: &Image, out: &mut [u32], w: u32, h: u32) {
         }
     });
 }
+
+/// The last `rows` screen lines of `text`, each line wrapped at `cols`
+/// characters.
+pub fn tail(text: &str, rows: usize, cols: usize) -> Vec<String> {
+    let cols = cols.max(1);
+    let mut out: Vec<String> = Vec::new();
+    for line in text.lines() {
+        let chars: Vec<char> = line.chars().collect();
+        if chars.is_empty() {
+            out.push(String::new());
+        }
+        out.extend(chars.chunks(cols).map(|c| c.iter().collect()));
+    }
+    let skip = out.len().saturating_sub(rows);
+    out.split_off(skip)
+}
+
+/// Draws `lines` (wrapped to fit, the newest at the bottom kept) in an 8x8
+/// pixel font, green on dark, at twice the size when the window is wide.
+fn text(lines: &[String], out: &mut [u32], w: u32, h: u32) {
+    use font8x8::legacy::BASIC_LEGACY;
+    out.fill(BG);
+    let px = if w >= 1600 { 2 } else { 1 };
+    let (cw, ch) = (8 * px, 10 * px);
+    let (cols, rows) = ((w.saturating_sub(2 * cw) / cw) as usize, (h / ch) as usize);
+    if cols == 0 {
+        return;
+    }
+    for (r, line) in tail(&lines.join("\n"), rows, cols).iter().enumerate() {
+        for (c, chr) in line.chars().enumerate() {
+            let glyph = BASIC_LEGACY
+                .get(chr as usize)
+                .unwrap_or(&BASIC_LEGACY[b'?' as usize]);
+            let (x0, y0) = (cw + c as u32 * cw, r as u32 * ch + px);
+            for (gy, bits) in glyph.iter().enumerate() {
+                for gx in (0..8).filter(|gx| bits >> gx & 1 != 0) {
+                    let x = (x0 + gx * px) as usize;
+                    for dy in 0..px {
+                        let y = (y0 + gy as u32 * px + dy) as usize;
+                        out[y * w as usize + x..][..px as usize].fill(FG);
+                    }
+                }
+            }
+        }
+    }
+}
+
+const BG: u32 = 0x0010_1410;
+const FG: u32 = 0x0040_FF60;
 
 /// For each of `dst` output pixels across `src` source ones: the two
 /// source pixels around its centre and the second's weight in 256ths.
@@ -332,6 +477,30 @@ mod xinput {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tail_wraps_and_keeps_the_newest() {
+        let log = "one\n\nabcdefg\nlast";
+        assert_eq!(tail(log, 10, 3), ["one", "", "abc", "def", "g", "las", "t"]);
+        assert_eq!(tail(log, 3, 3), ["g", "las", "t"]);
+        assert_eq!(tail(log, 2, 100), ["abcdefg", "last"]);
+        assert!(tail("", 5, 5).is_empty());
+        assert!(tail(log, 0, 0).is_empty());
+        // Characters, not bytes: never split inside one.
+        assert_eq!(tail("\u{e9}\u{e9}\u{e9}", 5, 2), ["\u{e9}\u{e9}", "\u{e9}"]);
+    }
+
+    #[test]
+    fn text_stays_inside_the_buffer() {
+        for (w, h) in [(40, 25), (41, 9), (1600, 23), (17, 3), (2, 2), (0, 0)] {
+            let mut out = vec![7; (w * h) as usize];
+            text(&["A\u{e9}xyz, far too long to fit".into()], &mut out, w, h);
+            assert!(out.iter().all(|&p| p == BG || p == FG), "{w}x{h}");
+        }
+        let mut out = vec![0; 40 * 25];
+        text(&["A".into()], &mut out, 40, 25);
+        assert!(out.contains(&FG));
+    }
 
     #[test]
     fn letterbox_and_scale() {
