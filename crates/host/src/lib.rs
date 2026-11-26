@@ -842,7 +842,7 @@ fn growth_line() -> String {
 }
 
 /// Resident memory of this process in bytes.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 fn host_rss() -> Option<u64> {
     let s = std::fs::read_to_string("/proc/self/statm").ok()?;
     Some(s.split_whitespace().nth(1)?.parse::<u64>().ok()? * 4096)
@@ -873,7 +873,7 @@ fn host_rss() -> Option<u64> {
     (ok != 0).then_some(c.working_set as u64)
 }
 
-#[cfg(not(any(target_os = "linux", windows)))]
+#[cfg(not(any(target_os = "linux", target_os = "android", windows)))]
 fn host_rss() -> Option<u64> {
     None
 }
