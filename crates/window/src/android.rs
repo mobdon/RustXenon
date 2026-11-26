@@ -9,6 +9,7 @@ use android_activity::input::{Axis, InputEvent, KeyAction, Source};
 use android_activity::ndk::hardware_buffer_format::HardwareBufferFormat;
 use android_activity::ndk::native_window::NativeWindow;
 use android_activity::{InputStatus, MainEvent, PollEvent, WindowManagerFlags};
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use xenon_input::android::Gamepad;
@@ -39,6 +40,13 @@ fn close() -> ! {
         f();
     }
     std::process::exit(0)
+}
+
+/// `get_or_init` so a Stop before the game thread reaches [`spawn`] is kept.
+fn set_hidden(on: bool) {
+    LINK.get_or_init(Default::default)
+        .hidden
+        .store(on, Ordering::Relaxed);
 }
 
 /// Whether an input source is a controller: the gamepad, joystick or D-pad
@@ -176,7 +184,13 @@ pub fn run(app: AndroidApp) -> ! {
                         redraw = true;
                     }
                     MainEvent::TerminateWindow { .. } => window = None,
-                    MainEvent::LostFocus => pad.release_all(),
+                    MainEvent::LostFocus | MainEvent::Pause => pad.release_all(),
+                    // Home, the app switcher or the screen going off: the
+                    // game runs on, unheard. Stop/Start, not Pause/Resume:
+                    // a paused activity can still be on screen (split
+                    // screen, a dialog on top) and should stay audible.
+                    MainEvent::Stop => set_hidden(true),
+                    MainEvent::Start => set_hidden(false),
                     MainEvent::Destroy => gone = true,
                     _ => {}
                 }

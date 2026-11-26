@@ -40,8 +40,11 @@ pub struct Ring {
     /// Largest pull seen, in samples.
     max_pull: usize,
     playing: bool,
-    /// Whether anything was ever pushed: silence before the first push is
-    /// not an underflow.
+    /// Muted ([`Ring::set_muted`]): pushes are dropped and pulls play
+    /// silence that is not counted as an underflow.
+    muted: bool,
+    /// Whether it has played since it was made or unmuted: the silence
+    /// while it first gathers [`Ring::target`] is not an underflow.
     started: bool,
     /// Stereo frames of silence played because the ring ran dry.
     pub underflow: u64,
@@ -59,6 +62,7 @@ impl Ring {
             start: samples(START_MS),
             max_pull: 0,
             playing: false,
+            muted: false,
             started: false,
             underflow: 0,
             overflow: 0,
@@ -84,7 +88,9 @@ impl Ring {
     /// it drops the oldest down to [`Ring::target`] in one cut, so a burst
     /// costs one jump rather than a trim on every later push.
     pub fn push(&mut self, stereo: &[f32]) {
-        self.started = true;
+        if self.muted {
+            return;
+        }
         self.buf.extend(stereo);
         if self.buf.len() > self.cap.max(2 * self.max_pull) {
             let over = (self.buf.len() - self.target()) & !1;
@@ -97,9 +103,14 @@ impl Ring {
     /// missing. It starts, and after running dry starts again, only once
     /// [`Ring::target`] is queued, so a whole pull is there to play.
     pub fn pop_into(&mut self, out: &mut [f32]) {
+        if self.muted {
+            out.fill(0.0);
+            return;
+        }
         self.max_pull = self.max_pull.max(out.len());
         if !self.playing && self.buf.len() >= self.target() {
             self.playing = true;
+            self.started = true;
         }
         let n = if self.playing {
             self.buf.len().min(out.len())
@@ -116,6 +127,19 @@ impl Ring {
                 self.underflow += (out.len() - n) as u64 / 2;
             }
         }
+    }
+
+    /// Mutes or unmutes. Muting drops what is queued and everything pushed
+    /// until unmuted, rather than holding it: held sound would play late,
+    /// after the game has moved on, and the game keeps mixing meanwhile.
+    /// Unmuted, it gathers [`Ring::target`] again before it plays.
+    pub fn set_muted(&mut self, on: bool) {
+        if on {
+            self.buf.clear();
+        }
+        self.muted = on;
+        self.playing = false;
+        self.started = false;
     }
 }
 
@@ -211,6 +235,8 @@ pub struct Speaker {
     base: f64,
     /// Ring level after each write, smoothed, in samples.
     fill: f64,
+    /// As last set by [`Speaker::set_muted`].
+    muted: bool,
 }
 
 fn lock(r: &Mutex<Ring>) -> std::sync::MutexGuard<'_, Ring> {
@@ -228,6 +254,17 @@ impl Speaker {
             scratch: Vec::new(),
             rate,
             fill: 0.0,
+            muted: false,
+        }
+    }
+
+    /// Plays silence while `on`, dropping the mix written meanwhile (see
+    /// [`Ring::set_muted`]). Cheap to call on every write: the ring is
+    /// locked only when the state changes.
+    pub fn set_muted(&mut self, on: bool) {
+        if self.muted != on {
+            self.muted = on;
+            lock(&self.shared.ring).set_muted(on);
         }
     }
 
@@ -290,6 +327,9 @@ impl Sink for Speaker {
             return Err(std::io::Error::other(format!(
                 "the output device stopped: {why}"
             )));
+        }
+        if self.muted {
+            return Ok(());
         }
         self.scratch.clear();
         self.resampler.process(stereo, &mut self.scratch);
@@ -459,6 +499,32 @@ mod tests {
     }
 
     #[test]
+    fn ring_muted_drops_sound_and_plays_silence() {
+        let mut r = Ring::new(1000);
+        let mut out = [1.0; 20];
+        r.push(&[0.5; 120]);
+        r.set_muted(true);
+        assert!(r.is_empty(), "muting drops what was queued");
+        r.push(&[0.5; 120]);
+        assert!(r.is_empty(), "pushes while muted are dropped");
+        r.pop_into(&mut out);
+        assert!(out.iter().all(|&s| s == 0.0));
+        assert_eq!(r.underflow, 0, "muted silence is not an underflow");
+        r.set_muted(false);
+        // Unmuted, it waits for the start level again, then plays.
+        r.push(&[0.25; 40]);
+        r.pop_into(&mut out);
+        assert!(out.iter().all(|&s| s == 0.0));
+        assert_eq!(
+            r.underflow, 0,
+            "the refill after unmuting is not an underflow"
+        );
+        r.push(&[0.25; 100]);
+        r.pop_into(&mut out);
+        assert!(out.iter().all(|&s| s == 0.25));
+    }
+
+    #[test]
     fn ring_waits_for_a_whole_pull() {
         // Start level 100 samples, but the device pulls 120 at a time.
         let mut r = Ring::new(1000);
@@ -571,6 +637,20 @@ mod tests {
         let want = 2560 * 441 / 480;
         assert!(frames.abs_diff(want) <= want / 100, "{frames}");
         assert_eq!(sp.counts_ms(), (0, 0));
+    }
+
+    #[test]
+    fn speaker_muted_writes_nothing() {
+        let shared = Shared::new(48_000);
+        let mut sp = Speaker::new(shared.clone(), 48_000);
+        sp.write(&[0.5; 512]).unwrap();
+        sp.set_muted(true);
+        assert!(lock(&shared.ring).is_empty());
+        sp.write(&[0.5; 512]).unwrap();
+        assert!(lock(&shared.ring).is_empty());
+        sp.set_muted(false);
+        sp.write(&[0.5; 512]).unwrap();
+        assert!(!lock(&shared.ring).is_empty());
     }
 
     #[test]

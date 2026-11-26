@@ -8,6 +8,7 @@
 //! Frames are copied to the window with the CPU (bilinear scaling,
 //! letterboxed, rows split over a few threads); no GPU work happens here.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::thread::ThreadId;
 use xenon_input::Pad;
@@ -71,6 +72,9 @@ pub struct Link {
     frame: Mutex<Option<Image>>,
     text: Mutex<Option<Vec<String>>>,
     pad: Mutex<Pad>,
+    /// Set while the app is not visible (Android's Stop until Start);
+    /// never set on Windows.
+    hidden: AtomicBool,
 }
 
 impl Link {
@@ -93,6 +97,11 @@ impl Link {
     /// The controller and keyboard together, as last read.
     pub fn pad(&self) -> Pad {
         *self.pad.lock().unwrap()
+    }
+
+    /// Whether the player has left the app, so its sound should not play.
+    pub fn hidden(&self) -> bool {
+        self.hidden.load(Ordering::Relaxed)
     }
 }
 
