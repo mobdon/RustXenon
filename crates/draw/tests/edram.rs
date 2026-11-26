@@ -649,6 +649,9 @@ fn restore_target_is_dropped_after_the_depth_draw() {
         let m = d.memory_line();
         let drops = format!("targets 1 MB in 1, {} dropped,", frame + 1);
         assert!(m.contains(&drops), "{m}");
+        // The next frame's colour target takes the dropped one's texture.
+        let reuse = format!(" 2 made, {frame} reused, 1 spare (0 MB),");
+        assert!(m.contains(&reuse), "{m}");
         assert!(d.read_render_target(colour, 0, 0, 1, 1).is_err());
         assert_eq!(word_at(&mem, DEST2, 50, 10), 0x4000_0078);
         assert_ne!(word_at(&mem, DEST2, 10, 10), 0x4000_0078);
