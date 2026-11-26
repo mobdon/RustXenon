@@ -337,6 +337,118 @@ pub fn resolve_half_pixel(lut: &[[u16; 2]], texel: &[u8], swap: bool, out: &mut 
     }
 }
 
+/// The host sub-pixel, on each axis, that a point-sampled guest pixel
+/// reads when targets are drawn at `s` host pixels per guest pixel:
+/// `s / 2`, the host pixel whose area holds the guest pixel's centre. For
+/// an odd `s` its centre is the guest centre; for an even `s` the guest
+/// centre is the corner four sub-pixels share, and the half-open pixel
+/// rule (a pixel holds its top and left edges) gives it to the one below
+/// and right of it.
+pub fn point_sub_pixel(s: u32) -> u32 {
+    s / 2
+}
+
+/// Whether a guest read of a `format` target drawn at more than one host
+/// pixel per guest pixel averages each guest pixel's host pixels (colour:
+/// unorm, snorm and float) rather than point sampling one of them (depth
+/// and stencil, whose values a mean would invent; integer colour formats
+/// would too, but none is hosted).
+pub fn box_averaged(format: TargetFormat) -> bool {
+    !format.is_depth()
+}
+
+/// `w` x `h` guest pixels from the `w * s` x `h * s` host texels of a
+/// `format` target (rows top to bottom, packed). Point sampled formats
+/// read [`point_sub_pixel`]. Box averaged ones take each channel from the
+/// `s * s` host texels as resolve.wgsl's `load_guest` does, so CPU and GPU
+/// reads agree: a channel whose host values are all the same bits keeps
+/// them; else unorm and snorm channels take the mean of their integers,
+/// rounded to nearest with halves away from zero, and float channels the
+/// f32 sum in row order times the f32 `1 / (s * s)`, rounded to the
+/// texel's precision. A 7e3 target sums its host texels as [`edram_rgba`]
+/// quantises them (7e3 RGB, 2-bit alpha), since a blended half can lie
+/// outside what the EDRAM holds.
+pub fn decimate(format: TargetFormat, host: &[u8], w: u32, h: u32, s: u32) -> Vec<u8> {
+    let (w, h, s) = (w as usize, h as usize, s as usize);
+    if s <= 1 || w == 0 || h == 0 {
+        return host.to_vec();
+    }
+    let n = s * s;
+    let texel = host.len() / (w * h * n);
+    let at = |x: usize, y: usize| &host[(y * w * s + x) * texel..][..texel];
+    let int_mean = |sum: i64| sum.signum() * ((sum.abs() + n as i64 / 2) / n as i64);
+    let recip = 1.0 / n as f32;
+    let mut out = Vec::with_capacity(w * h * texel);
+    for y in 0..h {
+        for x in 0..w {
+            if !box_averaged(format) {
+                let o = point_sub_pixel(s as u32) as usize;
+                out.extend_from_slice(at(x * s + o, y * s + o));
+                continue;
+            }
+            let subs = (0..n).map(|i| at(x * s + i % s, y * s + i / s));
+            let u16_at = |t: &[u8], i: usize| u16::from_le_bytes([t[2 * i], t[2 * i + 1]]);
+            let u32_at = |t: &[u8], i: usize| {
+                u32::from_le_bytes([t[4 * i], t[4 * i + 1], t[4 * i + 2], t[4 * i + 3]])
+            };
+            let int = |v: &dyn Fn(&[u8]) -> i64| int_mean(subs.clone().map(v).sum());
+            // A channel's bits when all host texels hold the same.
+            let same = |v: &dyn Fn(&[u8]) -> u32| {
+                let first = v(at(x * s, y * s));
+                subs.clone().all(|t| v(t) == first).then_some(first)
+            };
+            let mean =
+                |v: &dyn Fn(&[u8]) -> f32| subs.clone().fold(0.0f32, |a, t| a + v(t)) * recip;
+            match format {
+                TargetFormat::Rgba8 => {
+                    for c in 0..4 {
+                        out.push(int(&|t| i64::from(t[c])) as u8);
+                    }
+                }
+                TargetFormat::Rgb10a2 => {
+                    let mut p = 0u32;
+                    for (shift, bits) in [(0, 10), (10, 10), (20, 10), (30, 2)] {
+                        let k = int(&|t| i64::from((u32_at(t, 0) >> shift) & ((1 << bits) - 1)));
+                        p |= (k as u32) << shift;
+                    }
+                    out.extend_from_slice(&p.to_le_bytes());
+                }
+                TargetFormat::Float7e3 | TargetFormat::Rgba16Float | TargetFormat::Rg16Float => {
+                    // A 7e3 sub-pixel counts as the EDRAM holds it: blending
+                    // leaves its half unclamped.
+                    let value = |t: &[u8], c: usize| {
+                        if format == TargetFormat::Float7e3 {
+                            edram_rgba(format, t)[c]
+                        } else {
+                            half_to_f32(u16_at(t, c))
+                        }
+                    };
+                    for c in 0..texel / 2 {
+                        let h = same(&|t| u32::from(u16_at(t, c)))
+                            .map_or_else(|| f32_to_half(mean(&|t| value(t, c))), |h| h as u16);
+                        out.extend_from_slice(&h.to_le_bytes());
+                    }
+                }
+                TargetFormat::Float32 | TargetFormat::Rg32Float => {
+                    for c in 0..texel / 4 {
+                        let f = same(&|t| u32_at(t, c))
+                            .unwrap_or_else(|| mean(&|t| f32::from_bits(u32_at(t, c))).to_bits());
+                        out.extend_from_slice(&f.to_le_bytes());
+                    }
+                }
+                TargetFormat::Rg16Fixed | TargetFormat::Rgba16Fixed => {
+                    for c in 0..texel / 2 {
+                        let k = int(&|t| i64::from(u16_at(t, c) as i16));
+                        out.extend_from_slice(&(k as i16).to_le_bytes());
+                    }
+                }
+                TargetFormat::D24S8 | TargetFormat::D24FS8 => unreachable!("point sampled"),
+            }
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -524,5 +636,97 @@ mod tests {
             out,
             [1.5f32.to_le_bytes(), (-2.0f32).to_le_bytes()].concat()[..]
         );
+    }
+
+    /// Colour formats average the s * s host texels of a guest pixel,
+    /// depth point samples the one at s / 2; flat pixels keep their bytes.
+    #[test]
+    fn decimation_box_averages_colour_and_point_samples_depth() {
+        // 2x1 guest pixels at s = 2: host rows of 4 texels.
+        let rgba8 = [
+            [0u8, 10, 255, 7],
+            [255, 10, 255, 7],
+            [9, 9, 9, 9],
+            [9, 9, 9, 9],
+            [0, 11, 0, 7],
+            [255, 11, 0, 7],
+            [9, 9, 9, 9],
+            [9, 9, 9, 9],
+        ]
+        .concat();
+        // (0 + 255 + 0 + 255) / 4 = 127.5 rounds up; (10 + 10 + 11 + 11) / 4
+        // = 10.5 too; the second pixel is flat.
+        assert_eq!(
+            decimate(TargetFormat::Rgba8, &rgba8, 2, 1, 2),
+            [128, 11, 128, 7, 9, 9, 9, 9]
+        );
+        // 10:10:10:2 fields average on their own.
+        let p = |r: u32, a: u32| (r | (a << 30)).to_le_bytes();
+        let rgb10 = [p(1023, 3), p(0, 3), p(0, 0), p(1, 0)].concat();
+        let out = decimate(TargetFormat::Rgb10a2, &rgb10, 1, 1, 2);
+        assert_eq!(
+            u32::from_le_bytes(out[..].try_into().unwrap()),
+            256 | (2 << 30)
+        );
+        // Floats: f32 mean, halves rounded back; a flat NaN half keeps its
+        // payload.
+        let f32s: Vec<u8> = [1.0f32, 2.0, 3.0, 4.5]
+            .iter()
+            .flat_map(|f| f.to_le_bytes())
+            .collect();
+        assert_eq!(
+            decimate(TargetFormat::Float32, &f32s, 1, 1, 2),
+            2.625f32.to_le_bytes()
+        );
+        let halves = |h: [u16; 2]| [h[0].to_le_bytes(), h[1].to_le_bytes()].concat();
+        let rg16f = halves([0x3C00, 0x7E01]).repeat(4);
+        assert_eq!(
+            decimate(TargetFormat::Rg16Float, &rg16f, 1, 1, 2),
+            halves([0x3C00, 0x7E01])
+        );
+        let rg16f = [
+            halves([0x3C00, 0]),
+            halves([0, 0]),
+            halves([0, 0]),
+            halves([0, 0]),
+        ]
+        .concat();
+        assert_eq!(
+            decimate(TargetFormat::Rg16Float, &rg16f, 1, 1, 2),
+            halves([0x3400, 0])
+        );
+        // 7e3: blended halves outside the EDRAM range count as the EDRAM
+        // holds them (31.875, 0; alpha 1) before the mean.
+        let h4 = |v: [f32; 4]| v.map(|c| f32_to_half(c).to_le_bytes()).concat();
+        let f7e3 = [
+            h4([64.0, -4.0, 0.5, 2.0]),
+            h4([0.0, 1.0, 0.5, 0.0]),
+            h4([0.0, 1.0, 0.5, 0.0]),
+            h4([0.0, 1.0, 0.5, 0.0]),
+        ]
+        .concat();
+        assert_eq!(
+            decimate(TargetFormat::Float7e3, &f7e3, 1, 1, 2),
+            h4([31.875 / 4.0, 0.75, 0.5, 0.25])
+        );
+        // Snorm: signed mean, rounded to nearest.
+        let sn = |v: i16| [v.to_le_bytes(), 0i16.to_le_bytes()].concat();
+        let rg16 = [sn(-3), sn(-2), sn(0), sn(0)].concat();
+        assert_eq!(decimate(TargetFormat::Rg16Fixed, &rg16, 1, 1, 2), sn(-1));
+        // Depth: the texel at (s / 2, s / 2) of each guest pixel, for s 2
+        // and 3, whatever the others hold.
+        let depth: Vec<u8> = (0u32..16).flat_map(|i| i.to_le_bytes()).collect();
+        assert_eq!(
+            decimate(TargetFormat::D24S8, &depth, 2, 2, 2),
+            [5u32, 7, 13, 15].map(u32::to_le_bytes).concat()
+        );
+        let depth: Vec<u8> = (0u32..9).flat_map(|i| i.to_le_bytes()).collect();
+        assert_eq!(
+            decimate(TargetFormat::D24FS8, &depth, 1, 1, 3),
+            4u32.to_le_bytes()
+        );
+        assert!(box_averaged(TargetFormat::Rgba16Fixed) && !box_averaged(TargetFormat::D24FS8));
+        // Scale 1 is the texels as they are.
+        assert_eq!(decimate(TargetFormat::Rgba8, &rgba8, 4, 2, 1), rgba8);
     }
 }
