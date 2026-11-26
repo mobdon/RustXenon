@@ -483,7 +483,14 @@ fn texture_bind_groups_follow_the_textures() {
     let report = run(&mut d, &s, &mut mem);
     assert_eq!(report.draws, 3, "{report:?}");
     assert!(report.unsupported.is_empty(), "{report:?}");
-    assert_eq!(report.timings.texture_groups_reused, 1, "{report:?}");
+    // The texture set (its fetch constants) found again binds its group
+    // without the textures being looked up.
+    let t = &report.timings;
+    assert_eq!(
+        (t.texture_sets_reused, t.texture_groups_reused),
+        (1, 0),
+        "{report:?}"
+    );
     let img = d.read_render_target(COLOR_KEY, 0, 0, W, H).unwrap();
     assert_eq!(px(&img, W, 40, 40), GREEN);
     assert_eq!(px(&img, W, 8, 8), RED);
@@ -680,7 +687,14 @@ fn texture_bind_group_is_reused_across_a_resolve() {
     let report = run(&mut d, &s, &mut mem);
     assert_eq!((report.draws, report.resolves), (2, 1), "{report:?}");
     assert!(report.unsupported.is_empty(), "{report:?}");
-    assert_eq!(report.timings.texture_groups_reused, 1, "{report:?}");
+    // The texture set (its fetch constants) found again binds its group
+    // without the textures being looked up.
+    let t = &report.timings;
+    assert_eq!(
+        (t.texture_sets_reused, t.texture_groups_reused),
+        (1, 0),
+        "{report:?}"
+    );
     let img = d.read_render_target(COLOR_KEY, 0, 0, W, H).unwrap();
     assert_eq!(px(&img, W, 40, 40), GREEN);
 }
