@@ -11,4 +11,5 @@ license.workspace = true
 font8x8 = { version = "0.3", default-features = false }
 softbuffer = "0.4"
 winit = "0.30"
+xenon-icon = { path = "../icon" }
 xenon-input = { path = "../input" }

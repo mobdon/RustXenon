@@ -449,7 +449,7 @@ impl ApplicationHandler for App {
         if self.window.is_some() {
             return;
         }
-        let attrs = Window::default_attributes()
+        let attrs = xenon_window::with_icon(Window::default_attributes())
             .with_title("RustXenon")
             .with_inner_size(winit::dpi::LogicalSize::new(1280.0, 720.0))
             .with_min_inner_size(winit::dpi::LogicalSize::new(480.0, 270.0));

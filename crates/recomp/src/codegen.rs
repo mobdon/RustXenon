@@ -119,6 +119,7 @@ pub fn write(img: &Image, a: &Analysis, out: &Path, o: &Options) -> io::Result<S
 
     let rt = path_str(&o.crates.join("rt"));
     let host = path_str(&o.crates.join("host"));
+    let icon = path_str(&o.crates.join("icon"));
     let mut members = Vec::new();
     for (k, (src, fns)) in &chunks {
         let name = format!("g{k:03}");
@@ -156,10 +157,14 @@ pub fn write(img: &Image, a: &Analysis, out: &Path, o: &Options) -> io::Result<S
             "[package]\nname = \"game\"\nversion = \"0.0.0\"\nedition = \"2021\"\npublish = false\n\n\
              # `cargo build --features game/player`: no console window.\n\
              [features]\nplayer = []\n\n\
-             [dependencies]\nxenon-host = {{ path = \"{host}\" }}\nxenon-rt = {{ path = \"{rt}\" }}\n{deps}"
+             [dependencies]\nxenon-host = {{ path = \"{host}\" }}\nxenon-rt = {{ path = \"{rt}\" }}\n{deps}\n\
+             [build-dependencies]\nxenon-icon = {{ path = \"{icon}\" }}\n"
         ),
         &mut st,
     )?;
+    // The launcher's build script: the same exe icon.
+    let build = include_str!("../../play/build.rs");
+    put(&out.join("game/build.rs"), build, &mut st)?;
     put(
         &out.join("game/src/main.rs"),
         &format!(
