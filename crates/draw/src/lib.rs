@@ -471,6 +471,9 @@ pub struct Timings {
     /// Draws whose constants block equals the last one staged in the same
     /// batch, bound from there instead of staged again.
     pub consts_reused: u32,
+    /// Draws that bound indices staged earlier (by another draw of the same
+    /// index buffer, in any replay since the arena last wrapped).
+    pub indices_reused: u32,
     /// Draws that bound a texture bind group made earlier in their replay.
     pub texture_groups_reused: u32,
     /// Render passes begun for draws: each target change or flush ends one.
@@ -525,6 +528,7 @@ impl std::ops::AddAssign<&Timings> for Timings {
         self.windows_reused += t.windows_reused;
         self.reused_bytes += t.reused_bytes;
         self.consts_reused += t.consts_reused;
+        self.indices_reused += t.indices_reused;
         self.texture_groups_reused += t.texture_groups_reused;
         self.queue += t.queue;
         self.upload += t.upload;
@@ -1298,7 +1302,7 @@ pub struct Drawer {
     texture_groups: HashMap<TextureGroupKey, wgpu::BindGroup>,
     /// Group 0 bind groups over `arena`, by the sizes of the four slices
     /// they bind (at dynamic offsets). Cleared when the arena is replaced.
-    arena_groups: HashMap<[u64; 4], wgpu::BindGroup>,
+    arena_groups: HashMap<[u64; 6], wgpu::BindGroup>,
     /// Draw buffers (guest window, constants, epilogue, indices) staged
     /// since the last flush, as slices of `arena` from `staged_base`,
     /// written to it at the next flush. The arena is a ring: flushes
@@ -1333,6 +1337,15 @@ pub struct Drawer {
     /// bound again by a draw with the same bytes. Cleared with
     /// `window_memo` when the arena wraps or grows.
     staged_consts: Option<(ConstsBlock, (u64, u64))>,
+    /// Counts the arena's wraps (from 1): a slice staged in an earlier
+    /// epoch is overwritten (see [`HostIndices::staged`]).
+    arena_epoch: u64,
+    /// Counts the writes to the vertex stage's float constant registers,
+    /// and to the pixel stage's.
+    float_gens: [u64; 2],
+    /// The float constants of each stage staged last, bound again by
+    /// draws that read the same ones of unchanged registers.
+    staged_floats: [StagedFloats; 2],
     /// Bumped by every register write to the constants a `Consts` block
     /// holds, so a draw rebuilds the block only after one.
     consts_gen: u64,
@@ -1652,6 +1665,25 @@ struct HostIndices {
     bytes: Vec<u8>,
     len: u32,
     min_max: Option<(u32, u32)>,
+    /// Where these bytes were staged last: the [`Drawer::arena_epoch`]
+    /// then (0: never) and the arena offset. The slice holds them until
+    /// the arena wraps, so draws of the same indices bind it again.
+    staged: [std::sync::atomic::AtomicU64; 2],
+}
+
+impl HostIndices {
+    /// The arena slice holding these bytes in `epoch`, if one does.
+    fn staged_in(&self, epoch: u64) -> Option<(u64, u64)> {
+        use std::sync::atomic::Ordering::Relaxed;
+        (self.staged[0].load(Relaxed) == epoch)
+            .then(|| (self.staged[1].load(Relaxed), self.bytes.len() as u64))
+    }
+
+    fn set_staged(&self, epoch: u64, offset: u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.staged[1].store(offset, Relaxed);
+        self.staged[0].store(epoch, Relaxed);
+    }
 }
 
 /// [`Drawer::index_memo`] entries and index bytes held before it starts
@@ -1689,29 +1721,56 @@ type ConstsBlock = Arc<Vec<u8>>;
 /// (register generation, window base, rebase words) of a `Consts` block.
 type ConstsKey = (u64, u32, [i32; 96]);
 
+/// Registers of one stage's 256 float constants (4 each): the vertex
+/// stage's, then the pixel stage's.
+const FLOAT_STAGE_REGS: u32 = 1024;
+const _: () = assert!(xenon_shader::PIXEL_FLOAT_CONST_BASE * 4 == FLOAT_STAGE_REGS);
+
+/// A stage's float constants staged in the arena: the generation of its
+/// registers, the mask of the constants staged, and the slice.
+type StagedFloats = Option<((u64, [u64; 4]), (u64, u64))>;
+
+/// The float constants of `stage` (0 vertex, 1 pixel) that `mask` names,
+/// in ascending order, as the bytes of a stage's `fc` binding.
+fn float_consts(r: &regs::RegisterFile, stage: u32, mask: &[u64; 4]) -> Vec<u8> {
+    let all = r.slice(
+        regs::SHADER_CONSTANT_FLOAT + FLOAT_STAGE_REGS * stage,
+        FLOAT_STAGE_REGS,
+    );
+    let count: u32 = mask.iter().map(|w| w.count_ones()).sum();
+    let mut out = vec![0; 16 * count as usize];
+    let read = (0..256).filter(|i| mask[i / 64] >> (i % 64) & 1 != 0);
+    for (o, i) in out.chunks_exact_mut(16).zip(read) {
+        for (o, w) in o.chunks_exact_mut(4).zip(&all[4 * i..4 * i + 4]) {
+            o.copy_from_slice(&w.to_le_bytes());
+        }
+    }
+    out
+}
+
 /// The registers a `Consts` block is built from (see [`consts`]).
 const CONSTS_REGS: [std::ops::Range<u32>; 3] = [
-    regs::SHADER_CONSTANT_FLOAT..regs::SHADER_CONSTANT_FLOAT + 2048 + 192,
+    regs::SHADER_CONSTANT_FETCH..regs::SHADER_CONSTANT_FETCH + 192,
     regs::SHADER_CONSTANT_BOOL..regs::SHADER_CONSTANT_BOOL + 8 + 32,
     regs::VGT_INDX_OFFSET..regs::VGT_INDX_OFFSET + 1,
 ];
 
-/// The `Consts` uniform of the shader binding contract: float, fetch, bool
-/// and loop constants, then the window base, the index offset and the 96
-/// vertex fetch constants' rebase words.
+/// The `Consts` uniform of the shader binding contract: fetch, bool and
+/// loop constants, then the window base, the index offset and the 96
+/// vertex fetch constants' rebase words. (The float constants are bound
+/// apart, a span for each stage: see [`FLOAT_STAGE_REGS`].)
 fn consts(r: &regs::RegisterFile, window_base: u32, rebase: &[i32; 96]) -> Vec<u8> {
-    // Float and fetch constants are adjacent, and so are bool and loop.
-    const _: () = assert!(regs::SHADER_CONSTANT_FLOAT + 2048 == regs::SHADER_CONSTANT_FETCH);
+    // Bool and loop constants are adjacent.
     const _: () = assert!(regs::SHADER_CONSTANT_BOOL + 8 == regs::SHADER_CONSTANT_LOOP);
     let tail = [window_base, r.get(regs::VGT_INDX_OFFSET), 0, 0];
     let rebase = rebase.map(|w| w as u32);
     let blocks = [
-        r.slice(regs::SHADER_CONSTANT_FLOAT, 2048 + 192),
+        r.slice(regs::SHADER_CONSTANT_FETCH, 192),
         r.slice(regs::SHADER_CONSTANT_BOOL, 8 + 32),
         &tail,
         &rebase,
     ];
-    let mut b = vec![0; 4 * (2048 + 192 + 8 + 32 + 4 + 96)];
+    let mut b = vec![0; 4 * (192 + 8 + 32 + 4 + 96)];
     let mut at = 0;
     for block in blocks {
         for (o, w) in b[at..][..4 * block.len()].chunks_exact_mut(4).zip(block) {
@@ -2006,12 +2065,22 @@ impl Drawer {
             dynamic(wgpu::BufferBindingType::Uniform),
         );
         let group0 = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("guest window, constants, epilogue, rectangle indices"),
+            label: Some("guest window, constants, epilogue, rectangle indices, float constants"),
             entries: &[
                 entry(0, vf, dyn_storage),
                 entry(1, vf, dyn_uniform),
                 entry(2, wgpu::ShaderStages::VERTEX, dyn_uniform),
                 entry(3, wgpu::ShaderStages::VERTEX, dyn_storage),
+                entry(
+                    xenon_shader::VERTEX_FLOAT_CONSTS_BINDING,
+                    wgpu::ShaderStages::VERTEX,
+                    dyn_uniform,
+                ),
+                entry(
+                    xenon_shader::PIXEL_FLOAT_CONSTS_BINDING,
+                    wgpu::ShaderStages::FRAGMENT,
+                    dyn_uniform,
+                ),
             ],
         });
         let clear_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -2101,6 +2170,9 @@ impl Drawer {
             index_memo_bytes: 0,
             transfer_setups: HashMap::default(),
             staged_consts: None,
+            arena_epoch: 1,
+            float_gens: [0; 2],
+            staged_floats: [None; 2],
             consts_gen: 0,
             consts_built: None,
             staged_base: 0,
@@ -2558,6 +2630,12 @@ impl Drawer {
                     let end = base.saturating_add(values.len() as u32);
                     if CONSTS_REGS.iter().any(|r| *base < r.end && r.start < end) {
                         self.consts_gen += 1;
+                    }
+                    for (stage, written) in self.float_gens.iter_mut().enumerate() {
+                        let lo = regs::SHADER_CONSTANT_FLOAT + FLOAT_STAGE_REGS * stage as u32;
+                        if *base < lo + FLOAT_STAGE_REGS && lo < end {
+                            *written += 1;
+                        }
                     }
                     Ok(())
                 }
@@ -3070,10 +3148,13 @@ impl Drawer {
     /// staged windows and constants are no longer bound by later draws.
     /// Only after a flush, or once nothing will be submitted.
     fn wrap(&mut self) {
+        // Index bytes staged before are overwritten from here.
+        self.arena_epoch += 1;
         self.staged.clear();
         self.staged_base = 0;
         self.window_memo.clear();
         self.staged_consts = None;
+        self.staged_floats = [None; 2];
     }
 
     /// Copies `parts` into the batch's staging area, each at an offset
@@ -4865,6 +4946,7 @@ impl Drawer {
                     bytes: to_bytes(&idx),
                     len: idx.len() as u32,
                     min_max: min_max(&idx),
+                    staged: Default::default(),
                 });
                 if let Some(k) = key {
                     // Entries dropped by forget_guest still count until
@@ -5030,10 +5112,17 @@ impl Drawer {
             }
         };
         let epi = to_bytes(&state::epilogue(&self.regs, w, h));
-        // Rectangle lists read their guest indices in the vertex shader and
-        // draw 6 host vertices per rectangle without an index buffer.
-        let rect_indices: &[u8] = if rect_list { &idx.bytes } else { &[] };
-        let rest = [&epi[..], rect_indices, &idx.bytes].map(Part::Bytes);
+        // The indices are staged once and bound again by later draws of
+        // them until the arena wraps: a frame draws the same meshes many
+        // times, kilobytes of indices each. (Rectangle lists read them in
+        // the vertex shader, binding 3, and draw without an index buffer.)
+        let mut kept_index = idx.staged_in(self.arena_epoch);
+        let rest = |kept: Option<(u64, u64)>| -> [Option<Part>; 2] {
+            [
+                Some(Part::Bytes(&epi[..])),
+                kept.is_none().then_some(Part::Bytes(&idx.bytes)),
+            ]
+        };
         // The window and constants staged earlier (in this batch or one
         // submitted since) are bound again, unless the arena wrapped since
         // (it is then overwritten) or would wrap to stage the rest.
@@ -5042,14 +5131,33 @@ impl Drawer {
         let mut kept_consts = (self.staged_consts.as_ref())
             .filter(|(b, _)| Arc::ptr_eq(b, &consts) || **b == *consts)
             .map(|&(_, s)| s);
+        // Each stage's float constants: those it reads, staged again only
+        // when one of the stage's registers was written since.
+        let float_masks = [&vs_t.info, &ps_t.info].map(|info| info.float_consts_bound());
+        let float_keys = [0, 1].map(|i| float_masks[i].map(|m| (self.float_gens[i], m)));
+        let mut kept_floats = [0, 1].map(|i| {
+            (self.staged_floats[i].zip(float_keys[i]))
+                .filter(|((k, _), key)| k == key)
+                .map(|((_, s), _)| s)
+        });
+        // Built even for a stage whose staged ones are bound again: a full
+        // arena below stages them anew.
+        let float_bytes =
+            [0, 1].map(|i| float_masks[i].map(|mask| float_consts(&self.regs, i as u32, &mask)));
+        // The stages' float constants to stage: those read and not kept.
+        let floats = |kept: &[Option<(u64, u64)>; 2]| -> [Option<&[u8]>; 2] {
+            [0, 1].map(|i| float_bytes[i].as_deref().filter(|_| kept[i].is_none()))
+        };
         fn parts<'a>(
             w: Option<Vec<Part<'a>>>,
             c: Option<&'a [u8]>,
-            rest: [Part<'a>; 3],
+            f: [Option<&'a [u8]>; 2],
+            rest: [Option<Part<'a>>; 2],
         ) -> Vec<Part<'a>> {
             (w.into_iter().flatten())
                 .chain(c.map(Part::Bytes))
-                .chain(rest)
+                .chain(f.into_iter().flatten().map(Part::Bytes))
+                .chain(rest.into_iter().flatten())
                 .collect()
         }
         // The window's parts, or one empty part for no window.
@@ -5061,16 +5169,21 @@ impl Drawer {
                 .map(|&(lo, hi)| Part::Guest(lo as u32, (hi - lo) as usize))
                 .collect()
         };
-        if (kept_window.is_some() || kept_consts.is_some())
+        let any_kept = kept_window.is_some()
+            || kept_consts.is_some()
+            || kept_floats != [None; 2]
+            || kept_index.is_some();
+        if any_kept
             && !self.fits(&parts(
                 kept_window.is_none().then(|| window(&read)),
                 kept_consts.is_none().then_some(consts.as_slice()),
-                rest,
+                floats(&kept_floats),
+                rest(kept_index),
             ))
         {
             // Staging all of it submits the batch in `stage`; a kept window
             // is read again below.
-            (kept_window, kept_consts) = (None, None);
+            (kept_window, kept_consts, kept_floats, kept_index) = (None, None, [None; 2], None);
         }
         if let (Some(((lo, hi, _), _)), None) = (staged, kept_window) {
             self.sync(mem, lo, hi)?;
@@ -5086,7 +5199,8 @@ impl Drawer {
             &parts(
                 kept_window.is_none().then(|| window(&read)),
                 kept_consts.is_none().then_some(consts.as_slice()),
-                rest,
+                floats(&kept_floats),
+                rest(kept_index),
             ),
         )?)
         .into_iter();
@@ -5129,10 +5243,47 @@ impl Drawer {
                 s
             }
         };
-        let slices: Vec<(u64, u64)> = [window_slice, consts_slice]
-            .into_iter()
-            .chain(fresh)
-            .collect();
+        // A stage that reads no float constant declares no binding for
+        // them: the group still needs one, so the constants' first words.
+        let mut float_slices = [(consts_slice.0, 16); 2];
+        for i in 0..2 {
+            let Some(key) = float_keys[i] else { continue };
+            float_slices[i] = match kept_floats[i] {
+                Some(s) => s,
+                None => {
+                    let s = fresh.next().expect("staged float constants");
+                    self.staged_floats[i] = Some((key, s));
+                    s
+                }
+            };
+        }
+        let epilogue_slice = fresh.next().expect("staged epilogue");
+        let index_slice = match kept_index {
+            Some(s) => {
+                self.timings.indices_reused += 1;
+                s
+            }
+            None => {
+                let s = fresh.next().expect("staged indices");
+                idx.set_staged(self.arena_epoch, s.0);
+                s
+            }
+        };
+        // Binding 3 is unused but for rectangle lists: then the indices.
+        let rect_slice = if rect_list {
+            index_slice
+        } else {
+            epilogue_slice
+        };
+        // In binding order.
+        let slices = [
+            window_slice,
+            consts_slice,
+            epilogue_slice,
+            rect_slice,
+            float_slices[0],
+            float_slices[1],
+        ];
         let flushed = self.timings.submit - submit;
         self.timings.guest_data += lap(&mut t).saturating_sub(flushed);
         if self
@@ -5153,12 +5304,12 @@ impl Drawer {
         }
         self.timings.textures += lap(&mut t);
         let arena = self.arena.clone().expect("staged");
-        let offsets: Vec<u32> = slices[..4]
+        let offsets: Vec<u32> = slices
             .iter()
             .map(|&(offset, _)| u32::try_from(offset))
             .collect::<Result<_, _>>()
             .map_err(|_| Skip::Unsupported("draw data past 4 GiB of the arena".into()))?;
-        let sizes = [0, 1, 2, 3].map(|i| slices[i].1);
+        let sizes = slices.map(|s| s.1);
         // Window sizes vary without end over a long run; start over past a
         // cap rather than keep every one.
         if self.arena_groups.len() >= ARENA_GROUP_CAP {
@@ -5172,7 +5323,7 @@ impl Drawer {
                 device.create_bind_group(&wgpu::BindGroupDescriptor {
                     label: Some("draw group 0"),
                     layout: group0,
-                    entries: &[0, 1, 2, 3].map(|i| wgpu::BindGroupEntry {
+                    entries: &[0, 1, 2, 3, 4, 5].map(|i| wgpu::BindGroupEntry {
                         binding: i,
                         resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
                             buffer: &arena,
@@ -5259,7 +5410,7 @@ impl Drawer {
             pass.draw(0..idx.len * 2, 0..1);
         } else {
             // Staged at the arena's alignment, so a whole u32 index.
-            let first = (slices[4].0 / 4) as u32;
+            let first = (index_slice.0 / 4) as u32;
             pass.draw_indexed(first..first + idx.len, 0, 0..1);
         }
         self.timings.submit += lap(&mut t);
@@ -6185,8 +6336,7 @@ mod tests {
         r.set(regs::VGT_INDX_OFFSET, 77);
         let r = &r;
         let block = |base: u32, n: u32| (0..n).map(move |i| r.get(base + i));
-        let mut want: Vec<u32> = block(regs::SHADER_CONSTANT_FLOAT, 2048)
-            .chain(block(regs::SHADER_CONSTANT_FETCH, 192))
+        let mut want: Vec<u32> = block(regs::SHADER_CONSTANT_FETCH, 192)
             .chain(block(regs::SHADER_CONSTANT_BOOL, 8))
             .chain(block(regs::SHADER_CONSTANT_LOOP, 32))
             .collect();
