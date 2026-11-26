@@ -1,7 +1,8 @@
 //! The programs' icon, drawn by code so no picture file lives in git: a disc
-//! of corroded metal inside a steel ring with a thin green glow on its inner
-//! edge, crossed by two bevelled steel bars. [`rgba`] draws it at any size, [`ico`] packs several sizes into
-//! an .ico file and [`res`] wraps an .ico in a Win32 .res file that the MSVC
+//! of corroded metal inside a glowing green ring, crossed by a bold X of two
+//! bevelled steel bars, with "360" in green on a plate under it at larger
+//! sizes. [`rgba`] draws it at any size, [`ico`] packs several sizes into an
+//! .ico file and [`res`] wraps an .ico in a Win32 .res file that the MSVC
 //! linker takes as an input.
 
 use std::f32::consts::FRAC_1_SQRT_2;
@@ -95,9 +96,8 @@ struct Look {
     outline: f32,
     rim: f32,
     pits: bool,
-    /// Fine pitting on the disc and rust on the bars, only where it reads.
-    fine: bool,
-    rivets: bool,
+    /// The "360" plate under the X; its digits blur below 48 px.
+    label: bool,
 }
 
 fn look(size: u32) -> Look {
@@ -112,10 +112,10 @@ fn look(size: u32) -> Look {
             outline: 0.0,
             rim: 0.0,
             pits: false,
-            fine: false,
-            rivets: false,
+            label: false,
         },
-        25..=40 => Look {
+        // The owner's pick: the simple one-piece X at every larger size too.
+        _ => Look {
             ro: 0.93,
             ri: 0.74,
             w: 0.19,
@@ -123,19 +123,7 @@ fn look(size: u32) -> Look {
             outline: 0.0,
             rim: 0.0,
             pits: true,
-            fine: false,
-            rivets: false,
-        },
-        _ => Look {
-            ro: 0.9,
-            ri: 0.76,
-            w: 0.18,
-            l: 0.7,
-            outline: 0.0,
-            rim: 0.0,
-            pits: true,
-            fine: size > 64,
-            rivets: true,
+            label: size >= 48,
         },
     };
     // About a pixel each at small sizes, so the X keeps its shape.
@@ -170,9 +158,6 @@ fn disc(x: f32, y: f32, q: f32, k: &Look) -> Rgb {
     if k.pits {
         c = pits(c, x, y, 6.0, 21);
     }
-    if k.fine {
-        c = pits(c, x, y, 15.0, 22);
-    }
     // A shallow dome, lit from the top left.
     let z = (1.0 - q * q).max(0.0).sqrt();
     let (nx, ny) = (x / k.ri * 0.6, y / k.ri * 0.6);
@@ -204,39 +189,13 @@ fn bar_at(x: f32, y: f32, dx: f32, dy: f32, k: &Look) -> Option<(f32, [f32; 2], 
     Some((side.min(end), normal, a, n))
 }
 
-fn rivet(c: Rgb, ux: f32, uy: f32, rad: f32) -> Rgb {
-    let d = (ux * ux + uy * uy).sqrt();
-    if d > rad * 1.35 {
-        return c;
-    }
-    if d > rad {
-        return mix(c, rgb(PIT), 0.7 * (1.0 - smooth(rad, rad * 1.35, d)));
-    }
-    let (nx, ny) = (ux / rad, uy / rad);
-    let nz = (1.0 - nx * nx - ny * ny).max(0.0).sqrt();
-    let lit = (nx * LIGHT[0] + ny * LIGHT[1] + nz * LIGHT[2]).max(0.0);
-    let base = mix(rgb(STEEL_DARK), rgb(STEEL), lit);
-    mix(base, rgb(BONE), smooth(0.8, 1.0, lit))
-}
-
 /// The colour of a bar where it covers the point.
 /// `edges` false leaves out the bevel and rim (where a small X is one shape).
 fn bar(x: f32, y: f32, dx: f32, dy: f32, top: bool, edges: bool, k: &Look) -> Option<Rgb> {
     let (dist, normal, a, n) = bar_at(x, y, dx, dy, k)?;
-    // Brushed steel along the bar, eaten by rust patches.
+    // Brushed steel along the bar, bright so the X stands out from the rust.
     let brush = vnoise(a * 2.5, n * 40.0, if top { 31 } else { 41 });
-    // Small icons get brighter steel so the X stands out from the rust.
-    let base = if k.rivets { 0.35 } else { 0.6 };
-    let mut c = mix(rgb(STEEL_DARK), rgb(STEEL), base + 0.4 * brush);
-    if k.fine {
-        let eaten = smooth(
-            0.5,
-            0.75,
-            vnoise(x * 4.0, y * 4.0, if top { 33 } else { 43 }),
-        );
-        c = mix(c, oxide(x, y, if top { 35 } else { 45 }), 0.75 * eaten);
-        c = pits(c, x, y, 17.0, if top { 37 } else { 47 });
-    }
+    let mut c = mix(rgb(STEEL_DARK), rgb(STEEL), 0.6 + 0.4 * brush);
     // Bevelled edges: lit faces towards the light, dark ones away.
     let bev = 0.34 * k.w;
     if edges && dist < bev {
@@ -254,17 +213,60 @@ fn bar(x: f32, y: f32, dx: f32, dy: f32, top: bool, edges: bool, k: &Look) -> Op
         0.0
     };
     c = mix(c, rgb(GREEN), 0.9 * rim);
-    if k.rivets {
-        let along = [dx * FRAC_1_SQRT_2, dy * FRAC_1_SQRT_2];
-        for t in [-1.0, 1.0] {
-            let p = t * (k.l - 0.15);
-            c = rivet(c, x - along[0] * p, y - along[1] * p, 0.045);
-        }
-        if top {
-            c = rivet(c, x, y, 0.065);
+    Some(c)
+}
+
+/// "360" in a 3x5 pixel font, one row of bits per line, high bit left.
+const DIGITS: [[u8; 5]; 3] = [
+    [0b111, 0b001, 0b111, 0b001, 0b111],
+    [0b111, 0b100, 0b111, 0b101, 0b111],
+    [0b111, 0b101, 0b101, 0b101, 0b111],
+];
+/// The plate's centre height and one font cell, in -1..1 units.
+const PLATE_Y: f32 = 0.55;
+const CELL: f32 = 0.04;
+
+/// Whether font cell (`col`, `row`) of the "360" is lit.
+fn lit_cell(col: i32, row: i32) -> bool {
+    let (d, c) = (col / 4, col % 4);
+    (0..3).contains(&d)
+        && c < 3
+        && (0..5).contains(&row)
+        && DIGITS[d as usize][row as usize] >> (2 - c) & 1 == 1
+}
+
+/// The "360" plate over the disc: a dark recessed plate with glowing digits.
+fn label(c: Rgb, x: f32, y: f32) -> Rgb {
+    // 11 by 5 cells, plus a one-cell margin round them.
+    let (w, h) = (6.5 * CELL, 3.5 * CELL);
+    let (ux, uy) = (x, y - PLATE_Y);
+    if ux.abs() > w || uy.abs() > h {
+        return c;
+    }
+    let edge = (w - ux.abs()).min(h - uy.abs());
+    let mut c = mix(c, rgb(PIT), 0.8);
+    // A thin steel lip round the plate.
+    c = mix(c, rgb(STEEL), 0.7 * (1.0 - smooth(0.0, 0.3 * CELL, edge)));
+    let (gx, gy) = (ux / CELL + 5.5, uy / CELL + 2.5);
+    let (col, row) = (gx.floor() as i32, gy.floor() as i32);
+    // Soft glow from lit cells nearby, then the lit cells themselves.
+    let mut glow: f32 = 0.0;
+    for dc in -1..=1 {
+        for dr in -1..=1 {
+            if lit_cell(col + dc, row + dr) {
+                let (cx, cy) = ((col + dc) as f32 + 0.5, (row + dr) as f32 + 0.5);
+                let d = ((gx - cx).abs().max((gy - cy).abs()) - 0.5).max(0.0);
+                glow = glow.max(1.0 - smooth(0.0, 0.9, d));
+            }
         }
     }
-    Some(c)
+    c = mix(c, rgb(GREEN_DEEP), 0.8 * glow);
+    if lit_cell(col, row) {
+        let (fx, fy) = (gx - col as f32, gy - row as f32);
+        let core = 1.0 - (2.0 * fx - 1.0).abs().max((2.0 * fy - 1.0).abs());
+        c = mix(rgb(GREEN), rgb(GREEN_HI), smooth(0.2, 0.9, core));
+    }
+    c
 }
 
 /// One premultiplied RGBA sample at (`x`, `y`) in -1..1.
@@ -284,33 +286,24 @@ fn sample(x: f32, y: f32, k: &Look) -> [f32; 4] {
         return px;
     }
     if r >= k.ro - 0.02 {
-        // A soft dark edge, so the ring stands off light backgrounds.
+        // A soft green halo outside the ring.
         let t = (1.0 - r) / (1.0 - k.ro + 0.02);
-        px = over(px, rgb(PIT), 0.45 * t * t);
+        px = over(px, rgb(GREEN), 0.65 * t * t);
         if r >= k.ro {
             return px;
         }
     }
     if r >= k.ri {
-        // The ring: a steel tube lit from the top left, with a thin green
-        // glow along its inner edge (about a pixel at small sizes).
+        // The ring: a glowing tube, brightest along its middle and top left.
         let s = (r - k.ri) / (k.ro - k.ri);
         let tube = 1.0 - (2.0 * s - 1.0).powi(2);
         let lit = 0.5 + 0.5 * (x * LIGHT[0] + y * LIGHT[1]) / (r * 0.8);
-        let c = mix(
-            rgb(STEEL_DARK),
-            rgb(STEEL),
-            smooth(0.0, 0.7, tube) * (0.15 + 0.7 * lit),
-        );
-        let c = mix(c, rgb(BONE), 0.7 * smooth(0.75, 1.0, tube) * lit * lit);
-        let glow = (0.5 * k.outline / (k.ro - k.ri)).max(0.1);
+        let c = mix(rgb(GREEN_DEEP), rgb(GREEN), smooth(0.0, 0.55, tube));
         let c = mix(
             c,
-            rgb(GREEN_DEEP),
-            0.5 * (1.0 - smooth(glow, 1.6 * glow, s)),
+            rgb(GREEN_HI),
+            smooth(0.5, 1.0, tube) * (0.35 + 0.65 * lit),
         );
-        let c = mix(c, rgb(GREEN), 1.0 - smooth(0.4 * glow, glow, s));
-        let c = mix(c, rgb(GREEN_HI), 0.6 * (1.0 - smooth(0.0, 0.5 * glow, s)));
         return over(px, c, 1.0);
     }
     let mut c = disc(x, y, r / k.ri, k);
@@ -321,10 +314,9 @@ fn sample(x: f32, y: f32, k: &Look) -> [f32; 4] {
         l: k.l + k.outline,
         ..*k
     };
-    // Small icons draw the X as one shape: an edge across the crossing would
-    // cut the lower bar in two.
-    let one = !k.rivets;
-    let under = one && bar_at(x, y, 1.0, -1.0, k).is_some();
+    // The X is one shape: an edge across the crossing would cut the lower
+    // bar in two.
+    let under = bar_at(x, y, 1.0, -1.0, k).is_some();
     let edge = |mut c: Rgb, dy: f32| {
         if bar_at(x - sh, y - sh, 1.0, dy, k).is_some() {
             c = scale(c, 0.4);
@@ -334,16 +326,14 @@ fn sample(x: f32, y: f32, k: &Look) -> [f32; 4] {
         }
         c
     };
-    if one {
-        c = edge(edge(c, -1.0), 1.0);
-    }
+    c = edge(edge(c, -1.0), 1.0);
     for (dy, top) in [(-1.0, false), (1.0, true)] {
-        if !one {
-            c = edge(c, dy);
-        }
         if let Some(b) = bar(x, y, 1.0, dy, top, !(top && under), k) {
             c = b;
         }
+    }
+    if k.label {
+        c = label(c, x, y);
     }
     over(px, c, 1.0)
 }
