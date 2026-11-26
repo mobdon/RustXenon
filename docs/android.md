@@ -2,6 +2,14 @@
 
 Status: plan. Nothing here runs on a phone yet.
 
+Done since (compiled and unit tested, not run on a phone): the Android path
+in `xenon-window` (`android::run`, the NativeActivity event pump, CPU fill of
+the native window), `xenon_host::android_main`, and a game crate whose
+library builds as the Android `cdylib` (`cargo rustc -p game --lib
+--crate-type cdylib --target aarch64-linux-android`). Its files live in
+`<external files>/games/<sha256>/`: run.toml, an optional args.txt, the log
+and stdout.log.
+
 Goal: a game built by RustXenon runs on an Android phone, played with an Xbox
 controller paired over Bluetooth. No touch controls. A game picker on the
 phone is driven by the controller only.

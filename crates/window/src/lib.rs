@@ -1,21 +1,24 @@
-//! `xenon-window`: a window that shows the latest frame and turns an XInput
-//! controller (Windows) plus the keyboard into one pad reading.
+//! `xenon-window`: a window that shows the latest frame and turns a
+//! controller plus the keyboard into one pad reading.
 //!
-//! The event loop runs on its own thread so the host's main thread keeps its
-//! headless watch loop. Frames are copied to the window with the CPU
-//! (bilinear scaling, letterboxed, rows split over a few threads); no GPU
-//! work happens here.
+//! On desktops the event loop runs on its own thread so the host's main
+//! thread keeps its headless watch loop; an XInput controller is read on
+//! Windows. On Android, [`android::run`] is the event pump on the
+//! `android_main` thread and the pad comes from the activity's input events.
+//! Frames are copied to the window with the CPU (bilinear scaling,
+//! letterboxed, rows split over a few threads); no GPU work happens here.
 
-use std::num::NonZeroU32;
-use std::rc::Rc;
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
-use winit::application::ApplicationHandler;
-use winit::event::{ElementState, WindowEvent};
-use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
-use winit::keyboard::PhysicalKey;
-use winit::window::{Fullscreen, Window, WindowId};
-use xenon_input::{filtered, merge, Keyboard, Pad};
+use std::sync::Mutex;
+use xenon_input::Pad;
+
+#[cfg(target_os = "android")]
+pub mod android;
+#[cfg(target_os = "android")]
+pub use android::spawn;
+#[cfg(not(target_os = "android"))]
+mod desktop;
+#[cfg(not(target_os = "android"))]
+pub use desktop::spawn;
 
 /// One frame to show: rows top to bottom, 8-bit RGBA.
 pub struct Image {
@@ -77,190 +80,46 @@ impl Link {
     }
 }
 
-/// Opens the window on a new thread. `on_close` runs on that thread when the
-/// player closes it, or after printing why no window could be opened.
-pub fn spawn(title: String, cfg: Config, on_close: impl FnOnce() + Send + 'static) -> Arc<Link> {
-    let link = Arc::new(Link::default());
-    let l = link.clone();
-    std::thread::Builder::new()
-        .name("window".into())
-        .spawn(move || {
-            match event_loop() {
-                Ok(ev) => {
-                    if let Err(e) = ev.run_app(&mut App::new(title, cfg, l)) {
-                        eprintln!("window: {e}");
-                    }
-                }
-                Err(e) => eprintln!("window: cannot open one: {e}"),
-            }
-            on_close();
-        })
-        .expect("window thread");
-    link
+/// How a pixel's colour sits in the `u32`s of a window buffer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+// Each platform uses one layout; the tests use both.
+#[allow(dead_code)]
+pub(crate) enum Px {
+    /// 0x00RRGGBB (softbuffer).
+    Xrgb,
+    /// Bytes R, G, B, A in memory with A opaque: Android's RGBA_8888 and
+    /// RGBX_8888 on a little-endian CPU.
+    Rgbx,
 }
 
-fn event_loop() -> Result<EventLoop<()>, winit::error::EventLoopError> {
-    let mut b = EventLoop::builder();
-    #[cfg(windows)]
-    winit::platform::windows::EventLoopBuilderExtWindows::with_any_thread(&mut b, true);
-    #[cfg(all(unix, not(target_vendor = "apple")))]
-    {
-        winit::platform::x11::EventLoopBuilderExtX11::with_any_thread(&mut b, true);
-        winit::platform::wayland::EventLoopBuilderExtWayland::with_any_thread(&mut b, true);
-    }
-    b.build()
-}
-
-type Surface = softbuffer::Surface<Rc<Window>, Rc<Window>>;
-
-struct App {
-    title: String,
-    cfg: Config,
-    link: Arc<Link>,
-    keys: Keyboard,
-    pad: xinput::Reader,
-    window: Option<(Rc<Window>, Surface)>,
-    /// Kept so a resize can redraw it.
-    last: Option<Image>,
-    /// Text shown instead of frames, and whether the close buttons have
-    /// been seen up since (so a button held at the stop does not close it).
-    text: Option<(Vec<String>, bool)>,
-}
-
-impl App {
-    fn new(title: String, cfg: Config, link: Arc<Link>) -> Self {
-        App {
-            title,
-            cfg,
-            link,
-            keys: Keyboard::default(),
-            pad: xinput::Reader::default(),
-            window: None,
-            last: None,
-            text: None,
+impl Px {
+    /// Where red, green and blue go, and the bits always set.
+    fn layout(self) -> ([u32; 3], u32) {
+        match self {
+            Px::Xrgb => ([16, 8, 0], 0),
+            Px::Rgbx => ([0, 8, 16], 0xFF00_0000),
         }
     }
 
-    fn draw(&mut self) {
-        let Some((w, s)) = self.window.as_mut() else {
-            return;
-        };
-        if self.last.is_none() && self.text.is_none() {
-            return;
-        }
-        let size = w.inner_size();
-        let (Some(dw), Some(dh)) = (NonZeroU32::new(size.width), NonZeroU32::new(size.height))
-        else {
-            return;
-        };
-        if s.resize(dw, dh).is_err() {
-            return;
-        }
-        let Ok(mut buf) = s.buffer_mut() else { return };
-        match (&self.text, &self.last) {
-            (Some((lines, _)), _) => text(lines, &mut buf, size.width, size.height),
-            (None, Some(img)) => blit(img, &mut buf, size.width, size.height),
-            (None, None) => {}
-        }
-        let _ = buf.present();
+    /// A 0x00RRGGBB colour in this layout.
+    fn colour(self, c: u32) -> u32 {
+        let (at, base) = self.layout();
+        (0..3).fold(base, |v, k| v | (c >> (16 - 8 * k) & 0xFF) << at[k])
     }
 }
 
-impl ApplicationHandler for App {
-    fn resumed(&mut self, ev: &ActiveEventLoop) {
-        if self.window.is_some() {
-            return;
-        }
-        let c = self.cfg;
-        let fullscreen = c.fullscreen.then(|| {
-            let mon = ev
-                .primary_monitor()
-                .or_else(|| ev.available_monitors().next());
-            let mode = mon.as_ref().and_then(|m| {
-                m.video_modes().find(|v| {
-                    v.size() == winit::dpi::PhysicalSize::new(c.width, c.height)
-                        && (v.refresh_rate_millihertz() + 500) / 1000 == c.refresh
-                })
-            });
-            mode.map_or(Fullscreen::Borderless(mon), Fullscreen::Exclusive)
-        });
-        let attrs = Window::default_attributes()
-            .with_title(self.title.clone())
-            .with_inner_size(winit::dpi::LogicalSize::new(
-                c.width as f64,
-                c.height as f64,
-            ))
-            .with_fullscreen(fullscreen);
-        let made = ev
-            .create_window(attrs)
-            .map_err(|e| e.to_string())
-            .and_then(|w| {
-                let w = Rc::new(w);
-                let cx = softbuffer::Context::new(w.clone()).map_err(|e| e.to_string())?;
-                let s = Surface::new(&cx, w.clone()).map_err(|e| e.to_string())?;
-                Ok((w, s))
-            });
-        match made {
-            Ok(x) => self.window = Some(x),
-            Err(e) => {
-                eprintln!("window: {e}");
-                ev.exit();
-            }
-        }
-    }
-
-    fn window_event(&mut self, ev: &ActiveEventLoop, _: WindowId, e: WindowEvent) {
-        match e {
-            WindowEvent::CloseRequested => ev.exit(),
-            WindowEvent::Focused(false) => self.keys.release_all(),
-            WindowEvent::KeyboardInput { event, .. } => {
-                if let PhysicalKey::Code(code) = event.physical_key {
-                    let down = event.state == ElementState::Pressed;
-                    if down && self.text.is_some() && code == winit::keyboard::KeyCode::Escape {
-                        ev.exit();
-                    }
-                    self.keys.key(&format!("{code:?}"), down);
-                }
-            }
-            WindowEvent::Resized(_) | WindowEvent::RedrawRequested => self.draw(),
-            _ => {}
-        }
-    }
-
-    fn about_to_wait(&mut self, ev: &ActiveEventLoop) {
-        let pad = merge(filtered(self.pad.read()), self.keys.pad());
-        *self.link.pad.lock().unwrap() = pad;
-        let lines = self.link.text.lock().unwrap().take();
-        if let Some(lines) = lines {
-            self.text = Some((lines, false));
-            self.draw();
-        }
-        if let Some((_, armed)) = self.text.as_mut() {
-            // B or Back.
-            let held = pad.buttons & 0x2020 != 0;
-            if *armed && held {
-                ev.exit();
-            }
-            *armed |= !held;
-        }
-        let fresh = self.link.frame.lock().unwrap().take();
-        if let Some(img) = fresh.filter(|_| self.text.is_none()) {
-            self.last = Some(img);
-            self.draw();
-        }
-        // Read input at about 250 Hz; frames arrive far slower.
-        ev.set_control_flow(ControlFlow::WaitUntil(
-            Instant::now() + Duration::from_millis(4),
-        ));
-    }
-}
-
-/// Scales `img` to fit `w` x `h` keeping its shape, black bars around it,
-/// into 0RGB pixels. Bilinear: a 720p frame stretched to a large window with
-/// nearest-neighbour scaling showed every frame pixel as a hard block.
-fn blit(img: &Image, out: &mut [u32], w: u32, h: u32) {
-    out.fill(0);
-    if img.width == 0 || img.height == 0 || img.rgba8.len() < (img.width * img.height * 4) as usize
+/// Scales `img` to fit `w` x `h` keeping its shape, black bars around it.
+/// `out` holds `h` rows of `stride` pixels laid out as `px` says. Bilinear: a
+/// 720p frame stretched to a large window with nearest-neighbour scaling
+/// showed every frame pixel as a hard block.
+pub(crate) fn blit(img: &Image, out: &mut [u32], w: u32, h: u32, stride: usize, px: Px) {
+    let (shift, base) = px.layout();
+    out.fill(base);
+    if img.width == 0
+        || img.height == 0
+        || img.rgba8.len() < (img.width * img.height * 4) as usize
+        || stride < w as usize
+        || out.len() < stride * h as usize
     {
         return;
     }
@@ -276,26 +135,26 @@ fn blit(img: &Image, out: &mut [u32], w: u32, h: u32) {
     let (ox, oy) = ((w - fw) / 2, (h - fh) / 2);
     let xs = taps(img.width, fw);
     let ys = taps(img.height, fh);
-    let rows = &mut out[(oy * w) as usize..][..(fh * w) as usize];
+    let rows = &mut out[oy as usize * stride..][..fh as usize * stride];
     // A 4K window is 8 million pixels a frame: rows in a few threads.
     let threads = std::thread::available_parallelism().map_or(1, |n| n.get().min(8));
     let per = (fh as usize).div_ceil(threads).max(1);
     std::thread::scope(|scope| {
-        for (i, chunk) in rows.chunks_mut(per * w as usize).enumerate() {
+        for (i, chunk) in rows.chunks_mut(per * stride).enumerate() {
             let (xs, ys) = (&xs, &ys[i * per..]);
             scope.spawn(move || {
-                for (row, &(y0, y1, wy)) in chunk.chunks_mut(w as usize).zip(ys) {
+                for (row, &(y0, y1, wy)) in chunk.chunks_mut(stride).zip(ys) {
                     let row = &mut row[ox as usize..][..fw as usize];
                     let (r0, r1) = (y0 * img.width as usize, y1 * img.width as usize);
                     for (px, &(x0, x1, wx)) in row.iter_mut().zip(xs) {
                         let at = |r: usize, x: usize| &img.rgba8[(r + x) * 4..][..3];
                         let (a, b, c, d) = (at(r0, x0), at(r0, x1), at(r1, x0), at(r1, x1));
-                        let mut v = 0;
+                        let mut v = base;
                         for k in 0..3 {
                             let top = a[k] as u32 * (256 - wx) + b[k] as u32 * wx;
                             let bottom = c[k] as u32 * (256 - wx) + d[k] as u32 * wx;
                             let mix = (top * (256 - wy) + bottom * wy + (1 << 15)) >> 16;
-                            v |= mix << (16 - 8 * k);
+                            v |= mix << shift[k];
                         }
                         *px = v;
                     }
@@ -323,11 +182,16 @@ pub fn tail(text: &str, rows: usize, cols: usize) -> Vec<String> {
 
 /// Draws `lines` (wrapped to fit, the newest at the bottom kept) in an 8x8
 /// pixel font, green on dark, at twice the size when the window is wide.
-fn text(lines: &[String], out: &mut [u32], w: u32, h: u32) {
+/// `out` is laid out as for [`blit`].
+pub(crate) fn text(lines: &[String], out: &mut [u32], w: u32, h: u32, stride: usize, px: Px) {
     use font8x8::legacy::BASIC_LEGACY;
-    out.fill(BG);
-    let px = if w >= 1600 { 2 } else { 1 };
-    let (cw, ch) = (8 * px, 10 * px);
+    let (bg, fg) = (px.colour(BG), px.colour(FG));
+    out.fill(bg);
+    if stride < w as usize || out.len() < stride * h as usize {
+        return;
+    }
+    let scale = if w >= 1600 { 2 } else { 1 };
+    let (cw, ch) = (8 * scale, 10 * scale);
     let (cols, rows) = ((w.saturating_sub(2 * cw) / cw) as usize, (h / ch) as usize);
     if cols == 0 {
         return;
@@ -337,13 +201,13 @@ fn text(lines: &[String], out: &mut [u32], w: u32, h: u32) {
             let glyph = BASIC_LEGACY
                 .get(chr as usize)
                 .unwrap_or(&BASIC_LEGACY[b'?' as usize]);
-            let (x0, y0) = (cw + c as u32 * cw, r as u32 * ch + px);
+            let (x0, y0) = (cw + c as u32 * cw, r as u32 * ch + scale);
             for (gy, bits) in glyph.iter().enumerate() {
                 for gx in (0..8).filter(|gx| bits >> gx & 1 != 0) {
-                    let x = (x0 + gx * px) as usize;
-                    for dy in 0..px {
-                        let y = (y0 + gy as u32 * px + dy) as usize;
-                        out[y * w as usize + x..][..px as usize].fill(FG);
+                    let x = (x0 + gx * scale) as usize;
+                    for dy in 0..scale {
+                        let y = (y0 + gy as u32 * scale + dy) as usize;
+                        out[y * stride + x..][..scale as usize].fill(fg);
                     }
                 }
             }
@@ -353,6 +217,21 @@ fn text(lines: &[String], out: &mut [u32], w: u32, h: u32) {
 
 const BG: u32 = 0x0010_1410;
 const FG: u32 = 0x0040_FF60;
+
+/// A buffer size with the shape of a `ww` x `wh` window that a `fw` x `fh`
+/// frame fills one way at its own size: the compositor then scales the
+/// buffer to the window, and the frame is letterboxed inside it.
+pub fn buffer_size(ww: u32, wh: u32, fw: u32, fh: u32) -> (u32, u32) {
+    if ww == 0 || wh == 0 || fw == 0 || fh == 0 {
+        return (0, 0);
+    }
+    let along = |a: u32, b: u32, c: u32| ((a as u64 * b as u64 + c as u64 / 2) / c as u64) as u32;
+    if ww as u64 * fh as u64 > wh as u64 * fw as u64 {
+        (along(fh, ww, wh).max(1), fh)
+    } else {
+        (fw, along(fw, wh, ww).max(1))
+    }
+}
 
 /// For each of `dst` output pixels across `src` source ones: the two
 /// source pixels around its centre and the second's weight in 256ths.
@@ -367,91 +246,6 @@ fn taps(src: u32, dst: u32) -> Vec<(usize, usize, u32)> {
             (x0, (x0 + 1).min(src as usize - 1), (c & 255) as u32)
         })
         .collect()
-}
-
-#[cfg(windows)]
-mod xinput {
-    use std::time::{Duration, Instant};
-    use xenon_input::Pad;
-
-    #[repr(C)]
-    #[derive(Default)]
-    struct State {
-        packet: u32,
-        buttons: u16,
-        lt: u8,
-        rt: u8,
-        lx: i16,
-        ly: i16,
-        rx: i16,
-        ry: i16,
-    }
-
-    #[link(name = "xinput")]
-    extern "system" {
-        fn XInputGetState(user: u32, state: *mut State) -> u32;
-    }
-
-    fn get(user: u32) -> Option<Pad> {
-        let mut s = State::default();
-        // SAFETY: `s` is a valid XINPUT_STATE for the call to fill.
-        (unsafe { XInputGetState(user, &mut s) } == 0).then_some(Pad {
-            // Bit for bit the console's layout; 0x0400 (guide) is not reported.
-            buttons: s.buttons & !0x0400,
-            lt: s.lt,
-            rt: s.rt,
-            lx: s.lx,
-            ly: s.ly,
-            rx: s.rx,
-            ry: s.ry,
-        })
-    }
-
-    /// The first connected controller. Asking an empty port is slow, so
-    /// ports are searched again at most once a second.
-    #[derive(Default)]
-    pub struct Reader {
-        port: Option<u32>,
-        searched: Option<Instant>,
-    }
-
-    impl Reader {
-        pub fn read(&mut self) -> Pad {
-            if let Some(p) = self.port.and_then(get) {
-                return p;
-            }
-            self.port = None;
-            if self
-                .searched
-                .is_some_and(|t| t.elapsed() < Duration::from_secs(1))
-            {
-                return Pad::default();
-            }
-            self.searched = Some(Instant::now());
-            for user in 0..4 {
-                if let Some(p) = get(user) {
-                    eprintln!("window: controller on XInput port {user}");
-                    self.port = Some(user);
-                    return p;
-                }
-            }
-            Pad::default()
-        }
-    }
-}
-
-#[cfg(not(windows))]
-mod xinput {
-    /// shortcut: no controller off Windows (keyboard only), add one if the
-    /// host is ever played on another system.
-    #[derive(Default)]
-    pub struct Reader(());
-
-    impl Reader {
-        pub fn read(&mut self) -> xenon_input::Pad {
-            xenon_input::Pad::default()
-        }
-    }
 }
 
 #[cfg(test)]
@@ -474,11 +268,18 @@ mod tests {
     fn text_stays_inside_the_buffer() {
         for (w, h) in [(40, 25), (41, 9), (1600, 23), (17, 3), (2, 2), (0, 0)] {
             let mut out = vec![7; (w * h) as usize];
-            text(&["A\u{e9}xyz, far too long to fit".into()], &mut out, w, h);
+            text(
+                &["A\u{e9}xyz, far too long to fit".into()],
+                &mut out,
+                w,
+                h,
+                w as usize,
+                Px::Xrgb,
+            );
             assert!(out.iter().all(|&p| p == BG || p == FG), "{w}x{h}");
         }
         let mut out = vec![0; 40 * 25];
-        text(&["A".into()], &mut out, 40, 25);
+        text(&["A".into()], &mut out, 40, 25, 40, Px::Xrgb);
         assert!(out.contains(&FG));
     }
 
@@ -494,13 +295,13 @@ mod tests {
             rgba8: vec![255, 0, 0, 255, 0, 0, 255, 255],
         };
         let mut out = vec![7; 16];
-        blit(&img, &mut out, 4, 4);
+        blit(&img, &mut out, 4, 4, 4, Px::Xrgb);
         let (r, b) = (0xFF0000, 0x0000FF);
         let (rb, br) = (0xBF0040, 0x4000BF);
         assert_eq!(out, [0, 0, 0, 0, r, rb, br, b, r, rb, br, b, 0, 0, 0, 0]);
         // At its own size the frame is copied exactly.
         let mut out = vec![7; 2];
-        blit(&img, &mut out, 2, 1);
+        blit(&img, &mut out, 2, 1, 2, Px::Xrgb);
         assert_eq!(out, [r, b]);
         // A 720p frame into a 1440p window stays well inside a frame's time
         // (checked here in release builds only).
@@ -512,7 +313,7 @@ mod tests {
         let mut out = vec![0; 2560 * 1440];
         let t = std::time::Instant::now();
         for _ in 0..10 {
-            blit(&big, &mut out, 2560, 1440);
+            blit(&big, &mut out, 2560, 1440, 2560, Px::Xrgb);
         }
         let per = t.elapsed() / 10;
         eprintln!("blit 720p to 1440p: {per:?}");
@@ -526,7 +327,7 @@ mod tests {
             rgba8: vec![0, 255, 0, 255],
         };
         let mut out = vec![7; 3];
-        blit(&one, &mut out, 3, 1);
+        blit(&one, &mut out, 3, 1, 3, Px::Xrgb);
         assert_eq!(out, [0, 0x00FF00, 0]);
         // A short buffer draws nothing rather than panicking.
         let bad = Image {
@@ -534,7 +335,60 @@ mod tests {
             height: 4,
             rgba8: vec![0; 4],
         };
-        blit(&bad, &mut out, 3, 1);
+        blit(&bad, &mut out, 3, 1, 3, Px::Xrgb);
         assert_eq!(out, [0, 0, 0]);
+    }
+
+    #[test]
+    fn rgbx_with_stride() {
+        // Red then blue into a 2x1 window whose rows are 3 pixels apart:
+        // bytes R, G, B, A in memory, the padding filled opaque black.
+        let img = Image {
+            width: 2,
+            height: 1,
+            rgba8: vec![255, 0, 0, 255, 0, 0, 255, 255],
+        };
+        let mut out = vec![7; 6];
+        blit(&img, &mut out, 2, 2, 3, Px::Rgbx);
+        let bytes: Vec<u8> = out[..2].iter().flat_map(|p| p.to_le_bytes()).collect();
+        assert_eq!(bytes, [255, 0, 0, 255, 0, 0, 255, 255][..]);
+        assert_eq!(out[2..], [0xFF00_0000; 4]);
+        // Letterboxed: 2x1 into 2x3 puts the picture on the middle row.
+        let mut out = vec![7; 9];
+        blit(&img, &mut out, 2, 3, 3, Px::Rgbx);
+        assert_eq!(out[3..5], [0xFF00_00FF, 0xFFFF_0000]);
+        assert!(out
+            .iter()
+            .enumerate()
+            .all(|(i, &p)| (3..5).contains(&i) || p == 0xFF00_0000));
+        // A buffer shorter than stride x height draws nothing.
+        let mut out = vec![7; 5];
+        blit(&img, &mut out, 2, 2, 3, Px::Rgbx);
+        assert_eq!(out, [0xFF00_0000; 5]);
+        // Text colours move the same way.
+        assert_eq!(Px::Rgbx.colour(0x0011_2233), 0xFF33_2211);
+        assert_eq!(Px::Xrgb.colour(0x0011_2233), 0x0011_2233);
+        let mut out = vec![7; 41 * 25];
+        text(&["A".into()], &mut out, 40, 25, 41, Px::Rgbx);
+        assert!(out.contains(&Px::Rgbx.colour(FG)));
+        assert!(out
+            .iter()
+            .all(|&p| p == Px::Rgbx.colour(FG) || p == Px::Rgbx.colour(BG)));
+    }
+
+    #[test]
+    fn buffer_has_the_window_shape() {
+        // Wide phone screen: frame height kept, wider buffer (side bars).
+        assert_eq!(buffer_size(2400, 1080, 1280, 720), (1600, 720));
+        // Nearly square inner screen: frame width kept, taller buffer.
+        assert_eq!(buffer_size(2176, 1812, 1280, 720), (1280, 1066));
+        // Same shape: the frame's own size.
+        assert_eq!(buffer_size(1920, 1080, 1280, 720), (1280, 720));
+        // Tall portrait window.
+        assert_eq!(buffer_size(1080, 2400, 1280, 720), (1280, 2844));
+        assert_eq!(buffer_size(0, 1080, 1280, 720), (0, 0));
+        assert_eq!(buffer_size(1920, 1080, 0, 720), (0, 0));
+        assert_eq!(buffer_size(100_000, 1, 1, 1), (100_000, 1));
+        assert_eq!(buffer_size(1, 100_000, 1, 1), (1, 100_000));
     }
 }
