@@ -1,14 +1,16 @@
 //! Sound out of the host. Decoder contexts are decoded through an LGPL
 //! FFmpeg loaded at run time (silence when none is found), and the frames
-//! render clients submit are mixed to stereo and written to `--audio-wav`.
-//! Nothing is played. Pure parts live in `xenon-audio`.
+//! render clients submit are mixed to stereo, written to `--audio-wav` and
+//! played on the default output device (with `--window` or `--sound`).
+//! Pure parts live in `xenon-audio`.
 
 use super::*;
 use std::io::BufWriter;
 use xenon_audio::ffmpeg::{Decoder, Ffmpeg};
+use xenon_audio::speaker::Speaker;
 use xenon_audio::wav::WavWriter;
 use xenon_audio::xma;
-use xenon_audio::{Mixer, GUEST_FRAME_BYTES, SAMPLE_RATE};
+use xenon_audio::{Mixer, Sink, GUEST_FRAME_BYTES, SAMPLE_RATE};
 
 fn ffmpeg() -> Option<&'static Ffmpeg> {
     static FF: OnceLock<Option<Ffmpeg>> = OnceLock::new();
@@ -154,11 +156,14 @@ pub fn decode(rt: &Runtime, a: u32) -> bool {
     true
 }
 
+#[derive(Default)]
 struct Out {
     mixer: Mixer,
     /// Mixer source of each render client, by driver handle.
     sources: HashMap<u32, usize>,
     wav: Option<WavWriter<BufWriter<std::fs::File>>>,
+    /// Never blocks the tick: it only copies into the device's ring.
+    speaker: Option<Speaker>,
     frames: u64,
 }
 
@@ -167,13 +172,20 @@ static OUT: Mutex<Option<Out>> = Mutex::new(None);
 /// Starts writing the mix to `path` (`--audio-wav`).
 pub fn start_wav(path: &std::path::Path) -> std::io::Result<()> {
     let wav = WavWriter::create(path, SAMPLE_RATE, 2)?;
-    *OUT.lock().unwrap() = Some(Out {
-        mixer: Mixer::new(),
-        sources: HashMap::new(),
-        wav: Some(wav),
-        frames: 0,
-    });
+    OUT.lock().unwrap().get_or_insert_with(Out::default).wav = Some(wav);
     Ok(())
+}
+
+/// Starts playing the mix on the default output device; logs and stays
+/// silent when it cannot open.
+pub fn start_speaker() {
+    match Speaker::open() {
+        Ok(s) => {
+            crate::log(&format!("audio: playing at {} Hz", s.rate()));
+            OUT.lock().unwrap().get_or_insert_with(Out::default).speaker = Some(s);
+        }
+        Err(e) => crate::log(&format!("audio: no speaker ({e}); sound is not played")),
+    }
 }
 
 /// (driver, samples): one 5.1 frame of 256 big-endian floats per channel.
@@ -204,12 +216,15 @@ pub fn tick() {
     };
     let mix = o.mixer.mix_frame();
     if let Some(w) = o.wav.as_mut() {
-        if let Err(e) = xenon_audio::Sink::write(w, &mix) {
+        if let Err(e) = w.write(&mix) {
             crate::log(&format!("audio: wav stopped: {e}"));
             if let Some(w) = o.wav.take() {
                 let _ = w.finish();
             }
         }
+    }
+    if let Some(s) = o.speaker.as_mut() {
+        let _ = s.write(&mix); // never fails: a full ring drops and counts
     }
     o.frames += 1;
 }
@@ -238,22 +253,27 @@ pub fn finish() {
 
 /// Sizes for the once-a-second line: decoded bytes waiting on contexts
 /// (cap 64 KB each), mixer samples queued (cap 128 KB a client), seconds
-/// written and samples dropped at either cap.
+/// written and samples dropped at either cap; with a speaker, the ms of
+/// silence it played (underflow) and of sound it dropped (overflow).
 pub fn line() -> String {
     let (n, q, d) = CTXS.lock().unwrap().as_ref().map_or((0, 0, 0), |m| {
         m.values().fold((0, 0, 0), |(n, q, d), c| {
             (n + 1, q + c.stream.queued(), d + c.stream.dropped)
         })
     });
-    let (mq, md, secs) = OUT.lock().unwrap().as_ref().map_or((0, 0, 0), |o| {
+    let (mq, md, secs, sp) = OUT.lock().unwrap().as_ref().map_or((0, 0, 0, None), |o| {
         (
             o.mixer.queued_total() * 4,
             o.mixer.dropped,
             o.frames * 256 / SAMPLE_RATE as u64,
+            o.speaker.as_ref().map(Speaker::counts_ms),
         )
     });
+    let sp = sp.map_or(String::new(), |(u, o)| {
+        format!(", speaker underflow {u} ms overflow {o} ms")
+    });
     format!(
-        "audio {n} ctx {} KB, decoded {}k samples, mix {} KB, wav {secs} s, dropped {}",
+        "audio {n} ctx {} KB, decoded {}k samples, mix {} KB, wav {secs} s, dropped {}{sp}",
         q >> 10,
         DECODED.load(Ordering::Relaxed) / 1000,
         mq >> 10,

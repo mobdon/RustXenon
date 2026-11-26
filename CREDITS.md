@@ -235,7 +235,8 @@ Licence texts are kept in [`third_party/licenses/`](third_party/licenses/).
 Dependencies from crates.io keep their own licences and are not copied into
 this repository, so no licence files are added for them. `xenon-draw` uses
 `wgpu` and its `naga` shader compiler (MIT or Apache-2.0), `png` (MIT or
-Apache-2.0) and `pollster` (MIT or Apache-2.0).
+Apache-2.0) and `pollster` (MIT or Apache-2.0). `xenon-audio` uses
+`libloading` (ISC) and, on Windows, `cpal` (Apache-2.0) for live output.
 
 ## LibertyRecomp, LibertyRecompAndroid and XHYN-IV-recomp
 
