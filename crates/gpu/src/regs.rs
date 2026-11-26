@@ -175,6 +175,24 @@ impl RegisterFile {
         }
     }
 
+    /// Sets registers `base..` to `values`, as [`Self::set`] each with
+    /// `base.wrapping_add(i)` would: the in-range ones are copied at once
+    /// (a game writes shader constants hundreds at a time).
+    pub fn set_many(&mut self, base: u32, values: &[u32]) {
+        if u64::from(base) + values.len() as u64 > u64::from(u32::MAX) + 1 {
+            // The indices wrap past u32::MAX: one at a time, as `set` does.
+            for (i, &v) in values.iter().enumerate() {
+                self.set(base.wrapping_add(i as u32), v);
+            }
+            return;
+        }
+        let start = base as usize;
+        let n = self.values.len().saturating_sub(start).min(values.len());
+        if n > 0 {
+            self.values[start..start + n].copy_from_slice(&values[..n]);
+        }
+    }
+
     /// The six dwords of fetch constant `n` (0..32): a texture fetch
     /// constant, or three two-dword vertex fetch constants.
     pub fn fetch_constant(&self, n: u32) -> [u32; 6] {
@@ -187,5 +205,29 @@ impl RegisterFile {
     pub fn vertex_fetch(&self, n: u32) -> crate::VertexFetch {
         let base = SHADER_CONSTANT_FETCH.saturating_add(n.saturating_mul(2));
         crate::VertexFetch::decode([self.get(base), self.get(base.saturating_add(1))])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `set_many` writes what `set` would for each value: the in-range
+    /// ones, and none past the end; indices that wrap start again at 0.
+    #[test]
+    fn set_many_matches_set() {
+        let n = REGISTER_COUNT as u32;
+        let values: Vec<u32> = (1..=8).collect();
+        for base in [0, 100, n - 3, n, u32::MAX - 2] {
+            let (mut a, mut b) = (RegisterFile::default(), RegisterFile::default());
+            a.set_many(base, &values);
+            for (i, &v) in values.iter().enumerate() {
+                b.set(base.wrapping_add(i as u32), v);
+            }
+            assert!(a.values == b.values, "base {base:#x}");
+        }
+        let mut r = RegisterFile::default();
+        r.set_many(10, &[7, 8]);
+        assert_eq!((r.get(9), r.get(10), r.get(11), r.get(12)), (0, 7, 8, 0));
     }
 }
