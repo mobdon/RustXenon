@@ -179,6 +179,45 @@ struct Row {
     guest: f64,
     kernel: f64,
     wait: f64,
+    /// Of `wait`, the guest spin between calls of a waiting import.
+    spin: f64,
+}
+
+/// Fixed integer work: `n` dependent multiply-adds.
+fn fixed_work(n: u64) -> u64 {
+    let mut x = 1u64;
+    for i in 0..n {
+        x = std::hint::black_box(x.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(i));
+    }
+    x
+}
+
+/// Fastest of three runs of `fixed_work(n)`, in ns, so one preemption does
+/// not read as a slow machine.
+fn time_work(n: u64) -> u64 {
+    (0..3)
+        .map(|_| {
+            let s = Instant::now();
+            std::hint::black_box(fixed_work(n));
+            s.elapsed().as_nanos() as u64
+        })
+        .min()
+        .unwrap_or(0)
+}
+
+/// The fixed work's size and its time at the first tick, from [`calibrate`].
+static CAL: OnceLock<(u64, u64)> = OnceLock::new();
+
+/// Iteration count that takes about 1 ms now, and its time in ns.
+fn calibrate() -> (u64, u64) {
+    let mut n = 1024;
+    loop {
+        let t = time_work(n);
+        if t >= 1_000_000 || n >= 1 << 40 {
+            return (n, t.max(1));
+        }
+        n *= 2;
+    }
 }
 
 /// Lines for one window of `frames` frames over `secs` seconds, from the
@@ -232,10 +271,14 @@ fn lines(
         top.join(", ")
     ));
     // A thread busy for the whole frame at any frame rate is polling (a
-    // spin on a fence or the vertical blank), not doing that much work.
+    // spin on a fence or the vertical blank), not doing that much work. So is
+    // one that spends most of its time spinning on a waiting import: at a low
+    // frame rate the loop around the spin can still look like the busiest.
     let frame_ms = secs * 1e3 / n;
-    let (spin, work): (Vec<&Row>, Vec<&Row>) =
-        rows.iter().partition(|r| busy(r) / n >= 0.95 * frame_ms);
+    let (spin, work): (Vec<&Row>, Vec<&Row>) = rows.iter().partition(|r| {
+        busy(r) / n >= 0.95 * frame_ms
+            || r.spin >= 0.5 * (r.guest + r.kernel).max(f64::MIN_POSITIVE)
+    });
     if let Some(r) = work.first().filter(|_| frames > 0) {
         let b = busy(r) / n;
         let spin: Vec<&str> = spin.iter().map(|r| r.name.as_str()).collect();
@@ -274,6 +317,7 @@ pub fn tick(swaps: u64) {
     );
     let mut prev = PREV.lock().unwrap();
     let Some((t_prev, s_prev, old, irq_prev)) = prev.as_ref() else {
+        CAL.get_or_init(calibrate);
         *prev = Some((at, swaps, cur, irq));
         return;
     };
@@ -307,6 +351,7 @@ pub fn tick(swaps: u64) {
             guest: ms(guest - spin),
             kernel: ms(kernel + spin),
             wait: ms(wait + spin),
+            spin: ms(spin),
         });
     }
     let mut imports: Vec<_> = by
@@ -324,6 +369,15 @@ pub fn tick(swaps: u64) {
     ) {
         crate::log(&l);
     }
+    // Same work every window: a higher ratio is a slower machine (heat, boost,
+    // other load), not more work.
+    let (n, base) = *CAL.get_or_init(calibrate);
+    let t = time_work(n);
+    crate::log(&format!(
+        "[cpu]   fixed work {:.2} ms, {:.2}x the first window (above 1: the machine, not the guest, got slower)",
+        ms(t),
+        t as f64 / base as f64
+    ));
     *prev = Some((at, swaps, cur, irq));
 }
 
@@ -348,6 +402,7 @@ mod tests {
             guest,
             kernel,
             wait,
+            spin: 0.0,
         };
         // 300 frames in 5 s; guest-1 is busy 3000 ms of guest code plus
         // 600 ms of kernel calls, 300 ms of which waiting: 11 ms a frame.
@@ -378,6 +433,36 @@ mod tests {
                 && last.contains("likely polling: guest-5"),
             "{last}"
         );
+
+        // 50 frames in 5 s (100 ms a frame). guest-3 spins 3000 of its 5000 ms
+        // on a waiting import; the loop around the spin leaves it 40 ms a
+        // frame busy, under the whole-frame bar, but it is polling, not work.
+        let spinner = Row {
+            spin: 3000.0,
+            ..row("guest-3", 2000.0, 3000.0, 3000.0)
+        };
+        let l = lines(
+            5.0,
+            50,
+            vec![spinner, row("guest-1", 1000.0, 600.0, 100.0)],
+            vec![],
+            (0.0, 0),
+        );
+        let last = l.last().unwrap();
+        assert!(
+            last.contains("busiest thread guest-1 30.00 ms")
+                && last.contains("about 33 fps")
+                && last.contains("likely polling: guest-3"),
+            "{last}"
+        );
+    }
+
+    #[test]
+    fn fixed_work_is_calibrated_to_about_a_millisecond() {
+        let (n, base) = calibrate();
+        assert!(n >= 1024 && base >= 1_000_000, "{n} {base}");
+        assert!(time_work(n) > 0);
+        assert_ne!(fixed_work(n), fixed_work(n / 2));
     }
 
     #[test]
