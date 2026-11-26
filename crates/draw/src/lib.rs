@@ -1319,6 +1319,9 @@ pub struct Drawer {
     submits_in_flight: usize,
     arena: Option<wgpu::Buffer>,
     arena_align: u64,
+    /// Lists [`Self::guest_window`] and a draw fill and empty, kept so a
+    /// draw does not allocate them again.
+    window_scratch: WindowScratch,
     /// Vertex windows staged in the arena since it last wrapped: guest
     /// physical `lo` to `hi` and their (offset, size) in `arena`. Cleared
     /// when the arena wraps or grows and at the end of a replay, and
@@ -1476,7 +1479,7 @@ struct Batch {
 #[derive(Default)]
 struct Bound {
     pipeline: Option<wgpu::RenderPipeline>,
-    g0: Option<(wgpu::BindGroup, Vec<u32>)>,
+    g0: Option<(wgpu::BindGroup, [u32; 6])>,
     g1: Option<wgpu::BindGroup>,
     /// The whole arena, so draws pick their indices by first index.
     index: Option<wgpu::Buffer>,
@@ -2190,6 +2193,7 @@ impl Drawer {
                 .unwrap_or(SUBMITS_IN_FLIGHT),
             pre: None,
             resolve_pending: false,
+            window_scratch: WindowScratch::default(),
             arena_align: u64::from(
                 limits
                     .min_uniform_buffer_offset_alignment
@@ -4088,7 +4092,6 @@ impl Drawer {
     fn guest_window(
         &mut self,
         mask: u128,
-        reach: &[VertexFetchReach],
         indices: Option<(u32, u32)>,
         mem: &mut Tracked,
         report: &mut Report,
@@ -4101,7 +4104,39 @@ impl Drawer {
         ),
         Skip,
     > {
-        let mut ranges = Vec::new();
+        let mut scratch = std::mem::take(&mut self.window_scratch);
+        let window = self.guest_window_in(&mut scratch, mask, indices, mem, report);
+        self.window_scratch = scratch;
+        window
+    }
+
+    /// [`Self::guest_window`] with `scratch.reach` as the reach.
+    #[allow(clippy::type_complexity)]
+    fn guest_window_in(
+        &mut self,
+        scratch: &mut WindowScratch,
+        mask: u128,
+        indices: Option<(u32, u32)>,
+        mem: &mut Tracked,
+        report: &mut Report,
+    ) -> Result<
+        (
+            Vec<(u64, u64)>,
+            u32,
+            [i32; 96],
+            Option<((u64, u64, (u64, u64)), u64)>,
+        ),
+        Skip,
+    > {
+        let WindowScratch {
+            reach,
+            ranges,
+            part_of,
+            at,
+        } = scratch;
+        ranges.clear();
+        part_of.clear();
+        at.clear();
         let mut clipped = false;
         for k in (0..96).filter(|k| mask & (1u128 << k) != 0) {
             let vf = self.regs.vertex_fetch(k);
@@ -4118,11 +4153,10 @@ impl Drawer {
         }
         ranges.sort_unstable();
         let mut parts: Vec<(u64, u64)> = Vec::new();
-        let mut part_of = Vec::new();
         // A read past its constant's buffer must find the guest's word or 0,
         // not another part's, so such a draw stages one span with no rebase.
         let gap = if clipped { u64::MAX } else { WINDOW_GAP };
-        for &(lo, hi, k) in &ranges {
+        for &(lo, hi, k) in ranges.iter() {
             match parts.last_mut() {
                 Some(p) if lo <= p.1.saturating_add(gap) => p.1 = p.1.max(hi),
                 _ => parts.push((lo, hi)),
@@ -4140,7 +4174,6 @@ impl Drawer {
             }
         }
         // Where each part lands in the window, as `stage` lays them out.
-        let mut at = Vec::with_capacity(parts.len());
         let mut next = 0;
         for &(lo, hi) in &parts {
             at.push(next);
@@ -4156,7 +4189,7 @@ impl Drawer {
                 "vertex data window of {size} bytes is larger than the storage buffer limit"
             ));
         }
-        for (k, p) in part_of {
+        for &(k, p) in part_of.iter() {
             rebase[k as usize] = ((lo + at[p]) as i64 - parts[p].0 as i64) as i32 / 4;
         }
         for &(lo, hi) in &parts {
@@ -5113,13 +5146,13 @@ impl Drawer {
         setup[3] += t_targets.elapsed();
         self.timings.shaders += lap(&mut t);
 
-        let reach: Vec<VertexFetchReach> = (vs_t.info.vertex_fetch_reach.iter())
-            .chain(&ps_t.info.vertex_fetch_reach)
-            .copied()
-            .collect();
+        let reach = &mut self.window_scratch.reach;
+        reach.clear();
+        reach.extend(&vs_t.info.vertex_fetch_reach);
+        reach.extend(&ps_t.info.vertex_fetch_reach);
         let indices = offset_range(idx.min_max, self.regs.get(regs::VGT_INDX_OFFSET));
         let (mut read, window_base, rebase, staged) =
-            self.guest_window(vf_mask, &reach, indices, mem, report)?;
+            self.guest_window(vf_mask, indices, mem, report)?;
         let key = (self.consts_gen, window_base, rebase);
         let consts = match &self.consts_built {
             Some((k, c)) if *k == key => c.clone(),
@@ -5332,11 +5365,11 @@ impl Drawer {
         }
         self.timings.textures += lap(&mut t);
         let arena = self.arena.clone().expect("staged");
-        let offsets: Vec<u32> = slices
-            .iter()
-            .map(|&(offset, _)| u32::try_from(offset))
-            .collect::<Result<_, _>>()
-            .map_err(|_| Skip::Unsupported("draw data past 4 GiB of the arena".into()))?;
+        let mut offsets = [0u32; 6];
+        for (o, &(offset, _)) in offsets.iter_mut().zip(&slices) {
+            *o = u32::try_from(offset)
+                .map_err(|_| Skip::Unsupported("draw data past 4 GiB of the arena".into()))?;
+        }
         let mut sizes = slices.map(|s| s.1);
         // The float constant bindings at a power of two of at least their
         // size (the shader declares its count; the words past it go
@@ -6194,6 +6227,19 @@ impl Drawer {
             (f.fetch_type == 2 && f.base_address & PHYSICAL_MASK == addr).then_some(f.swizzle);
         (endian, swizzle)
     }
+}
+
+/// See [`Drawer::window_scratch`].
+#[derive(Default)]
+struct WindowScratch {
+    /// The vertex fetches the draw's shaders reach, vertex shader first.
+    reach: Vec<VertexFetchReach>,
+    /// Each fetch constant's `[lo, hi)` and number, sorted.
+    ranges: Vec<(u64, u64, u32)>,
+    /// Each fetch constant's part.
+    part_of: Vec<(u32, usize)>,
+    /// Where each part lands in the window.
+    at: Vec<u64>,
 }
 
 /// `ranges` sorted by start, with those that touch or overlap made one.
