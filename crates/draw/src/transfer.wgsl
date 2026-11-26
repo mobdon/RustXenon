@@ -106,9 +106,13 @@ fn color_to_stencil(@builtin(position) pos: vec4<f32>) {
     }
 }
 
+// The word's low byte is the stencil (depth_word's is 0): only the stencil
+// is read. depth_src is named so it stays in the pipeline's layout, which
+// the transfer's bind group fills.
 @fragment
 fn depth_stencil_to_stencil(@builtin(position) pos: vec4<f32>) {
-    if (depth_stencil_word(pos, false) & (1u << transfer_bit)) == 0u {
+    _ = textureDimensions(depth_src);
+    if (textureLoad(stencil_src, src_at(pos, false), 0).r & (1u << transfer_bit)) == 0u {
         discard;
     }
 }
