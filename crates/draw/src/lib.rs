@@ -402,6 +402,18 @@ pub struct Timings {
     pub queue: Duration,
     /// Of `queue`: copying the staged draw buffers into upload memory.
     pub upload: Duration,
+    /// Of `submit`, the draws' own recording by step: their bind groups
+    /// (looked up or made), beginning their render passes, and the `set_*`
+    /// and draw calls.
+    pub submit_parts: [Duration; 3],
+    /// Commands other than draws, resolves and swaps (register writes,
+    /// shader loads, MEM_WRITEs), and the upkeep after every command.
+    pub commands: Duration,
+    /// The start and end of a replay outside the other phases: memo upkeep
+    /// for the guest writes listed, and render target drops.
+    pub edges: Duration,
+    /// Shader loads replayed.
+    pub shader_loads: u32,
     /// Submitting batches on the submit thread, alongside the drawer's
     /// own phases (not part of them).
     pub submit_thread: Duration,
@@ -542,6 +554,12 @@ impl std::ops::AddAssign<&Timings> for Timings {
         self.texture_sets_reused += t.texture_sets_reused;
         self.queue += t.queue;
         self.upload += t.upload;
+        for (a, b) in self.submit_parts.iter_mut().zip(t.submit_parts) {
+            *a += b;
+        }
+        self.commands += t.commands;
+        self.edges += t.edges;
+        self.shader_loads += t.shader_loads;
         self.submit_thread += t.submit_thread;
         self.finish_thread += t.finish_thread;
         self.writebacks += t.writebacks;
@@ -2778,6 +2796,7 @@ impl Drawer {
     ) -> Result<Report, Error> {
         let mut report = Report::default();
         self.timings = Timings::default();
+        let start = Instant::now();
         let was_watching = self.watching;
         match mem.take_written() {
             Some(written) if self.texture_memo.len() < TEXTURE_MEMO_CAP => {
@@ -2820,6 +2839,7 @@ impl Drawer {
             mem,
             written: Vec::new(),
         };
+        self.timings.edges += start.elapsed();
         if let Some((before, w)) = self.late.take() {
             self.end_writeback(&mut mem, w, Some(before))?;
         }
@@ -2833,8 +2853,10 @@ impl Drawer {
         let done = done.and(flushed);
         self.batch = None;
         self.pre = None;
+        let t = Instant::now();
         let replay = self.replays;
         (self.texture_groups).retain(|_, &mut (_, used)| used + 1 >= replay);
+        self.timings.edges += t.elapsed();
         if !self.watching || done.is_err() {
             self.wrap();
         }
@@ -2842,7 +2864,9 @@ impl Drawer {
         let kept = self.finish_mirrors(&mut mem);
         done?;
         kept?;
+        let t = Instant::now();
         self.drop_targets(&mut report);
+        self.timings.edges += t.elapsed();
         // Counts made where only the report is mutable (durations there
         // are zero).
         let mut t = std::mem::take(&mut self.timings);
@@ -2859,6 +2883,13 @@ impl Drawer {
     ) -> Result<(), Error> {
         for c in commands {
             let mem = &mut *tracked;
+            // Draws, resolves and swaps time their own phases; the rest,
+            // and the upkeep below, count as `commands`.
+            let own = matches!(
+                c,
+                Command::Draw(_) | Command::Resolve(_) | Command::Swap { .. }
+            );
+            let mut t = Instant::now();
             let done = match c {
                 Command::WriteRegisters { base, values } => {
                     self.regs.set_many(*base, values);
@@ -2885,6 +2916,7 @@ impl Drawer {
                             "shader load at instruction offset {start} treated as 0"
                         ));
                     }
+                    self.timings.shader_loads += 1;
                     let p = Some(Program {
                         hash: hash_words(words),
                         words: words.as_slice().into(),
@@ -2937,6 +2969,9 @@ impl Drawer {
                 }
                 _ => Ok(()),
             };
+            if own {
+                t = Instant::now();
+            }
             for (lo, hi) in tracked.written.drain(..) {
                 self.forget_guest(lo, hi);
                 // Any write but a resolve's makes a kept copy stale; the
@@ -2952,6 +2987,7 @@ impl Drawer {
                 Err(Skip::Fatal(e)) => return Err(e),
             }
             self.check_uncaptured()?;
+            self.timings.commands += t.elapsed();
         }
         Ok(())
     }
@@ -5236,6 +5272,7 @@ impl Drawer {
 
     /// Draws `d`; Ok(false) when the state makes it draw nothing.
     fn draw(&mut self, d: &Draw, mem: &mut Tracked, report: &mut Report) -> Result<bool, Skip> {
+        let mut t = Instant::now();
         let color_on = match self.regs.get(regs::RB_MODECONTROL) & 7 {
             4 => true,
             5 => false,
@@ -5265,7 +5302,6 @@ impl Drawer {
                 wgpu::PrimitiveTopology::TriangleList | wgpu::PrimitiveTopology::TriangleStrip
             );
         let param_gen = self.param_gen(topology, polygonal);
-        let mut t = Instant::now();
         let vs_t = self.translate(&vs, ShaderStage::Vertex, None)?;
         let ps_t = self.translate(&ps, ShaderStage::Pixel, param_gen)?;
         let surface = self.regs.get(regs::RB_SURFACE_INFO);
@@ -5928,12 +5964,14 @@ impl Drawer {
             }
             g
         };
+        let t_groups = Instant::now();
         // Staging may have flushed the batch, ending the pass: then it
         // begins again and needs the textures.
         if current && !self.pass_open(&pass_key) {
             (color_tex, depth_tex) = self.targets_of(pass_key, rows, msaa, report)?;
         }
         let (pass, bound) = self.pass(pass_key, &color_tex, depth_tex.as_ref());
+        let t_pass = Instant::now();
         if bound.pipeline.as_ref() != Some(&pipeline) {
             pass.set_pipeline(&pipeline);
             bound.pipeline = Some(pipeline);
@@ -5983,7 +6021,6 @@ impl Drawer {
             let first = (index_slice.0 / 4) as u32;
             pass.draw_indexed(first..first + idx.len, 0, 0..1);
         }
-        self.timings.submit += lap(&mut t);
         // Recorded, not yet submitted: everything else that touches the
         // targets flushes the batch first, so stamps follow submit order.
         // The targets of one draw share its stamp: none is newer than
@@ -5995,6 +6032,11 @@ impl Drawer {
         if let Some(k) = depth_key.filter(|_| depth.write || stencil.is_some()) {
             self.stamp_written(k, rows, msaa);
         }
+        let parts = &mut self.timings.submit_parts;
+        parts[0] += t_groups - t;
+        parts[1] += t_pass - t_groups;
+        parts[2] += t_pass.elapsed();
+        self.timings.submit += lap(&mut t);
         Ok(true)
     }
 
