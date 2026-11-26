@@ -64,15 +64,17 @@ pub fn load_game(dir: &Path) -> Result<Game, String> {
     })?;
     let title = r.title.filter(|t| !t.trim().is_empty()).unwrap_or_else(|| {
         // No title chosen: the unpacked game folder's name.
-        Path::new(&r.game)
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| {
-                dir.file_name()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .into_owned()
-            })
+        // Split by hand: run.toml holds Windows paths on any system.
+        let seps = ['\\', '/'];
+        let name = r.game.trim_end_matches(seps).rsplit(seps).next();
+        match name.filter(|n| !n.is_empty() && !n.ends_with(':')) {
+            Some(n) => n.to_string(),
+            None => dir
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned(),
+        }
     });
     Ok(Game {
         dir: dir.to_path_buf(),
@@ -269,10 +271,14 @@ pub(crate) mod tests {
         // Add to front, dedupe (loosely: case and trailing separator).
         let r = add_recent(&[], &g.join("1"));
         let r = add_recent(&r, &elsewhere);
-        let same = PathBuf::from(format!(
-            "{}\\",
-            g.join("1").to_string_lossy().to_uppercase()
-        ));
+        // Case differs only where the file system ignores it.
+        let one = g.join("1").to_string_lossy().into_owned();
+        let one = if cfg!(windows) {
+            one.to_uppercase()
+        } else {
+            one
+        };
+        let same = PathBuf::from(format!("{one}{}", std::path::MAIN_SEPARATOR));
         let r = add_recent(&r, &same);
         assert_eq!(r, [same.clone(), elsewhere.clone()]);
         // A line that is no longer a game is dropped on load.
