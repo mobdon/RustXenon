@@ -23,6 +23,7 @@
 
 use crate::Pad;
 
+/// Key codes, values from `android.view.KeyEvent`.
 pub const KEYCODE_BACK: i32 = 4;
 pub const KEYCODE_DPAD_UP: i32 = 19;
 pub const KEYCODE_DPAD_DOWN: i32 = 20;
@@ -42,6 +43,7 @@ pub const KEYCODE_BUTTON_START: i32 = 108;
 pub const KEYCODE_BUTTON_SELECT: i32 = 109;
 pub const KEYCODE_BUTTON_MODE: i32 = 110;
 
+/// Axis ids, values from `android.view.MotionEvent`.
 pub const AXIS_X: i32 = 0;
 pub const AXIS_Y: i32 = 1;
 pub const AXIS_Z: i32 = 11;
