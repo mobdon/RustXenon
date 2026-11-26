@@ -917,12 +917,6 @@ fn unsupported_features_are_errors() {
         Err(Error::Unsupported(m)) => m,
         other => panic!("expected Unsupported, got {other:?}"),
     };
-    // Depth export.
-    let m = unsupported(
-        assemble(&[exec(0, 1, true)], &[alu(export(61, r(0)))]),
-        Pixel,
-    );
-    assert!(m.contains("depth"), "{m}");
     // Memory export.
     let m = unsupported(
         assemble(&[exec(0, 1, true)], &[alu(export(32, r(0)))]),
@@ -952,6 +946,37 @@ fn unsupported_features_are_errors() {
     // Kill in a vertex shader.
     let a = AluInstr::scalar(ScalarOp::KillsEq, 0, 0, r(0));
     unsupported(assemble(&[exec(0, 1, true)], &[alu(a)]), Vertex);
+}
+
+/// oDepth becomes `@builtin(frag_depth)`: its x clamped to [0, 1], with or
+/// without a colour export.
+#[test]
+fn depth_export_writes_frag_depth() {
+    let words = assemble(&[exec(0, 1, true)], &[alu(export(61, r(1)))]);
+    let t = ok(&words, Pixel);
+    assert!(t.info.writes_depth);
+    assert_eq!(t.info.colour_targets_written, 0);
+    has(&t, "fn ps_main(input: PsIn) -> PsOut");
+    has(&t, "o_depth.x = vr.x;");
+    has(&t, xenon_shader::DEPTH_MEMBER);
+    has(&t, xenon_shader::DEPTH_STORE);
+
+    let words = assemble(
+        &[exec(0, 2, true)],
+        &[alu(export(0, r(0))), alu(export(61, r(1)))],
+    );
+    let t = ok(&words, Pixel);
+    assert!(t.info.writes_depth);
+    assert_eq!(t.info.colour_targets_written, 1);
+    has(&t, "out.c0 = o_col[0];");
+    has(&t, "out.depth = clamp(o_depth.x, 0.0, 1.0);");
+
+    let t = ok(
+        &assemble(&[exec(0, 1, true)], &[alu(export(0, r(0)))]),
+        Pixel,
+    );
+    assert!(!t.info.writes_depth);
+    assert!(!t.wgsl.contains("frag_depth"));
 }
 
 #[test]

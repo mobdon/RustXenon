@@ -96,6 +96,9 @@ pub struct ShaderInfo {
     pub interpolators_read: u16,
     /// Pixel stage: bit i means `@location(i)` colour output is declared.
     pub colour_targets_written: u8,
+    /// Pixel stage: the program exports oDepth, so `PsOut` has a
+    /// `@builtin(frag_depth) depth` member (oDepth.x clamped to [0, 1]).
+    pub writes_depth: bool,
     /// Vertex stage: the program exports a position.
     pub writes_position: bool,
     /// Lowest and highest float constant read with an absolute index, in the
@@ -168,6 +171,12 @@ pub const PIXEL_FLOAT_CONSTS_BINDING: u32 = 5;
 /// The console's D3D runtime sets SQ_VS_CONST to base 0 and SQ_PS_CONST to
 /// base 256, 256 constants each (Xenia asserts this split).
 pub const PIXEL_FLOAT_CONST_BASE: u32 = 256;
+
+/// The `PsOut` member and the store of a pixel shader that exports oDepth
+/// ([`ShaderInfo::writes_depth`]); a pipeline without a depth attachment
+/// must drop both lines.
+pub const DEPTH_MEMBER: &str = "    @builtin(frag_depth) depth: f32,\n";
+pub const DEPTH_STORE: &str = "    out.depth = clamp(o_depth.x, 0.0, 1.0);\n";
 
 /// Control-flow steps a single invocation may take before the program is cut
 /// short, so a broken loop cannot hang the GPU.
@@ -825,7 +834,10 @@ impl Gen {
                 self.info.colour_targets_written |= 1 << reg;
                 Ok(Some(format!("o_col[{reg}]")))
             }
-            (ShaderStage::Pixel, 61) => Self::unsupported("pixel depth export (oDepth)"),
+            (ShaderStage::Pixel, 61) => {
+                self.info.writes_depth = true;
+                Ok(Some("o_depth".into()))
+            }
             (stage, _) => Err(Error::Malformed(format!(
                 "export register {reg} is invalid for {stage:?}"
             ))),
@@ -1433,7 +1445,11 @@ fn cnst(i: i32) -> vec4<f32> {
                 (entry, ret)
             }
             ShaderStage::Pixel => {
-                s.push_str("var<private> o_col: array<vec4<f32>, 4>;\n\n");
+                s.push_str("var<private> o_col: array<vec4<f32>, 4>;\n");
+                if self.info.writes_depth {
+                    s.push_str("var<private> o_depth: vec4<f32>;\n");
+                }
+                s.push('\n');
                 let reads = self.info.interpolators_read;
                 let pg = self.param_gen;
                 let has_input = reads != 0 || pg.is_some();
@@ -1453,8 +1469,9 @@ fn cnst(i: i32) -> vec4<f32> {
                     s.push_str("}\n\n");
                 }
                 let cols = self.info.colour_targets_written;
+                let has_output = cols != 0 || self.info.writes_depth;
                 let mut ret = String::new();
-                if cols != 0 {
+                if has_output {
                     s.push_str("struct PsOut {\n");
                     ret.push_str("    var out: PsOut;\n");
                     for i in 0..4 {
@@ -1463,13 +1480,20 @@ fn cnst(i: i32) -> vec4<f32> {
                             let _ = writeln!(ret, "    out.c{i} = o_col[{i}];");
                         }
                     }
+                    if self.info.writes_depth {
+                        // shortcut: no 20e4 rounding of the exported depth
+                        // (Xenia's float24 conversion); add it if depth
+                        // tests against a kD24FS8 target flicker.
+                        s.push_str(DEPTH_MEMBER);
+                        ret.push_str(DEPTH_STORE);
+                    }
                     s.push_str("}\n\n");
                     ret.push_str("    return out;\n");
                 }
                 let mut entry = format!(
                     "@fragment\nfn ps_main({}){} {{\n",
                     if has_input { "input: PsIn" } else { "" },
-                    if cols != 0 { " -> PsOut" } else { "" }
+                    if has_output { " -> PsOut" } else { "" }
                 );
                 for i in 0..16 {
                     if reads & (1 << i) != 0 {
