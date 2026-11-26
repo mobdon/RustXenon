@@ -9,6 +9,7 @@ use android_activity::input::{Axis, InputEvent, KeyAction, Source};
 use android_activity::ndk::hardware_buffer_format::HardwareBufferFormat;
 use android_activity::ndk::native_window::NativeWindow;
 use android_activity::{InputStatus, MainEvent, PollEvent, WindowManagerFlags};
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use xenon_input::android::Gamepad;
@@ -39,6 +40,12 @@ fn close() -> ! {
         f();
     }
     std::process::exit(0)
+}
+
+fn set_hidden(on: bool) {
+    if let Some(l) = LINK.get() {
+        l.hidden.store(on, Ordering::Relaxed);
+    }
 }
 
 /// Whether an input source is a controller: the gamepad, joystick or D-pad
@@ -177,6 +184,13 @@ pub fn run(app: AndroidApp) -> ! {
                     }
                     MainEvent::TerminateWindow { .. } => window = None,
                     MainEvent::LostFocus => pad.release_all(),
+                    // Home, the app switcher or the screen going off: the
+                    // game runs on, unheard and with the pad let go.
+                    MainEvent::Pause => {
+                        pad.release_all();
+                        set_hidden(true);
+                    }
+                    MainEvent::Resume { .. } => set_hidden(false),
                     MainEvent::Destroy => gone = true,
                     _ => {}
                 }

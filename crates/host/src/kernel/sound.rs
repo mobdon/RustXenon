@@ -234,6 +234,8 @@ pub fn tick() {
         }
     }
     if let Some(s) = o.speaker.as_mut() {
+        // In the background the game keeps mixing; the speaker drops it.
+        s.set_muted(super::input::WINDOW.get().is_some_and(|l| l.hidden()));
         if let Err(e) = s.write(&mix) {
             crate::log(&format!("audio: speaker stopped: {e}"));
             o.speaker = None;
