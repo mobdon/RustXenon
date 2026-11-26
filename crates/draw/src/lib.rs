@@ -1289,7 +1289,7 @@ pub struct Drawer {
     /// Guest texture bytes are read into this buffer, kept across lookups:
     /// a fresh one per texture costs zeroing and page faults every frame.
     texture_scratch: Vec<u8>,
-    samplers: HashMap<([u8; 3], u8, u8, u8, u32), wgpu::Sampler>,
+    samplers: HashMap<SamplerKey, wgpu::Sampler>,
     /// Draws recorded but not yet submitted (see [`Batch`]).
     batch: Option<Batch>,
     /// Texture bind groups by texture slot mask and the slots' views and
@@ -1374,6 +1374,9 @@ pub struct Drawer {
     /// `Rg16Snorm` and `Rgba16Snorm` can be render targets (k_16_16 and
     /// k_16_16_16_16 are refused without them).
     snorm16: bool,
+    /// The adapter filters anisotropically (samplers take the fetch
+    /// constant's anisotropy only then).
+    anisotropic: bool,
     /// The snorm16 targets blend (else their blending is dropped).
     snorm16_blend: bool,
     /// [`formats::half_lut`] tables by source format and exponent bias, for
@@ -1993,6 +1996,9 @@ impl Drawer {
                 "the adapter has no storage buffers in vertex shaders".into(),
             ));
         }
+        let anisotropic = caps
+            .flags
+            .contains(wgpu::DownlevelFlags::ANISOTROPIC_FILTERING);
         let info = adapter.get_info();
         let limits = adapter.limits();
         // kD24FS8 keeps its stencil only where the host has a float depth
@@ -2202,6 +2208,7 @@ impl Drawer {
             resolve_pipelines: [None, None, None],
             float_stencil,
             snorm16,
+            anisotropic,
             snorm16_blend,
             half_luts: HashMap::default(),
             mirrors: Vec::new(),
@@ -4703,6 +4710,11 @@ impl Drawer {
         // samplers are made per fetch constant.
         let min_level = fetch.mip_range().0;
         let base_map = fetch.mip_filter == 2;
+        let aniso = if self.anisotropic {
+            anisotropy(fetch.aniso_filter)
+        } else {
+            1
+        };
         self.samplers
             .entry((
                 fetch.clamp,
@@ -4710,20 +4722,33 @@ impl Drawer {
                 fetch.min_filter,
                 fetch.mip_filter,
                 min_level,
+                aniso,
             ))
             .or_insert_with(|| {
+                // Anisotropic filtering is linear in all three, as Xenia's
+                // anisotropic sampler (WebGPU requires it too).
+                let linear = aniso > 1;
                 device.create_sampler(&wgpu::SamplerDescriptor {
                     label: Some("guest sampler"),
                     address_mode_u: modes[0],
                     address_mode_v: modes[1],
                     address_mode_w: modes[2],
-                    mag_filter: filter(fetch.mag_filter),
-                    min_filter: filter(fetch.min_filter),
-                    mipmap_filter: if fetch.mip_filter == 1 {
+                    mag_filter: if linear {
+                        wgpu::FilterMode::Linear
+                    } else {
+                        filter(fetch.mag_filter)
+                    },
+                    min_filter: if linear {
+                        wgpu::FilterMode::Linear
+                    } else {
+                        filter(fetch.min_filter)
+                    },
+                    mipmap_filter: if fetch.mip_filter == 1 || (linear && !base_map) {
                         wgpu::MipmapFilterMode::Linear
                     } else {
                         wgpu::MipmapFilterMode::Nearest
                     },
+                    anisotropy_clamp: aniso,
                     lod_min_clamp: min_level as f32,
                     lod_max_clamp: if base_map {
                         min_level as f32 + 0.25
@@ -6219,6 +6244,20 @@ fn meets(ranges: &[(u64, u64)], a: u64, b: u64) -> bool {
     ranges.get(i).is_some_and(|&(lo, _)| lo < b)
 }
 
+/// A guest sampler's clamp modes, mag, min and mip filters, first mip
+/// level and maximum anisotropy.
+type SamplerKey = ([u8; 3], u8, u8, u8, u32, u16);
+
+/// The maximum anisotropy of a fetch constant's `AnisoFilter`: 1, 2, 4, 8
+/// or 16 for 1 to 5, as Xenia's samplers; 1 for disabled (0) and for "use
+/// the fetch constant" (7), which has no other value to take here.
+fn anisotropy(aniso_filter: u8) -> u16 {
+    match aniso_filter {
+        1..=5 => 1 << (aniso_filter - 1),
+        _ => 1,
+    }
+}
+
 /// A tiled front buffer's bytes as a frame.
 fn detile_front(
     mut raw: Vec<u8>,
@@ -6391,6 +6430,13 @@ fn host_texture_format(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The fetch constant's anisotropy field gives Xenia's maximum.
+    #[test]
+    fn anisotropy_follows_the_fetch_constant() {
+        let got: Vec<u16> = (0..8).map(anisotropy).collect();
+        assert_eq!(got, [1, 1, 2, 4, 8, 16, 1, 1]);
+    }
 
     /// `meets` over merged ranges agrees with checking every range.
     #[test]
