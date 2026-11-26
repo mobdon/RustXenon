@@ -451,16 +451,43 @@ fn say(s: &str) {
 /// close handler.
 static STOPPED: AtomicI32 = AtomicI32::new(0);
 
-/// Ends the run with `code`. With a window open (and this not its thread)
-/// the window first shows the log's newest lines until the player closes
-/// it; its close handler then exits.
+/// Marks the run stopped with `code`. Only the first stop goes on: a
+/// later one (another thread faulting behind the stop screen) parks for
+/// good, so the first reason stays on screen.
+fn claim_stop(code: i32) {
+    if STOPPED
+        .compare_exchange(0, code, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        if std::thread::current().name() == Some("window") {
+            std::process::exit(STOPPED.load(Ordering::SeqCst));
+        }
+        loop {
+            std::thread::park();
+        }
+    }
+}
+
+/// The log's newest lines.
+fn tail() -> Vec<String> {
+    let t = TAIL.lock().unwrap_or_else(|e| e.into_inner());
+    t.iter().cloned().collect()
+}
+
+/// Ends the run with `code` (see [`show`]).
 fn hold(code: i32) -> ! {
-    STOPPED.store(code, Ordering::SeqCst);
+    claim_stop(code);
+    show(code, tail())
+}
+
+/// Ends a claimed stop. With a window open (and this not its thread) the
+/// sound stops and the window shows `lines` until the player closes it;
+/// its close handler then exits.
+fn show(code: i32, lines: Vec<String>) -> ! {
     if let Some(w) = kernel::input::WINDOW.get() {
         if std::thread::current().name() != Some("window") {
-            let lines = TAIL.lock().unwrap_or_else(|e| e.into_inner());
-            w.show_text(lines.iter().cloned().collect());
-            drop(lines);
+            kernel::sound::silence();
+            w.show_text(lines);
             loop {
                 std::thread::park();
             }
@@ -543,6 +570,8 @@ pub fn run(sha256: &str, regs: &[fn(&mut Runtime)]) -> ExitCode {
     let opened = std::fs::File::create(me_dir.join("rustxenon-play.log"))
         .map(|f| LOG_FILE.set(Mutex::new(f)));
     log(&format!("build {BUILD}"));
+    // Early, so a panic while starting up reaches the log and the stop screen.
+    std::panic::set_hook(Box::new(|info| stop(&info.to_string())));
     if let Err(e) = opened {
         log(&format!("rustxenon-play.log: {e}; logging to stderr only"));
     }
@@ -687,7 +716,6 @@ pub fn run(sha256: &str, regs: &[fn(&mut Runtime)]) -> ExitCode {
     set_runtime(rt.clone());
     log(&format!("call table: {} MB", rt.table_bytes() >> 20));
 
-    std::panic::set_hook(Box::new(|info| stop(&info.to_string())));
     xenon_rt::guard::on_wild_access(|a| {
         stop(&format!(
             "wild guest access at {a:#010x}, never allocated{}",
@@ -853,6 +881,7 @@ fn host_rss() -> Option<u64> {
 /// Stops the run: the reason, this thread's last calls and guest return
 /// addresses, then the full report (every thread). Never returns.
 fn stop(why: &str) -> ! {
+    claim_stop(101);
     let name = std::thread::current().name().unwrap_or("?").to_string();
     log(&format!("STOP in {name}: {why}"));
     log(&format!(
@@ -875,8 +904,15 @@ fn stop(why: &str) -> ! {
             ));
         }
     }
-    report();
-    hold(101);
+    // Taken before the report, whose lines would push these off the screen.
+    let mut lines = tail();
+    lines.push("The full report follows in rustxenon-play.log.".into());
+    // The kernel is installed before RT is set; without it there is
+    // nothing to report.
+    if RT.get().is_some() {
+        report();
+    }
+    show(101, lines)
 }
 
 fn report() {

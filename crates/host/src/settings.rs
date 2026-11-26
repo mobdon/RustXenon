@@ -190,7 +190,8 @@ pub fn load(home: &Path, exe_dir: &Path, sha256: &str, warn: &mut Vec<String>) -
             Run::default()
         }
     };
-    let defaults = read(home.join("settings.toml"));
+    let settings = home.join("settings.toml");
+    let defaults = read(settings.clone());
     let beside = exe_dir.join("run.toml");
     let run_toml = if beside.exists() {
         beside
@@ -198,6 +199,21 @@ pub fn load(home: &Path, exe_dir: &Path, sha256: &str, warn: &mut Vec<String>) -
         home.join("games").join(sha256).join("run.toml")
     };
     let mut run = read(run_toml);
+    let d = &defaults;
+    for (key, v) in [
+        ("title", &d.title),
+        ("exe", &d.exe),
+        ("game", &d.game),
+        ("update", &d.update),
+        ("data", &d.data),
+    ] {
+        if v.is_some() {
+            warn.push(format!(
+                "{}: {key} belongs in a game's run.toml; ignored",
+                settings.display()
+            ));
+        }
+    }
     run.layer = run.layer.over(defaults.layer);
     run
 }
@@ -363,6 +379,12 @@ mod tests {
         assert_eq!((r.exe, r.game.as_deref()), (None, Some("g")));
         assert_eq!(r.layer.width, Some(800));
         assert!(w.is_empty(), "{w:?}");
+        // A game's paths in settings.toml: a warning, and not used.
+        std::fs::write(root.join("settings.toml"), "exe = 'x'\n").unwrap();
+        let r = load(&root, &dropped, &sha, &mut w);
+        assert_eq!(r.exe, None);
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(w[0].contains("exe belongs in a game's run.toml"), "{w:?}");
         std::fs::remove_dir_all(root).unwrap();
     }
 }
