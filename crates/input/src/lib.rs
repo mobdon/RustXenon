@@ -5,6 +5,8 @@
 //! `ArrowUp`), radial stick dead zones, and merging a real pad with the
 //! keyboard. The window crate feeds it key events and XInput readings.
 
+pub mod android;
+
 use std::collections::HashSet;
 
 /// Button bits of the gamepad state, with the names `--press` uses.
