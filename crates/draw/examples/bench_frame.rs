@@ -6,7 +6,8 @@
 //! writes the first replay's last frame to `out.png` (and the last
 //! replay's to `out.png.last.png`). `XENON_GPU_TIMESTAMPS=1` adds GPU time
 //! per pass kind; it waits for the GPU at every flush, so the wall time
-//! is then longer.
+//! is then longer. The front buffer is read a frame late, as the host
+//! does, unless `XENON_LATE_FRAME=0`.
 
 use std::path::Path;
 use std::time::Instant;
@@ -31,6 +32,7 @@ fn main() {
     let (cmds, mut mem) = xenon_gpu::bundle::read(Path::new(&args[0]))
         .unwrap_or_else(|e| fail(format!("{}: {e}", args[0])));
     let mut d = Drawer::new().unwrap_or_else(|e| fail(e.to_string()));
+    d.late_front_buffer = std::env::var("XENON_LATE_FRAME").as_deref() != Ok("0");
     println!("{}", d.memory_line());
     let mut best = f64::MAX;
     for i in 0..n {
