@@ -3546,7 +3546,15 @@ impl Drawer {
         let own = self.written.get(&key).copied().unwrap_or_default();
         let range = edram_range(key, rows.max(own.rows), msaa);
         let mut newest: Option<(RenderTargetKey, Written)> = None;
-        for (&k, &w) in &self.written {
+        // Stamps come from `clock`, so a target stamped at the clock has no
+        // newer one to find: the scan below would skip every entry. Most
+        // draws go to the target drawn to last (4 ms a frame of scans).
+        let others = if own.stamp < self.clock {
+            self.written.len()
+        } else {
+            0
+        };
+        for (&k, &w) in self.written.iter().take(others) {
             if w.stamp <= own.stamp || k == key {
                 continue;
             }
@@ -3676,6 +3684,12 @@ impl Drawer {
     /// Records a write to `key`, drawn with `msaa`, down to row `rows`.
     fn mark_written(&mut self, key: RenderTargetKey, rows: u32, msaa: u32) {
         self.clock += 1;
+        self.stamp_written(key, rows, msaa);
+    }
+
+    /// [`Self::mark_written`] at the current `clock`, for the targets of one
+    /// draw.
+    fn stamp_written(&mut self, key: RenderTargetKey, rows: u32, msaa: u32) {
         let w = self.written.entry(key).or_default();
         w.stamp = self.clock;
         w.rows = w.rows.max(rows);
@@ -5560,11 +5574,14 @@ impl Drawer {
         self.timings.submit += lap(&mut t);
         // Recorded, not yet submitted: everything else that touches the
         // targets flushes the batch first, so stamps follow submit order.
+        // The targets of one draw share its stamp: none is newer than
+        // another, and the next draw to any of them finds no newer target.
+        self.clock += 1;
         for k in color.into_iter().flatten() {
-            self.mark_written(k, rows, msaa);
+            self.stamp_written(k, rows, msaa);
         }
         if let Some(k) = depth_key.filter(|_| depth.write || stencil.is_some()) {
-            self.mark_written(k, rows, msaa);
+            self.stamp_written(k, rows, msaa);
         }
         Ok(true)
     }
