@@ -1127,9 +1127,15 @@ struct DiskCache {
 /// order.
 type TextureGroupKey = (u32, Vec<(wgpu::TextureView, wgpu::Sampler)>);
 
-/// A draw's texture slot mask, the fetch constants of those slots and the
-/// slots' fetch filter overrides.
-type TextureSetKey = (u32, Vec<[u32; 6]>, [Option<[u8; 4]>; 32]);
+/// A draw's texture slot mask, and the fetch constants of those slots with
+/// each slot's packed fetch filter overrides ([`pack_filters`]).
+type TextureSetKey = (u32, Vec<([u32; 6], u32)>);
+
+/// A fetch instruction's filter overrides as one word: 0 for none, else
+/// bit 31 with mag, min, mip and aniso in bytes 0 to 3.
+fn pack_filters(f: Option<[u8; 4]>) -> u32 {
+    f.map_or(0, |f| 1 << 31 | u32::from_le_bytes(f))
+}
 
 /// A program's translation, or why it failed.
 type Translation = Result<Arc<Translated>, String>;
@@ -1322,7 +1328,7 @@ pub struct Drawer {
     texture_set_flags: HashMap<[u32; 6], Vec<Arc<AtomicBool>>>,
     /// The fetch constants of a draw's texture set, kept so looking a set
     /// up does not allocate.
-    texture_set_key: Vec<[u32; 6]>,
+    texture_set_key: Vec<([u32; 6], u32)>,
     /// Counts the changes that drop all [`Drawer::texture_memo`] entries.
     texture_memo_epoch: u64,
     /// Group 0 bind groups over `arena`, by the sizes of the four slices
@@ -1980,11 +1986,12 @@ fn sampler_address(clamp: u8, border: bool) -> (wgpu::AddressMode, bool) {
         2 => (A::ClampToEdge, true),
         6 if border => (A::ClampToBorder, true),
         // Xenia draws the mirror-once modes (to edge, half-way, border) as
-        // mirror clamp to edge, which wgpu lacks: mirror repeat is the same
-        // over [-1, 1], the range a mirror-once texture is drawn over.
-        // shortcut: past it, repeats instead of clamping; would need the
-        // coordinate's abs() in a shader variant per fetch constant.
-        3 | 5 | 7 => (A::MirrorRepeat, false),
+        // mirror clamp to edge, which wgpu lacks.
+        // shortcut: edge clamp, right for coordinates >= 0 and wrong for
+        // negative ones (the guest mirrors them); upgrade when a trace shows
+        // negative coordinates on a mirror-once fetch, with abs() on the
+        // coordinate from a per-slot bit the translated fetch reads.
+        3 | 5 | 7 => (A::ClampToEdge, false),
         // Half-way clamp is edge clamp, as in Xenia; border without the
         // feature too.
         _ => (A::ClampToEdge, false),
@@ -2028,22 +2035,26 @@ fn sampler_key(
         pick(aniso, 7, fetch.aniso_filter),
     );
     let address = fetch.clamp.map(|c| sampler_address(c, border).0);
-    // wgpu takes anisotropy only with every filter linear. Xenia: border
-    // colours other than opaque white are transparent black (CrYCb ones
-    // are not done).
-    let linear = (mag, min, mip) == (1, 1, 1);
+    // As Xenia, any anisotropy (1:1 too) makes every filter linear, which
+    // wgpu also needs for anisotropy. Xenia: border colours other than
+    // opaque white are transparent black (CrYCb ones are not done).
+    let (mag_f, min_f, mip_linear) = if aniso != 0 {
+        (1, 1, true)
+    } else {
+        (mag, min, mip == 1)
+    };
     SamplerKey {
         address,
-        mag: filter(mag),
-        min: filter(min),
-        mip: if mip == 1 {
+        mag: filter(mag_f),
+        min: filter(min_f),
+        mip: if mip_linear {
             wgpu::MipmapFilterMode::Linear
         } else {
             wgpu::MipmapFilterMode::Nearest
         },
         anisotropy: match aniso {
-            1..=5 if linear => 1 << (aniso - 1),
-            _ => 1,
+            0 => 1,
+            a => 1 << (a.min(5) - 1),
         },
         border: address
             .contains(&wgpu::AddressMode::ClampToBorder)
@@ -5247,8 +5258,8 @@ impl Drawer {
         // Each slot has one sampler: the vertex stage's filters, else the
         // pixel stage's.
         let (vs_i, ps_i) = (&vs_t.info, &ps_t.info);
-        let filters: [Option<[u8; 4]>; 32] =
-            std::array::from_fn(|n| vs_i.texture_filters[n].or(ps_i.texture_filters[n]));
+        let filters =
+            |n: u32| vs_i.texture_filters[n as usize].or(ps_i.texture_filters[n as usize]);
         let both = vs_i.textures_used & ps_i.textures_used;
         let differ = (0..32)
             .any(|n| both & (1 << n) != 0 && vs_i.texture_filters[n] != ps_i.texture_filters[n]);
@@ -5571,13 +5582,13 @@ impl Drawer {
         // of the set in each memo epoch does both.
         // The key is built in a kept list: a new one only when a set is
         // recorded below.
-        let mut key = (tex_mask, std::mem::take(&mut self.texture_set_key), filters);
+        let mut key = (tex_mask, std::mem::take(&mut self.texture_set_key));
         key.1.clear();
         let regs = &self.regs;
         (key.1).extend(
             (0..32)
                 .filter(|n| tex_mask & (1 << n) != 0)
-                .map(|n| regs.fetch_constant(n)),
+                .map(|n| (regs.fetch_constant(n), pack_filters(filters(n)))),
         );
         let set = (self.texture_sets.get(&key))
             .filter(|(_, epoch, kept)| {
@@ -5588,7 +5599,7 @@ impl Drawer {
         let mut textures = Vec::new();
         if set.is_none() {
             for n in (0..32).filter(|n| tex_mask & (1 << n) != 0) {
-                textures.push(self.texture(n, filters[n as usize], mem, report)?);
+                textures.push(self.texture(n, filters(n), mem, report)?);
             }
         }
         self.timings.textures += lap(&mut t);
@@ -5645,24 +5656,24 @@ impl Drawer {
                 self.texture_sets.clear();
                 self.texture_set_flags.clear();
             }
-            let constants: Vec<[u32; 6]> = (0..32)
+            let constants: Vec<([u32; 6], u32)> = (0..32)
                 .filter(|n| tex_mask & (1 << n) != 0)
-                .map(|n| self.regs.fetch_constant(n))
+                .map(|n| (self.regs.fetch_constant(n), pack_filters(filters(n))))
                 .collect();
             // Only a set whose textures all came from the texture memo: a
             // texture that could not be read or decoded is drawn as zeros
             // with no memo entry, so no guest write would move the epoch
             // and the set would keep its zeros after the data is fixed.
             // (Slots without a texture fetch constant read no memory.)
-            let found = constants.iter().all(|c| {
+            let found = constants.iter().all(|(c, _)| {
                 xenon_texture::TextureFetch::decode(*c).fetch_type != 2
                     || self.texture_memo.contains_key(c)
             });
             if found {
                 let kept = Arc::new(AtomicBool::new(true));
-                for c in constants
+                for (c, _) in constants
                     .iter()
-                    .filter(|c| self.texture_memo.contains_key(*c))
+                    .filter(|(c, _)| self.texture_memo.contains_key(c))
                 {
                     let flags = self.texture_set_flags.entry(*c).or_default();
                     // A set made again after its flag was cleared leaves the
@@ -5673,7 +5684,7 @@ impl Drawer {
                     flags.push(kept.clone());
                 }
                 let epoch = self.texture_memo_epoch;
-                let key = (tex_mask, constants, filters);
+                let key = (tex_mask, constants);
                 (self.texture_sets).insert(key, (g.clone(), epoch, kept));
             }
             g
@@ -6703,11 +6714,11 @@ mod tests {
             (A::Repeat, A::Repeat),
             (A::MirrorRepeat, A::MirrorRepeat),
             (A::ClampToEdge, A::ClampToEdge),
-            (A::MirrorRepeat, A::MirrorRepeat),
             (A::ClampToEdge, A::ClampToEdge),
-            (A::MirrorRepeat, A::MirrorRepeat),
+            (A::ClampToEdge, A::ClampToEdge),
+            (A::ClampToEdge, A::ClampToEdge),
             (A::ClampToEdge, A::ClampToBorder),
-            (A::MirrorRepeat, A::MirrorRepeat),
+            (A::ClampToEdge, A::ClampToEdge),
         ];
         for (c, &(plain, border)) in want.iter().enumerate() {
             let f = sampler_fetch([c as u32, 0, 2], [1, 1, 0, 0], 1);
@@ -6728,7 +6739,7 @@ mod tests {
     }
 
     /// Instruction filter fields override the fetch constant's unless 3
-    /// (aniso 7); anisotropy only with every filter linear.
+    /// (aniso 7); any anisotropy makes every filter linear, as in Xenia.
     #[test]
     fn sampler_key_filters_and_anisotropy() {
         use wgpu::FilterMode::{Linear, Nearest};
@@ -6744,24 +6755,47 @@ mod tests {
         assert_eq!((k.mag, k.min, k.mip), (Linear, Nearest, M::Linear));
         let k = sampler_key(&point, Some([1, 1, 2, 7]), false);
         assert!(k.base_map);
-        for (aniso, want) in [(0, 1), (1, 1), (2, 2), (3, 4), (4, 8), (5, 16), (6, 1)] {
+        for (aniso, want) in [(0, 1), (1, 1), (2, 2), (3, 4), (4, 8), (5, 16), (6, 16)] {
             let f = sampler_fetch([0; 3], [1, 1, 1, aniso], 0);
             assert_eq!(
                 sampler_key(&f, None, false).anisotropy,
                 want,
                 "aniso {aniso}"
             );
-            // The instruction's aniso, and filters that are not all linear.
+            // The instruction's aniso over point filters: linear filters
+            // with it, point ones without.
+            let k = sampler_key(&point, Some([3, 3, 3, aniso as u8]), false);
+            let (f_want, m_want) = if aniso != 0 {
+                (Linear, M::Linear)
+            } else {
+                (Nearest, M::Nearest)
+            };
             assert_eq!(
-                sampler_key(&point, Some([1, 1, 1, aniso as u8]), false).anisotropy,
-                want
+                (k.mag, k.min, k.mip, k.anisotropy),
+                (f_want, f_want, m_want, want),
+                "aniso {aniso} over point"
             );
-            let k = sampler_key(&f, Some([0, 3, 3, 7]), false);
-            assert_eq!(k.anisotropy, 1, "aniso {aniso} with point mag");
+            // A base map mip filter stays one under anisotropy.
+            let k = sampler_key(&point, Some([0, 0, 2, aniso as u8]), false);
+            assert!(k.base_map, "aniso {aniso}");
         }
         // The instruction turns the constant's anisotropy off.
         let f = sampler_fetch([0; 3], [1, 1, 1, 5], 0);
         assert_eq!(sampler_key(&f, Some([3, 3, 3, 0]), false).anisotropy, 1);
+    }
+
+    /// Packed filter overrides tell no override from all-zero ones and
+    /// keep every field.
+    #[test]
+    fn packed_filters_differ() {
+        assert_eq!(pack_filters(None), 0);
+        assert_ne!(pack_filters(Some([0; 4])), 0);
+        let base = pack_filters(Some([1, 2, 3, 4]));
+        for i in 0..4 {
+            let mut f = [1, 2, 3, 4];
+            f[i] = 0;
+            assert_ne!(pack_filters(Some(f)), base, "field {i}");
+        }
     }
 
     /// `meets` over merged ranges agrees with checking every range.
