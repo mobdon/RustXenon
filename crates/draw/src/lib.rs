@@ -287,6 +287,12 @@ struct Mirror {
     checked: Vec<bool>,
     /// Textures decoded from the buffer, by fetch constant.
     views: HashMap<[u32; 6], Kept>,
+    /// Resolve bind groups writing into the buffer, by source texture and
+    /// `resolve_pipelines` entry, the parameters in the arena at a dynamic
+    /// offset. They hold the buffer, so they go when it does; also dropped
+    /// when the arena is replaced, and at the end of a replay for textures
+    /// no longer kept.
+    groups: HashMap<(wgpu::Texture, usize), wgpu::BindGroup>,
 }
 
 /// A texture decoded from a [`Mirror`].
@@ -402,6 +408,18 @@ pub struct Timings {
     pub queue: Duration,
     /// Of `queue`: copying the staged draw buffers into upload memory.
     pub upload: Duration,
+    /// Of `submit`, the draws' own recording by step: their bind groups
+    /// (looked up or made), beginning their render passes, and the `set_*`
+    /// and draw calls.
+    pub submit_parts: [Duration; 3],
+    /// Commands other than draws, resolves and swaps (register writes,
+    /// shader loads, MEM_WRITEs), and the upkeep after every command.
+    pub commands: Duration,
+    /// The start and end of a replay outside the other phases: memo upkeep
+    /// for the guest writes listed, and render target drops.
+    pub edges: Duration,
+    /// Shader loads replayed.
+    pub shader_loads: u32,
     /// Submitting batches on the submit thread, alongside the drawer's
     /// own phases (not part of them).
     pub submit_thread: Duration,
@@ -542,6 +560,12 @@ impl std::ops::AddAssign<&Timings> for Timings {
         self.texture_sets_reused += t.texture_sets_reused;
         self.queue += t.queue;
         self.upload += t.upload;
+        for (a, b) in self.submit_parts.iter_mut().zip(t.submit_parts) {
+            *a += b;
+        }
+        self.commands += t.commands;
+        self.edges += t.edges;
+        self.shader_loads += t.shader_loads;
         self.submit_thread += t.submit_thread;
         self.finish_thread += t.finish_thread;
         self.writebacks += t.writebacks;
@@ -1334,8 +1358,9 @@ pub struct Drawer {
     /// generation.
     modules: HashMap<ModuleKey, wgpu::ShaderModule>,
     /// With the use that last drew with each, for least recently used
-    /// eviction past `pipeline_cap`.
-    pipelines: HashMap<PipelineKey, (wgpu::RenderPipeline, u64)>,
+    /// eviction past `pipeline_cap`, and the texture bind group layout of
+    /// its key's slots.
+    pipelines: HashMap<PipelineKey, (wgpu::RenderPipeline, u64, wgpu::BindGroupLayout)>,
     pipeline_uses: u64,
     pipeline_cap: usize,
     pipeline_drops: u64,
@@ -1419,6 +1444,12 @@ pub struct Drawer {
     /// Group 0 bind groups over `arena`, by the sizes of the four slices
     /// they bind (at dynamic offsets). Cleared when the arena is replaced.
     arena_groups: HashMap<[u64; 6], wgpu::BindGroup>,
+    /// The clear bind group over `arena`, its value at a dynamic offset.
+    /// Dropped when the arena is replaced.
+    clear_group: Option<wgpu::BindGroup>,
+    /// Views of render target textures for clears, kept as long as the
+    /// target.
+    target_views: HashMap<wgpu::Texture, wgpu::TextureView>,
     /// Draw buffers (guest window, constants, epilogue, indices) staged
     /// since the last flush, as slices of `arena` from `staged_base`,
     /// written to it at the next flush. The arena is a ring: flushes
@@ -1452,10 +1483,10 @@ pub struct Drawer {
     index_memo_bytes: usize,
     /// See [`Drawer::transfer_setup`].
     transfer_setups: HashMap<(RenderTargetKey, u32, RenderTargetKey, u32), Arc<TransferSetup>>,
-    /// The last `Consts` block staged in the arena and its (offset, size),
-    /// bound again by a draw with the same bytes. Cleared with
-    /// `window_memo` when the arena wraps or grows.
-    staged_consts: Option<(ConstsBlock, (u64, u64))>,
+    /// The last `Consts` block staged in the arena, as prefix and suffix,
+    /// and its (offset, size), bound again by a draw with the same bytes.
+    /// Cleared with `window_memo` when the arena wraps or grows.
+    staged_consts: Option<(ConstsBlock, [u32; CONSTS_SUFFIX], (u64, u64))>,
     /// Counts the arena's wraps (from 1): a slice staged in an earlier
     /// epoch is overwritten (see [`HostIndices::staged`]).
     arena_epoch: u64,
@@ -1468,8 +1499,10 @@ pub struct Drawer {
     /// Bumped by every register write to the constants a `Consts` block
     /// holds, so a draw rebuilds the block only after one.
     consts_gen: u64,
-    /// The last `Consts` block built, by (generation, window base, rebase).
-    consts_built: Option<(ConstsKey, ConstsBlock)>,
+    /// The last `Consts` block prefix built, by generation: the same
+    /// block while its registers hold the same words, so draws compare
+    /// blocks by pointer.
+    consts_built: Option<(u64, ConstsBlock)>,
     /// Kept-resolve texture decodes recorded since the last flush,
     /// submitted with (before) the batch's draws.
     pre: Option<wgpu::CommandEncoder>,
@@ -1490,6 +1523,8 @@ pub struct Drawer {
     /// Compute pipeline of resolve.wgsl, made on the first GPU resolve.
     /// Colour, depth and depth + stencil entry points of resolve.wgsl.
     resolve_pipelines: [Option<wgpu::ComputePipeline>; 3],
+    /// Their bind group and pipeline layouts.
+    resolve_layouts: [(wgpu::BindGroupLayout, wgpu::PipelineLayout); 3],
     /// kD24FS8 is hosted as `Depth32FloatStencil8` (else `Depth32Float`).
     float_stencil: bool,
     /// `Rg16Snorm` and `Rgba16Snorm` can be render targets (k_16_16 and
@@ -1607,23 +1642,6 @@ struct Bound {
     blend: Option<[u32; 4]>,
 }
 
-/// One buffer of a draw's staged data: bytes, or `len` guest bytes at
-/// `addr` read straight into the staging area.
-#[derive(Clone, Copy)]
-enum Part<'a> {
-    Bytes(&'a [u8]),
-    Guest(u32, usize),
-}
-
-impl Part<'_> {
-    fn len(&self) -> usize {
-        match *self {
-            Part::Bytes(b) => b.len(),
-            Part::Guest(_, len) => len,
-        }
-    }
-}
-
 /// What [`Drawer::transfer`] records for one pair of targets.
 struct TransferSetup {
     pipelines: Vec<wgpu::RenderPipeline>,
@@ -1654,6 +1672,9 @@ const ARENA_GROUP_CAP: usize = 4096;
 
 /// Texture bind groups kept between evictions and replay ends.
 const TEXTURE_GROUP_CAP: usize = 4096;
+
+/// Resolve bind groups one kept resolve buffer keeps between replay ends.
+const RESOLVE_GROUP_CAP: usize = 1024;
 
 /// Bytes of each upload staging chunk, and the most one belt write takes.
 const BELT_CHUNK: u64 = 4 << 20;
@@ -1842,10 +1863,9 @@ fn to_bytes(words: &[u32]) -> Vec<u8> {
     out
 }
 
-/// A built `Consts` block, shared by the draws that bind it.
+/// A built `Consts` block prefix ([`consts_prefix`]), shared by the draws
+/// that bind it.
 type ConstsBlock = Arc<Vec<u8>>;
-/// (register generation, window base, rebase words) of a `Consts` block.
-type ConstsKey = (u64, u32, [i32; 96]);
 
 /// Registers of one stage's 256 float constants (4 each): the vertex
 /// stage's, then the pixel stage's.
@@ -1857,21 +1877,26 @@ const _: () = assert!(xenon_shader::PIXEL_FLOAT_CONST_BASE * 4 == FLOAT_STAGE_RE
 type StagedFloats = Option<((u64, [u64; 4]), (u64, u64))>;
 
 /// The float constants of `stage` (0 vertex, 1 pixel) that `mask` names,
-/// in ascending order, as the bytes of a stage's `fc` binding.
-fn float_consts(r: &regs::RegisterFile, stage: u32, mask: &[u64; 4]) -> Vec<u8> {
+/// in ascending order, written to `out` (16 bytes each) as the bytes of a
+/// stage's `fc` binding.
+fn float_consts(r: &regs::RegisterFile, stage: u32, mask: &[u64; 4], out: &mut [u8]) {
     let all = r.slice(
         regs::SHADER_CONSTANT_FLOAT + FLOAT_STAGE_REGS * stage,
         FLOAT_STAGE_REGS,
     );
-    let count: u32 = mask.iter().map(|w| w.count_ones()).sum();
-    let mut out = vec![0; 16 * count as usize];
     let read = (0..256).filter(|i| mask[i / 64] >> (i % 64) & 1 != 0);
     for (o, i) in out.chunks_exact_mut(16).zip(read) {
         for (o, w) in o.chunks_exact_mut(4).zip(&all[4 * i..4 * i + 4]) {
             o.copy_from_slice(&w.to_le_bytes());
         }
     }
-    out
+}
+
+/// `words` as little-endian bytes into `out`, which holds them all.
+fn words_into(words: &[u32], out: &mut [u8]) {
+    for (o, w) in out.chunks_exact_mut(4).zip(words) {
+        o.copy_from_slice(&w.to_le_bytes());
+    }
 }
 
 /// The registers a `Consts` block is built from (see [`consts`]).
@@ -1881,30 +1906,41 @@ const CONSTS_REGS: [std::ops::Range<u32>; 3] = [
     regs::VGT_INDX_OFFSET..regs::VGT_INDX_OFFSET + 1,
 ];
 
-/// The `Consts` uniform of the shader binding contract: fetch, bool and
-/// loop constants, then the window base, the index offset and the 96
-/// vertex fetch constants' rebase words. (The float constants are bound
-/// apart, a span for each stage: see [`FLOAT_STAGE_REGS`].)
-fn consts(r: &regs::RegisterFile, window_base: u32, rebase: &[i32; 96]) -> Vec<u8> {
+/// Words of a `Consts` block's suffix: the window base, the index offset,
+/// two of padding and the 96 rebase words.
+const CONSTS_SUFFIX: usize = 4 + 96;
+
+/// Bytes of a `Consts` block: its prefix (see [`consts_prefix`]) and suffix.
+const CONSTS_BYTES: usize = 4 * (192 + 8 + 32) + 4 * CONSTS_SUFFIX;
+
+/// The `Consts` uniform of the shader binding contract is this prefix, the
+/// fetch, bool and loop constants, which only register writes change, then
+/// [`consts_suffix`]. (The float constants are bound apart, a span for
+/// each stage: see [`FLOAT_STAGE_REGS`].)
+fn consts_prefix(r: &regs::RegisterFile) -> Vec<u8> {
     // Bool and loop constants are adjacent.
     const _: () = assert!(regs::SHADER_CONSTANT_BOOL + 8 == regs::SHADER_CONSTANT_LOOP);
-    let tail = [window_base, r.get(regs::VGT_INDX_OFFSET), 0, 0];
-    let rebase = rebase.map(|w| w as u32);
-    let blocks = [
-        r.slice(regs::SHADER_CONSTANT_FETCH, 192),
-        r.slice(regs::SHADER_CONSTANT_BOOL, 8 + 32),
-        &tail,
-        &rebase,
-    ];
-    let mut b = vec![0; 4 * (192 + 8 + 32 + 4 + 96)];
-    let mut at = 0;
-    for block in blocks {
-        for (o, w) in b[at..][..4 * block.len()].chunks_exact_mut(4).zip(block) {
-            o.copy_from_slice(&w.to_le_bytes());
-        }
-        at += 4 * block.len();
-    }
+    let fetch = r.slice(regs::SHADER_CONSTANT_FETCH, 192);
+    let bool_loop = r.slice(regs::SHADER_CONSTANT_BOOL, 8 + 32);
+    let mut b = vec![0; 4 * (fetch.len() + bool_loop.len())];
+    words_into(fetch, &mut b);
+    words_into(bool_loop, &mut b[4 * fetch.len()..]);
     b
+}
+
+/// The rest of a `Consts` block, which each draw's window sets: the window
+/// base, the index offset and the 96 vertex fetch constants' rebase words.
+fn consts_suffix(
+    r: &regs::RegisterFile,
+    window_base: u32,
+    rebase: &[i32; 96],
+) -> [u32; CONSTS_SUFFIX] {
+    let mut s = [0; CONSTS_SUFFIX];
+    s[..2].copy_from_slice(&[window_base, r.get(regs::VGT_INDX_OFFSET)]);
+    for (o, &w) in s[4..].iter_mut().zip(rebase) {
+        *o = w as u32;
+    }
+    s
 }
 
 /// Adds the epilogue and the extra outputs to a translated vertex shader.
@@ -2267,11 +2303,6 @@ impl Drawer {
             ty,
             count: None,
         };
-        let uniform = wgpu::BindingType::Buffer {
-            ty: wgpu::BufferBindingType::Uniform,
-            has_dynamic_offset: false,
-            min_binding_size: None,
-        };
         let vf = wgpu::ShaderStages::VERTEX_FRAGMENT;
         // Arena slices are bound at dynamic offsets, so draws whose slices
         // have the same sizes share one bind group.
@@ -2303,10 +2334,56 @@ impl Drawer {
                 ),
             ],
         });
+        // Clear values and resolve parameters are staged in the arena too.
         let clear_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("clear"),
-            entries: &[entry(0, vf, uniform)],
+            entries: &[entry(0, vf, dyn_uniform)],
         });
+        // resolve.wgsl's main, depth_main and depth_stencil_main: the
+        // source (colour, depth, depth and stencil), the kept resolve
+        // buffer and the parameters.
+        let resolve_layouts = {
+            let cs = wgpu::ShaderStages::COMPUTE;
+            let texture = |sample_type| wgpu::BindingType::Texture {
+                sample_type,
+                view_dimension: wgpu::TextureViewDimension::D2,
+                multisampled: false,
+            };
+            let dest = entry(
+                1,
+                cs,
+                wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: false },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+            );
+            let color = entry(
+                0,
+                cs,
+                texture(wgpu::TextureSampleType::Float { filterable: false }),
+            );
+            let depth = entry(3, cs, texture(wgpu::TextureSampleType::Depth));
+            let stencil = entry(4, cs, texture(wgpu::TextureSampleType::Uint));
+            let params = entry(2, cs, dyn_uniform);
+            [
+                vec![color, dest, params],
+                vec![dest, params, depth],
+                vec![dest, params, depth, stencil],
+            ]
+            .map(|entries| {
+                let group = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some("resolve"),
+                    entries: &entries,
+                });
+                let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                    label: Some("resolve"),
+                    bind_group_layouts: &[Some(&group)],
+                    immediate_size: 0,
+                });
+                (group, layout)
+            })
+        };
         let clear_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("clear"),
             source: wgpu::ShaderSource::Wgsl(CLEAR_WGSL.into()),
@@ -2390,6 +2467,8 @@ impl Drawer {
             texture_set_key: Vec::new(),
             texture_memo_epoch: 0,
             arena_groups: HashMap::default(),
+            clear_group: None,
+            target_views: HashMap::default(),
             staged: Vec::new(),
             arena: None,
             window_memo: BTreeMap::new(),
@@ -2424,6 +2503,7 @@ impl Drawer {
             clamp_to_border: required_features
                 .contains(wgpu::Features::ADDRESS_MODE_CLAMP_TO_BORDER),
             resolve_pipelines: [None, None, None],
+            resolve_layouts,
             float_stencil,
             snorm16,
             snorm16_blend,
@@ -2731,7 +2811,7 @@ impl Drawer {
             let Some(old) = self
                 .pipelines
                 .iter()
-                .min_by_key(|(_, (_, used))| *used)
+                .min_by_key(|(_, (_, used, _))| *used)
                 .map(|(k, _)| k.clone())
             else {
                 break;
@@ -2778,6 +2858,7 @@ impl Drawer {
     ) -> Result<Report, Error> {
         let mut report = Report::default();
         self.timings = Timings::default();
+        let start = Instant::now();
         let was_watching = self.watching;
         match mem.take_written() {
             Some(written) if self.texture_memo.len() < TEXTURE_MEMO_CAP => {
@@ -2820,6 +2901,7 @@ impl Drawer {
             mem,
             written: Vec::new(),
         };
+        self.timings.edges += start.elapsed();
         if let Some((before, w)) = self.late.take() {
             self.end_writeback(&mut mem, w, Some(before))?;
         }
@@ -2833,8 +2915,10 @@ impl Drawer {
         let done = done.and(flushed);
         self.batch = None;
         self.pre = None;
+        let t = Instant::now();
         let replay = self.replays;
         (self.texture_groups).retain(|_, &mut (_, used)| used + 1 >= replay);
+        self.timings.edges += t.elapsed();
         if !self.watching || done.is_err() {
             self.wrap();
         }
@@ -2842,7 +2926,17 @@ impl Drawer {
         let kept = self.finish_mirrors(&mut mem);
         done?;
         kept?;
+        let t = Instant::now();
         self.drop_targets(&mut report);
+        // Views and resolve groups hold their textures and buffers: only
+        // those of kept targets and kept resolves stay.
+        let targets = &self.targets;
+        let live = |tex: &wgpu::Texture| targets.values().any(|t| t == tex);
+        self.target_views.retain(|t, _| live(t));
+        for m in &mut self.mirrors {
+            m.groups.retain(|(tex, _), _| live(tex));
+        }
+        self.timings.edges += t.elapsed();
         // Counts made where only the report is mutable (durations there
         // are zero).
         let mut t = std::mem::take(&mut self.timings);
@@ -2857,8 +2951,17 @@ impl Drawer {
         tracked: &mut Tracked,
         report: &mut Report,
     ) -> Result<(), Error> {
+        // One clock read per command, two for those timing their own phases:
+        // `mark` carries the end of the previous command forward.
+        let mut mark = Instant::now();
         for c in commands {
             let mem = &mut *tracked;
+            // Draws, resolves and swaps time their own phases; the rest,
+            // and the upkeep below, count as `commands`.
+            let own = matches!(
+                c,
+                Command::Draw(_) | Command::Resolve(_) | Command::Swap { .. }
+            );
             let done = match c {
                 Command::WriteRegisters { base, values } => {
                     self.regs.set_many(*base, values);
@@ -2885,6 +2988,7 @@ impl Drawer {
                             "shader load at instruction offset {start} treated as 0"
                         ));
                     }
+                    self.timings.shader_loads += 1;
                     let p = Some(Program {
                         hash: hash_words(words),
                         words: words.as_slice().into(),
@@ -2937,6 +3041,9 @@ impl Drawer {
                 }
                 _ => Ok(()),
             };
+            if own {
+                mark = Instant::now();
+            }
             for (lo, hi) in tracked.written.drain(..) {
                 self.forget_guest(lo, hi);
                 // Any write but a resolve's makes a kept copy stale; the
@@ -2952,6 +3059,9 @@ impl Drawer {
                 Err(Skip::Fatal(e)) => return Err(e),
             }
             self.check_uncaptured()?;
+            let now = Instant::now();
+            self.timings.commands += now - mark;
+            mark = now;
         }
         Ok(())
     }
@@ -3263,6 +3373,7 @@ impl Drawer {
             hashes,
             checked,
             views: HashMap::default(),
+            groups: HashMap::default(),
         });
         Ok(Some(self.mirrors.len() - 1))
     }
@@ -3404,15 +3515,19 @@ impl Drawer {
         self.staged_floats = [None; 2];
     }
 
-    /// Copies `parts` into the batch's staging area, each at an offset
-    /// aligned for uniform and storage bindings, and returns their
-    /// (offset, size) in the arena. Submits the batch and wraps the arena
+    /// Arena bytes a part of `len` bytes takes when [`Self::push`]ed: its
+    /// size, then padding to the next part's alignment.
+    fn staged_size(&self, len: u64) -> u64 {
+        len.max(4)
+            .next_multiple_of(4)
+            .next_multiple_of(self.arena_align)
+    }
+
+    /// Makes room for `need` bytes of parts (see [`Self::staged_size`]) in
+    /// the batch's staging area: submits the batch and wraps the arena
     /// first when it is full, and grows the arena when one draw does not
     /// fit. A grown arena is a new buffer: submitted draws keep the old one.
-    fn stage(&mut self, mem: &dyn GuestRead, parts: &[Part]) -> Result<Vec<(u64, u64)>, Skip> {
-        let size = |p: &Part| (p.len() as u64).max(4).next_multiple_of(4);
-        let align = self.arena_align;
-        let need: u64 = parts.iter().map(|p| size(p).next_multiple_of(align)).sum();
+    fn reserve(&mut self, need: u64) -> Result<(), Skip> {
         let have = self.arena.as_ref().map_or(0, |b| b.size());
         if self.staged_base + self.staged.len() as u64 + need > have {
             self.flush()?;
@@ -3433,6 +3548,8 @@ impl Drawer {
                 // from an odd size would).
                 self.staged = Vec::with_capacity(size.min(STAGED_RESERVE) as usize);
                 self.arena_groups.clear();
+                self.clear_group = None;
+                self.mirrors.iter_mut().for_each(|m| m.groups.clear());
                 self.arena = Some(self.device.create_buffer(&wgpu::BufferDescriptor {
                     label: Some("draw arena"),
                     size,
@@ -3444,37 +3561,53 @@ impl Drawer {
                 }));
             }
         }
-        let mut out = Vec::with_capacity(parts.len());
-        for p in parts {
-            let off = self.staged.len() as u64;
-            match *p {
-                Part::Bytes(b) => self.staged.extend_from_slice(b),
-                Part::Guest(addr, len) => {
-                    self.staged.resize(off as usize + len, 0);
-                    if !mem.read_into(addr, &mut self.staged[off as usize..]) {
-                        self.staged.truncate(off as usize);
-                        let end = u64::from(addr) + len as u64;
-                        return unsupported(format!(
-                            "vertex data at 0x{addr:08X}..0x{end:08X} not readable"
-                        ));
-                    }
-                }
-            }
-            self.staged.resize((off + size(p)) as usize, 0);
-            out.push((self.staged_base + off, size(p)));
-            let end = self.staged.len() as u64;
-            self.staged.resize(end.next_multiple_of(align) as usize, 0);
-        }
-        Ok(out)
+        Ok(())
     }
 
-    /// Whether `parts` can be staged without submitting the batch first.
-    fn fits<'a>(&self, parts: impl IntoIterator<Item = Part<'a>>) -> bool {
-        let size = |p: &Part| (p.len() as u64).max(4).next_multiple_of(4);
-        let need: u64 = parts
-            .into_iter()
-            .map(|p| size(&p).next_multiple_of(self.arena_align))
-            .sum();
+    /// Appends a part of `len` bytes, which `fill` writes over zeros, to
+    /// the staging area at an offset aligned for uniform and storage
+    /// bindings, and returns its (offset, size) in the arena; `None`, with
+    /// nothing appended, when `fill` fails. Only after [`Self::reserve`]
+    /// made room for it.
+    fn push(&mut self, len: usize, fill: impl FnOnce(&mut [u8]) -> bool) -> Option<(u64, u64)> {
+        let off = self.staged.len();
+        let size = (len as u64).max(4).next_multiple_of(4);
+        self.staged.resize(off + size as usize, 0);
+        if !fill(&mut self.staged[off..off + len]) {
+            self.staged.truncate(off);
+            return None;
+        }
+        let end = (off as u64 + size).next_multiple_of(self.arena_align);
+        self.staged.resize(end as usize, 0);
+        Some((self.staged_base + off as u64, size))
+    }
+
+    /// [`Self::push`] of `bytes`.
+    fn push_bytes(&mut self, bytes: &[u8]) -> (u64, u64) {
+        self.push(bytes.len(), |b| {
+            b.copy_from_slice(bytes);
+            true
+        })
+        .expect("bytes staged")
+    }
+
+    /// Stages `words` (a clear value or resolve parameters) for a uniform
+    /// binding of the arena at a dynamic offset, and returns the offset.
+    /// Submits the batch first when the arena is full, like a draw.
+    fn stage_uniform(&mut self, words: &[u32]) -> Result<u32, Skip> {
+        self.reserve(self.staged_size(4 * words.len() as u64))?;
+        let (offset, _) = (self.push(4 * words.len(), |b| {
+            words_into(words, b);
+            true
+        }))
+        .expect("uniform staged");
+        u32::try_from(offset)
+            .map_err(|_| Skip::Unsupported("draw data past 4 GiB of the arena".into()))
+    }
+
+    /// Whether `need` bytes of parts can be staged without submitting the
+    /// batch first.
+    fn fits(&self, need: u64) -> bool {
         self.staged_base + self.staged.len() as u64 + need
             <= self.arena.as_ref().map_or(0, |b| b.size())
     }
@@ -4616,11 +4749,6 @@ impl Drawer {
         buf
     }
 
-    /// The `Consts` uniform of the shader binding contract.
-    fn consts(&self, window_base: u32, rebase: &[i32; 96]) -> Vec<u8> {
-        consts(&self.regs, window_base, rebase)
-    }
-
     /// Texture and sampler for fetch constant slot `n`. A slot without a
     /// texture fetch constant, or whose texture cannot be read or decoded,
     /// gets a 1x1 texture of zeros (as Xenia binds its null image) and a
@@ -5236,6 +5364,7 @@ impl Drawer {
 
     /// Draws `d`; Ok(false) when the state makes it draw nothing.
     fn draw(&mut self, d: &Draw, mem: &mut Tracked, report: &mut Report) -> Result<bool, Skip> {
+        let mut t = Instant::now();
         let color_on = match self.regs.get(regs::RB_MODECONTROL) & 7 {
             4 => true,
             5 => false,
@@ -5265,7 +5394,6 @@ impl Drawer {
                 wgpu::PrimitiveTopology::TriangleList | wgpu::PrimitiveTopology::TriangleStrip
             );
         let param_gen = self.param_gen(topology, polygonal);
-        let mut t = Instant::now();
         let vs_t = self.translate(&vs, ShaderStage::Vertex, None)?;
         let ps_t = self.translate(&ps, ShaderStage::Pixel, param_gen)?;
         let surface = self.regs.get(regs::RB_SURFACE_INFO);
@@ -5504,10 +5632,7 @@ impl Drawer {
             report.warn("texture fetches of one slot with different filters drawn with one");
         }
         let extra = ps_t.info.interpolators_read & !vs_t.info.interpolators_written;
-        let vs_mod = self.module(vs.hash, true, extra, vs_variant, None, &vs_t)?;
         let ps_extra = u16::from(ps_t.info.writes_depth && depth_format.is_none());
-        let ps_mod = self.module(ps.hash, false, ps_extra, ps_variant, param_gen, &ps_t)?;
-        let (g1_layout, layout) = self.texture_layout(tex_mask);
 
         let key_stencil = stencil
             .as_ref()
@@ -5537,12 +5662,17 @@ impl Drawer {
             textures: tex_mask,
         };
         self.pipeline_uses += 1;
-        let pipeline = match self.pipelines.get_mut(&key) {
-            Some((p, used)) => {
+        // The key names the modules and the texture layout: a cached
+        // pipeline needs neither looked up.
+        let (pipeline, g1_layout) = match self.pipelines.get_mut(&key) {
+            Some((p, used, g1)) => {
                 *used = self.pipeline_uses;
-                p.clone()
+                (p.clone(), g1.clone())
             }
             None => {
+                let vs_mod = self.module(vs.hash, true, extra, vs_variant, None, &vs_t)?;
+                let ps_mod = self.module(ps.hash, false, ps_extra, ps_variant, param_gen, &ps_t)?;
+                let (g1_layout, layout) = self.texture_layout(tex_mask);
                 let k = key.clone();
                 let cache = self.pipeline_cache();
                 let t0 = Instant::now();
@@ -5590,10 +5720,11 @@ impl Drawer {
                     })
                 })?;
                 self.pipeline_made(t0);
-                self.pipelines.insert(key, (p.clone(), self.pipeline_uses));
+                let entry = (p.clone(), self.pipeline_uses, g1_layout.clone());
+                self.pipelines.insert(key, entry);
                 self.timings.pipelines_created += 1;
                 self.drop_pipelines();
-                p
+                (p, g1_layout)
             }
         };
         let setup = &mut self.timings.setup_parts;
@@ -5610,35 +5741,35 @@ impl Drawer {
         let indices = offset_range(idx.min_max, self.regs.get(regs::VGT_INDX_OFFSET));
         let (mut read, window_base, rebase, staged) =
             self.guest_window(vf_mask, indices, mem, report)?;
-        let key = (self.consts_gen, window_base, rebase);
+        let gen = self.consts_gen;
         let consts = match &self.consts_built {
-            Some((k, c)) if *k == key => c.clone(),
-            _ => {
-                let c = Arc::new(self.consts(window_base, &rebase));
-                self.consts_built = Some((key, c.clone()));
+            Some((g, c)) if *g == gen => c.clone(),
+            built => {
+                // Registers written with the words they held keep the block.
+                let c = consts_prefix(&self.regs);
+                let c = match built {
+                    Some((_, old)) if **old == c => old.clone(),
+                    _ => Arc::new(c),
+                };
+                self.consts_built = Some((gen, c.clone()));
                 c
             }
         };
-        let epi = to_bytes(&state::epilogue(&self.regs, w, h));
+        let suffix = consts_suffix(&self.regs, window_base, &rebase);
+        let epi = state::epilogue(&self.regs, w, h);
         // The indices are staged once and bound again by later draws of
         // them until the arena wraps: a frame draws the same meshes many
         // times, kilobytes of indices each. (Rectangle lists read them in
         // the vertex shader, binding 3, and draw without an index buffer.)
         let mut kept_index = idx.staged_in(self.arena_epoch);
-        let rest = |kept: Option<(u64, u64)>| -> [Option<Part>; 2] {
-            [
-                Some(Part::Bytes(&epi[..])),
-                kept.is_none().then_some(Part::Bytes(&idx.bytes)),
-            ]
-        };
         // The window and constants staged earlier (in this batch or one
         // submitted since) are bound again, unless the arena wrapped since
         // (it is then overwritten) or would wrap to stage the rest.
         let mut kept_window =
             staged.filter(|((a, b, s), _)| self.window_memo.get(a) == Some(&(*b, *s)));
         let mut kept_consts = (self.staged_consts.as_ref())
-            .filter(|(b, _)| Arc::ptr_eq(b, &consts) || **b == *consts)
-            .map(|&(_, s)| s);
+            .filter(|(b, s, _)| *s == suffix && (Arc::ptr_eq(b, &consts) || **b == *consts))
+            .map(|&(_, _, s)| s);
         // Each stage's float constants: those it reads, staged again only
         // when one of the stage's registers was written since.
         let float_masks = [&vs_t.info, &ps_t.info].map(|info| info.float_consts_bound());
@@ -5649,52 +5780,48 @@ impl Drawer {
                 .map(|((_, s), _)| s)
         });
         // Whether all of it fits is decided on the sizes alone: a stage's
-        // float constants are built only once it is known to stage them.
-        static ZEROS: [u8; 4096] = [0; 4096];
+        // float constants are written only once it is known to stage them.
         let float_len = [0, 1].map(|i| {
             float_masks[i].map(|m| 16 * m.iter().map(|w| w.count_ones() as usize).sum::<usize>())
         });
-        let float_sizes = |kept: &[Option<(u64, u64)>; 2]| -> [Option<&[u8]>; 2] {
-            [0, 1].map(|i| {
-                float_len[i]
-                    .filter(|_| kept[i].is_none())
-                    .map(|n| &ZEROS[..n])
-            })
+        // The arena bytes of each part, staged in this order: the window
+        // (its parts, the kept window read again, or one empty part for no
+        // window), constants, float constants, epilogue and indices.
+        let window_need = match staged {
+            Some(((lo, hi, _), _)) => self.staged_size(hi - lo),
+            None if read.is_empty() => self.staged_size(0),
+            None => (read.iter())
+                .map(|&(lo, hi)| self.staged_size(hi - lo))
+                .sum(),
         };
-        fn parts<'a>(
-            w: Option<Vec<Part<'a>>>,
-            c: Option<&'a [u8]>,
-            f: [Option<&'a [u8]>; 2],
-            rest: [Option<Part<'a>>; 2],
-        ) -> impl Iterator<Item = Part<'a>> {
-            (w.into_iter().flatten())
-                .chain(c.map(Part::Bytes))
-                .chain(f.into_iter().flatten().map(Part::Bytes))
-                .chain(rest.into_iter().flatten())
-        }
-        // The window's parts, or one empty part for no window.
-        let window = |read: &[(u64, u64)]| -> Vec<Part<'static>> {
-            if read.is_empty() {
-                return vec![Part::Bytes(&[])];
-            }
-            (read.iter())
-                .map(|&(lo, hi)| Part::Guest(lo as u32, (hi - lo) as usize))
-                .collect()
+        let consts_need = self.staged_size(CONSTS_BYTES as u64);
+        let float_need = float_len.map(|n| n.map_or(0, |n| self.staged_size(n as u64)));
+        let epi_need = self.staged_size(4 * epi.len() as u64);
+        let index_need = self.staged_size(idx.bytes.len() as u64);
+        // Of the parts, those staged (not kept).
+        let need = |window: bool, consts: bool, floats: [bool; 2], index: bool| {
+            let part = |staged: bool, n: u64| if staged { n } else { 0 };
+            part(window, window_need)
+                + part(consts, consts_need)
+                + part(floats[0], float_need[0])
+                + part(floats[1], float_need[1])
+                + epi_need
+                + part(index, index_need)
         };
         let any_kept = kept_window.is_some()
             || kept_consts.is_some()
             || kept_floats != [None; 2]
             || kept_index.is_some();
         if any_kept
-            && !self.fits(parts(
-                kept_window.is_none().then(|| window(&read)),
-                kept_consts.is_none().then_some(consts.as_slice()),
-                float_sizes(&kept_floats),
-                rest(kept_index),
+            && !self.fits(need(
+                kept_window.is_none(),
+                kept_consts.is_none(),
+                kept_floats.map(|k| k.is_none()),
+                kept_index.is_none(),
             ))
         {
-            // Staging all of it submits the batch in `stage`; a kept window
-            // is read again below.
+            // Staging all of it submits the batch in `reserve`; a kept
+            // window is read again below.
             (kept_window, kept_consts, kept_floats, kept_index) = (None, None, [None; 2], None);
         }
         if let (Some(((lo, hi, _), _)), None) = (staged, kept_window) {
@@ -5704,24 +5831,15 @@ impl Drawer {
         if kept_window.is_none() {
             report.timings.guest_bytes += read.iter().map(|(lo, hi)| hi - lo).sum::<u64>();
         }
-        // The float constants of the stages that stage them.
-        let float_bytes = [0, 1].map(|i| {
-            (float_masks[i].filter(|_| kept_floats[i].is_none()))
-                .map(|mask| float_consts(&self.regs, i as u32, &mask))
-        });
-        // A full arena submits the batch in `stage`: submit time, not guest data.
+        // A full arena submits the batch in `reserve`: submit time, not
+        // guest data.
         let submit = self.timings.submit;
-        let mut fresh = (self.stage(
-            &*mem,
-            &parts(
-                kept_window.is_none().then(|| window(&read)),
-                kept_consts.is_none().then_some(consts.as_slice()),
-                float_bytes.each_ref().map(|b| b.as_deref()),
-                rest(kept_index),
-            )
-            .collect::<Vec<_>>(),
-        )?)
-        .into_iter();
+        self.reserve(need(
+            kept_window.is_none(),
+            kept_consts.is_none(),
+            kept_floats.map(|k| k.is_none()),
+            kept_index.is_none(),
+        ))?;
         let window_slice = match kept_window {
             Some((w, len)) => {
                 self.timings.windows_reused += 1;
@@ -5729,12 +5847,22 @@ impl Drawer {
                 w.2
             }
             None => {
-                let first = fresh.next().expect("staged window");
-                // The parts after the first end the window's binding.
-                let last = (read.iter().skip(1))
-                    .map(|_| fresh.next().expect("staged window part"))
-                    .last()
-                    .unwrap_or(first);
+                // The window's parts are read straight into the staging
+                // area; the parts after the first end the window's binding.
+                let mut first_last = None;
+                for &(lo, hi) in &read {
+                    let Some(s) = self.push((hi - lo) as usize, |b| mem.read_into(lo as u32, b))
+                    else {
+                        return unsupported(format!(
+                            "vertex data at 0x{lo:08X}..0x{hi:08X} not readable"
+                        ));
+                    };
+                    first_last = Some((first_last.map_or(s, |(f, _)| f), s));
+                }
+                let (first, last) = first_last.unwrap_or_else(|| {
+                    let s = self.push_bytes(&[]);
+                    (s, s)
+                });
                 if let [(lo, hi)] = read[..] {
                     // None holds this window (it was read), so those it
                     // holds are the ones from `lo` that end by `hi`.
@@ -5756,8 +5884,14 @@ impl Drawer {
                 s
             }
             None => {
-                let s = fresh.next().expect("staged constants");
-                self.staged_consts = Some((consts, s));
+                let s = (self.push(CONSTS_BYTES, |b| {
+                    let (prefix, rest) = b.split_at_mut(consts.len());
+                    prefix.copy_from_slice(&consts);
+                    words_into(&suffix, rest);
+                    true
+                }))
+                .expect("constants staged");
+                self.staged_consts = Some((consts, suffix, s));
                 s
             }
         };
@@ -5769,20 +5903,27 @@ impl Drawer {
             float_slices[i] = match kept_floats[i] {
                 Some(s) => s,
                 None => {
-                    let s = fresh.next().expect("staged float constants");
+                    let len = float_len[i].expect("float constants read");
+                    let s = self.push(len, |_| true).expect("float constants staged");
+                    let at = (s.0 - self.staged_base) as usize;
+                    float_consts(&self.regs, i as u32, &key.1, &mut self.staged[at..at + len]);
                     self.staged_floats[i] = Some((key, s));
                     s
                 }
             };
         }
-        let epilogue_slice = fresh.next().expect("staged epilogue");
+        let epilogue_slice = (self.push(4 * epi.len(), |b| {
+            words_into(&epi, b);
+            true
+        }))
+        .expect("epilogue staged");
         let index_slice = match kept_index {
             Some(s) => {
                 self.timings.indices_reused += 1;
                 s
             }
             None => {
-                let s = fresh.next().expect("staged indices");
+                let s = self.push_bytes(&idx.bytes);
                 idx.set_staged(self.arena_epoch, s.0);
                 s
             }
@@ -5928,12 +6069,14 @@ impl Drawer {
             }
             g
         };
+        let t_groups = Instant::now();
         // Staging may have flushed the batch, ending the pass: then it
         // begins again and needs the textures.
         if current && !self.pass_open(&pass_key) {
             (color_tex, depth_tex) = self.targets_of(pass_key, rows, msaa, report)?;
         }
         let (pass, bound) = self.pass(pass_key, &color_tex, depth_tex.as_ref());
+        let t_pass = Instant::now();
         if bound.pipeline.as_ref() != Some(&pipeline) {
             pass.set_pipeline(&pipeline);
             bound.pipeline = Some(pipeline);
@@ -5983,7 +6126,6 @@ impl Drawer {
             let first = (index_slice.0 / 4) as u32;
             pass.draw_indexed(first..first + idx.len, 0, 0..1);
         }
-        self.timings.submit += lap(&mut t);
         // Recorded, not yet submitted: everything else that touches the
         // targets flushes the batch first, so stamps follow submit order.
         // The targets of one draw share its stamp: none is newer than
@@ -5995,6 +6137,11 @@ impl Drawer {
         if let Some(k) = depth_key.filter(|_| depth.write || stencil.is_some()) {
             self.stamp_written(k, rows, msaa);
         }
+        let parts = &mut self.timings.submit_parts;
+        parts[0] += t_groups - t;
+        parts[1] += t_pass - t_groups;
+        parts[2] += t_pass.elapsed();
+        self.timings.submit += lap(&mut t);
         Ok(true)
     }
 
@@ -6094,19 +6241,29 @@ impl Drawer {
         }
         let format = self.host_format(key.format);
         let pipeline = self.clear_pipeline(format)?;
-        let mut v: Vec<u32> = color.iter().map(|c| c.to_bits()).collect();
-        v.extend([depth.to_bits(), 0, 0, 0]);
-        let ub = self.buffer("clear value", &to_bytes(&v), wgpu::BufferUsages::UNIFORM);
-        let scope = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
-        let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("clear"),
-            layout: &self.clear_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: ub.as_entire_binding(),
-            }],
-        });
-        let view = tex.create_view(&Default::default());
+        let c = color.map(f32::to_bits);
+        let value = [c[0], c[1], c[2], c[3], depth.to_bits(), 0, 0, 0];
+        let offset = self.stage_uniform(&value)?;
+        let (device, layout) = (&self.device, &self.clear_layout);
+        let arena = self.arena.as_ref().expect("staged");
+        let bg = (self.clear_group.get_or_insert_with(|| {
+            device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("clear"),
+                layout,
+                entries: &[wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer: arena,
+                        offset: 0,
+                        size: wgpu::BufferSize::new(4 * value.len() as u64),
+                    }),
+                }],
+            })
+        }))
+        .clone();
+        let view = (self.target_views.entry(tex.clone()))
+            .or_insert_with(|| tex.create_view(&Default::default()))
+            .clone();
         let is_depth = format.is_depth_stencil_format();
         let keep = wgpu::Operations {
             load: wgpu::LoadOp::Load,
@@ -6150,13 +6307,10 @@ impl Drawer {
                 ..Default::default()
             });
             pass.set_pipeline(&pipeline);
-            pass.set_bind_group(0, &bg, &[]);
+            pass.set_bind_group(0, &bg, &[offset]);
             pass.set_scissor_rect(rect.x0, rect.y0, rect.width(), rect.height());
             pass.set_stencil_reference(stencil);
             pass.draw(0..3, 0..1);
-        }
-        if let Some(e) = block_on(scope.pop()) {
-            return Err(Skip::Fatal(Error::Gpu(e.to_string())));
         }
         self.mark_written(key, rect.y1, msaa);
         Ok(())
@@ -6463,14 +6617,10 @@ impl Drawer {
             ((lo - self.mirrors[i].lo) / 4) as u32,
             0,
         ];
-        let uniform = self.buffer(
-            "resolve params",
-            &to_bytes(&params),
-            wgpu::BufferUsages::UNIFORM,
-        );
-        let scope = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let offset = self.stage_uniform(&params)?;
         let device = &self.device;
         let cache = self.disk_cache.as_ref().map(|c| &c.cache);
+        let layouts = &self.resolve_layouts[entry];
         // Set once the shader module is made, so it times the pipeline alone.
         let mut t0 = None;
         let pipeline = self.resolve_pipelines[entry].get_or_insert_with(|| {
@@ -6481,7 +6631,7 @@ impl Drawer {
             t0 = Some(Instant::now());
             device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                 label: Some("resolve"),
-                layout: None,
+                layout: Some(&layouts.1),
                 module: &module,
                 entry_point: Some(["main", "depth_main", "depth_stencil_main"][entry]),
                 compilation_options: Default::default(),
@@ -6492,42 +6642,58 @@ impl Drawer {
         if let Some(t0) = t0 {
             self.pipeline_made(t0);
         }
-        let aspect = |aspect| {
-            tex.create_view(&wgpu::TextureViewDescriptor {
-                aspect,
-                ..Default::default()
+        // The source's aspect views and the buffer, made once for each
+        // pair: a frame resolves the same targets into the same buffers.
+        let (device, layouts) = (&self.device, &self.resolve_layouts[entry]);
+        let arena = self.arena.as_ref().expect("staged");
+        let Mirror { buf, groups, .. } = &mut self.mirrors[i];
+        if groups.len() >= RESOLVE_GROUP_CAP {
+            groups.clear();
+        }
+        let bg = (groups.entry((tex.clone(), entry)))
+            .or_insert_with(|| {
+                let aspect = |aspect| {
+                    tex.create_view(&wgpu::TextureViewDescriptor {
+                        aspect,
+                        ..Default::default()
+                    })
+                };
+                let views = match entry {
+                    0 => vec![(0, aspect(wgpu::TextureAspect::All))],
+                    1 => vec![(3, aspect(wgpu::TextureAspect::DepthOnly))],
+                    _ => vec![
+                        (3, aspect(wgpu::TextureAspect::DepthOnly)),
+                        (4, aspect(wgpu::TextureAspect::StencilOnly)),
+                    ],
+                };
+                let mut entries: Vec<_> = views
+                    .iter()
+                    .map(|(binding, view)| wgpu::BindGroupEntry {
+                        binding: *binding,
+                        resource: wgpu::BindingResource::TextureView(view),
+                    })
+                    .collect();
+                entries.extend([
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                            buffer: arena,
+                            offset: 0,
+                            size: wgpu::BufferSize::new(4 * params.len() as u64),
+                        }),
+                    },
+                ]);
+                device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("resolve"),
+                    layout: &layouts.0,
+                    entries: &entries,
+                })
             })
-        };
-        let views = match entry {
-            0 => vec![(0, aspect(wgpu::TextureAspect::All))],
-            1 => vec![(3, aspect(wgpu::TextureAspect::DepthOnly))],
-            _ => vec![
-                (3, aspect(wgpu::TextureAspect::DepthOnly)),
-                (4, aspect(wgpu::TextureAspect::StencilOnly)),
-            ],
-        };
-        let mut entries: Vec<_> = views
-            .iter()
-            .map(|(binding, view)| wgpu::BindGroupEntry {
-                binding: *binding,
-                resource: wgpu::BindingResource::TextureView(view),
-            })
-            .collect();
-        entries.extend([
-            wgpu::BindGroupEntry {
-                binding: 1,
-                resource: self.mirrors[i].buf.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 2,
-                resource: uniform.as_entire_binding(),
-            },
-        ]);
-        let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("resolve"),
-            layout: &pipeline.get_bind_group_layout(0),
-            entries: &entries,
-        });
+            .clone();
         // Recorded in the batch after its draws, which end their render
         // pass here; submitted with them.
         let device = &self.device;
@@ -6542,14 +6708,11 @@ impl Drawer {
                 timestamp_writes: GpuClock::compute(&mut self.gpu_clock, 2),
             });
             pass.set_pipeline(pipeline);
-            pass.set_bind_group(0, &bg, &[]);
+            pass.set_bind_group(0, &bg, &[offset]);
             pass.dispatch_workgroups(rect.width().div_ceil(8), rect.height().div_ceil(8), 1);
         }
         self.resolve_pending = true;
         self.timings.resolve_cpu += lap(&mut t);
-        if let Some(e) = block_on(scope.pop()) {
-            return Err(Skip::Fatal(Error::Gpu(e.to_string())));
-        }
         let m = &mut self.mirrors[i];
         let (mut a, mut b) = (lo, hi);
         m.dirty.retain(|&(x, y)| {
@@ -7145,7 +7308,10 @@ mod tests {
         want.extend([0x1234_5678, 77, 0, 0]);
         let rebase = std::array::from_fn(|k| k as i32 - 3);
         want.extend(rebase.map(|w: i32| w as u32));
-        assert_eq!(consts(r, 0x1234_5678, &rebase), to_bytes(&want));
+        let mut got = consts_prefix(r);
+        got.extend(to_bytes(&consts_suffix(r, 0x1234_5678, &rebase)));
+        assert_eq!(got, to_bytes(&want));
+        assert_eq!(got.len(), CONSTS_BYTES);
     }
 
     /// A drawer on the test adapter, held under one lock so the unit tests
@@ -7266,11 +7432,13 @@ mod tests {
     #[test]
     fn staged_capacity_stays_within_the_arena() {
         let Some(mut d) = gpu() else { return };
-        let mem = SliceMemory::default();
+        let stage = |d: &mut Drawer, part: &[u8]| {
+            d.reserve(d.staged_size(part.len() as u64)).unwrap();
+            d.push_bytes(part)
+        };
         let part = vec![7u8; 3 << 20];
-        let part = [Part::Bytes(&part)];
         for _ in 0..12 {
-            d.stage(&mem, &part).unwrap();
+            stage(&mut d, &part);
             let arena = d.arena.as_ref().unwrap().size();
             assert!(
                 d.staged.capacity() as u64 <= arena,
@@ -7279,11 +7447,35 @@ mod tests {
             );
         }
         let big = vec![1u8; 20 << 20];
-        d.stage(&mem, &[Part::Bytes(&big)]).unwrap();
-        d.stage(&mem, &part).unwrap();
+        stage(&mut d, &big);
+        stage(&mut d, &part);
         assert_eq!(d.arena.as_ref().unwrap().size(), 32 << 20);
         assert!(d.staged.capacity() <= 32 << 20, "{}", d.staged.capacity());
         d.flush().unwrap();
+    }
+
+    /// Each part is padded with zeros to a multiple of 4 (at least 4) and
+    /// starts at the arena's alignment; a part whose fill fails leaves
+    /// nothing behind.
+    #[test]
+    fn pushed_parts_are_padded_and_aligned() {
+        let Some(mut d) = gpu() else { return };
+        d.wrap();
+        let align = d.arena_align as usize;
+        assert_eq!(d.push_bytes(&[1, 2, 3, 4, 5]), (0, 8));
+        assert_eq!(d.staged.len(), align);
+        assert_eq!(d.staged[..8], [1, 2, 3, 4, 5, 0, 0, 0]);
+        assert_eq!(d.push(12, |_| false), None);
+        assert_eq!(d.staged.len(), align);
+        assert_eq!(d.push_bytes(&[]), (align as u64, 4));
+        let s = d.push(3, |b| {
+            b.copy_from_slice(&[9; 3]);
+            true
+        });
+        assert_eq!(s, Some((2 * align as u64, 4)));
+        assert_eq!(d.staged[2 * align..2 * align + 4], [9, 9, 9, 0]);
+        assert_eq!(d.staged_size(5), align as u64);
+        d.wrap();
     }
 
     /// Past the cap the least recently written targets go first, and
