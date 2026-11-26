@@ -16,7 +16,7 @@ use sha2::{Digest, Sha256};
 use std::cell::Cell;
 use std::path::PathBuf;
 use std::process::ExitCode;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use xenon_rt::{Context, GuestMemory, Runtime};
@@ -43,7 +43,10 @@ thread_local! {
 }
 
 /// What a thread last did, for finding where a stalled title waits.
+/// Written on every guest call by its own thread; aligned to two cache lines
+/// (adjacent-line prefetch) so threads' entries never share one.
 #[derive(Default)]
+#[repr(align(128))]
 struct Activity {
     /// Last import thunk called, and when (ms since start).
     import: AtomicU32,
@@ -212,6 +215,11 @@ pub fn set_runtime(rt: Arc<Runtime>) {
 /// import counts.
 pub fn install_trace(rt: &mut Runtime) {
     rt.trace = Some(trace);
+    let on = |v| std::env::var_os(v).is_some();
+    DEBUG_HOOKS.store(
+        on("XENON_CALL_PROFILE") || on("XENON_WATCH"),
+        Ordering::Relaxed,
+    );
     if cpu_profile::on() {
         rt.after = Some(after);
     }
@@ -246,6 +254,11 @@ pub fn last_call() -> u32 {
 static PROFILE: std::sync::Mutex<Option<std::collections::HashMap<u32, u64>>> =
     std::sync::Mutex::new(None);
 
+/// Set by [`install_trace`] when `XENON_CALL_PROFILE` or `XENON_WATCH` is
+/// given, so the per-call hook skips both (and their config cells) otherwise.
+static DEBUG_HOOKS: AtomicBool = AtomicBool::new(false);
+
+#[cold]
 fn profile_call(addr: u32) {
     static CFG: OnceLock<Option<(String, u32, u32)>> = OnceLock::new();
     let Some((who, from, to)) = CFG.get_or_init(|| {
@@ -276,6 +289,7 @@ fn profile_call(addr: u32) {
 /// (`m82bf99d4`), a byte at a register plus an offset (`b3+14c7`), or the
 /// text a register points at (`s3`); a leading `*` logs every call, not
 /// only changes.
+#[cold]
 fn watch(c: &Context, addr: u32) {
     enum What {
         Reg(usize),
@@ -354,8 +368,10 @@ fn watch(c: &Context, addr: u32) {
 }
 
 fn trace(c: &Context, addr: u32) {
-    profile_call(addr);
-    watch(c, addr);
+    if DEBUG_HOOKS.load(Ordering::Relaxed) {
+        profile_call(addr);
+        watch(c, addr);
+    }
     SP.with(|s| s.set(c.r[1] as u32));
     MINE.with(|m| {
         let h = m.head.load(Ordering::Relaxed);
@@ -364,30 +380,40 @@ fn trace(c: &Context, addr: u32) {
         m.call.store(addr, Ordering::Relaxed);
         m.sp.store(c.r[1] as u32, Ordering::Relaxed);
         m.r3.store(c.r[3] as u32, Ordering::Relaxed);
+        if is_thunk(addr) {
+            import_call(m, c, addr);
+        }
     });
-    if is_thunk(addr) {
-        if cpu_profile::on() {
-            cpu_profile::enter(addr);
-        }
-        MINE.with(|m| {
-            m.import.store(addr, Ordering::Relaxed);
-            m.arg0.store(c.r[3] as u32, Ordering::Relaxed);
-            m.at_ms.store(ms(), Ordering::Relaxed);
-        });
-        if let Some(name) = kernel::count_call(addr) {
-            log(&format!(
-                "[call] {} {name}({:#x}, {:#x}, {:#x}, {:#x}, {:#x}, {:#x}) from {:#010x}",
-                std::thread::current().name().unwrap_or("?"),
-                c.r[3],
-                c.r[4],
-                c.r[5],
-                c.r[6],
-                c.r[7],
-                c.r[8],
-                c.lr as u32
-            ));
-        }
+}
+
+/// The import half of [`trace`], out of line so the per-call hook stays small.
+#[inline(never)]
+fn import_call(m: &Activity, c: &Context, addr: u32) {
+    if cpu_profile::on() {
+        cpu_profile::enter(addr);
     }
+    m.import.store(addr, Ordering::Relaxed);
+    m.arg0.store(c.r[3] as u32, Ordering::Relaxed);
+    m.at_ms.store(ms(), Ordering::Relaxed);
+    if let Some(name) = kernel::count_call(addr) {
+        log_call(c, &name);
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn log_call(c: &Context, name: &str) {
+    log(&format!(
+        "[call] {} {name}({:#x}, {:#x}, {:#x}, {:#x}, {:#x}, {:#x}) from {:#010x}",
+        std::thread::current().name().unwrap_or("?"),
+        c.r[3],
+        c.r[4],
+        c.r[5],
+        c.r[6],
+        c.r[7],
+        c.r[8],
+        c.lr as u32
+    ));
 }
 
 /// A line on stderr with the time since start.

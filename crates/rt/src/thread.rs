@@ -1,7 +1,7 @@
 //! Per-guest-thread state: suspend count, exit value and host join handle.
 //! The runtime's public API is on [`crate::Runtime`].
 
-use std::cell::OnceCell;
+use std::cell::{Cell, OnceCell};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
@@ -26,6 +26,11 @@ thread_local! {
     // Set once per host thread and never borrowed mutably, so the per-call
     // checkpoint has no borrow flag that could panic (seen once in a game run).
     static CURRENT: OnceCell<Arc<GuestThread>> = const { OnceCell::new() };
+    // The same thread as a plain pointer for the per-call checkpoint: a
+    // const Cell with no destructor is one TLS load, with no lazy-init or
+    // destructor-state check. Null when no guest thread is bound or after
+    // `Exit` (the runtime's thread map keeps the `GuestThread` alive too).
+    static FAST: Cell<*const GuestThread> = const { Cell::new(std::ptr::null()) };
 }
 
 impl GuestThread {
@@ -62,10 +67,16 @@ impl GuestThread {
         prev
     }
 
+    #[inline]
     fn wait_while_suspended(&self) {
-        if self.suspend_hint.load(Ordering::Relaxed) == 0 {
-            return;
+        if self.suspend_hint.load(Ordering::Relaxed) != 0 {
+            self.wait_slow();
         }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn wait_slow(&self) {
         let mut s = self.state.lock().unwrap();
         while s.suspend > 0 {
             s = self.cv.wait(s).unwrap();
@@ -103,6 +114,7 @@ pub(crate) struct Exit;
 
 impl Drop for Exit {
     fn drop(&mut self) {
+        FAST.with(|f| f.set(std::ptr::null()));
         CURRENT.with(|c| {
             if let Some(t) = c.get() {
                 t.mark_done(None);
@@ -114,7 +126,9 @@ impl Drop for Exit {
 /// Binds `t` to the calling host thread.
 pub(crate) fn enter(t: Arc<GuestThread>) -> Exit {
     CURRENT.with(|c| {
+        let p = Arc::as_ptr(&t);
         assert!(c.set(t).is_ok(), "host thread already runs a guest thread");
+        FAST.with(|f| f.set(p));
     });
     Exit
 }
@@ -132,11 +146,12 @@ pub(crate) fn finish(code: u64) {
 /// guest call.
 #[inline]
 pub(crate) fn checkpoint() {
-    CURRENT.with(|c| {
-        if let Some(t) = c.get() {
-            t.wait_while_suspended();
-        }
-    });
+    let t = FAST.with(Cell::get);
+    // SAFETY: non-null only between `enter` and `Exit`, while `CURRENT` on
+    // this same thread holds an `Arc` to it.
+    if let Some(t) = unsafe { t.as_ref() } {
+        t.wait_while_suspended();
+    }
 }
 
 pub(crate) fn current_id() -> Option<u32> {

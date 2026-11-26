@@ -48,6 +48,10 @@ pub struct Runtime {
     /// Called after every guest call returns (not when it unwinds), with
     /// the callee's context and the target; for timing calls.
     pub after: Option<fn(&Context, u32)>,
+    /// Whether a call must check `trace`, `after` or `call_budget`. Set by
+    /// [`Runtime::share`] (the fields cannot change after it); true before,
+    /// so calls on an unshared runtime always check.
+    slow: bool,
     threads: Mutex<HashMap<u32, Arc<GuestThread>>>,
     next_thread: AtomicU32,
     /// Host-side objects (locks, events, semaphores) by guest address.
@@ -66,6 +70,7 @@ impl Runtime {
             call_budget: u64::MAX,
             trace: None,
             after: None,
+            slow: true,
             threads: Mutex::new(HashMap::new()),
             next_thread: AtomicU32::new(1),
             objects: Mutex::new(HashMap::new()),
@@ -87,6 +92,7 @@ impl Runtime {
     /// share it. [`Runtime::spawn`] works only after this.
     pub fn share(mut self) -> Arc<Self> {
         self.build_table();
+        self.slow = self.trace.is_some() || self.after.is_some() || self.call_budget != u64::MAX;
         let rt = Arc::new(self);
         rt.me.set(Arc::downgrade(&rt)).unwrap();
         rt
@@ -124,6 +130,7 @@ impl Runtime {
         self.table.len() * std::mem::size_of::<Option<GuestFn>>()
     }
 
+    #[inline]
     fn lookup(&self, addr: u32) -> Option<GuestFn> {
         let i = addr.wrapping_sub(self.table_base) as usize / 4;
         if addr & 3 == 0 && i < self.table.len() {
@@ -137,21 +144,42 @@ impl Runtime {
 
     /// Calls the guest function at `addr`. Panics with the address if nothing
     /// is registered there, so an unbuilt range reports where it was reached.
+    ///
+    /// Inlined into every generated call site, so it holds only the branch;
+    /// both bodies stay out of line to keep game crates small.
+    #[inline]
     pub fn call(&self, ctx: &mut Context, addr: u32) {
         ctx.calls += 1;
+        if self.slow {
+            self.call_checked(ctx, addr)
+        } else {
+            self.call_fast(ctx, addr)
+        }
+    }
+
+    /// [`Runtime::call`] without hooks or budget.
+    #[inline(never)]
+    fn call_fast(&self, ctx: &mut Context, addr: u32) {
+        thread::checkpoint();
+        let Some(f) = self.lookup(addr) else {
+            missing(addr)
+        };
+        f(self, ctx);
+    }
+
+    /// [`Runtime::call`] with the budget, `trace` and `after` checks.
+    #[inline(never)]
+    fn call_checked(&self, ctx: &mut Context, addr: u32) {
         if ctx.calls > self.call_budget {
-            panic!(
-                "guest thread used its call budget of {} at {addr:#010x}",
-                self.call_budget
-            );
+            over_budget(self.call_budget, addr);
         }
         if let Some(trace) = self.trace {
             trace(ctx, addr);
         }
         thread::checkpoint();
-        let f = self
-            .lookup(addr)
-            .unwrap_or_else(|| panic!("no guest function at {addr:#010x}{}", wild_hint(addr)));
+        let Some(f) = self.lookup(addr) else {
+            missing(addr)
+        };
         f(self, ctx);
         if let Some(after) = self.after {
             after(ctx, addr);
@@ -274,6 +302,18 @@ impl Runtime {
     }
 }
 
+#[cold]
+#[inline(never)]
+fn missing(addr: u32) -> ! {
+    panic!("no guest function at {addr:#010x}{}", wild_hint(addr))
+}
+
+#[cold]
+#[inline(never)]
+fn over_budget(budget: u64, addr: u32) -> ! {
+    panic!("guest thread used its call budget of {budget} at {addr:#010x}")
+}
+
 /// A call target that is really a common instruction word means code bytes
 /// were read as a pointer: an overwritten function pointer or a stale object.
 pub fn wild_hint(addr: u32) -> String {
@@ -362,6 +402,39 @@ mod tests {
         for _ in 0..3 {
             rt.call(&mut c, 0x8200_0000);
         }
+    }
+
+    #[test]
+    fn shared_runtime_keeps_hooks_and_budget() {
+        use std::sync::atomic::AtomicU64;
+        static SEEN: AtomicU64 = AtomicU64::new(0);
+        fn before(_: &Context, _: u32) {
+            SEEN.fetch_add(1, Ordering::Relaxed);
+        }
+        fn after(_: &Context, _: u32) {
+            SEEN.fetch_add(100, Ordering::Relaxed);
+        }
+        let mut rt = Runtime::new(GuestMemory::new(16));
+        rt.register(0x8200_0000, add_one);
+        rt.trace = Some(before);
+        rt.after = Some(after);
+        rt.call_budget = 2;
+        let rt = rt.share();
+        let mut c = Context::new();
+        rt.call(&mut c, 0x8200_0000);
+        rt.call(&mut c, 0x8200_0000);
+        assert_eq!((c.r[3], SEEN.load(Ordering::Relaxed)), (2, 202));
+        let over = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            rt.call(&mut c, 0x8200_0000)
+        }));
+        assert!(over.is_err());
+        // Without hooks the shared runtime still counts calls.
+        let mut plain = Runtime::new(GuestMemory::new(16));
+        plain.register(0x8200_0000, add_one);
+        let plain = plain.share();
+        let mut c = Context::new();
+        plain.call(&mut c, 0x8200_0000);
+        assert_eq!((c.r[3], c.calls), (1, 1));
     }
 
     /// Speed of one guest call through `Runtime::call`, for comparing
