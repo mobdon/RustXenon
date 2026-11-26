@@ -1579,6 +1579,11 @@ pub struct Drawer {
     /// The front buffer copy queued at the last swap, see
     /// [`Drawer::late_front_buffer`].
     late_front: Option<LateFront>,
+    /// The read-back buffer last frame's late copy was read from, and the
+    /// decode buffer, kept for the next swap of the same size: creating
+    /// both every frame allocated 7 MB of GPU memory a frame at 720p.
+    front_spare: Option<wgpu::Buffer>,
+    front_rows: Option<wgpu::Buffer>,
     /// Records kept-texture decodes after a resolve in the open batch
     /// instead of flushing it first: about a tenth of the drawer's time in
     /// a frame of thousands of draws. `XENON_DECODE_IN_BATCH=0` turns it
@@ -2612,6 +2617,8 @@ impl Drawer {
             late_writeback: std::env::var("XENON_RESOLVE_WRITEBACK").as_deref() == Ok("late"),
             late_front_buffer: std::env::var("XENON_LATE_FRAME").as_deref() == Ok("1"),
             late_front: None,
+            front_spare: None,
+            front_rows: None,
             decode_in_batch: std::env::var("XENON_DECODE_IN_BATCH").as_deref() != Ok("0"),
             late: None,
             texture_cache_limit: TEXTURE_CACHE_LIMIT,
@@ -7025,12 +7032,19 @@ impl Drawer {
                 usage: u,
                 mapped_at_creation: false,
             };
-            let buf = (self.device).create_buffer(&usage(
-                wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-            ));
-            let rows = (self.device).create_buffer(&usage(
-                wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-            ));
+            let take = |b: Option<wgpu::Buffer>| b.filter(|b| b.size() == size);
+            let buf = take(self.front_spare.take()).unwrap_or_else(|| {
+                (self.device).create_buffer(&usage(
+                    wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                ))
+            });
+            // One decode buffer serves every frame: the queue runs each
+            // frame's copy out of it before the next frame's decode.
+            let rows = take(self.front_rows.take()).unwrap_or_else(|| {
+                (self.device).create_buffer(&usage(
+                    wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+                ))
+            });
             let (endian, swizzle) = self.front_buffer_read(addr);
             let pipeline = self.decode_pipeline(false);
             let m = &self.mirrors[i];
@@ -7089,6 +7103,7 @@ impl Drawer {
                 pass.dispatch_workgroups(width.div_ceil(8), height.div_ceil(8), 1);
             }
             b.enc.copy_buffer_to_buffer(&rows, 0, &buf, 0, size);
+            self.front_rows = Some(rows);
             self.flush().map_err(|e| match e {
                 Skip::Fatal(e) => e,
                 Skip::Unsupported(why) => Error::Gpu(why),
@@ -7105,6 +7120,7 @@ impl Drawer {
             // A frame later, its batch is most likely submitted already.
             let index = self.submitter.wait_for(old.sent);
             let rgba8 = self.map_submitted(&old.buf, index)?;
+            self.front_spare = Some(old.buf);
             let (width, height) = old.size;
             return Ok(Ok(Frame {
                 width,

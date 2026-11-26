@@ -17,11 +17,15 @@ use winit::keyboard::PhysicalKey;
 use winit::window::{Fullscreen, Window, WindowId};
 use xenon_input::{filtered, merge, Keyboard, Pad};
 
+/// Pixels shared with whoever made them, so a frame reaches the window
+/// without being copied.
+pub type Pixels = Arc<dyn AsRef<[u8]> + Send + Sync>;
+
 /// One frame to show: rows top to bottom, 8-bit RGBA.
 pub struct Image {
     pub width: u32,
     pub height: u32,
-    pub rgba8: Vec<u8>,
+    pub rgba8: Pixels,
 }
 
 /// How the window opens.
@@ -56,7 +60,7 @@ pub struct Link {
 
 impl Link {
     /// Hands the window a new frame; an older one not yet shown is dropped.
-    pub fn show(&self, width: u32, height: u32, rgba8: Vec<u8>) {
+    pub fn show(&self, width: u32, height: u32, rgba8: Pixels) {
         *self.frame.lock().unwrap() = Some(Image {
             width,
             height,
@@ -279,9 +283,16 @@ impl ApplicationHandler for App {
 /// into 0RGB pixels. Bilinear: a 720p frame stretched to a large window with
 /// nearest-neighbour scaling showed every frame pixel as a hard block.
 fn blit(img: &Image, out: &mut [u32], w: u32, h: u32) {
+    blit_with(img, out, w, h, true)
+}
+
+/// [`blit`]; with `copy`, a frame shown at its own size (bars or not) is
+/// copied straight, the same pixels the bilinear path gives without its
+/// arithmetic.
+fn blit_with(img: &Image, out: &mut [u32], w: u32, h: u32, copy: bool) {
     out.fill(0);
-    if img.width == 0 || img.height == 0 || img.rgba8.len() < (img.width * img.height * 4) as usize
-    {
+    let src: &[u8] = (*img.rgba8).as_ref();
+    if img.width == 0 || img.height == 0 || src.len() < (img.width * img.height * 4) as usize {
         return;
     }
     // Largest size with the frame's aspect that fits.
@@ -294,6 +305,7 @@ fn blit(img: &Image, out: &mut [u32], w: u32, h: u32) {
         return;
     }
     let (ox, oy) = ((w - fw) / 2, (h - fh) / 2);
+    let same = copy && (fw, fh) == (img.width, img.height);
     let xs = taps(img.width, fw);
     let ys = taps(img.height, fh);
     let rows = &mut out[(oy * w) as usize..][..(fh * w) as usize];
@@ -307,8 +319,16 @@ fn blit(img: &Image, out: &mut [u32], w: u32, h: u32) {
                 for (row, &(y0, y1, wy)) in chunk.chunks_mut(w as usize).zip(ys) {
                     let row = &mut row[ox as usize..][..fw as usize];
                     let (r0, r1) = (y0 * img.width as usize, y1 * img.width as usize);
+                    if same {
+                        // At its own size every tap is source pixel y0, x.
+                        let line = src[r0 * 4..][..fw as usize * 4].chunks_exact(4);
+                        for (px, p) in row.iter_mut().zip(line) {
+                            *px = u32::from(p[0]) << 16 | u32::from(p[1]) << 8 | u32::from(p[2]);
+                        }
+                        continue;
+                    }
                     for (px, &(x0, x1, wx)) in row.iter_mut().zip(xs) {
-                        let at = |r: usize, x: usize| &img.rgba8[(r + x) * 4..][..3];
+                        let at = |r: usize, x: usize| &src[(r + x) * 4..][..3];
                         let (a, b, c, d) = (at(r0, x0), at(r0, x1), at(r1, x0), at(r1, x1));
                         let mut v = 0;
                         for k in 0..3 {
@@ -511,7 +531,7 @@ mod tests {
         let img = Image {
             width: 2,
             height: 1,
-            rgba8: vec![255, 0, 0, 255, 0, 0, 255, 255],
+            rgba8: Arc::new(vec![255, 0, 0, 255, 0, 0, 255, 255]),
         };
         let mut out = vec![7; 16];
         blit(&img, &mut out, 4, 4);
@@ -527,7 +547,7 @@ mod tests {
         let big = Image {
             width: 1280,
             height: 720,
-            rgba8: vec![128; 1280 * 720 * 4],
+            rgba8: Arc::new(vec![128; 1280 * 720 * 4]),
         };
         let mut out = vec![0; 2560 * 1440];
         let t = std::time::Instant::now();
@@ -543,7 +563,7 @@ mod tests {
         let one = Image {
             width: 1,
             height: 1,
-            rgba8: vec![0, 255, 0, 255],
+            rgba8: Arc::new(vec![0, 255, 0, 255]),
         };
         let mut out = vec![7; 3];
         blit(&one, &mut out, 3, 1);
@@ -552,9 +572,33 @@ mod tests {
         let bad = Image {
             width: 4,
             height: 4,
-            rgba8: vec![0; 4],
+            rgba8: Arc::new(vec![0; 4]),
         };
         blit(&bad, &mut out, 3, 1);
         assert_eq!(out, [0, 0, 0]);
+    }
+
+    #[test]
+    fn copy_at_own_size_matches_the_bilinear_blit() {
+        // Every byte value in every channel, at a size that splits rows
+        // over the threads unevenly; then with bars above and below and at
+        // the sides, still at the frame's own size.
+        let (fw, fh) = (37, 23);
+        let img = Image {
+            width: fw,
+            height: fh,
+            rgba8: Arc::new(
+                (0..fw * fh * 4)
+                    .map(|i: u32| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
+                    .collect::<Vec<_>>(),
+            ),
+        };
+        for (w, h) in [(fw, fh), (fw, fh + 9), (fw + 6, fh)] {
+            let (mut fast, mut slow) = (vec![7; (w * h) as usize], vec![9; (w * h) as usize]);
+            blit_with(&img, &mut fast, w, h, true);
+            blit_with(&img, &mut slow, w, h, false);
+            assert_eq!(fast, slow, "{w}x{h}");
+            assert!(fast.iter().any(|&p| p != 0), "{w}x{h}");
+        }
     }
 }
