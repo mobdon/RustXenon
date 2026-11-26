@@ -218,11 +218,28 @@ impl DrawStats {
             let (count, bytes) = t.uploads_by_format[i];
             format!("{} ({:.1} MB)", count / n, mb(bytes))
         };
+        // The drawer's time in none of the phases (they do not overlap but
+        // for transfers, which are also counted where they were needed).
+        let phases = [
+            t.shaders,
+            t.guest_data,
+            t.textures,
+            t.submit,
+            t.gpu_wait,
+            t.readback,
+            t.resolve_cpu,
+            t.clears,
+            t.swap,
+            t.commands,
+            t.edges,
+        ];
+        let other = self.busy.saturating_sub(phases.iter().sum());
+        let percent = |a: u32, b: u32| f64::from(a) * 100.0 / f64::from(b.max(1));
         format!(
             "[draw] {:.1} s: {} frames, {} replays; ms per {per}: drawer {:.0} = shaders {:.0} (state {:.0}, indices {:.0}, targets {:.0}, pipeline {:.0}), \
-             guest data {:.0}, textures {:.0}, submit {:.0} (queue {:.0}, upload {:.0}; finish thread {:.0}, submit thread {:.0} alongside), gpu wait {:.0}, readback {:.0}, \
-             resolve cpu {:.0}, clears {:.0}, swap {:.0} (transfers {:.0}); of those, creating \
-             pipelines {:.0}; per {per}: {} draws, \
+             guest data {:.0}, textures {:.0}, submit {:.0} (groups {:.1}, pass {:.1}, record {:.1}, queue {:.0}, upload {:.0}; finish thread {:.0}, submit thread {:.0} alongside), gpu wait {:.0}, readback {:.0}, \
+             resolve cpu {:.0}, clears {:.0}, swap {:.0} (transfers {:.0}), commands {:.1}, edges {:.1}, other {:.1}; of those, creating \
+             pipelines {:.0}; per {per}: {} draws ({} consts reused, {} indices reused, {} texture sets reused = {:.0}%), {} shader loads, \
              {} resolves, {} submits ({} resolve, {} transfer, {} decode, {} flush/other), {} transfers ({} passes, {} set up), {} render passes, {} write-backs, readback {:.1} MB, \
              hashed {:.1} MB (kept resolves {:.1} MB), {} textures uploaded ({:.1} MB, {} evicted before), \
              {} evicted, {} from kept resolves, {} pipelines created; guest data {:.1} MB ({} windows reused, {:.1} MB); \
@@ -239,6 +256,9 @@ impl DrawStats {
             ms(t.guest_data),
             ms(t.textures),
             ms(t.submit),
+            ms(t.submit_parts[0]),
+            ms(t.submit_parts[1]),
+            ms(t.submit_parts[2]),
             ms(t.queue),
             ms(t.upload),
             ms(t.finish_thread),
@@ -249,8 +269,16 @@ impl DrawStats {
             ms(t.clears),
             ms(t.swap),
             ms(t.transfer),
+            ms(t.commands),
+            ms(t.edges),
+            ms(other),
             ms(t.pipeline),
             self.draws / n,
+            t.consts_reused / n,
+            t.indices_reused / n,
+            t.texture_sets_reused / n,
+            percent(t.texture_sets_reused, self.draws),
+            t.shader_loads / n,
             self.resolves / n,
             t.submits / n,
             t.submits_by_site[0] / n,
@@ -878,6 +906,12 @@ mod tests {
         s.t.submit = ms(160);
         s.t.queue = ms(60);
         s.t.upload = ms(20);
+        s.t.submit_parts = [ms(20), ms(10), ms(40)];
+        s.t.commands = ms(40);
+        s.t.edges = ms(20);
+        s.t.consts_reused = 600;
+        s.t.texture_sets_reused = 690;
+        s.t.shader_loads = 10;
         s.t.finish_thread = ms(30);
         s.t.submit_thread = ms(50);
         s.t.writebacks = 14;
@@ -900,7 +934,11 @@ mod tests {
             "readback 150,",
             "1380 draws",
             "42 resolves",
-            "submit 80 (queue 30, upload 10; finish thread 15, submit thread 25 alongside),",
+            "submit 80 (groups 10.0, pass 5.0, record 20.0, queue 30, upload 10; finish thread 15, submit thread 25 alongside),",
+            // 2000 ms busy less 300 readback, 160 submit, 40 commands and
+            // 20 edges, per frame.
+            "commands 20.0, edges 10.0, other 740.0;",
+            "1380 draws (300 consts reused, 0 indices reused, 345 texture sets reused = 25%), 5 shader loads,",
             "6 transfers (30 passes, 0 set up), 250 render passes, 7 write-backs,",
             "readback 40.0 MB",
             "140 submits (44 resolve, 19 transfer, 17 decode, 60 flush/other)",

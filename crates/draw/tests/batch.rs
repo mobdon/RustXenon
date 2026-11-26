@@ -497,6 +497,29 @@ fn equal_constants_are_staged_once_per_batch() {
     assert_eq!(px(&img, W, 40, 40), GREEN);
 }
 
+/// Constants registers written again with the words they held leave the
+/// block bound again; a changed bool constant stages a new one.
+#[test]
+fn rewritten_constants_bind_the_block_while_their_words_stay() {
+    let Some(mut d) = drawer() else { return };
+    let mut mem = memory();
+    rect(&mut mem, VERTS, W as f32, H as f32, RED);
+    let mut s = Stream::default();
+    s.setup()
+        .shader(false, &vs_color())
+        .shader(true, &ps_interp())
+        .vertex_fetch(0, VERTS, 24)
+        .draw_auto(PRIM_RECT_LIST, 3)
+        .vertex_fetch(0, VERTS, 24)
+        .regs(SHADER_CONSTANT_BOOL, &[0])
+        .draw_auto(PRIM_RECT_LIST, 3)
+        .regs(SHADER_CONSTANT_BOOL, &[1])
+        .draw_auto(PRIM_RECT_LIST, 3);
+    let report = run(&mut d, &s, &mut mem);
+    assert_eq!(report.draws, 3, "{report:?}");
+    assert_eq!(report.timings.consts_reused, 1, "{report:?}");
+}
+
 /// Draws in one batch that sample the same texture share one texture bind
 /// group; one that samples another texture gets its own.
 #[test]
