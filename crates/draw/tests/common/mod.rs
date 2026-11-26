@@ -319,11 +319,49 @@ pub fn ps_interp() -> Vec<u32> {
     assemble(&[exec(0, 1, true)], &[export(0, r(0))])
 }
 
+/// `vs_color` that also reads float constants c0 and c255 (into an
+/// interpolator nothing reads), so it binds all 256 of the vertex stage.
+pub fn vs_color_all_consts() -> Vec<u32> {
+    let mut pos = VertexFetch::full(1, 0, 0, VertexFormat::F32_32_32_FLOAT, 4, 0);
+    pos.dest_swizzle = fetch_dest_swz("xyz1");
+    let mut col = VertexFetch::full(2, 0, 0, VertexFormat::F8_8_8_8, 4, 3);
+    col.mini = true;
+    assemble(
+        &[exec(0, 6, true)],
+        &[
+            Instr::Fetch(FetchInstr::Vertex(pos)),
+            Instr::Fetch(FetchInstr::Vertex(col)),
+            export(62, r(1)),
+            export(1, AluSrc::constant(0, SWZ_XYZW)),
+            export(1, AluSrc::constant(255, SWZ_XYZW)),
+            export(0, r(2)),
+        ],
+    )
+}
+
+/// `ps_interp` that first reads float constants c0 and c255, so it binds
+/// all 256 of the pixel stage; the colour is still interpolator 0.
+pub fn ps_interp_all_consts() -> Vec<u32> {
+    assemble(
+        &[exec(0, 3, true)],
+        &[
+            export(0, AluSrc::constant(0, SWZ_XYZW)),
+            export(0, AluSrc::constant(255, SWZ_XYZW)),
+            export(0, r(0)),
+        ],
+    )
+}
+
 /// Pixel shader: oC0 = pixel constant c0.
 pub fn ps_const() -> Vec<u32> {
+    ps_const_n(0)
+}
+
+/// Pixel shader: oC0 = pixel constant c`n`.
+pub fn ps_const_n(n: u32) -> Vec<u32> {
     assemble(
         &[exec(0, 1, true)],
-        &[export(0, AluSrc::constant(0, SWZ_XYZW))],
+        &[export(0, AluSrc::constant(n, SWZ_XYZW))],
     )
 }
 

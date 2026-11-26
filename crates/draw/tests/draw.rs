@@ -481,6 +481,50 @@ fn pixel_shader_float_constant() {
     assert_eq!(px(&img, W, 60, 60), CLEAR);
 }
 
+/// A stage is bound only the span of float constants it reads (c7 alone
+/// here, not c0): each draw gets the values at its time, and a draw after
+/// no write to them binds the span staged before.
+#[test]
+fn float_constant_span_follows_each_draw() {
+    let Some(mut d) = drawer() else { return };
+    let mut mem = memory();
+    let black = [0, 0, 0, 255];
+    let tri = |x: f32, y: f32| {
+        color_verts(&[
+            (x, y, 0.0, black),
+            (x + 32.0, y, 0.0, black),
+            (x, y + 32.0, 0.0, black),
+        ])
+    };
+    mem.write_words(VERTS, &tri(0.0, 0.0));
+    mem.write_words(VERTS + 0x100, &tri(32.0, 32.0));
+    mem.write_words(VERTS + 0x200, &tri(0.0, 32.0));
+    let c = |v: u32| f(v as f32 / 255.0);
+    // Pixel c7 is float constant 256 + 7.
+    let c7 = SHADER_CONSTANT_FLOAT + (256 + 7) * 4;
+    let mut s = Stream::default();
+    s.setup()
+        .resolve(&mut mem, W, H, false, Some((rgba(CLEAR), 0)))
+        .shader(false, &vs_color())
+        .shader(true, &ps_const_n(7))
+        .regs(c7, &[c(51), c(102), c(204), c(255)])
+        .vertex_fetch(0, VERTS, 12)
+        .draw_auto(PRIM_TRI_LIST, 3)
+        .regs(c7, &[c(255), c(153), c(0), c(255)])
+        .vertex_fetch(0, VERTS + 0x100, 12)
+        .draw_auto(PRIM_TRI_LIST, 3)
+        .vertex_fetch(0, VERTS + 0x200, 12)
+        .draw_auto(PRIM_TRI_LIST, 3);
+    let report = run(&mut d, &s, &mut mem);
+    assert_eq!(report.draws, 3, "{report:?}");
+    assert!(report.unsupported.is_empty(), "{report:?}");
+    let img = d.read_render_target(COLOR_KEY, 0, 0, W, H).unwrap();
+    assert_eq!(px(&img, W, 4, 4), [51, 102, 204, 255]);
+    assert_eq!(px(&img, W, 40, 36), [255, 153, 0, 255]);
+    assert_eq!(px(&img, W, 4, 36), [255, 153, 0, 255]);
+    assert_eq!(px(&img, W, 60, 60), CLEAR);
+}
+
 /// Depth test hides a farther triangle drawn later; an alpha-blended
 /// triangle without depth test mixes with what is below.
 #[test]

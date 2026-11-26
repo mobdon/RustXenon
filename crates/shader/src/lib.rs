@@ -23,7 +23,6 @@
 //!
 //!   ```text
 //!   struct Consts {
-//!       float_consts: array<vec4<f32>, 512>,
 //!       fetch: array<vec4<u32>, 48>,
 //!       bool_consts: array<vec4<u32>, 2>,
 //!       loop_consts: array<vec4<u32>, 8>,
@@ -35,16 +34,22 @@
 //!   }
 //!   ```
 //!
-//!   `float_consts[0..256]` are the vertex shader's c0..c255 and
-//!   `float_consts[256..512]` the pixel shader's c0..c255
-//!   ([`PIXEL_FLOAT_CONST_BASE`]; SQ_VS_CONST base 0 and SQ_PS_CONST base
-//!   256, as the console's D3D runtime sets them and Xenia asserts).
 //!   `fetch` holds the 32 fetch constants x 6 dwords in register order:
 //!   dword `d` of fetch constant `n` is `fetch[(n*6+d)/4][(n*6+d)%4]`.
 //!   Vertex fetch constant `k` (0..=95) is the dword pair starting at
 //!   `2k`. `bool_consts` holds 256 bits, bit `i` being bit `i % 32` of
 //!   flattened word `i / 32`. `loop_consts` holds the 32 loop constants
 //!   (count in bits 0..8, aL start in 8..16, signed aL step in 16..24).
+//! - `@group(0) @binding(4)` in the vertex stage and `@binding(5)` in the
+//!   pixel stage is `var<uniform> fc: array<vec4<f32>, count>`: the float
+//!   constants `first..first + count` of that stage, as
+//!   [`ShaderInfo::float_consts_span`] gives them, declared only when it is
+//!   `Some`. A draw changes a few of the 512 float constants and a stage
+//!   reads a few dozen, so the drawer uploads these spans, not all of them.
+//!   The vertex shader's c0..c255 are float constant registers 0..256 and
+//!   the pixel shader's are 256..512 ([`PIXEL_FLOAT_CONST_BASE`]; SQ_VS_CONST
+//!   base 0 and SQ_PS_CONST base 256, as the console's D3D runtime sets them
+//!   and Xenia asserts).
 //! - Texture fetch slot `n` binds `@group(1) @binding(2n)` as
 //!   `texture_2d<f32>` and `@group(1) @binding(2n+1)` as `sampler`, only for
 //!   the slots in [`ShaderInfo::textures_used`]. The drawer applies the
@@ -97,5 +102,6 @@ mod wgsl;
 
 pub use wgsl::{
     translate, translate_with, Error, ParamGen, ParamGenPrimitive, ShaderInfo, ShaderStage,
-    Translated, VertexFetchReach, PIXEL_FLOAT_CONST_BASE, TEMP_REGISTERS, WATCHDOG_STEPS,
+    Translated, VertexFetchReach, PIXEL_FLOAT_CONSTS_BINDING, PIXEL_FLOAT_CONST_BASE,
+    TEMP_REGISTERS, VERTEX_FLOAT_CONSTS_BINDING, WATCHDOG_STEPS,
 };

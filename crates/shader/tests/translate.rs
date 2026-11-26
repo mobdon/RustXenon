@@ -8,7 +8,6 @@ use xenon_shader::asm::*;
 use xenon_shader::ucode::*;
 use xenon_shader::{
     translate, translate_with, Error, ParamGen, ParamGenPrimitive, ShaderStage, VertexFetchReach,
-    PIXEL_FLOAT_CONST_BASE,
 };
 
 use ShaderStage::{Pixel, Vertex};
@@ -407,21 +406,31 @@ fn float_constants() {
     mul.const0_relative = true;
     let words = assemble(&[exec(0, 2, true)], &[alu(add), alu(mul)]);
     let t = ok(&words, Vertex);
-    has(&t, "let v0 = consts.float_consts[3];");
+    has(&t, "let v0 = fc[3u - FC_LO];");
     has(&t, "let v1 = cnst(5 + a0);");
     has(&t, "let v1 = cnst(2 + al()).wzyx;");
-    has(&t, "return consts.float_consts[u32(i) + 0u];");
+    has(&t, "return fc[u32(i)];");
     assert_eq!(t.info.float_consts_used, Some((3, 3)));
     assert!(t.info.float_consts_dynamic);
+    // A dynamic index may read any of the stage's 256: all are bound.
+    assert_eq!(t.info.float_consts_span(), Some((0, 256)));
+    has(&t, "const FC_LO: u32 = 0u;");
+    has(
+        &t,
+        "@group(0) @binding(4) var<uniform> fc: array<vec4<f32>, 256>;",
+    );
 
-    // PS constants live at 256 and up.
+    // The pixel stage binds its own span, c7 alone here, at binding 5.
     let mut a = mov(0, mask("xyzw"), AluSrc::constant(7, SWZ_XYZW)).exported(0);
     a.abs_constants = true;
     let words = assemble(&[exec(0, 1, true)], &[alu(a)]);
     let t = ok(&words, Pixel);
+    has(&t, "abs(fc[7u - FC_LO])");
+    assert_eq!(t.info.float_consts_span(), Some((7, 1)));
+    has(&t, "const FC_LO: u32 = 7u;");
     has(
         &t,
-        &format!("abs(consts.float_consts[{}])", 7 + PIXEL_FLOAT_CONST_BASE),
+        "@group(0) @binding(5) var<uniform> fc: array<vec4<f32>, 1>;",
     );
     assert_eq!(t.info.interpolators_read, 0);
     has(&t, "fn ps_main() -> PsOut");
@@ -786,7 +795,7 @@ fn every_scalar_opcode() {
                 // Constant `a` from c9.w, temporary `b` from the register
                 // number packed into the opcode and swizzle bits.
                 let reg = (op as u32 & 1) | (swz("xyzw") & 0x3C);
-                has(&t, "let sa = consts.float_consts[9].w;");
+                has(&t, "let sa = fc[9u - FC_LO].w;");
                 has(&t, &format!("let sb = r[{reg}].x;"));
             }
             _ => {}

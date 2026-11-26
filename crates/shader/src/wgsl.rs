@@ -100,7 +100,7 @@ pub struct ShaderInfo {
     pub writes_position: bool,
     /// Lowest and highest float constant read with an absolute index, in the
     /// stage's own numbering (0..=255; add [`PIXEL_FLOAT_CONST_BASE`] for the
-    /// pixel stage's index in `consts.float_consts`).
+    /// pixel stage's float constant registers).
     pub float_consts_used: Option<(u32, u32)>,
     /// Some float constant is read relative to a0 or aL, so any of the
     /// stage's 256 may be read.
@@ -117,6 +117,20 @@ pub struct ShaderInfo {
     pub point_size_export_ignored: bool,
     /// The pixel program can discard.
     pub kills: bool,
+}
+
+impl ShaderInfo {
+    /// The float constants the stage's `fc` binding holds, as (first, count)
+    /// in the stage's own numbering: the span read with an absolute index,
+    /// or all 256 when any is read by a dynamic one. `None`: the stage reads
+    /// none and declares no `fc`.
+    pub fn float_consts_span(&self) -> Option<(u32, u32)> {
+        match (self.float_consts_dynamic, self.float_consts_used) {
+            (true, _) => Some((0, 256)),
+            (false, Some((lo, hi))) => Some((lo, hi - lo + 1)),
+            (false, None) => None,
+        }
+    }
 }
 
 /// The guest words some vertex fetches of one fetch constant read: words
@@ -141,7 +155,13 @@ pub struct Translated {
     pub info: ShaderInfo,
 }
 
-/// Index of the first pixel-shader float constant in `consts.float_consts`.
+/// `@group(0)` binding of the vertex stage's float constants.
+pub const VERTEX_FLOAT_CONSTS_BINDING: u32 = 4;
+/// `@group(0)` binding of the pixel stage's float constants.
+pub const PIXEL_FLOAT_CONSTS_BINDING: u32 = 5;
+
+/// Number of the first pixel-shader float constant among the 512 float
+/// constant registers (the vertex shader's come first).
 /// The console's D3D runtime sets SQ_VS_CONST to base 0 and SQ_PS_CONST to
 /// base 256, 256 constants each (Xenia asserts this split).
 pub const PIXEL_FLOAT_CONST_BASE: u32 = 256;
@@ -156,7 +176,6 @@ pub const TEMP_REGISTERS: u32 = 64;
 const FLT_MAX: &str = "3.40282346638528859812e+38f";
 
 const PRELUDE: &str = "struct Consts {
-    float_consts: array<vec4<f32>, 512>,
     fetch: array<vec4<u32>, 48>,
     bool_consts: array<vec4<u32>, 2>,
     loop_consts: array<vec4<u32>, 8>,
@@ -719,17 +738,13 @@ impl Gen {
     }
 
     fn const_ref(&mut self, idx: u32, relative: bool, a0_relative: bool) -> String {
-        let base = match self.stage {
-            ShaderStage::Vertex => 0,
-            ShaderStage::Pixel => PIXEL_FLOAT_CONST_BASE,
-        };
         if relative {
             self.info.float_consts_dynamic = true;
             let off = if a0_relative { "a0" } else { "al()" };
             format!("cnst({idx} + {off})")
         } else {
             self.note_float_const(idx);
-            format!("consts.float_consts[{}]", idx + base)
+            format!("fc[{idx}u - FC_LO]")
         }
     }
 
@@ -1339,22 +1354,31 @@ impl Gen {
         }
         let _ = writeln!(s, "const FLT_MAX: f32 = {FLT_MAX};\n");
         s.push_str(PRELUDE);
-        if self.info.float_consts_dynamic {
-            let base = match self.stage {
-                ShaderStage::Vertex => 0,
-                ShaderStage::Pixel => PIXEL_FLOAT_CONST_BASE,
+        if let Some((first, count)) = self.info.float_consts_span() {
+            let binding = match self.stage {
+                ShaderStage::Vertex => VERTEX_FLOAT_CONSTS_BINDING,
+                ShaderStage::Pixel => PIXEL_FLOAT_CONSTS_BINDING,
             };
             let _ = write!(
                 s,
                 "
-// Float constant by dynamic index; out of range reads 0.
-fn cnst(i: i32) -> vec4<f32> {{
-    if (i < 0 || i > 255) {{
-        return vec4<f32>(0.0);
-    }}
-    return consts.float_consts[u32(i) + {base}u];
-}}
+// The stage's float constants c{first}..: only the span it reads.
+const FC_LO: u32 = {first}u;
+@group(0) @binding({binding}) var<uniform> fc: array<vec4<f32>, {count}>;
 "
+            );
+        }
+        if self.info.float_consts_dynamic {
+            s.push_str(
+                "
+// Float constant by dynamic index; out of range reads 0.
+fn cnst(i: i32) -> vec4<f32> {
+    if (i < 0 || i > 255) {
+        return vec4<f32>(0.0);
+    }
+    return fc[u32(i)];
+}
+",
             );
         }
         if self.info.uses_vertex_fetch {

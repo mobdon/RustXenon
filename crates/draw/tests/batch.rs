@@ -243,11 +243,15 @@ fn a_full_upload_arena_submits_and_continues() {
     rect(&mut mem, VERTS + 48, wf, wf, GREEN);
     let mut s = Stream::default();
     s.setup()
-        .shader(false, &vs_color())
-        .shader(true, &ps_interp());
-    // About 9 KiB of constants per draw: 2001 draws need two arena fills.
+        .shader(false, &vs_color_all_consts())
+        .shader(true, &ps_interp_all_consts());
+    // Both stages read c0 and c255, so a draw after a write to each
+    // stage's constants stages all 256 of both: about 10 KiB per draw
+    // with the other constants, and 2001 draws need two arena fills.
     for i in 0..2001 {
-        s.vertex_fetch(0, VERTS + 48 * (i % 2), 12)
+        s.regs(SHADER_CONSTANT_FLOAT, &[i])
+            .regs(SHADER_CONSTANT_FLOAT + 1024, &[i])
+            .vertex_fetch(0, VERTS + 48 * (i % 2), 12)
             .draw_auto(PRIM_RECT_LIST, 3);
     }
     let report = run(&mut d, &s, &mut mem);
