@@ -44,7 +44,7 @@ See [DATA-RULES.md](DATA-RULES.md).
 | `crates/rt` | `xenon-rt`: guest CPU state, big-endian guest memory, call dispatch and overrides. Kept tiny so generated code rebuilds rarely |
 | `crates/cpu-tests` | Per-instruction tests: hand-assembled words, reference results as text, no game bytes |
 | `tools/ppc-oracle` | Regenerates the reference results on a CPU emulator (needs LLVM and QEMU; CI does not) |
-| `crates/audio` | `xenon-audio`: mixes render-client frames to stereo, writes .wav files, decodes the console's compressed audio through a run-time loaded LGPL FFmpeg. Never plays sound |
+| `crates/audio` | `xenon-audio`: mixes render-client frames to stereo, writes .wav files, decodes the console's compressed audio through a run-time loaded LGPL FFmpeg, plays the mix live on the default output device (Windows, through `cpal`) |
 | `crates/gpu` | `xenon-gpu`: GPU command recorder: PM4 packets from guest memory to a typed command list, register file |
 | `crates/texture` | `xenon-texture`: texture fetch constants, tiling, endian swaps, texel formats to RGBA8 |
 | `crates/shader` | `xenon-shader`: GPU shader microcode decoder, assembler for tests, translation to WGSL |
@@ -203,7 +203,7 @@ titles test them with 64-bit record compares.
 | System library | Content packages as local folders, saved games listed from those folders, an empty achievement enumerator, the start-up notifications a console sends, system screens closed at once, no headset |
 | Network | The stack starts with no link; socket calls fail with "network down" |
 | Video | Display mode 1280x720 at 60 Hz. The command ring is parsed by `xenon-gpu`'s recorder; the host applies register side effects, memory, fence and event writes, conditional writes, waits and interrupts. Draws are not rendered yet. `VdSwap` leaves the real swap packets (front buffer fetch constant, then the swap) in the ring. The vertical-blank interrupt runs at 60 Hz |
-| Audio | Render clients are asked for a frame every 5.33 ms (48 kHz, 256 samples), as the console's audio hardware does; the frames are dropped. Decoder contexts live in physical memory; a silent stand-in drains their input buffers and fills their output rings with silence |
+| Audio | Render clients are asked for a frame every 5.33 ms (48 kHz, 256 samples), as the console's audio hardware does, and mixed to stereo. `--audio-wav` writes the mix to a .wav file; `--window` or `--sound` play it live on the default output device (Windows; `--mute` turns it off). Decoder contexts live in physical memory; a silent stand-in drains their input buffers and fills their output rings with silence |
 | Stops | Bug checks, exceptions other than the debugger's thread-naming one, structured exception unwinding, reboot and title launch stop with their arguments |
 
 When the title stops, the host prints the panic, the newest call targets,
