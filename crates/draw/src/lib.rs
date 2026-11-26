@@ -395,7 +395,8 @@ pub struct Timings {
     /// `shaders` split by step: shader lookup and state decode, guest
     /// indices, render target lookup, then modules and pipeline lookup.
     /// Sampled: one draw in 32 is timed and counts for 32, so the parts
-    /// only approximate `shaders`.
+    /// only approximate `shaders`; sampled draws that made a pipeline,
+    /// target, transfer or shader are left out (see `pipeline`).
     pub setup_parts: [Duration; 4],
     /// Guest vertex window, constants and index buffers: reading guest
     /// memory and uploading it, per draw.
@@ -1503,7 +1504,9 @@ pub struct Drawer {
     /// holds, so a draw rebuilds the block only after one.
     consts_gen: u64,
     /// Draws through pipeline lookup: those at multiples of
-    /// [`PART_SAMPLE`] time their sub-phases.
+    /// [`PART_SAMPLE`] time their sub-phases. A sampled draw that took a
+    /// slow path ([`Drawer::slow_work`]) is not counted, so the next draw
+    /// takes its slot.
     part_draws: u32,
     /// The last `Consts` block prefix built, by generation: the same
     /// block while its registers hold the same words, so draws compare
@@ -2762,6 +2765,21 @@ impl Drawer {
     /// The pipeline cache, for pipeline descriptors.
     fn pipeline_cache(&self) -> Option<&wgpu::PipelineCache> {
         self.disk_cache.as_ref().map(|c| &c.cache)
+    }
+
+    /// Marks that move when a draw takes a slow path: pipelines (any kind),
+    /// EDRAM transfers, targets, shader translations and modules made. A
+    /// sampled draw that moves them is left out of the sampled splits, as
+    /// scaling a one-off compile by [`PART_SAMPLE`] would swamp them; that
+    /// time is exact in `pipeline` and the phase totals.
+    fn slow_work(&self) -> (Duration, u32, u64, usize, usize) {
+        (
+            self.timings.pipeline,
+            self.timings.transfers,
+            self.targets_made,
+            self.translated.len(),
+            self.modules.len(),
+        )
     }
 
     /// Counts a pipeline created since `t0` and writes the cache file every
@@ -5616,6 +5634,7 @@ impl Drawer {
 
         let sample = self.part_draws.is_multiple_of(PART_SAMPLE);
         let stamp = || sample.then(Instant::now);
+        let slow0 = sample.then(|| self.slow_work());
         let t_state = stamp();
         let strip = matches!(
             topology,
@@ -5834,8 +5853,11 @@ impl Drawer {
         };
         let t0 = t;
         self.timings.shaders += lap(&mut t);
-        self.part_draws = self.part_draws.wrapping_add(1);
-        if let (Some(a), Some(b), Some(c)) = (t_state, t_indices, t_targets) {
+        let slow = slow0.is_some_and(|s| s != self.slow_work());
+        if !slow {
+            self.part_draws = self.part_draws.wrapping_add(1);
+        }
+        if let (false, Some(a), Some(b), Some(c)) = (slow, t_state, t_indices, t_targets) {
             add_sampled(&mut self.timings.setup_parts, &[t0, a, b, c, t]);
         }
 
@@ -6244,7 +6266,8 @@ impl Drawer {
         }
         let t0 = t;
         self.timings.submit += lap(&mut t);
-        if let (Some(a), Some(b)) = (t_groups, t_pass) {
+        let slow = slow0.is_some_and(|s| s != self.slow_work());
+        if let (false, Some(a), Some(b)) = (slow, t_groups, t_pass) {
             add_sampled(&mut self.timings.submit_parts, &[t0, a, b, t]);
         }
         Ok(true)
