@@ -176,14 +176,12 @@ pub fn start_wav(path: &std::path::Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Starts playing the mix on the default output device; logs and stays
-/// silent when it cannot open.
+/// Starts playing the mix on the default output device. Without one, or
+/// once it is lost, the speaker thread keeps trying the default device and
+/// [`tick`] logs each change; only a platform without live sound gives up.
 pub fn start_speaker() {
     match Speaker::open() {
-        Ok(s) => {
-            crate::log(&format!("audio: playing at {} Hz", s.rate()));
-            OUT.lock().unwrap().get_or_insert_with(Out::default).speaker = Some(s);
-        }
+        Ok(s) => OUT.lock().unwrap().get_or_insert_with(Out::default).speaker = Some(s),
         Err(e) => crate::log(&format!("audio: no speaker ({e}); sound is not played")),
     }
 }
@@ -234,10 +232,11 @@ pub fn tick() {
         }
     }
     if let Some(s) = o.speaker.as_mut() {
-        if let Err(e) = s.write(&mix) {
-            crate::log(&format!("audio: speaker stopped: {e}"));
-            o.speaker = None;
+        if let Some(line) = s.poll() {
+            crate::log(&format!("audio: {line}"));
         }
+        // Never fails: with no device open the mix is dropped.
+        let _ = s.write(&mix);
     }
     o.frames += 1;
 }
@@ -279,7 +278,7 @@ pub fn line() -> String {
             o.mixer.queued_total() * 4,
             o.mixer.dropped,
             o.frames * 256 / SAMPLE_RATE as u64,
-            o.speaker.as_ref().map(Speaker::counts_ms),
+            o.speaker.as_ref().and_then(Speaker::counts_ms),
         )
     });
     let sp = sp.map_or(String::new(), |(u, o)| {
