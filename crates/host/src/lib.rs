@@ -608,6 +608,13 @@ pub fn android_main(app: AndroidApp, sha256: &'static str, regs: &'static [fn(&m
     let _ = std::fs::create_dir_all(&dir);
     let _ = std::env::set_current_dir(&dir);
     redirect_output(&dir.join("stdout.log"));
+    // A phone's Vulkan driver keeps no shader cache of its own: without
+    // this every pipeline is compiled again each run, about 0.35 s each on
+    // the first phone tried, and the game waits for them (a black screen
+    // of 10 s or more when play starts).
+    if std::env::var_os("XENON_PIPELINE_CACHE").is_none() {
+        std::env::set_var("XENON_PIPELINE_CACHE", dir.join("pipeline-cache"));
+    }
     let mut args = vec![
         "--window".to_string(),
         "--home".to_string(),
