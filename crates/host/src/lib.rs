@@ -378,13 +378,15 @@ fn trace(c: &mut Context, addr: u32) {
     }
     // This thread's entry, found once per context instead of per call: a
     // thread-local lookup is a libc call on Android.
-    if c.host.0.is_null() {
-        c.host.0 = MINE.with(Arc::as_ptr).cast();
+    if c.host.get().is_null() {
+        // SAFETY: this thread's Activity is kept in ACTIVITY for good, and
+        // guest contexts stay on the host thread that runs them.
+        unsafe { c.host.set(MINE.with(Arc::as_ptr).cast()) };
     }
     // SAFETY: set just above on this host thread from an entry that is
-    // never freed; the runtime resets the slot when a context moves to a
-    // new thread or is cloned.
-    let m = unsafe { &*c.host.0.cast::<Activity>() };
+    // never freed. `spawn` and `clone` reset the slot; nothing moves a
+    // running guest context to another host thread (see ThreadSlot::set).
+    let m = unsafe { &*c.host.get().cast::<Activity>() };
     let h = m.head.load(Ordering::Relaxed);
     m.ring[(h % 8) as usize].store(addr, Ordering::Relaxed);
     m.head.store(h.wrapping_add(1), Ordering::Relaxed);
@@ -1185,8 +1187,8 @@ mod tests {
         assert_eq!(super::last_call(), 0x8200_0028);
         // The hook found this thread's entry once and kept it in the context.
         let mine = super::MINE.with(super::Arc::as_ptr).cast::<()>();
-        assert_eq!(c.host.0, mine);
-        assert!(c.clone().host.0.is_null());
+        assert_eq!(c.host.get(), mine);
+        assert!(c.clone().host.get().is_null());
         {
             let _w = super::waiting(0x4000_0010, 3);
             assert_eq!(
