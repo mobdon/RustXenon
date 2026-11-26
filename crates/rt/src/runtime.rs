@@ -144,12 +144,22 @@ impl Runtime {
 
     /// Calls the guest function at `addr`. Panics with the address if nothing
     /// is registered there, so an unbuilt range reports where it was reached.
+    ///
+    /// Inlined into every generated call site, so it holds only the branch;
+    /// both bodies stay out of line to keep game crates small.
     #[inline]
     pub fn call(&self, ctx: &mut Context, addr: u32) {
         ctx.calls += 1;
         if self.slow {
-            return self.call_checked(ctx, addr);
+            self.call_checked(ctx, addr)
+        } else {
+            self.call_fast(ctx, addr)
         }
+    }
+
+    /// [`Runtime::call`] without hooks or budget.
+    #[inline(never)]
+    fn call_fast(&self, ctx: &mut Context, addr: u32) {
         thread::checkpoint();
         let Some(f) = self.lookup(addr) else {
             missing(addr)
