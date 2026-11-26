@@ -5140,13 +5140,18 @@ impl Drawer {
                 .filter(|((k, _), key)| k == key)
                 .map(|((_, s), _)| s)
         });
-        // Built even for a stage whose staged ones are bound again: a full
-        // arena below stages them anew.
-        let float_bytes =
-            [0, 1].map(|i| float_masks[i].map(|mask| float_consts(&self.regs, i as u32, &mask)));
-        // The stages' float constants to stage: those read and not kept.
-        let floats = |kept: &[Option<(u64, u64)>; 2]| -> [Option<&[u8]>; 2] {
-            [0, 1].map(|i| float_bytes[i].as_deref().filter(|_| kept[i].is_none()))
+        // Whether all of it fits is decided on the sizes alone: a stage's
+        // float constants are built only once it is known to stage them.
+        static ZEROS: [u8; 4096] = [0; 4096];
+        let float_len = [0, 1].map(|i| {
+            float_masks[i].map(|m| 16 * m.iter().map(|w| w.count_ones() as usize).sum::<usize>())
+        });
+        let float_sizes = |kept: &[Option<(u64, u64)>; 2]| -> [Option<&[u8]>; 2] {
+            [0, 1].map(|i| {
+                float_len[i]
+                    .filter(|_| kept[i].is_none())
+                    .map(|n| &ZEROS[..n])
+            })
         };
         fn parts<'a>(
             w: Option<Vec<Part<'a>>>,
@@ -5177,7 +5182,7 @@ impl Drawer {
             && !self.fits(&parts(
                 kept_window.is_none().then(|| window(&read)),
                 kept_consts.is_none().then_some(consts.as_slice()),
-                floats(&kept_floats),
+                float_sizes(&kept_floats),
                 rest(kept_index),
             ))
         {
@@ -5192,6 +5197,11 @@ impl Drawer {
         if kept_window.is_none() {
             report.timings.guest_bytes += read.iter().map(|(lo, hi)| hi - lo).sum::<u64>();
         }
+        // The float constants of the stages that stage them.
+        let float_bytes = [0, 1].map(|i| {
+            (float_masks[i].filter(|_| kept_floats[i].is_none()))
+                .map(|mask| float_consts(&self.regs, i as u32, &mask))
+        });
         // A full arena submits the batch in `stage`: submit time, not guest data.
         let submit = self.timings.submit;
         let mut fresh = (self.stage(
@@ -5199,7 +5209,7 @@ impl Drawer {
             &parts(
                 kept_window.is_none().then(|| window(&read)),
                 kept_consts.is_none().then_some(consts.as_slice()),
-                floats(&kept_floats),
+                float_bytes.each_ref().map(|b| b.as_deref()),
                 rest(kept_index),
             ),
         )?)
@@ -5309,7 +5319,17 @@ impl Drawer {
             .map(|&(offset, _)| u32::try_from(offset))
             .collect::<Result<_, _>>()
             .map_err(|_| Skip::Unsupported("draw data past 4 GiB of the arena".into()))?;
-        let sizes = slices.map(|s| s.1);
+        let mut sizes = slices.map(|s| s.1);
+        // The float constant bindings at a power of two of at least their
+        // size (the shader declares its count; the words past it go
+        // unread), so draws of different shaders share a bind group: exact
+        // sizes made thousands, past the cap that drops them all.
+        for i in [4, 5] {
+            let up = sizes[i].max(16).next_power_of_two();
+            if slices[i].0 + up <= arena.size() {
+                sizes[i] = up;
+            }
+        }
         // Window sizes vary without end over a long run; start over past a
         // cap rather than keep every one.
         if self.arena_groups.len() >= ARENA_GROUP_CAP {
