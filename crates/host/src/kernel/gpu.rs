@@ -317,12 +317,22 @@ impl Gpu {
         // 256 ring spans between swaps bound what the queue holds.
         let q = Arc::new(xenon_gpu::ahead::Ahead::<Vec<Command>>::new(ahead, 256));
         let (q2, rt) = (q.clone(), rt.clone());
+        // Replayed commands are freed on a thread of their own: thousands of
+        // small allocations a frame, made on the command thread, were a
+        // twentieth of the draw thread to free there.
+        let (spent, freer) = std::sync::mpsc::channel::<Vec<Command>>();
+        let _ = std::thread::Builder::new()
+            .name("draw free".into())
+            .spawn(move || freer.into_iter().for_each(drop));
         let spawned = std::thread::Builder::new()
             .name("draw".into())
             .spawn(move || {
                 while let Some((cmds, swaps)) = q2.pop() {
                     let ok = side.replay(&rt, &cmds);
                     q2.done(swaps);
+                    if let Err(e) = spent.send(cmds) {
+                        drop(e.0);
+                    }
                     if !ok {
                         q2.close();
                     }
