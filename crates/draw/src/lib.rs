@@ -430,7 +430,8 @@ pub struct Timings {
     /// Submitting batches on the submit thread, alongside the drawer's
     /// own phases (not part of them).
     pub submit_thread: Duration,
-    /// Finishing batches' encoders on the finish thread, alongside too.
+    /// Of the submit thread's work, finishing batches' encoders (not
+    /// counted in `submit_thread`).
     pub finish_thread: Duration,
     /// Kept resolve write-backs to guest memory: each waits for the GPU.
     pub writebacks: u32,
@@ -595,14 +596,17 @@ type WriteBack = (
 /// time in order, so the drawer records the next batch meanwhile: wgpu
 /// encodes the recorded passes for the driver at `finish`, and the driver
 /// takes them at `submit`, which together cost tens of microseconds a draw
-/// on some drivers.
+/// on some drivers. Both run on the one thread: with the finish on a
+/// thread of its own, a batch ahead, NVIDIA's `vkQueueSubmit` sometimes
+/// waited 20-230 ms on a driver lock while the next batch was encoded,
+/// with the GPU idle.
 struct Submitter {
     tx: Option<std::sync::mpsc::Sender<SubmitJob>>,
     rx: Mutex<std::sync::mpsc::Receiver<SubmitDone>>,
     /// Batches sent and not yet received back, and what came back: time
     /// spent, the first validation error and the last submission.
     state: Mutex<SubmitState>,
-    /// The finish thread, then the submit thread.
+    /// The submit thread.
     threads: Vec<std::thread::JoinHandle<()>>,
 }
 
@@ -643,46 +647,36 @@ impl Submitter {
     fn new(device: wgpu::Device, queue: wgpu::Queue) -> Submitter {
         let (tx, jobs) = std::sync::mpsc::channel::<SubmitJob>();
         let (done, rx) = std::sync::mpsc::channel();
-        // Finishing encoders (wgpu encodes the recorded passes then) runs on
-        // a thread of its own, a batch ahead of the uploads and submits.
-        let (fin_tx, finished) = std::sync::mpsc::channel();
-        let dev = device.clone();
-        let finisher = std::thread::Builder::new()
-            .name("xenon-draw finish".into())
-            .spawn(move || {
-                for (upload, encs) in jobs {
-                    let t = Instant::now();
-                    let scope = dev.push_error_scope(wgpu::ErrorFilter::Validation);
-                    let bufs: Vec<wgpu::CommandBuffer> =
-                        encs.into_iter().map(|e| e.finish()).collect();
-                    let error = block_on(scope.pop()).map(|e| e.to_string());
-                    if fin_tx.send((upload, bufs, t.elapsed(), error)).is_err() {
-                        break;
-                    }
-                }
-            })
-            .expect("spawn finish thread");
         let thread = std::thread::Builder::new()
             .name("xenon-draw submit".into())
             .spawn(move || {
                 // Mapped upload chunks, kept and reused: recalled after each
                 // submit, so mapped again by the next upload.
                 let mut belt = wgpu::util::StagingBelt::new(device.clone(), BELT_CHUNK);
-                while let Ok(first) = finished.recv() {
-                    let t = Instant::now();
-                    // Batches finished meanwhile go in the same submit: each
+                while let Ok(first) = jobs.recv() {
+                    // Batches flushed meanwhile go in the same submit: each
                     // `queue.submit` has a fixed cost, and a run of resolves
                     // flushes many small batches close together.
-                    let mut jobs = vec![first];
-                    jobs.extend(finished.try_iter().take(SUBMIT_MERGE_MAX - 1));
+                    let mut batch = vec![first];
+                    batch.extend(jobs.try_iter().take(SUBMIT_MERGE_MAX - 1));
                     // Error scopes are per thread.
+                    let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
+                    let mut finished = Vec::with_capacity(batch.len());
+                    for (upload, encs) in batch {
+                        let t = Instant::now();
+                        let bufs: Vec<wgpu::CommandBuffer> =
+                            encs.into_iter().map(|e| e.finish()).collect();
+                        finished.push((upload, bufs, t.elapsed()));
+                    }
+                    let finish_error = block_on(scope.pop()).map(|e| e.to_string());
+                    let t = Instant::now();
                     let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
                     // Maps the chunks recalled after earlier submits whose
                     // work the GPU finished.
                     let _ = device.poll(wgpu::PollType::Poll);
                     let mut cmds = Vec::new();
-                    let mut dones = Vec::with_capacity(jobs.len());
-                    for (upload, bufs, finish, finish_error) in jobs {
+                    let mut dones = Vec::with_capacity(finished.len());
+                    for (upload, bufs, finish) in finished {
                         let mut used = None;
                         if let Some((arena, base, bytes)) = upload {
                             let mut enc = device.create_command_encoder(&Default::default());
@@ -703,20 +697,19 @@ impl Submitter {
                             used = Some(bytes);
                         }
                         cmds.extend(bufs);
-                        dones.push((finish, finish_error, used));
+                        dones.push((finish, used));
                     }
                     belt.finish();
                     let index = queue.submit(cmds);
                     belt.recall();
-                    let error = block_on(scope.pop()).map(|e| e.to_string());
+                    let error = finish_error.or(block_on(scope.pop()).map(|e| e.to_string()));
                     // The submit time goes to the first batch of the merge.
                     let mut busy = t.elapsed();
-                    for (i, (finish, finish_error, used)) in dones.into_iter().enumerate() {
-                        let error = finish_error.or(if i == 0 { error.clone() } else { None });
+                    for (i, (finish, used)) in dones.into_iter().enumerate() {
                         let sent = done.send((
                             finish,
                             std::mem::take(&mut busy),
-                            error,
+                            if i == 0 { error.clone() } else { None },
                             index.clone(),
                             used,
                         ));
@@ -731,7 +724,7 @@ impl Submitter {
             tx: Some(tx),
             rx: Mutex::new(rx),
             state: Mutex::new(SubmitState::default()),
-            threads: vec![finisher, thread],
+            threads: vec![thread],
         }
     }
 

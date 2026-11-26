@@ -306,7 +306,7 @@ impl DrawStats {
         let percent = |a: u32, b: u32| f64::from(a) * 100.0 / f64::from(b.max(1));
         format!(
             "[draw] {:.1} s: {} frames, {} replays; ms per {per}: drawer {:.0} = shaders {:.0} (state {:.0}, indices {:.0}, targets {:.0}, pipeline {:.0}), \
-             guest data {:.0}, textures {:.0}, submit {:.0} (groups {:.1}, pass {:.1}, record {:.1}, queue {:.0}, upload {:.0}; finish thread {:.0}, submit thread {:.0} alongside), gpu wait {:.0}, readback {:.0}, \
+             guest data {:.0}, textures {:.0}, submit {:.0} (groups {:.1}, pass {:.1}, record {:.1}, queue {:.0}, upload {:.0}; finish {:.0} and submit {:.0} on the submit thread alongside), gpu wait {:.0}, readback {:.0}, \
              resolve cpu {:.0}, clears {:.0}, swap {:.0} (transfers {:.0}), commands {:.1}, edges {:.1}, other {:.1}; of those, creating \
              pipelines {:.0}; per {per}: {} draws ({} consts reused, {} indices reused, {} texture sets reused = {:.0}%), {} shader loads, \
              {} resolves, {} submits ({} resolve, {} transfer, {} decode, {} flush/other), {} transfers ({} passes, {} set up), {} render passes, {} write-backs, readback {:.1} MB, \
@@ -1037,7 +1037,7 @@ mod tests {
             "readback 150,",
             "1380 draws",
             "42 resolves",
-            "submit 80 (groups 10.0, pass 5.0, record 20.0, queue 30, upload 10; finish thread 15, submit thread 25 alongside),",
+            "submit 80 (groups 10.0, pass 5.0, record 20.0, queue 30, upload 10; finish 15 and submit 25 on the submit thread alongside),",
             // 2000 ms busy less 300 readback, 160 submit, 40 commands and
             // 20 edges, per frame.
             "commands 20.0, edges 10.0, other 740.0;",
