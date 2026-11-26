@@ -232,6 +232,61 @@ fn mem_write_into_a_texture_is_sampled_by_later_draws() {
     assert_eq!(px(&img, W, 40, 40), RED);
 }
 
+/// A guest write over one texture drops only the texture sets that use it:
+/// a draw of another texture binds its set again, a draw of the written
+/// one looks it up anew and samples the new texels.
+#[test]
+fn a_guest_write_drops_only_the_sets_of_its_texture() {
+    let Some(mut d) = drawer() else { return };
+    let mut mem = memory();
+    let green = green_texture_quad(&mut mem);
+    // A second texture, red, 64 KiB further on.
+    let other = TEXTURE + 0x1_0000;
+    let linear: Vec<u8> = (0..W * H).flat_map(|_| RED).collect();
+    let mut tiled = tile::tile_2d(&linear, W, H, W, 4).unwrap();
+    endian::swap_in_place(&mut tiled, xenon_texture::Endian::K8in32);
+    mem.data[other as usize..][..tiled.len()].copy_from_slice(&tiled);
+    let mut red = green;
+    red[1] = (red[1] & 0xFFF) | other;
+    // One black texel word over the red texture's first block.
+    let packet = [other, 0];
+    let mut s = Stream::default();
+    s.setup()
+        .shader(false, &vs_uv())
+        .shader(true, &ps_texture(1))
+        .vertex_fetch(0, VERTS + 0x100, 20)
+        .regs(SHADER_CONSTANT_FETCH + 6, &green)
+        .draw_auto(PRIM_QUAD_LIST, 4)
+        .regs(SHADER_CONSTANT_FETCH + 6, &red)
+        .draw_auto(PRIM_QUAD_LIST, 4);
+    s.0.extend(xenon_gpu::pm4::build::type3(
+        xenon_gpu::pm4::PM4_MEM_WRITE,
+        &packet,
+    ));
+    s.regs(SHADER_CONSTANT_FETCH + 6, &green)
+        .draw_auto(PRIM_QUAD_LIST, 4);
+    let report = run(&mut d, &s, &mut mem);
+    assert_eq!(report.draws, 3, "{report:?}");
+    assert!(report.unsupported.is_empty(), "{report:?}");
+    // The green set survives the write over the red texture.
+    assert_eq!(report.timings.texture_sets_reused, 1, "{report:?}");
+    let img = d.read_render_target(COLOR_KEY, 0, 0, W, H).unwrap();
+    assert_eq!(px(&img, W, 40, 40), GREEN);
+
+    // The red set does not: its texture is looked up and drawn anew.
+    let mut s = Stream::default();
+    s.setup()
+        .shader(false, &vs_uv())
+        .shader(true, &ps_texture(1))
+        .vertex_fetch(0, VERTS + 0x100, 20)
+        .regs(SHADER_CONSTANT_FETCH + 6, &red)
+        .draw_auto(PRIM_QUAD_LIST, 4);
+    let report = run(&mut d, &s, &mut mem);
+    assert_eq!(report.timings.texture_sets_reused, 0, "{report:?}");
+    let img = d.read_render_target(COLOR_KEY, 0, 0, W, H).unwrap();
+    assert_eq!(px(&img, W, 40, 40), RED);
+}
+
 /// More draw data than the 16 MiB upload arena holds submits the batch
 /// part-way and reuses the arena; the draws still land in order.
 #[test]

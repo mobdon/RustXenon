@@ -176,6 +176,7 @@ type HashMap<K, V> =
 type HashSet<K> = std::collections::HashSet<K, std::hash::BuildHasherDefault<rustc_hash::FxHasher>>;
 use std::fmt;
 use std::hash::{Hash, Hasher};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -1310,10 +1311,15 @@ pub struct Drawer {
     texture_groups: HashMap<TextureGroupKey, (wgpu::BindGroup, u64)>,
     /// A draw's texture bind group by its slot mask and the fetch constants
     /// of those slots, with the [`Drawer::texture_memo_epoch`] it was found
-    /// in: a later draw with the same constants binds it without looking
-    /// each texture up again, until the texture memo drops an entry.
-    texture_sets: HashMap<TextureSetKey, (wgpu::BindGroup, u64)>,
-    /// Counts the changes that drop [`Drawer::texture_memo`] entries.
+    /// in and a flag that stays set while the memo keeps its textures: a
+    /// later draw with the same constants binds it without looking each
+    /// texture up again.
+    texture_sets: HashMap<TextureSetKey, (wgpu::BindGroup, u64, Arc<AtomicBool>)>,
+    /// The flags of the sets each fetch constant is in: a guest write that
+    /// drops the constant's memo entry clears them, so only the sets using
+    /// that texture go (dropping them all made a third of draws miss).
+    texture_set_flags: HashMap<[u32; 6], Vec<Arc<AtomicBool>>>,
+    /// Counts the changes that drop all [`Drawer::texture_memo`] entries.
     texture_memo_epoch: u64,
     /// Group 0 bind groups over `arena`, by the sizes of the four slices
     /// they bind (at dynamic offsets). Cleared when the arena is replaced.
@@ -2186,6 +2192,7 @@ impl Drawer {
             batch: None,
             texture_groups: HashMap::default(),
             texture_sets: HashMap::default(),
+            texture_set_flags: HashMap::default(),
             texture_memo_epoch: 0,
             arena_groups: HashMap::default(),
             staged: Vec::new(),
@@ -2760,11 +2767,19 @@ impl Drawer {
         if ranges.is_empty() {
             return;
         }
-        let had = self.texture_memo.len();
-        self.texture_memo
-            .retain(|_, &mut (_, a, b, _)| !meets(ranges, a, b));
-        if self.texture_memo.len() != had {
-            self.texture_memo_epoch += 1;
+        let mut gone = Vec::new();
+        self.texture_memo.retain(|c, &mut (_, a, b, _)| {
+            let keep = !meets(ranges, a, b);
+            if !keep {
+                gone.push(*c);
+            }
+            keep
+        });
+        // The sets that used those textures; the others stay bound.
+        for c in gone {
+            for flag in self.texture_set_flags.remove(&c).into_iter().flatten() {
+                flag.store(false, Ordering::Relaxed);
+            }
         }
         self.window_memo
             .retain(|&a, &mut (b, _)| !meets(ranges, a, b));
@@ -4766,6 +4781,7 @@ impl Drawer {
         // Groups and the memo hold views; drop them so evicted textures go too.
         self.texture_groups.clear();
         self.texture_sets.clear();
+        self.texture_set_flags.clear();
         self.texture_memo.clear();
         self.texture_memo_epoch += 1;
         // shortcut: the evicted-key set only feeds a counter; cleared
@@ -5441,8 +5457,10 @@ impl Drawer {
             .map(|n| self.regs.fetch_constant(n))
             .collect();
         let set = (self.texture_sets.get(&(tex_mask, constants)))
-            .filter(|(_, epoch)| *epoch == self.texture_memo_epoch)
-            .map(|(g, _)| g.clone());
+            .filter(|(_, epoch, kept)| {
+                *epoch == self.texture_memo_epoch && kept.load(Ordering::Relaxed)
+            })
+            .map(|(g, _, _)| g.clone());
         let mut textures = Vec::new();
         if set.is_none() {
             for n in (0..32).filter(|n| tex_mask & (1 << n) != 0) {
@@ -5501,6 +5519,7 @@ impl Drawer {
             let g = self.texture_group(tex_mask, textures, &g1_layout);
             if self.texture_sets.len() >= TEXTURE_GROUP_CAP {
                 self.texture_sets.clear();
+                self.texture_set_flags.clear();
             }
             let constants: Vec<[u32; 6]> = (0..32)
                 .filter(|n| tex_mask & (1 << n) != 0)
@@ -5516,8 +5535,21 @@ impl Drawer {
                     || self.texture_memo.contains_key(c)
             });
             if found {
+                let kept = Arc::new(AtomicBool::new(true));
+                for c in constants
+                    .iter()
+                    .filter(|c| self.texture_memo.contains_key(*c))
+                {
+                    let flags = self.texture_set_flags.entry(*c).or_default();
+                    // A set made again after its flag was cleared leaves the
+                    // old one here: drop those as the list grows.
+                    if flags.len() >= 64 {
+                        flags.retain(|f| f.load(Ordering::Relaxed));
+                    }
+                    flags.push(kept.clone());
+                }
                 let epoch = self.texture_memo_epoch;
-                (self.texture_sets).insert((tex_mask, constants), (g.clone(), epoch));
+                (self.texture_sets).insert((tex_mask, constants), (g.clone(), epoch, kept));
             }
             g
         };
