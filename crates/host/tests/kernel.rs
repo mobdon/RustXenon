@@ -1139,6 +1139,39 @@ fn saves_are_created_listed_and_reopened() {
     call(rt, &mut c, xam::xam_content_close, &[0xF000, 0]);
     let data = e.game.parent().unwrap().join("data/content/SLOT1/data.bin");
     assert_eq!(std::fs::read(data).unwrap(), b"progress");
+    // A handle only read from has nothing to flush (Windows cannot sync a
+    // read-only handle); a handle that is not a file is refused.
+    let r = call(
+        rt,
+        &mut c,
+        files::nt_create_file,
+        &[
+            0xF500,
+            0x8000_0000,
+            attrs(rt, 0xF600, "game:\\a.txt"),
+            0xF700,
+            0,
+            0,
+            0,
+            1,
+        ],
+    );
+    assert_eq!(r, 0);
+    let h = rt.mem.read_u32(0xF500);
+    assert_eq!(
+        call(
+            rt,
+            &mut c,
+            files::nt_flush_buffers_file,
+            &[h as u64, 0xF700]
+        ),
+        0
+    );
+    call(rt, &mut c, objects::nt_close, &[h as u64]);
+    assert_eq!(
+        call(rt, &mut c, files::nt_flush_buffers_file, &[0xDEAD, 0xF700]) as u32,
+        0xC000_0008
+    );
     // Listed by type with its display name, one per call, then the end.
     rt.mem.write_u32(0x2_7054, 0);
     call(
@@ -1245,6 +1278,16 @@ fn saves_are_created_listed_and_reopened() {
     assert_eq!(std::fs::read(bak.join("new.bin")).unwrap(), b"newer");
     assert!(!bak.join("data.bin").exists());
     assert!(!data.join("content/SLOT1/new.bin").exists());
+    // When the old save cannot be moved aside it is left, not deleted.
+    std::fs::write(data.join("content/SLOT1/kept.bin"), b"kept").unwrap();
+    std::fs::remove_dir_all(data.join("content.bak")).unwrap();
+    std::fs::write(data.join("content.bak"), b"in the way").unwrap();
+    assert_eq!(create(&mut c, 2), 0);
+    call(rt, &mut c, xam::xam_content_close, &[0xF000, 0]);
+    assert_eq!(
+        std::fs::read(data.join("content/SLOT1/kept.bin")).unwrap(),
+        b"kept"
+    );
 }
 
 #[test]

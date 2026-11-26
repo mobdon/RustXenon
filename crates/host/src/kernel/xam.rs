@@ -250,11 +250,12 @@ pub fn xam_content_create_ex(rt: &Runtime, c: &mut Context) {
         let bak = backup_root().join(&name);
         let _ = std::fs::remove_dir_all(&bak);
         let _ = std::fs::create_dir_all(backup_root());
+        // If it cannot be moved (a file in it still open, say), it stays:
+        // the title overwrites what it writes, and nothing is half deleted.
         if let Err(e) = std::fs::rename(&dir, &bak) {
             crate::log(&format!(
-                "[xam] cannot keep the old content {name:?} ({e}); emptied instead"
+                "[xam] cannot move the old content {name:?} aside ({e}); left in place"
             ));
-            let _ = std::fs::remove_dir_all(&dir);
         }
     }
     if !existed || empty {
