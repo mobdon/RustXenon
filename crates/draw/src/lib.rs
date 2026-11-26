@@ -1428,6 +1428,9 @@ pub struct Drawer {
     cache_key: Option<String>,
     disk_cache: Option<DiskCache>,
     uncaptured: Arc<Mutex<Vec<String>>>,
+    /// Set with the first error put in `uncaptured`, so the check after
+    /// every command is one load while there is none.
+    uncaptured_any: Arc<std::sync::atomic::AtomicBool>,
     max_dim: u32,
     max_storage: u64,
     /// Last, so it drops after the device and every resource made from it.
@@ -1975,10 +1978,12 @@ impl Drawer {
         }))
         .map_err(|e| Error::RequestDevice(e.to_string()))?;
         let uncaptured = Arc::new(Mutex::new(Vec::new()));
-        let sink = uncaptured.clone();
+        let uncaptured_any = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (sink, any) = (uncaptured.clone(), uncaptured_any.clone());
         device.on_uncaptured_error(Arc::new(move |e: wgpu::Error| {
             if let Ok(mut v) = sink.lock() {
                 v.push(e.to_string());
+                any.store(true, std::sync::atomic::Ordering::Release);
             }
         }));
         let entry = |binding, visibility, ty| wgpu::BindGroupLayoutEntry {
@@ -2157,6 +2162,7 @@ impl Drawer {
                 .flatten(),
             disk_cache: None,
             uncaptured,
+            uncaptured_any,
             max_dim: limits.max_texture_dimension_2d,
             max_storage: limits.max_storage_buffer_binding_size,
         };
@@ -3207,6 +3213,10 @@ impl Drawer {
     }
 
     fn check_uncaptured(&self) -> Result<(), Error> {
+        use std::sync::atomic::Ordering;
+        if !self.uncaptured_any.swap(false, Ordering::Acquire) {
+            return Ok(());
+        }
         let mut v = self
             .uncaptured
             .lock()
