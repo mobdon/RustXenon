@@ -68,6 +68,8 @@ pub enum Hit {
     Tab(Page),
     /// A list row, counted from the first row shown.
     Row(usize),
+    /// The Games page's prompt box under the details (start, or look again).
+    Info,
 }
 
 // Layout on the board.
@@ -205,6 +207,9 @@ pub fn hit(w: usize, h: usize, page: Page, x: f32, y: f32) -> Option<Hit> {
         {
             return Some(Hit::Tab(p));
         }
+    }
+    if page == Page::Games && inside(info_rect(&l)) {
+        return Some(Hit::Info);
     }
     (0..ROWS).find(|&r| inside(row_rect(&l, r))).map(Hit::Row)
 }
@@ -579,7 +584,7 @@ impl Cv<'_> {
         }
     }
 
-    /// A soft shadow (black) or halo (added light) round a rounded rectangle.
+    /// A soft shadow (black) or glow (added light) round a rounded rectangle.
     fn glow(&mut self, (x, y, w, h): Rect, r: f32, reach: f32, c: u32, a: f32) {
         let (x0, y0, x1, y1) = self.rect((x - reach, y - reach, w + 2.0 * reach, h + 2.0 * reach));
         let (c, add) = (rgb(c), c != BLACK);
@@ -641,7 +646,7 @@ impl Cv<'_> {
         self.text(right - text_w(size, s), y, size, c, s);
     }
 
-    /// A soft halo round `s`: its pixels blurred and added in `c`.
+    /// A soft glow round `s`: its pixels blurred and added in `c`.
     fn text_glow(&mut self, x: f32, y: f32, size: f32, c: u32, s: &str, radius: f32, amount: f32) {
         let m = text_mask(self.fit(), x, y, size, s, false);
         let r = (radius * self.k).max(1.0) as i32;
@@ -797,7 +802,8 @@ fn rivet(cv: &mut Cv, cx: f32, cy: f32, r: f32) {
 
 /// A side blade: a curved strip of brushed steel, rusting from its edges,
 /// riveted top and bottom, its page's name written up it. `left` says which
-/// edge of the screen it is at; its name sits in the part that shows.
+/// edge of the screen it is at; its name sits in the part that shows. With
+/// no name it is a bare edge of the stack: no rivets, no label.
 fn strip(cv: &mut Cv, (x, y, w, h): Rect, name: &str, left: bool, seed: u32) {
     let r = 16.0;
     cv.glow((x, y + 4.0, w, h), r, 14.0, BLACK, 0.55);
@@ -834,6 +840,9 @@ fn strip(cv: &mut Cv, (x, y, w, h): Rect, name: &str, left: bool, seed: u32) {
         (c, 1.0)
     });
     let cx = shown_x + STRIP_W / 2.0;
+    if name.is_empty() {
+        return;
+    }
     for cy in [y + 20.0, y + h - 20.0] {
         rivet(cv, cx, cy, 4.2);
     }
@@ -873,8 +882,8 @@ fn blade(cv: &mut Cv, l: &Lay) {
         // A soft sheen band across the top, curving down at the sides.
         let s = u / w - 0.5;
         let tb = t - 0.24 * s * s;
-        let band = smooth(0.012, 0.05, tb) * (1.0 - smooth(0.09, 0.2, tb));
-        c = mix(c, [255.0; 3], 0.3 * band);
+        let band = smooth(0.012, 0.05, tb) * (1.0 - smooth(0.11, 0.24, tb));
+        c = mix(c, [255.0; 3], 0.5 * band);
         // Light pooling at the upper left, falling off to the right.
         c = scale(c, 1.06 - 0.14 * (u / w));
         // Faint brushed metal under the paint.
@@ -890,9 +899,9 @@ fn blade(cv: &mut Cv, l: &Lay) {
                 c = mix(c, scale(rust(bu, bv, px, py, 3), 0.85), amt);
             }
         }
-        // Pits in the paint near the rim, rarer further in.
-        let near = 1.0 - smooth(6.0, 60.0, inward);
-        let (pit, core) = pit(bu, bv, 0.006 + 0.2 * near, 8);
+        // Pits in the paint near the rim only, rarer further in.
+        let near = 1.0 - smooth(4.0, 36.0, inward);
+        let (pit, core) = pit(bu, bv, 0.22 * near, 8);
         if pit > 0.0 {
             c = mix(c, rgb(RUST_HI), pit * 0.9);
             c = mix(c, rgb(0x1a0a04), core * 0.85);
@@ -940,6 +949,34 @@ fn preview_plate(cv: &mut Cv, l: &Lay, seed: u32) {
     }
 }
 
+const HINT_GAP: f32 = 24.0;
+
+/// The footer's button hints (Y, B, A), each with the board x it starts at,
+/// and the x where the LB/RB page hint starts.
+#[allow(clippy::type_complexity)]
+fn hints(page: Page) -> ([(f32, &'static str, u32, &'static str); 3], f32) {
+    let first = if page == Page::Games {
+        "Start"
+    } else {
+        "Change"
+    };
+    let mut hints = [
+        (0.0, "Y", 0xf0b428, "Refresh"),
+        (0.0, "B", 0xe0402a, "Back"),
+        (0.0, "A", GREEN, first),
+    ];
+    let mut total = text_w(2.0, "Page") + pill_w(22.0, "LB") + pill_w(22.0, "RB") + 12.0;
+    for (.., label) in hints {
+        total += 32.0 + text_w(2.0, label) + HINT_GAP;
+    }
+    let mut hx = BOARD_W - M - 26.0 - total;
+    for (x, .., label) in &mut hints {
+        *x = hx;
+        hx += 32.0 + text_w(2.0, label) + HINT_GAP;
+    }
+    (hints, hx)
+}
+
 /// The slim bar of button hints at the bottom.
 fn footer(cv: &mut Cv, page: Page) {
     let (x, y, w, h) = (M, FOOT_Y, BOARD_W - 2.0 * M, FOOT_H);
@@ -959,28 +996,11 @@ fn footer(cv: &mut Cv, page: Page) {
         DIM,
         "Drop a game folder here to add it",
     );
-    let first = if page == Page::Games {
-        "Start"
-    } else {
-        "Change"
-    };
-    let hints: [(&str, u32, &str); 3] = [
-        ("Y", 0xf0b428, "Refresh"),
-        ("B", 0xe0402a, "Back"),
-        ("A", GREEN, first),
-    ];
     let cy = y + h / 2.0;
-    let gap = 24.0;
-    let mut total = text_w(2.0, "Page") + pill_w(22.0, "LB") + pill_w(22.0, "RB") + 12.0;
-    for (_, _, label) in hints {
-        total += 32.0 + text_w(2.0, label) + gap;
-    }
-    let mut hx = x + w - 26.0 - total;
-    for (key, c, label) in hints {
+    let (hints, mut hx) = hints(page);
+    for (hx, key, c, label) in hints {
         cv.button(hx + 13.0, cy, 13.0, c, key);
-        hx += 32.0;
-        cv.text(hx, cy - 7.0, 2.0, BONE, label);
-        hx += text_w(2.0, label) + gap;
+        cv.text(hx + 32.0, cy - 7.0, 2.0, BONE, label);
     }
     for b in ["LB", "RB"] {
         hx += cv.pill(hx, cy - 11.0, 22.0, 0x50565a, WHITE, b) + 4.0;
@@ -1033,6 +1053,14 @@ pub fn backdrop(w: usize, h: usize, page: Page) -> Vec<u32> {
     header(&mut cv);
     let l = lay(page);
     let i = index(page);
+    // Bare edges of more blades behind, at both ends, so they read as a stack.
+    for (n, off) in [(0u32, 16.0), (1, 8.0)] {
+        let inset = STRIP_INSET + 10.0 - off * 0.5;
+        let (y, h, w) = (BLADE_Y + inset, BLADE_H - 2.0 * inset, STRIP_W);
+        strip(&mut cv, (M - off, y, w, h), "", true, 60 + n);
+        let x = BOARD_W - M + off - w - STRIP_TUCK;
+        strip(&mut cv, (x, y, w + STRIP_TUCK, h), "", false, 62 + n);
+    }
     // Outermost strips first, so each tucks under its inner neighbour.
     let mut order: Vec<usize> = (0..PAGES.len()).filter(|&j| j != i).collect();
     order.sort_by_key(|&j| std::cmp::Reverse(j.abs_diff(i)));
@@ -1047,8 +1075,14 @@ pub fn backdrop(w: usize, h: usize, page: Page) -> Vec<u32> {
         Page::Settings => "Player Settings",
     };
     let (tx, ty) = (l.bx + PAD + 4.0, BLADE_Y + 30.0);
-    cv.text_glow(tx, ty, 5.0, WHITE, title, 6.0, 0.18);
-    cv.text_sh(tx, ty, 5.0, WHITE, title);
+    // White on the sheen needs a deep green edge and drop to stand out.
+    let m = text_mask(cv.fit(), tx, ty, 5.0, title, false);
+    let o = (2.0 * cv.k).round().max(1.0) as i32;
+    for (dx, dy) in [(-1, 0), (1, 0), (0, -1), (0, 1)] {
+        cv.mask(&m, dx, dy, rgb(GREEN_DEEP), 0.45);
+    }
+    cv.mask(&m, o, o + 1, rgb(GREEN_DEEP), 0.7);
+    cv.mask(&m, 0, 0, [255.0; 3], 1.0);
     preview_plate(&mut cv, &l, 150 + i as u32);
     // The info box under the details.
     let (ix, iy, iw, ih) = info_rect(&l);
@@ -1227,7 +1261,8 @@ pub fn overlay(px: &mut [u32], w: usize, h: usize, v: &View, t: f32) {
         ),
         Page::Settings => "player defaults".into(),
     };
-    cv.text_right(l.bx + l.bw - PAD, BLADE_Y + 44.0, 2.4, PALE, &count);
+    let cx = l.bx + l.bw - PAD - text_w(2.4, &count);
+    cv.text_sh(cx, BLADE_Y + 44.0, 2.4, WHITE, &count);
 
     let rows = rows(v);
     if rows.is_empty() {
@@ -1322,6 +1357,23 @@ pub fn overlay(px: &mut [u32], w: usize, h: usize, v: &View, t: f32) {
     }
 
     details(&mut cv, &l, v, pulse);
+
+    // Dim the footer hints that do nothing now: all of them while a game
+    // runs, A when there is no game to start.
+    let (hs, end) = hints(v.page);
+    let (a_x, .., a_label) = hs[2];
+    let dim = if v.running.is_some() {
+        let pills = pill_w(22.0, "LB") + pill_w(22.0, "RB");
+        Some((hs[0].0, end + pills + 12.0 + text_w(2.0, "Page")))
+    } else if v.page == Page::Games && v.games.is_empty() {
+        Some((a_x, a_x + 32.0 + text_w(2.0, a_label)))
+    } else {
+        None
+    };
+    if let Some((x0, x1)) = dim {
+        let r = (x0 - 4.0, FOOT_Y + 8.0, x1 - x0 + 8.0, FOOT_H - 16.0);
+        cv.fill(r, 12.0, 0x16191a, 0.72);
+    }
 }
 
 fn empty(cv: &mut Cv, l: &Lay, home: &Path) {
@@ -1555,6 +1607,10 @@ mod tests {
                     };
                     assert_eq!(at(tuck, y + sh / 2.0), None);
                 }
+                let (x, y, iw, ih) = info_rect(&l);
+                let info = (page == Page::Games).then_some(Hit::Info);
+                assert_eq!(at(x + iw / 2.0, y + ih / 2.0), info);
+                assert_eq!(at(x + 3.0, y + ih - 3.0), info);
                 assert_eq!(at(l.bx + PAD + 10.0, BLADE_Y + 40.0), None);
                 assert_eq!(at(5.0, 5.0), None);
             }
@@ -1595,7 +1651,8 @@ mod tests {
                 (steel[1] - steel[0]).abs() < 60.0,
                 "{page:?} strip {steel:?}"
             );
-            let green = px_at(&px, l.bx + l.bw / 2.0, LIST_Y - 20.0);
+            // In the gap between the list and the details, below the sheen.
+            let green = px_at(&px, l.dx - 8.0, LIST_Y + 250.0);
             assert!(green[1] > green[0] + 60.0, "{page:?} blade {green:?}");
         }
     }

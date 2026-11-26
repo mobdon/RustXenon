@@ -173,8 +173,8 @@ struct App {
     note: Option<String>,
     running: Option<(String, Child)>,
     window: Option<(Rc<Window>, Surface)>,
-    /// The backdrop for this size and page.
-    back: Option<(usize, usize, Page, Vec<u32>)>,
+    /// The backdrop of each page seen at this size, so a page switch is free.
+    back: Vec<(usize, usize, Page, Vec<u32>)>,
     pad: xinput::Reader,
     buttons: u16,
     held: Option<(Act, Instant)>,
@@ -197,7 +197,7 @@ impl App {
             note: None,
             running: None,
             window: None,
-            back: None,
+            back: Vec::new(),
             pad: xinput::Reader::default(),
             buttons: 0,
             held: None,
@@ -380,14 +380,15 @@ impl App {
             return;
         }
         let page = self.page;
-        if !matches!(&self.back, Some((bw, bh, bp, _)) if (*bw, *bh, *bp) == (w, h, page)) {
-            self.back = Some((w, h, page, draw::backdrop(w, h, page)));
+        if !self.back.iter().any(|b| (b.0, b.1, b.2) == (w, h, page)) {
+            self.back.retain(|b| (b.0, b.1) == (w, h));
+            self.back.push((w, h, page, draw::backdrop(w, h, page)));
         }
         let Some((_, s)) = self.window.as_mut() else {
             return;
         };
         let Ok(mut buf) = s.buffer_mut() else { return };
-        if let Some((.., back)) = &self.back {
+        if let Some((.., back)) = self.back.iter().find(|b| b.2 == page) {
             buf.copy_from_slice(back);
         }
         // Not self.view(): self.window is borrowed mutably for the buffer.
@@ -543,6 +544,13 @@ impl ApplicationHandler for App {
                     {
                         self.select(self.scroll[self.page as usize] + r);
                         self.act(Act::Go);
+                    }
+                    Some(Hit::Info) if self.running.is_none() => {
+                        self.act(if self.games.is_empty() {
+                            Act::Refresh
+                        } else {
+                            Act::Go
+                        })
                     }
                     _ => {}
                 }
