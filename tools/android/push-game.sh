@@ -78,7 +78,39 @@ def self_test():
     assert parsed["exe"] == "/p/a.xex" and parsed["window"]["exe"] == 1
     assert phone_name("exe", "C:\\x\\a.xex") == "a.xex"
     assert phone_name("game", "C:\\x\\folder\\") == "game"
+    shell_test()
     print("push-game.sh self-test ok")
+
+
+def shell_test():
+    """Runs RECOVER and MIGRATE in a local sh on each interrupted state."""
+    def sh(cmd):
+        return subprocess.run(["sh", "-c", cmd]).returncode
+
+    def tree(d):
+        return sorted(os.listdir(d)) if os.path.isdir(d) else None
+
+    def mk(d, *names):
+        os.makedirs(d)
+        for n in names:
+            open(os.path.join(d, n), "w").close()
+
+    with tempfile.TemporaryDirectory() as tmp:
+        b = os.path.join(tmp, "g").replace(os.sep, "/")
+        # Stopped after `mv b b.old`: b.own is the whole new copy.
+        mk(b + ".old", "a", "s"); mk(b + ".own", "a", "s")
+        assert sh(RECOVER.format(b)) == 0 and tree(b) == ["a", "s"]
+        assert tree(b + ".old") is None and tree(b + ".own") is None
+        # Stopped after `mv b.own b`, or inside `rm -rf b.old`.
+        mk(b + ".old", "a")
+        assert sh(RECOVER.format(b)) == 0 and tree(b) == ["a", "s"] and tree(b + ".old") is None
+        # Stopped inside `cp`: b is whole, the partial b.own is thrown away.
+        mk(b + ".own", "a")
+        assert sh(RECOVER.format(b)) == 0 and sh(MIGRATE.format(b)) == 0
+        assert tree(b) == ["a", "s"] and tree(b + ".own") is None and tree(b + ".old") is None
+        # Both leftovers and b: RECOVER keeps everything and fails.
+        mk(b + ".old", "a"); mk(b + ".own", "a")
+        assert sh(RECOVER.format(b)) != 0 and tree(b + ".old") == ["a"]
 
 
 def adb(*args, **kw):
@@ -96,16 +128,36 @@ def remote_sizes(package, path):
     """{relative path: size} of the files under `path` on the phone."""
     r = run_as(
         package,
-        'find "%s" -type f -exec stat -c "%%s %%n" {} + 2>/dev/null' % path,
+        'find "%s" -type f -exec stat -c "%%s %%n" {} +' % path,
         capture_output=True,
         text=True,
     )
+    # A partial list would make data/ look absent and its saves get overwritten.
+    if r.returncode != 0:
+        sys.exit("push-game.sh: could not list %s on the phone: %s" % (path, r.stderr.strip()))
     sizes = {}
     for line in r.stdout.splitlines():
         size, _, name = line.strip().partition(" ")
         if size.isdigit() and name.startswith(path + "/"):
             sizes[name[len(path) + 1:]] = int(size)
     return sizes
+
+
+# An older push-game.sh pushed straight into the game folder, and the app
+# cannot open those files. MIGRATE copies the folder once as the app's user.
+# It swaps the folders before deleting anything, so an interrupted run never
+# loses the only full copy; RECOVER finishes an interrupted swap first and
+# fails if it cannot tell which copy is whole.
+RECOVER = (
+    'b="{0}"; if [ -d "$b.old" ]; then '
+    'if [ ! -e "$b" ] && [ -d "$b.own" ]; then mv "$b.own" "$b"; fi; '
+    'if [ -e "$b" ] && [ ! -e "$b.own" ]; then rm -rf "$b.old"; fi; fi; '
+    '[ ! -e "$b.old" ]'
+)
+MIGRATE = (
+    'b="{0}"; rm -rf "$b.own" && cp -r "$b" "$b.own" && mv "$b" "$b.old" '
+    '&& mv "$b.own" "$b" && rm -rf "$b.old"'
+)
 
 
 def main(package, sha, run_toml):
@@ -145,17 +197,16 @@ def main(package, sha, run_toml):
     base = "%s/games/%s" % (files_dir, sha)
     stage = "%s/.push/%s" % (files_dir, sha)
     phone = {k: base + "/" + phone_name(k, p) for k, p in local.items()}
+    if run_as(package, RECOVER.format(base)).returncode != 0:
+        sys.exit(
+            "push-game.sh: %s.old is left from an interrupted copy and %s.own is "
+            "also there; check which one is whole on the phone by hand" % (base, base)
+        )
     run_as(package, 'mkdir -p "%s"' % base, check=True)
-    # An older push-game.sh pushed straight into the game folder; the app
-    # cannot open those files, so copy that folder once as the app's user.
     r = run_as(package, 'find "%s" ! -user $(id -u) | head -n 1' % base, capture_output=True, text=True)
     if r.stdout.strip():
         print("%s holds files the app cannot open; copying it as the app's user" % base)
-        run_as(
-            package,
-            'rm -rf "{0}.own" && cp -r "{0}" "{0}.own" && rm -rf "{0}" && mv "{0}.own" "{0}"'.format(base),
-            check=True,
-        )
+        run_as(package, MIGRATE.format(base), check=True)
     have = remote_sizes(package, base)
     adb("shell", "rm -rf '%s' && mkdir -p '%s'" % (stage, stage))
     pushed = skipped = 0
