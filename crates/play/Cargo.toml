@@ -16,5 +16,7 @@ png = "0.17"
 serde = { version = "1", features = ["derive"] }
 softbuffer = "0.4"
 toml = "0.8"
+# Already in the tree under toml: edits settings.toml keeping comments and order.
+toml_edit = "0.22"
 winit = "0.30"
 xenon-input = { path = "../input" }
