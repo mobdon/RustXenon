@@ -510,11 +510,30 @@ pub struct Timings {
     /// Render passes begun for draws: each target change or flush ends one.
     pub render_passes: u32,
     /// GPU time measured by timestamps around the batch's draw passes,
-    /// clear passes and resolve copies, with
+    /// clear passes, resolve copies and EDRAM transfers, with
     /// [`Drawer::enable_gpu_timestamps`] on (zero otherwise); and the
     /// passes measured.
-    pub gpu_passes: [Duration; 3],
+    pub gpu_passes: [Duration; 4],
     pub passes_timed: u32,
+    /// Render pass attachments (colour, depth and stencil aspects counted
+    /// apart) loaded from memory, cleared on load, stored and discarded at
+    /// the end: on a tiled GPU each load and store moves the whole target.
+    pub attachment_ops: [u32; 4],
+}
+
+impl Timings {
+    /// Counts `n` attachment aspects loaded (or cleared, `clear`) and
+    /// stored by one render pass.
+    fn attachments(&mut self, n: u32, clear: bool) {
+        self.attachment_ops[usize::from(clear)] += n;
+        self.attachment_ops[2] += n;
+    }
+}
+
+/// Attachment aspects of a render pass on `colors` colour targets and a
+/// depth target of `depth` format.
+fn aspects(colors: usize, depth: Option<wgpu::TextureFormat>) -> u32 {
+    colors as u32 + depth.map_or(0, |f| 1 + u32::from(f.has_stencil_aspect()))
 }
 
 impl std::ops::AddAssign<&Timings> for Timings {
@@ -578,6 +597,9 @@ impl std::ops::AddAssign<&Timings> for Timings {
             *a += b;
         }
         self.passes_timed += t.passes_timed;
+        for (a, b) in self.attachment_ops.iter_mut().zip(t.attachment_ops) {
+            *a += b;
+        }
     }
 }
 
@@ -840,7 +862,8 @@ struct GpuClock {
     set: wgpu::QuerySet,
     resolve: wgpu::Buffer,
     read: wgpu::Buffer,
-    /// Kind of each timed pass in the batch: 0 draw, 1 clear, 2 resolve.
+    /// Kind of each timed pass in the batch: 0 draw, 1 clear, 2 resolve,
+    /// 3 transfer.
     kinds: Vec<u8>,
     /// Nanoseconds per tick.
     period: f32,
@@ -3791,6 +3814,11 @@ impl Drawer {
                 .map(|t| t.as_ref().map(|t| t.create_view(&Default::default())));
             let depth_view = depth.map(|t| (t.format(), t.create_view(&Default::default())));
             self.timings.render_passes += 1;
+            let n = aspects(
+                color.iter().flatten().count(),
+                depth.map(wgpu::Texture::format),
+            );
+            self.timings.attachments(n, false);
             let timestamp_writes = GpuClock::render(&mut self.gpu_clock, 0);
             let pass = batch
                 .enc
@@ -4143,6 +4171,11 @@ impl Drawer {
         });
         batch.pass = None;
         let depth = f.is_depth_stencil_format();
+        let n = match depth {
+            true => aspects(0, Some(f)),
+            false => 1,
+        };
+        self.timings.attachments(n, true);
         batch.enc.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("clear reused target"),
             color_attachments: if depth { &[] } else { &color_attachment },
@@ -4396,9 +4429,15 @@ impl Drawer {
             enc: device.create_command_encoder(&Default::default()),
         });
         batch.pass = None;
+        let n = match to_depth {
+            true => 1 + u32::from(setup.stencil),
+            false => 1,
+        };
+        self.timings.attachments(n, false);
         {
             let mut pass = batch.enc.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("transfer"),
+                timestamp_writes: GpuClock::render(&mut self.gpu_clock, 3),
                 color_attachments: if to_depth { &[] } else { &color_attachment },
                 depth_stencil_attachment: to_depth.then(|| {
                     wgpu::RenderPassDepthStencilAttachment {
@@ -6424,6 +6463,11 @@ impl Drawer {
             enc: device.create_command_encoder(&Default::default()),
         });
         batch.pass = None;
+        let n = match is_depth {
+            true => aspects(0, Some(format)),
+            false => 1,
+        };
+        self.timings.attachments(n, false);
         {
             let mut pass = batch.enc.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("clear"),

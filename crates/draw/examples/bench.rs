@@ -220,11 +220,12 @@ fn main() {
     );
     if t.passes_timed > 0 {
         println!(
-            "  GPU (timestamps, {} passes): draw {:.2?}, clear {:.2?}, resolve {:.2?} per frame",
+            "  GPU (timestamps, {} passes): draw {:.2?}, clear {:.2?}, resolve {:.2?}, transfer {:.2?} per frame",
             t.passes_timed / n,
             t.gpu_passes[0] / n,
             t.gpu_passes[1] / n,
-            t.gpu_passes[2] / n
+            t.gpu_passes[2] / n,
+            t.gpu_passes[3] / n
         );
     }
     println!("  {}", d.memory_line());
