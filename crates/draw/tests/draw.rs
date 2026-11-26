@@ -665,6 +665,28 @@ fn late_front_buffer_is_one_swap_behind() {
     assert!(run(&mut d, &next, &mut mem).frames.is_empty());
 }
 
+/// The late copy is shown through fetch constant 0's swizzle too. The host
+/// turns late front buffers on, so this is the path a game's frames take.
+#[test]
+fn late_front_buffer_applies_fetch_constant_0_swizzle() {
+    let Some(mut d) = drawer() else { return };
+    let mut mem = memory();
+    let mut s = Stream::default();
+    draw_pattern(&mut mem, &mut s);
+    let zyxw = 2 | (1 << 3) | (3 << 9);
+    s.regs(SHADER_CONSTANT_FETCH, &[2, DEST, 0, zyxw << 1, 0, 0])
+        .swap(W, H);
+    let sync = run(&mut d, &s, &mut mem).frames.remove(0);
+    let rt = d.read_render_target(COLOR_KEY, 0, 0, W, H).unwrap();
+    assert_ne!(sync.rgba8, rt);
+
+    d.late_front_buffer = true;
+    assert!(run(&mut d, &s, &mut mem).frames.is_empty());
+    let r = run(&mut d, &s, &mut mem);
+    assert_eq!(r.frames.len(), 1, "{r:?}");
+    assert_eq!(r.frames[0].rgba8, sync.rgba8);
+}
+
 /// A frame bundle of two frames, saved and read back, replays to the same
 /// last frame; with that frame's draw skipped, only the clear is left.
 #[test]
