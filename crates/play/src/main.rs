@@ -44,6 +44,16 @@ fn main() {
         .and_then(|p| p.parent().map(Path::to_path_buf))
         .unwrap_or_else(|| PathBuf::from("."));
     *LOG.lock().unwrap() = File::create(exe_dir.join("rustxenon-play-launcher.log")).ok();
+    // No console in the GUI subsystem, so panics go to the log file.
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        if let Ok(mut l) = LOG.lock() {
+            if let Some(f) = l.as_mut() {
+                let _ = writeln!(f, "panic: {info}");
+            }
+        }
+        default_hook(info);
+    }));
     let code = match run(exe_dir) {
         Ok(()) => 0,
         Err(e) => {
@@ -77,6 +87,9 @@ fn run(exe_dir: PathBuf) -> Result<(), String> {
             _ => folders.push(PathBuf::from(a)),
         }
     }
+    // The game runs with its own folder as working folder, so a relative home
+    // would point somewhere else for it.
+    let home = std::path::absolute(&home).map_err(|e| format!("--home: {e}"))?;
     log(&format!("home {}", home.display()));
     let mut app = App::new(home);
     app.page = page;
@@ -128,6 +141,9 @@ struct App {
     home: PathBuf,
     games: Vec<Game>,
     settings: Settings,
+    /// False while settings.toml exists but does not parse: then it is not
+    /// overwritten, so a hand edit with a typo keeps its other keys.
+    settings_ok: bool,
     page: Page,
     /// Selection and first row shown, per page.
     sel: [usize; 2],
@@ -141,6 +157,8 @@ struct App {
     buttons: u16,
     held: Option<(Act, Instant)>,
     cursor: (f32, f32),
+    /// Wheel or touchpad scroll not yet turned into a whole row, in rows.
+    wheel: f32,
     started: Instant,
 }
 
@@ -150,6 +168,7 @@ impl App {
             home,
             games: Vec::new(),
             settings: Settings::default(),
+            settings_ok: false,
             page: Page::Games,
             sel: [0; 2],
             scroll: [0; 2],
@@ -161,6 +180,7 @@ impl App {
             buttons: 0,
             held: None,
             cursor: (-1.0, -1.0),
+            wheel: 0.0,
             started: Instant::now(),
         };
         app.refresh();
@@ -208,8 +228,12 @@ impl App {
         let keep = self.games.get(self.sel[0]).map(|g| g.dir.clone());
         self.games = xenon_play::merged(&self.home);
         match Settings::load(&self.home.join("settings.toml")) {
-            Ok(s) => self.settings = s,
+            Ok(s) => {
+                self.settings = s;
+                self.settings_ok = true;
+            }
             Err(e) => {
+                self.settings_ok = false;
                 log(&e);
                 self.note = Some(format!("settings.toml not read: {e}"));
             }
@@ -224,6 +248,7 @@ impl App {
     /// Adds a dropped folder (or its game.exe or run.toml) to the recent list.
     fn add_folder(&mut self, p: &Path) {
         let dir = xenon_play::dropped_folder(p);
+        let dir = std::path::absolute(&dir).unwrap_or(dir);
         match xenon_play::load_game(&dir) {
             Ok(_) => {
                 let recent = xenon_play::add_recent(&xenon_play::load_recent(&self.home), &dir);
@@ -306,6 +331,10 @@ impl App {
     }
 
     fn change(&mut self, dir: i32) {
+        if !self.settings_ok {
+            self.note = Some("settings.toml has an error: fix it, then press Refresh.".into());
+            return;
+        }
         self.settings.step(self.sel[1], dir);
         let path = self.home.join("settings.toml");
         self.note = self.settings.save(&path).err().map(|e| {
@@ -339,6 +368,7 @@ impl App {
         if let Some((.., back)) = &self.back {
             buf.copy_from_slice(back);
         }
+        // Not self.view(): self.window is borrowed mutably for the buffer.
         let v = View {
             page: self.page,
             games: &self.games,
@@ -397,6 +427,13 @@ impl App {
             }
             (None, _) => self.held = None,
         }
+    }
+
+    /// Takes the pad as it is now without acting, so a button still held
+    /// when a game exits (Start, say) does not count as a new press.
+    fn pad_settle(&mut self) {
+        self.buttons = xenon_input::filtered(self.pad.read()).buttons;
+        self.held = None;
     }
 
     fn size(&self) -> (usize, usize) {
@@ -477,7 +514,10 @@ impl ApplicationHandler for App {
                 let (w, h) = self.size();
                 match draw::hit(w, h, self.cursor.0, self.cursor.1) {
                     Some(Hit::Tab(p)) if self.running.is_none() => self.page = p,
-                    Some(Hit::Row(r)) if self.scroll[self.page as usize] + r < self.len() => {
+                    Some(Hit::Row(r))
+                        if self.running.is_none()
+                            && self.scroll[self.page as usize] + r < self.len() =>
+                    {
                         self.select(self.scroll[self.page as usize] + r);
                         self.act(Act::Go);
                     }
@@ -485,12 +525,15 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::MouseWheel { delta, .. } => {
-                let lines = match delta {
+                // A touchpad sends many small steps: add them up, one row per 60 px.
+                self.wheel += match delta {
                     MouseScrollDelta::LineDelta(_, y) => y,
                     MouseScrollDelta::PixelDelta(p) => p.y as f32 / 60.0,
                 };
-                let a = if lines > 0.0 { Act::Up } else { Act::Down };
-                for _ in 0..lines.abs().round().max(1.0) as usize {
+                let rows = self.wheel.trunc();
+                self.wheel -= rows;
+                let a = if rows > 0.0 { Act::Up } else { Act::Down };
+                for _ in 0..rows.abs() as usize {
                     self.act(a);
                 }
             }
@@ -510,6 +553,7 @@ impl ApplicationHandler for App {
                 Ok(Some(status)) => {
                     log(&format!("game exited: {status}"));
                     self.running = None;
+                    self.pad_settle();
                     if !status.success() {
                         self.note = Some(format!(
                             "Game stopped ({status}) - see rustxenon-play.log in its folder."
@@ -521,6 +565,7 @@ impl ApplicationHandler for App {
                 Err(e) => {
                     log(&format!("waiting for the game: {e}"));
                     self.running = None;
+                    self.pad_settle();
                 }
             }
         } else {
