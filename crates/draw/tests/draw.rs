@@ -1373,17 +1373,18 @@ fn strip_primitive_reset_32_bit() {
 /// the depth surface raw to k_8_8_8_8 and return the words at (2, 2) (in
 /// the triangle) and (40, 40) (cleared).
 fn depth_resolve_words(d: &mut xenon_draw::Drawer, depth_info: u32, clear: u32) -> (u32, u32) {
-    depth_resolve_words_at(d, depth_info, clear, 0.25, 6)
+    depth_resolve_words_at(d, depth_info, clear, 0.25, 6, &ps_interp())
 }
 
-/// [`depth_resolve_words`] with the triangle at depth `z` and destination
-/// format `dest_format` (ignored for depth copies).
+/// [`depth_resolve_words`] with the triangle at depth `z`, destination
+/// format `dest_format` (ignored for depth copies) and pixel shader `ps`.
 fn depth_resolve_words_at(
     d: &mut xenon_draw::Drawer,
     depth_info: u32,
     clear: u32,
     z: f32,
     dest_format: u32,
+    ps: &[u32],
 ) -> (u32, u32) {
     let mut mem = memory();
     mem.write_words(
@@ -1405,7 +1406,7 @@ fn depth_resolve_words_at(
             [clear, 0, 0],
         )
         .shader(false, &vs_color())
-        .shader(true, &ps_interp())
+        .shader(true, ps)
         .vertex_fetch(0, VERTS, 12)
         // z test always, z write.
         .regs(RB_DEPTHCONTROL, &[2 | 4 | (7 << 4)])
@@ -1525,7 +1526,7 @@ fn depth_resolve_d24s8_exact_and_any_dest_format() {
     }
     // 0.75 * 0xFFFFFF = 12582911.25.
     assert_eq!(
-        depth_resolve_words_at(&mut d, DEPTH_BASE, 0x1234_5678, 0.75, 25),
+        depth_resolve_words_at(&mut d, DEPTH_BASE, 0x1234_5678, 0.75, 25, &ps_interp()),
         ((12_582_911 << 8) | 0x78, 0x1234_5678)
     );
 }
@@ -1538,9 +1539,40 @@ fn depth_resolve_d24fs8_truncates() {
     let stencil = if d.float_stencil() { 0x78 } else { 0 };
     let z = f32::from_bits(0x3E99_999E);
     assert_eq!(
-        depth_resolve_words_at(&mut d, DEPTH_BASE | (1 << 16), 0x78, z, 6).0,
+        depth_resolve_words_at(&mut d, DEPTH_BASE | (1 << 16), 0x78, z, 6, &ps_interp()).0,
         (0xD3_3333 << 8) | stencil
     );
+}
+
+/// A pixel shader's oDepth replaces the triangle's depth (here oDepth.x is
+/// the white colour's red, 1.0, over the triangle's 0.25), and without a
+/// depth target the same shader still draws its colour.
+#[test]
+fn depth_export_writes_depth() {
+    use xenon_shader::asm::*;
+    use xenon_shader::ucode::*;
+    let Some(mut d) = drawer() else { return };
+    let r0 = AluSrc::temp(0, SWZ_XYZW);
+    let ps = assemble(&[exec(0, 2, true)], &[export(0, r0), export(61, r0)]);
+    assert_eq!(
+        depth_resolve_words_at(&mut d, DEPTH_BASE, 0x1234_5678, 0.25, 6, &ps).0,
+        (0xFF_FFFF << 8) | 0x78
+    );
+
+    let mut mem = memory();
+    mem.write_words(VERTS, &full_triangle(WHITE, 0.0));
+    let mut s = Stream::default();
+    s.setup()
+        .resolve(&mut mem, W, H, false, Some((rgba(CLEAR), 0)))
+        .shader(false, &vs_color())
+        .shader(true, &ps)
+        .vertex_fetch(0, VERTS, 12)
+        .draw_auto(PRIM_TRI_LIST, 3);
+    let report = run(&mut d, &s, &mut mem);
+    assert_eq!(report.draws, 1, "{report:?}");
+    assert!(report.unsupported.is_empty(), "{report:?}");
+    let img = d.read_render_target(COLOR_KEY, 0, 0, W, H).unwrap();
+    assert_eq!(px(&img, W, 8, 8), WHITE);
 }
 
 /// A pixel shader with getGradients goes through the drawer's own WGSL

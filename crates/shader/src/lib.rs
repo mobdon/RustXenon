@@ -71,12 +71,14 @@
 //! - Pixel stage: entry `ps_main`. Inputs are `@location(i)` vec4 for each
 //!   bit of [`ShaderInfo::interpolators_read`], copied to r<i> on entry;
 //!   outputs are `@location(0..4)` vec4 for the colour exports in
-//!   [`ShaderInfo::colour_targets_written`]. With [`translate_with`] and a
+//!   [`ShaderInfo::colour_targets_written`], and `@builtin(frag_depth)`
+//!   (oDepth.x clamped to [0, 1]) when [`ShaderInfo::writes_depth`]. With
+//!   [`translate_with`] and a
 //!   [`ParamGen`], the pixel parameters (position, facing, primitive flags)
 //!   are written to their register on entry from `@builtin(position)` and
 //!   `@builtin(front_facing)`, after the interpolators are copied.
 //!
-//! Depth export and memory export fail with [`Error::Unsupported`]; the
+//! Memory export fails with [`Error::Unsupported`]; the
 //! point size / kill-vertex export is dropped and reported in
 //! [`ShaderInfo::point_size_export_ignored`].
 //!
@@ -102,6 +104,6 @@ mod wgsl;
 
 pub use wgsl::{
     translate, translate_with, Error, ParamGen, ParamGenPrimitive, ShaderInfo, ShaderStage,
-    Translated, VertexFetchReach, PIXEL_FLOAT_CONSTS_BINDING, PIXEL_FLOAT_CONST_BASE,
-    TEMP_REGISTERS, VERTEX_FLOAT_CONSTS_BINDING, WATCHDOG_STEPS,
+    Translated, VertexFetchReach, DEPTH_MEMBER, DEPTH_STORE, PIXEL_FLOAT_CONSTS_BINDING,
+    PIXEL_FLOAT_CONST_BASE, TEMP_REGISTERS, VERTEX_FLOAT_CONSTS_BINDING, WATCHDOG_STEPS,
 };

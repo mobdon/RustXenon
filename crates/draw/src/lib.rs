@@ -107,7 +107,9 @@
 //! RB_COLOR_CLEAR_LO << 32` per format ([`formats::clear_color`]).
 //! Depth targets: `kD24S8` as `Depth24PlusStencil8` and `kD24FS8` as
 //! `Depth32FloatStencil8` where the host has it, else `Depth32Float` without
-//! stencil (the 20e4 float is stored at f32 precision).
+//! stencil (the 20e4 float is stored at f32 precision). A pixel shader's
+//! oDepth export is the draw's depth (`frag_depth`); a draw with no depth
+//! target drops it.
 //!
 //! # Resolves
 //!
@@ -185,7 +187,10 @@ use xenon_gpu::{
     Command, CopyCommand, Draw, FetchConstantType, GuestRead, RegisterFile, Resolve, ShaderStage,
     SliceMemory, PHYSICAL_MASK,
 };
-use xenon_shader::{ParamGen, ParamGenPrimitive, ShaderInfo, Translated, VertexFetchReach};
+use xenon_shader::{
+    ParamGen, ParamGenPrimitive, ShaderInfo, Translated, VertexFetchReach, DEPTH_MEMBER,
+    DEPTH_STORE,
+};
 use xenon_texture::convert::float20e4_to_f32 as float20e4;
 
 pub use frame::Frame;
@@ -1016,6 +1021,8 @@ struct PipelineKey {
     vs_extra: u16,
     vs_variant: Variant,
     ps: u64,
+    /// 1 when the pixel shader's depth export is dropped (no depth target).
+    ps_extra: u16,
     ps_variant: Variant,
     ps_param_gen: Option<ParamGen>,
     topology: wgpu::PrimitiveTopology,
@@ -1141,14 +1148,15 @@ fn pack_filters(f: Option<[u8; 4]>) -> u32 {
 type Translation = Result<Arc<Translated>, String>;
 
 /// Key of a shader module: program hash, vertex stage, extra vertex
-/// outputs, variant and pixel parameter generation.
+/// outputs (pixel stage: 1 when the depth export is dropped), variant and
+/// pixel parameter generation.
 type ModuleKey = (u64, bool, u16, Variant, Option<ParamGen>);
 
 /// The vertex and pixel shader modules a pipeline is made from.
 fn module_keys(k: &PipelineKey) -> [ModuleKey; 2] {
     [
         (k.vs, true, k.vs_extra, k.vs_variant, None),
-        (k.ps, false, 0, k.ps_variant, k.ps_param_gen),
+        (k.ps, false, k.ps_extra, k.ps_variant, k.ps_param_gen),
     ]
 }
 
@@ -2052,6 +2060,17 @@ fn output_pixel_wgsl(
         &format!("    out.c{rt} = vec4<f32>({rgb}, {a}){scaled};\n"),
         1,
     ))
+}
+
+/// A translated pixel shader without its oDepth output, for a pass with no
+/// depth target (wgpu refuses a `frag_depth` output there).
+fn drop_depth_wgsl(ps: &str) -> Result<String, String> {
+    if !ps.contains(DEPTH_MEMBER) || !ps.contains(DEPTH_STORE) {
+        return Err("pixel shader depth output not recognised".into());
+    }
+    Ok(ps
+        .replacen(DEPTH_MEMBER, "", 1)
+        .replacen(DEPTH_STORE, "", 1))
 }
 
 /// The address mode of a `ClampMode`, and whether it is exact. `border`:
@@ -4325,23 +4344,25 @@ impl Drawer {
             (true, Variant::RectList) => patch_vertex_wgsl(&t.wgsl, extra)
                 .and_then(|vs| rect_list_wgsl(&vs, t.info.interpolators_written | extra)),
             (true, _) => patch_vertex_wgsl(&t.wgsl, extra),
-            (false, Variant::Output(c)) => {
-                c.iter()
-                    .enumerate()
-                    .try_fold(t.wgsl.clone(), |ps, (rt, c)| match c {
-                        Some((rgb, a, bias, k)) => output_pixel_wgsl(
-                            &ps,
-                            rt,
-                            *bias,
-                            f32::from_bits(*rgb),
-                            f32::from_bits(*a),
-                            f32::from_bits(*k),
-                        ),
-                        None => Ok(ps),
-                    })
-            }
+            (false, _) if extra != 0 => drop_depth_wgsl(&t.wgsl),
             (false, _) => Ok(t.wgsl.clone()),
         }
+        .and_then(|src| match variant {
+            Variant::Output(c) if !vertex => {
+                c.iter().enumerate().try_fold(src, |ps, (rt, c)| match c {
+                    Some((rgb, a, bias, k)) => output_pixel_wgsl(
+                        &ps,
+                        rt,
+                        *bias,
+                        f32::from_bits(*rgb),
+                        f32::from_bits(*a),
+                        f32::from_bits(*k),
+                    ),
+                    None => Ok(ps),
+                })
+            }
+            _ => Ok(src),
+        })
         .map_err(Skip::Unsupported)?;
         let m = self.validated("shader module", |d| {
             d.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -5484,7 +5505,8 @@ impl Drawer {
         }
         let extra = ps_t.info.interpolators_read & !vs_t.info.interpolators_written;
         let vs_mod = self.module(vs.hash, true, extra, vs_variant, None, &vs_t)?;
-        let ps_mod = self.module(ps.hash, false, 0, ps_variant, param_gen, &ps_t)?;
+        let ps_extra = u16::from(ps_t.info.writes_depth && depth_format.is_none());
+        let ps_mod = self.module(ps.hash, false, ps_extra, ps_variant, param_gen, &ps_t)?;
         let (g1_layout, layout) = self.texture_layout(tex_mask);
 
         let key_stencil = stencil
@@ -5500,6 +5522,7 @@ impl Drawer {
             vs_extra: extra,
             vs_variant,
             ps: ps.hash,
+            ps_extra,
             ps_variant,
             ps_param_gen: param_gen,
             topology,
@@ -7660,6 +7683,12 @@ mod tests {
         assert!(
             ps.contains("out.c3 = vec4<f32>((o_col[3] * 2.0).xyz, (o_col[3] * 2.0).w) * 0.03125;")
         );
+        let ps = format!("struct PsOut {{\n{DEPTH_MEMBER}}}\n{DEPTH_STORE}    return out;\n");
+        assert_eq!(
+            drop_depth_wgsl(&ps).unwrap(),
+            "struct PsOut {\n}\n    return out;\n"
+        );
+        assert!(drop_depth_wgsl(DEPTH_MEMBER).is_err());
     }
 
     #[test]
