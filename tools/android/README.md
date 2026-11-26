@@ -68,7 +68,18 @@ kept.
 The sha256 is the name of the folder holding `run.toml` unless `--sha256` is
 given. Relative paths in the PC's `run.toml` are taken from that folder. A
 folder not yet on the phone goes over in one `adb push`. Otherwise only files
-whose size differs are pushed, so the second run is quick.
+whose size differs are pushed, so the second run is quick. The executable is
+always pushed, since a re-patched one usually keeps its size. Files already in
+the phone's `data` folder are never replaced: once the game has run there, that
+folder holds the phone's saves, and only files missing on the phone are copied.
+
+Install the APK before the first push. The script stops if the package is not
+installed, because a folder that `adb` makes under `Android/data` before the
+app exists can end up unreadable by the app.
+
+`build-apk.sh --release` makes a non-debuggable APK; dev builds are debuggable
+so that `adb shell run-as <package>` works. Both are signed with the debug key,
+so they are for this phone only.
 `push-game.sh --self-test` checks the `run.toml` rewrite without a phone.
 
 The files stay the player's own: they go to the phone only, never into git.

@@ -13,7 +13,10 @@
 #
 # The sha256 defaults to the name of the folder holding run.toml (built games
 # sit in games/<sha256>/). Relative paths in run.toml are taken from that
-# folder. Files already on the phone with the same size are skipped. ADB
+# folder. The exe is always pushed (a re-patched exe keeps its size). Other
+# files already on the phone with the same size are skipped, and a file
+# already in data/ is never replaced: those are the phone's saves. The app
+# must be installed first, so that Android owns its folder. ADB
 # defaults to this PC's platform-tools; set ADB to use another.
 # `push-game.sh --self-test` checks the run.toml rewrite without a phone.
 set -euo pipefail
@@ -114,6 +117,9 @@ def main(package, sha, run_toml):
             if k == "data":  # made by the game on first run
                 continue
             sys.exit("push-game.sh: %s = %s does not exist" % (k, p))
+    r = subprocess.run([os.environ["ADB"], "shell", "pm path " + package], capture_output=True, text=True)
+    if "package:" not in r.stdout:
+        sys.exit("push-game.sh: %s is not installed on the phone; install the APK first" % package)
     base = "/storage/emulated/0/Android/data/%s/files/games/%s" % (package, sha)
     phone = {k: base + "/" + phone_name(k, p) for k, p in local.items()}
     adb("shell", "mkdir -p '%s'" % base)
@@ -137,7 +143,8 @@ def main(package, sha, run_toml):
             pushed += len(files)
             continue
         for path, rel in files:
-            if have.get(rel) == os.path.getsize(path):
+            # data/ holds the phone's saves: never overwrite one with the PC copy.
+            if (k == "data" and rel in have) or (k != "exe" and have.get(rel) == os.path.getsize(path)):
                 skipped += 1
                 continue
             adb("push", path, base + "/" + rel, stdout=subprocess.DEVNULL)

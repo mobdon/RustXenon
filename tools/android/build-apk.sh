@@ -5,8 +5,8 @@
 #   tools/android/build-apk.sh [options] <workspace> <out.apk>
 #
 # Options:
-#   --release         build the release profile (default: dev, as generated
-#                     workspaces use)
+#   --release         build the release profile, not debuggable (default: dev,
+#                     as generated workspaces use, debuggable for run-as)
 #   --no-strip        ship the library unstripped (default: debug info is
 #                     stripped, the symbol table is kept for tombstones)
 #   --so <file>       ship another .so beside libgame.so (repeatable, e.g.
@@ -64,7 +64,8 @@ for f in "$bin/aarch64-linux-android29-clang.cmd" "$tools/aapt2.exe" "$tools/zip
     [ -e "$f" ] || { echo "build-apk.sh: missing $f (set ANDROID_SDK, ANDROID_NDK or JAVA_HOME)" >&2; exit 1; }
 done
 export JAVA_HOME
-export PATH="$JAVA_HOME/bin:$PATH"
+# PATH is ":"-separated, so a "C:/..." entry must be turned into "/c/..." first.
+export PATH="$(cygpath -u "$JAVA_HOME")/bin:$PATH"
 export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$bin/aarch64-linux-android29-clang.cmd"
 export CC_aarch64_linux_android="$bin/aarch64-linux-android29-clang.cmd"
 export AR_aarch64_linux_android="$bin/llvm-ar.exe"
@@ -113,12 +114,15 @@ done
 [ $missing = 0 ] || exit 1
 
 echo "== aapt2 link ($package)"
-python - "$here/AndroidManifest.xml" "$stage/AndroidManifest.xml" "$package" "$label" <<'EOF'
+debuggable=true
+[ "$profile" = release ] && debuggable=false
+python - "$here/AndroidManifest.xml" "$stage/AndroidManifest.xml" "$package" "$label" "$debuggable" <<'EOF'
 import sys
 from xml.sax.saxutils import escape
-src, dst, package, label = sys.argv[1:]
+src, dst, package, label, debuggable = sys.argv[1:]
 text = open(src, encoding="utf-8").read()
 text = text.replace("@PACKAGE@", package).replace("@LABEL@", escape(label, {'"': "&quot;"}))
+text = text.replace("@DEBUGGABLE@", debuggable)
 open(dst, "w", encoding="utf-8").write(text)
 EOF
 "$tools/aapt2.exe" link -o "$stage/base.apk" -I "$jar" --manifest "$stage/AndroidManifest.xml"
@@ -138,7 +142,7 @@ echo "== zipalign, sign"
 "$tools/zipalign.exe" -P 16 -f 4 "$stage/base.apk" "$stage/aligned.apk"
 if [ ! -f "$KEYSTORE" ]; then
     mkdir -p "$(dirname "$KEYSTORE")"
-    keytool.exe -genkeypair -keystore "$KEYSTORE" -storepass android -keypass android \
+    "$JAVA_HOME/bin/keytool.exe" -genkeypair -keystore "$KEYSTORE" -storepass android -keypass android \
         -alias androiddebugkey -keyalg RSA -keysize 2048 -validity 10000 \
         -dname "CN=Android Debug,O=Android,C=US"
 fi

@@ -1,5 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- Template: build-apk.sh replaces @PACKAGE@ and @LABEL@. -->
+<!-- Template: build-apk.sh replaces @PACKAGE@, @LABEL@ and @DEBUGGABLE@
+     (true for dev builds, false for release). -->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="@PACKAGE@"
     android:versionCode="1"
@@ -19,7 +20,7 @@
         android:isGame="true"
         android:appCategory="game"
         android:extractNativeLibs="false"
-        android:debuggable="true"
+        android:debuggable="@DEBUGGABLE@"
         android:theme="@android:style/Theme.NoTitleBar.Fullscreen">
 
         <!-- configChanges: folding, rotating or a controller connecting must
