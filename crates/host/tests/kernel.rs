@@ -45,7 +45,29 @@ struct Env {
     game: std::path::PathBuf,
 }
 
-fn env() -> &'static Env {
+/// The shared kernel, held by one test at a time: tests count and free
+/// blocks of one heap and threads of one kernel, and in parallel one saw
+/// another's allocations (failures in CI that did not reproduce alone).
+struct Held(
+    #[allow(dead_code)] std::sync::MutexGuard<'static, ()>,
+    &'static Env,
+);
+
+impl std::ops::Deref for Held {
+    type Target = Env;
+    fn deref(&self) -> &Env {
+        self.1
+    }
+}
+
+fn env() -> Held {
+    static TURN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    // A test that panicked while holding it leaves nothing half done here.
+    let turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
+    Held(turn, shared_env())
+}
+
+fn shared_env() -> &'static Env {
     static E: OnceLock<Env> = OnceLock::new();
     E.get_or_init(|| {
         let root = std::env::temp_dir().join(format!("xenon-kernel-{}", std::process::id()));
@@ -831,7 +853,8 @@ fn decoder_context_plays_its_input_into_the_output_ring() {
         );
         return eprintln!("skipping: {e}");
     }
-    let rt = &env().rt;
+    let e = env();
+    let rt = &e.rt;
     let (ctx, input, ring) = (
         memory::physical(rt, 64, 256),
         memory::physical(rt, 8 * 2048, 2048),
