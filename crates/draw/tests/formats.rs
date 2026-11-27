@@ -799,6 +799,98 @@ fn gpu_half2_resolve_matches_cpu_reference() {
     assert!(failed.is_empty(), "{failed:#?}");
 }
 
+/// The GPU resolve to k_32_FLOAT keeps a NaN's sign and payload and quiets
+/// it, as the CPU packer's multiply by the bias does: a corner of a negative
+/// signalling NaN with a payload, a quiet NaN, -inf and a negative denormal, over
+/// float sources, with and without a bias and the red/blue swap.
+#[test]
+fn gpu_float_resolve_keeps_nan_bits() {
+    use xenon_draw::{formats, resolve};
+    let Some(mut d) = drawer() else { return };
+    const SPECIAL: u32 = VERTS + 0x100;
+    let corner = color_verts(&[
+        (0.0, 0.0, 0.0, [0; 4]),
+        (8.0, 0.0, 0.0, [0; 4]),
+        (0.0, 8.0, 0.0, [0; 4]),
+    ]);
+    // (exponent bias, swap, endian)
+    let cases = [(0, false, 0), (3, false, 2), (-2, true, 1)];
+    let mut failed = Vec::new();
+    for (rt, format) in [
+        (RT_16_16_16_16_FLOAT, TargetFormat::Rgba16Float),
+        (RT_32_FLOAT, TargetFormat::Float32),
+        (RT_32_32_FLOAT, TargetFormat::Rg32Float),
+    ] {
+        let mut mem = memory();
+        mem.write_words(SPECIAL, &corner);
+        let mut s = Stream::default();
+        s.setup()
+            .regs(RB_COLOR_INFO, &[rt << 16])
+            .shader(false, &vs_color())
+            .shader(true, &ps_const())
+            .regs(
+                SHADER_CONSTANT_FLOAT + 256 * 4,
+                &[0xFF80_1234, 0x7FC0_0001, 0xFF80_0000, f(-(2f32).powi(-24))],
+            )
+            .vertex_fetch(0, SPECIAL, 12)
+            .draw_auto(PRIM_RECT_LIST, 3);
+        let dest = |i: usize| DEST + 0x1_0000 * i as u32;
+        for (i, &(bias, swap, endian)) in cases.iter().enumerate() {
+            s.resolve_with(
+                &mut mem,
+                (W, H),
+                COPY_CONVERT,
+                (
+                    dest(i),
+                    W | (H << 16),
+                    (dest_info(formats::DEST_32_FLOAT, bias, swap) & !3) | endian,
+                ),
+                [0; 3],
+            );
+        }
+        let report = run(&mut d, &s, &mut mem);
+        assert_eq!(report.resolves, cases.len() as u32, "{report:?}");
+        assert!(report.unsupported.is_empty(), "{report:?}");
+        let raw = d.read_render_target_raw(key(format), 0, 0, W, H).unwrap();
+        let src_bytes = raw.len() / (W * H) as usize;
+        let mut expected = memory();
+        for (i, &(bias, swap, endian)) in cases.iter().enumerate() {
+            let mut out = vec![0; (W * H * 4) as usize];
+            for (src, dst) in raw.chunks_exact(src_bytes).zip(out.chunks_exact_mut(4)) {
+                let rgba = formats::edram_rgba(format, src);
+                formats::resolve_pixel(rgba, bias, swap, formats::DEST_32_FLOAT, dst);
+            }
+            // Not a vacuous pass: the red channel is a negative NaN somewhere.
+            if !swap {
+                assert!(
+                    out.chunks_exact(4)
+                        .any(|w| u32::from_le_bytes(w.try_into().unwrap()) >> 22 == 0x3FF),
+                    "{format:?} case {i}: no negative NaN"
+                );
+            }
+            let rect = resolve::Rect {
+                x0: 0,
+                y0: 0,
+                x1: W,
+                y1: H,
+            };
+            resolve::write_tiled_texels(&mut expected, dest(i), W, rect, &out, 2, endian).unwrap();
+            let range = dest(i) as usize..(dest(i) + W * H * 4) as usize;
+            let got = &mem.data[range.clone()];
+            if let Some(at) = (0..got.len() / 4).find(|&k| {
+                got[4 * k..4 * k + 4] != expected.data[range.start + 4 * k..range.start + 4 * k + 4]
+            }) {
+                failed.push(format!(
+                    "{format:?} rt {rt} case {i} word {at}: {:02x?} want {:02x?}",
+                    &got[4 * at..4 * at + 4],
+                    &expected.data[range.start + 4 * at..range.start + 4 * at + 4]
+                ));
+            }
+        }
+    }
+    assert!(failed.is_empty(), "{failed:#?}");
+}
+
 /// Draws a quad over the whole k_16_16_16_16_FLOAT target sampling a 1x1
 /// linear texture of `format` (endian none, swizzle RGBA, point filter)
 /// whose guest bytes are `texel_bytes`, and returns the halves at (8, 8).

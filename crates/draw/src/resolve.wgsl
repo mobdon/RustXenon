@@ -169,7 +169,13 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     } else if p.src_format >= 9u {
         c = vec4<f32>(c.rg, 0.0, 0.0);
     }
-    c = c * p.scale;
+    // The CPU's c * k on NaN and inf, done on the bits: a GPU multiply may
+    // drop a NaN's sign and payload. NaN keeps both and gets the quiet bit;
+    // inf stays inf.
+    let b = bitcast<vec4<u32>>(c);
+    let special = (b & vec4<u32>(0x7F800000u)) == vec4<u32>(0x7F800000u);
+    let quiet = select(vec4<u32>(0u), vec4<u32>(0x400000u), (b & vec4<u32>(0x7FFFFFFFu)) > vec4<u32>(0x7F800000u));
+    c = select(c * p.scale, bitcast<vec4<f32>>(b | quiet), special);
     if p.swap != 0u {
         c = c.bgra;
     }
