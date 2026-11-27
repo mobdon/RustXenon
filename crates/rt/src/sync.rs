@@ -5,9 +5,67 @@
 //! Waits take an optional timeout and return `true` when the object was
 //! acquired, `false` when the timeout ran out.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex, MutexGuard};
 use std::thread::{self, ThreadId};
 use std::time::{Duration, Instant};
+
+/// Threads inside [`wait_any`], and a generation bumped (with a wake) each
+/// time an object may have become signalled while there are any. Waits for
+/// several objects sleep on this instead of polling, because a short sleep
+/// lasts about 1 ms on Windows and made every such wait wake that late.
+static ANY_WAITERS: AtomicUsize = AtomicUsize::new(0);
+static ANY: (Mutex<u64>, Condvar) = (Mutex::new(0), Condvar::new());
+
+/// Wakes [`wait_any`] callers. Call after an object's state change that may
+/// satisfy a wait, with the object's own lock released. Costs one atomic
+/// load when nobody waits for several objects.
+fn signal_any() {
+    if ANY_WAITERS.load(Ordering::SeqCst) > 0 {
+        *ANY.0.lock().unwrap() += 1;
+        ANY.1.notify_all();
+    }
+}
+
+/// Calls `ready` until it gives a value or `timeout` runs out, sleeping
+/// between calls until some object here is signalled. `ready` must not
+/// block (take objects with a zero timeout).
+///
+/// No wake is lost: this thread counts itself in before it reads the
+/// generation, and reads the generation before it calls `ready`, so a
+/// signal after `ready` looked changes the generation and the wait below
+/// returns at once.
+pub fn wait_any<T>(timeout: Option<Duration>, mut ready: impl FnMut() -> Option<T>) -> Option<T> {
+    struct Leave;
+    impl Drop for Leave {
+        fn drop(&mut self) {
+            ANY_WAITERS.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+    let deadline = timeout.map(|t| Instant::now() + t);
+    ANY_WAITERS.fetch_add(1, Ordering::SeqCst);
+    let _leave = Leave;
+    let mut seen = *ANY.0.lock().unwrap();
+    loop {
+        if let Some(v) = ready() {
+            return Some(v);
+        }
+        // Capped, so a state change made without signal_any is still seen.
+        let mut nap = Duration::from_millis(1);
+        if let Some(d) = deadline {
+            let now = Instant::now();
+            if now >= d {
+                return None;
+            }
+            nap = nap.min(d - now);
+        }
+        let mut g = ANY.0.lock().unwrap();
+        if *g == seen {
+            g = ANY.1.wait_timeout(g, nap).unwrap().0;
+        }
+        seen = *g;
+    }
+}
 
 /// Waits on `cv` until `ready` holds or the timeout runs out. Returns the
 /// guard and whether `ready` held.
@@ -61,6 +119,8 @@ impl Event {
         } else {
             self.cv.notify_one();
         }
+        drop(s);
+        signal_any();
         was
     }
 
@@ -117,6 +177,8 @@ impl Semaphore {
         for _ in 0..n {
             self.cv.notify_one();
         }
+        drop(c);
+        signal_any();
         Some(prev)
     }
 
@@ -194,6 +256,8 @@ impl CriticalSection {
         if g.1 == 0 {
             g.0 = None;
             self.cv.notify_one();
+            drop(g);
+            signal_any();
         }
         true
     }
@@ -204,6 +268,85 @@ mod tests {
     use super::*;
 
     const SHORT: Option<Duration> = Some(Duration::from_millis(20));
+    const LONG: Option<Duration> = Some(Duration::from_secs(5));
+
+    /// Runs `f` on another thread after a short delay.
+    fn later(f: impl FnOnce() + Send + 'static) -> thread::JoinHandle<()> {
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(20));
+            f()
+        })
+    }
+
+    #[test]
+    fn wait_any_returns_the_object_that_was_set() {
+        let a = std::sync::Arc::new([Event::new(false, false), Event::new(false, false)]);
+        let b = a.clone();
+        let t = later(move || {
+            b[1].set();
+        });
+        let ready = || (0..2).find(|&i| a[i].wait(Some(Duration::ZERO)));
+        assert_eq!(wait_any(LONG, ready), Some(1));
+        t.join().unwrap();
+        // The auto-reset event was taken, so nothing is ready now.
+        assert_eq!(wait_any(SHORT, ready), None);
+        assert_eq!(wait_any(Some(Duration::ZERO), ready), None);
+    }
+
+    #[test]
+    fn wait_any_wakes_for_a_semaphore_release() {
+        let s = std::sync::Arc::new(Semaphore::new(0, 1));
+        let s2 = s.clone();
+        let t = later(move || {
+            s2.release(1);
+        });
+        assert_eq!(
+            wait_any(LONG, || s.wait(Some(Duration::ZERO)).then_some(0)),
+            Some(0)
+        );
+        t.join().unwrap();
+    }
+
+    #[test]
+    fn wait_any_wakes_for_a_critical_section_leave() {
+        let cs = std::sync::Arc::new(CriticalSection::new());
+        let (held, take) = std::sync::mpsc::channel();
+        let cs2 = cs.clone();
+        let t = thread::spawn(move || {
+            assert!(cs2.enter(None));
+            held.send(()).unwrap();
+            thread::sleep(Duration::from_millis(20));
+            cs2.leave();
+        });
+        take.recv().unwrap();
+        assert_eq!(wait_any(LONG, || cs.try_enter().then_some(0)), Some(0));
+        cs.leave();
+        t.join().unwrap();
+    }
+
+    #[test]
+    fn set_release_and_leave_bump_the_generation_while_someone_waits() {
+        let bumps = |f: &dyn Fn()| {
+            ANY_WAITERS.fetch_add(1, Ordering::SeqCst);
+            let before = *ANY.0.lock().unwrap();
+            f();
+            let after = *ANY.0.lock().unwrap();
+            ANY_WAITERS.fetch_sub(1, Ordering::SeqCst);
+            after > before
+        };
+        let e = Event::new(true, false);
+        assert!(bumps(&|| {
+            e.set();
+        }));
+        let s = Semaphore::new(0, 1);
+        assert!(bumps(&|| {
+            s.release(1);
+        }));
+        let cs = CriticalSection::new();
+        assert!(cs.enter(None) && cs.enter(None));
+        cs.leave();
+        assert!(bumps(&|| cs.leave()));
+    }
 
     #[test]
     fn auto_reset_event_releases_one_wait() {

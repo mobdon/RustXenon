@@ -345,19 +345,14 @@ fn wait_many(rt: &Runtime, objs: &[u32], all: bool, t: Option<Duration>) -> u32 
     }
     let os: Vec<_> = objs.iter().map(|&a| get(rt, a)).collect();
     let _w = crate::waiting(objs.first().copied().unwrap_or(0), objs.len() as u32);
-    let mut nap = Duration::from_micros(50);
-    loop {
-        for (i, o) in os.iter().enumerate() {
-            if o.wait(Some(Duration::ZERO)) {
-                return i as u32;
-            }
-        }
-        if deadline.is_some_and(|d| Instant::now() >= d) {
-            return STATUS_TIMEOUT;
-        }
-        std::thread::sleep(nap);
-        nap = (nap * 2).min(Duration::from_millis(1));
-    }
+    // Every signalled-state change goes through Event::set,
+    // Semaphore::release or CriticalSection::try_leave, which wake this.
+    let ready = || {
+        os.iter()
+            .position(|o| o.wait(Some(Duration::ZERO)))
+            .map(|i| i as u32)
+    };
+    xenon_rt::sync::wait_any(t, ready).unwrap_or(STATUS_TIMEOUT)
 }
 
 pub fn ke_wait_for_single_object(rt: &Runtime, c: &mut Context) {
