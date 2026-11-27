@@ -2,22 +2,26 @@
 //! controller (Windows) plus the keyboard into one pad reading.
 //!
 //! The event loop runs on its own thread so the host's main thread keeps its
-//! headless watch loop. Frames are copied to the window with the CPU
-//! (bilinear scaling, letterboxed, rows split over a few threads); no GPU
-//! work happens here.
+//! headless watch loop. Once the drawer hands over its device
+//! ([`Link::attach_gpu`]), frames are presented through a swapchain on it,
+//! scaled on the GPU at the monitor's refresh (see [`gpu`]). Until then, or
+//! without one, frames are copied to the window with the CPU (bilinear
+//! scaling, letterboxed, rows split over a few threads).
 
 use std::num::NonZeroU32;
-use std::rc::Rc;
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, WindowEvent};
-use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::PhysicalKey;
 use winit::window::{Fullscreen, Window, WindowId};
 use xenon_input::{filtered, merge, Keyboard, Pad};
 
+mod gpu;
 mod pace;
+
+pub use gpu::Gpu;
 
 /// Pixels shared with whoever made them, so a frame reaches the window
 /// without being copied.
@@ -52,22 +56,63 @@ impl Default for Config {
     }
 }
 
+/// A frame to show: pixels, or a texture on the device of
+/// [`Link::attach_gpu`].
+enum Shown {
+    Cpu(Image),
+    Gpu(wgpu::Texture),
+}
+
 /// Shared between the host and the window thread.
 #[derive(Default)]
 pub struct Link {
-    frame: Mutex<Option<Image>>,
+    frame: Mutex<Option<Shown>>,
     text: Mutex<Option<Vec<String>>>,
     pad: Mutex<Pad>,
+    /// Wakes the event loop, once it runs, so a frame is shown when it
+    /// arrives rather than at the next input poll.
+    wake: Mutex<Option<EventLoopProxy<()>>>,
+    /// A device to present with, and where to answer whether it can.
+    attach: Mutex<Option<(Gpu, Answer)>>,
 }
+
+/// Whether the window presents with the device it was given.
+type Answer = mpsc::Sender<Result<(), String>>;
 
 impl Link {
     /// Hands the window a new frame; an older one not yet shown is dropped.
     pub fn show(&self, width: u32, height: u32, rgba8: Pixels) {
-        *self.frame.lock().unwrap() = Some(Image {
+        *self.frame.lock().unwrap() = Some(Shown::Cpu(Image {
             width,
             height,
             rgba8,
-        });
+        }));
+        self.wake();
+    }
+
+    /// Hands the window a frame texture on the device given to
+    /// [`Link::attach_gpu`], whose writes are submitted already; an older
+    /// one not yet shown is dropped.
+    pub fn show_texture(&self, tex: wgpu::Texture) {
+        *self.frame.lock().unwrap() = Some(Shown::Gpu(tex));
+        self.wake();
+    }
+
+    /// Has the window present through a swapchain on `gpu`'s device from
+    /// now on, and waits for its answer: an error leaves it copying
+    /// frames with the CPU, and [`Link::show_texture`] unused.
+    pub fn attach_gpu(&self, gpu: Gpu) -> Result<(), String> {
+        let (tx, rx) = mpsc::channel();
+        *self.attach.lock().unwrap() = Some((gpu, tx));
+        self.wake();
+        (rx.recv_timeout(Duration::from_secs(10)))
+            .map_err(|_| "the window did not take the device".to_string())?
+    }
+
+    fn wake(&self) {
+        if let Some(p) = &*self.wake.lock().unwrap() {
+            let _ = p.send_event(());
+        }
     }
 
     /// Replaces the picture with these lines of text (green on dark, the
@@ -113,6 +158,7 @@ pub fn spawn(title: String, cfg: Config, on_close: impl FnOnce() + Send + 'stati
         .spawn(move || {
             match event_loop() {
                 Ok(ev) => {
+                    *l.wake.lock().unwrap() = Some(ev.create_proxy());
                     if let Err(e) = ev.run_app(&mut App::new(title, cfg, l)) {
                         eprintln!("window: {e}");
                     }
@@ -137,7 +183,7 @@ fn event_loop() -> Result<EventLoop<()>, winit::error::EventLoopError> {
     b.build()
 }
 
-type Surface = softbuffer::Surface<Rc<Window>, Rc<Window>>;
+type Surface = softbuffer::Surface<Arc<Window>, Arc<Window>>;
 
 struct App {
     title: String,
@@ -145,9 +191,13 @@ struct App {
     link: Arc<Link>,
     keys: Keyboard,
     pad: xinput::Reader,
-    window: Option<(Rc<Window>, Surface)>,
+    window: Option<Arc<Window>>,
+    /// The CPU path's surface, made when first drawn to.
+    soft: Option<Surface>,
+    /// The GPU path, once the drawer handed over its device.
+    gpu: Option<gpu::Presenter>,
     /// Kept so a resize can redraw it.
-    last: Option<Image>,
+    last: Option<Shown>,
     /// Text shown instead of frames, and whether the close buttons have
     /// been seen up since (so a button held at the stop does not close it).
     text: Option<(Vec<String>, bool)>,
@@ -164,34 +214,79 @@ impl App {
             keys: Keyboard::default(),
             pad: xinput::Reader::default(),
             window: None,
+            soft: None,
+            gpu: None,
             last: None,
             text: None,
             pace: pace::Pacing::default(),
         }
     }
 
-    fn draw(&mut self) {
-        let Some((w, s)) = self.window.as_mut() else {
-            return;
+    /// Shows the text or the last frame; whether it reached the screen.
+    fn draw(&mut self) -> bool {
+        let Some(w) = self.window.clone() else {
+            return false;
         };
         if self.last.is_none() && self.text.is_none() {
-            return;
+            return false;
         }
         let size = w.inner_size();
         let (Some(dw), Some(dh)) = (NonZeroU32::new(size.width), NonZeroU32::new(size.height))
         else {
-            return;
+            return false;
+        };
+        let (ww, wh) = (size.width, size.height);
+        if let Some(g) = self.gpu.as_mut() {
+            let tex = match (&self.text, &self.last) {
+                (Some((lines, _)), _) => {
+                    let mut buf = vec![0; ww as usize * wh as usize];
+                    text(lines, &mut buf, ww, wh);
+                    let rgba: Vec<u8> = (buf.iter())
+                        .flat_map(|&p| [(p >> 16) as u8, (p >> 8) as u8, p as u8, 255])
+                        .collect();
+                    g.upload(ww, wh, &rgba)
+                }
+                (None, Some(Shown::Gpu(t))) => t.clone(),
+                (None, Some(Shown::Cpu(img))) => {
+                    let px: &[u8] = (*img.rgba8).as_ref();
+                    let n = img.width as usize * img.height as usize * 4;
+                    if n == 0 || px.len() < n {
+                        return false;
+                    }
+                    g.upload(img.width, img.height, &px[..n])
+                }
+                (None, None) => return false,
+            };
+            return match g.present(&tex, ww, wh) {
+                Ok(shown) => shown,
+                Err(e) => {
+                    eprintln!("window: present: {e}");
+                    false
+                }
+            };
+        }
+        if self.soft.is_none() {
+            let made = softbuffer::Context::new(w.clone())
+                .and_then(|cx| Surface::new(&cx, w.clone()))
+                .map_err(|e| eprintln!("window: {e}"));
+            self.soft = made.ok();
+        }
+        let Some(s) = self.soft.as_mut() else {
+            return false;
         };
         if s.resize(dw, dh).is_err() {
-            return;
+            return false;
         }
-        let Ok(mut buf) = s.buffer_mut() else { return };
+        let Ok(mut buf) = s.buffer_mut() else {
+            return false;
+        };
         match (&self.text, &self.last) {
-            (Some((lines, _)), _) => text(lines, &mut buf, size.width, size.height),
-            (None, Some(img)) => blit(img, &mut buf, size.width, size.height),
-            (None, None) => {}
+            (Some((lines, _)), _) => text(lines, &mut buf, ww, wh),
+            (None, Some(Shown::Cpu(img))) => blit(img, &mut buf, ww, wh),
+            // Textures come only with a presenter.
+            (None, Some(Shown::Gpu(_))) | (None, None) => return false,
         }
-        let _ = buf.present();
+        buf.present().is_ok()
     }
 }
 
@@ -220,17 +315,8 @@ impl ApplicationHandler for App {
                 c.height as f64,
             ))
             .with_fullscreen(fullscreen);
-        let made = ev
-            .create_window(attrs)
-            .map_err(|e| e.to_string())
-            .and_then(|w| {
-                let w = Rc::new(w);
-                let cx = softbuffer::Context::new(w.clone()).map_err(|e| e.to_string())?;
-                let s = Surface::new(&cx, w.clone()).map_err(|e| e.to_string())?;
-                Ok((w, s))
-            });
-        match made {
-            Ok(x) => self.window = Some(x),
+        match ev.create_window(attrs) {
+            Ok(w) => self.window = Some(Arc::new(w)),
             Err(e) => {
                 eprintln!("window: {e}");
                 ev.exit();
@@ -251,7 +337,9 @@ impl ApplicationHandler for App {
                     self.keys.key(&format!("{code:?}"), down);
                 }
             }
-            WindowEvent::Resized(_) | WindowEvent::RedrawRequested => self.draw(),
+            WindowEvent::Resized(_) | WindowEvent::RedrawRequested => {
+                self.draw();
+            }
             _ => {}
         }
     }
@@ -259,6 +347,22 @@ impl ApplicationHandler for App {
     fn about_to_wait(&mut self, ev: &ActiveEventLoop) {
         let pad = merge(filtered(self.pad.read()), self.keys.pad());
         *self.link.pad.lock().unwrap() = pad;
+        let asked = self.link.attach.lock().unwrap().take();
+        match (asked, self.window.clone()) {
+            (Some((gpu, answer)), Some(w)) => {
+                // The swapchain takes the window over from the CPU path.
+                self.soft = None;
+                let made = gpu::Presenter::new(gpu, w).map(|p| self.gpu = Some(p));
+                if let Err(e) = &made {
+                    eprintln!("window: frames stay on the CPU: {e}");
+                }
+                let _ = answer.send(made);
+                self.draw();
+            }
+            // No window yet: asked again next time.
+            (Some(a), None) => *self.link.attach.lock().unwrap() = Some(a),
+            (None, _) => {}
+        }
         let lines = self.link.text.lock().unwrap().take();
         if let Some(lines) = lines {
             self.text = Some((lines, false));
@@ -275,12 +379,13 @@ impl ApplicationHandler for App {
         let fresh = self.link.frame.lock().unwrap().take();
         if let Some(img) = fresh.filter(|_| self.text.is_none()) {
             self.last = Some(img);
-            self.draw();
-            if let Some(s) = self.pace.frame(Instant::now()) {
-                eprintln!("window: {s}");
+            if self.draw() {
+                if let Some(s) = self.pace.frame(Instant::now()) {
+                    eprintln!("window: {s}");
+                }
             }
         }
-        // Read input at about 250 Hz; frames arrive far slower.
+        // Read input at about 250 Hz; frames wake the loop when they come.
         ev.set_control_flow(ControlFlow::WaitUntil(
             Instant::now() + Duration::from_millis(4),
         ));
@@ -303,16 +408,9 @@ fn blit_with(img: &Image, out: &mut [u32], w: u32, h: u32, copy: bool) {
     if img.width == 0 || img.height == 0 || src.len() < (img.width * img.height * 4) as usize {
         return;
     }
-    // Largest size with the frame's aspect that fits.
-    let (fw, fh) = if w as u64 * img.height as u64 > h as u64 * img.width as u64 {
-        ((h as u64 * img.width as u64 / img.height as u64) as u32, h)
-    } else {
-        (w, (w as u64 * img.height as u64 / img.width as u64) as u32)
-    };
-    if fw == 0 || fh == 0 {
+    let Some((ox, oy, fw, fh)) = fit(img.width, img.height, w, h) else {
         return;
-    }
-    let (ox, oy) = ((w - fw) / 2, (h - fh) / 2);
+    };
     let same = copy && (fw, fh) == (img.width, img.height);
     let xs = taps(img.width, fw);
     let ys = taps(img.height, fh);
@@ -351,6 +449,21 @@ fn blit_with(img: &Image, out: &mut [u32], w: u32, h: u32, copy: bool) {
             });
         }
     });
+}
+
+/// Where an `iw` x `ih` frame goes in a `w` x `h` window: the largest
+/// rectangle with its shape that fits, centred (x, y, width, height); none
+/// when nothing of it would show.
+fn fit(iw: u32, ih: u32, w: u32, h: u32) -> Option<(u32, u32, u32, u32)> {
+    if iw == 0 || ih == 0 {
+        return None;
+    }
+    let (fw, fh) = if w as u64 * ih as u64 > h as u64 * iw as u64 {
+        ((h as u64 * iw as u64 / ih as u64) as u32, h)
+    } else {
+        (w, (w as u64 * ih as u64 / iw as u64) as u32)
+    };
+    (fw != 0 && fh != 0).then_some(((w - fw) / 2, (h - fh) / 2, fw, fh))
 }
 
 /// The last `rows` screen lines of `text`, each line wrapped at `cols`
@@ -541,6 +654,12 @@ mod tests {
             height: 1,
             rgba8: Arc::new(vec![255, 0, 0, 255, 0, 0, 255, 255]),
         };
+        // Where the GPU path draws it too.
+        assert_eq!(fit(2, 1, 4, 4), Some((0, 1, 4, 2)));
+        assert_eq!(fit(1280, 720, 2560, 1600), Some((0, 80, 2560, 1440)));
+        assert_eq!(fit(1280, 720, 3440, 1440), Some((440, 0, 2560, 1440)));
+        assert_eq!(fit(1280, 720, 1, 1), None);
+        assert_eq!(fit(0, 720, 100, 100), None);
         let mut out = vec![7; 16];
         blit(&img, &mut out, 4, 4);
         let (r, b) = (0xFF0000, 0x0000FF);

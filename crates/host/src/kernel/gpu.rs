@@ -681,7 +681,11 @@ pub mod capture {
 
     /// Writes the drawer's frame number `n` when it was asked for.
     pub fn frame_done(n: u32, f: &Arc<xenon_draw::Frame>) {
-        if let Some(w) = super::super::input::WINDOW.get() {
+        // A frame with no pixels went to the window on the GPU already.
+        if let Some(w) = super::super::input::WINDOW
+            .get()
+            .filter(|_| !f.rgba8.is_empty())
+        {
             // Shared, not copied: a copy of every frame was 3.7 MB at 720p.
             w.show(f.width, f.height, f.clone());
         }

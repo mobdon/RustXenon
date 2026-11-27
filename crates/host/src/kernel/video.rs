@@ -213,6 +213,31 @@ pub fn start(rt: std::sync::Arc<Runtime>) {
                         d.sharp_front = super::input::WINDOW.get().is_some()
                             && SETTINGS.get().is_none()
                             && FRAMES.get().is_none();
+                        // Frames go to the window on the GPU, with no
+                        // read-back, unless captures need their pixels
+                        // (XENON_GPU_PRESENT=0 reads them back as before).
+                        let window = (super::input::WINDOW.get()).filter(|_| {
+                            SETTINGS.get().is_none()
+                                && FRAMES.get().is_none()
+                                && std::env::var("XENON_GPU_PRESENT").as_deref() != Ok("0")
+                        });
+                        if let Some(w) = window {
+                            let (instance, adapter, device, queue) = d.gpu();
+                            let gpu = xenon_window::Gpu {
+                                instance,
+                                adapter,
+                                device,
+                                queue,
+                            };
+                            match w.attach_gpu(gpu) {
+                                Ok(()) => {
+                                    let w = w.clone();
+                                    d.present = Some(std::sync::Arc::new(move |t| w.show_texture(t)));
+                                    crate::log("[draw] frames go to the window on the GPU (XENON_GPU_PRESENT=0 reads them back)");
+                                }
+                                Err(e) => crate::log(&format!("[draw] frames read back for the window: {e}")),
+                            }
+                        }
                         if d.skip_resolve_writeback {
                             crate::log("[draw] resolve write-back: skipped (the CPU never sees resolve output; XENON_RESOLVE_WRITEBACK=on writes it back)");
                         }
