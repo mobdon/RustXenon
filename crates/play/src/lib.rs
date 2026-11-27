@@ -56,23 +56,17 @@ pub fn load_game(dir: &Path) -> Result<Game, String> {
         return Err("no game.exe in it".into());
     }
     let text = std::fs::read_to_string(dir.join("run.toml")).map_err(|_| "no run.toml in it")?;
-    let r: RunToml = toml::from_str(&text).map_err(|e| {
-        let first = e.to_string();
-        let first = first.lines().next().unwrap_or("").to_string();
-        format!("run.toml: {first}")
-    })?;
-    let title = r.title.filter(|t| !t.trim().is_empty()).unwrap_or_else(|| {
+    let r: RunToml =
+        toml::from_str(&text).map_err(|e| format!("run.toml: {}", settings::toml_error(&e)))?;
+    let title = r.title.map(|t| one_line(&t)).filter(|t| !t.is_empty());
+    let title = title.unwrap_or_else(|| {
         // No title chosen: the unpacked game folder's name.
         // Split by hand: run.toml holds Windows paths on any system.
         let seps = ['\\', '/'];
         let name = r.game.trim_end_matches(seps).rsplit(seps).next();
         match name.filter(|n| !n.is_empty() && !n.ends_with(':')) {
-            Some(n) => n.to_string(),
-            None => dir
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .into_owned(),
+            Some(n) => one_line(n),
+            None => one_line(&dir.file_name().unwrap_or_default().to_string_lossy()),
         }
     });
     Ok(Game {
@@ -86,24 +80,74 @@ pub fn load_game(dir: &Path) -> Result<Game, String> {
     })
 }
 
-/// Every built game folder under `<home>/games`.
-pub fn discover(home: &Path) -> Vec<Game> {
-    let Ok(rd) = std::fs::read_dir(home.join("games")) else {
-        return Vec::new();
-    };
-    rd.flatten()
-        .filter_map(|e| load_game(&e.path()).ok())
-        .collect()
+/// A title on one line: line breaks, tabs and other control characters
+/// become spaces, invisible format marks (zero-width space, direction marks)
+/// go, and a run of spaces is one.
+fn one_line(s: &str) -> String {
+    let invisible = |c: char| matches!(c, '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2060}'..='\u{2069}' | '\u{feff}');
+    let s: String = s.chars().filter(|&c| !invisible(c)).collect();
+    s.split(|c: char| c.is_whitespace() || c.is_control())
+        .filter(|w| !w.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
-/// A path compared loosely: separators, a trailing separator and letter case
-/// ignored. shortcut: case is ignored on every system (Windows is the only
-/// one played on), compare exactly if another system ever is.
+/// Whether a load error means the folder is a game whose run.toml is broken
+/// (the player is told), not a folder that is gone or not a game.
+fn broken(e: &str) -> bool {
+    e.starts_with("run.toml:")
+}
+
+/// Every built game folder under `<home>/games`, and each folder there whose
+/// run.toml is broken with why.
+pub fn discover(home: &Path) -> (Vec<Game>, Vec<(PathBuf, String)>) {
+    let (mut games, mut bad) = (Vec::new(), Vec::new());
+    let Ok(rd) = std::fs::read_dir(home.join("games")) else {
+        return (games, bad);
+    };
+    for e in rd.flatten() {
+        match load_game(&e.path()) {
+            Ok(g) => games.push(g),
+            Err(why) if broken(&why) => bad.push((e.path(), why)),
+            Err(_) => {}
+        }
+    }
+    (games, bad)
+}
+
+/// "folder: why", by the folder's name: the whole path would not fit.
+fn bad_line(dir: &Path, why: &str) -> String {
+    let name = dir.file_name().unwrap_or(dir.as_os_str());
+    format!("{}: {why}", name.to_string_lossy())
+}
+
+/// A path compared loosely: separators, a trailing separator, letter case,
+/// a `\\?\` prefix and `.` and `..` parts ignored. shortcut: case is ignored
+/// on every system (Windows is the only one played on), compare exactly if
+/// another system ever is.
 fn key(p: &Path) -> String {
-    p.to_string_lossy()
-        .replace('/', "\\")
-        .trim_end_matches('\\')
-        .to_lowercase()
+    let s = p.to_string_lossy().replace('/', "\\").to_lowercase();
+    let s = match s.strip_prefix(r"\\?\") {
+        Some(rest) => match rest.strip_prefix(r"unc\") {
+            Some(unc) => format!(r"\\{unc}"),
+            None => rest.to_string(),
+        },
+        None => s,
+    };
+    let lead = s.len() - s.trim_start_matches('\\').len();
+    let mut parts: Vec<&str> = Vec::new();
+    for part in s.split('\\') {
+        match part {
+            "" | "." => {}
+            // Never above the drive or share.
+            ".." if parts.len() > 1 => {
+                parts.pop();
+            }
+            ".." => {}
+            p => parts.push(p),
+        }
+    }
+    format!("{}{}", "\\".repeat(lead), parts.join("\\"))
 }
 
 /// `recent.txt`. Lines that are not built game folders now are kept (the
@@ -124,31 +168,52 @@ pub fn load_recent(home: &Path) -> Vec<PathBuf> {
 
 /// The launcher window's first size in logical pixels: 1280x720, or 16:9
 /// and smaller so it fits a `screen` of that logical size with room for the
-/// title bar and the taskbar.
+/// title bar and the taskbar. Under [`MIN_WINDOW`] only when the screen is
+/// too small for that.
 pub fn window_size(screen: (f64, f64)) -> (f64, f64) {
     let w = (screen.0 * 0.9).min((screen.1 - 120.0) * 16.0 / 9.0);
-    let w = w.clamp(MIN_WINDOW.0, 1280.0).round();
+    let w = w.clamp(320.0, 1280.0).round();
     (w, (w * 9.0 / 16.0).round())
 }
 
 /// The smallest launcher window, in logical pixels: below this the small
-/// text is not readable.
+/// text is not readable. A screen too small for it gets a smaller window
+/// ([`window_size`]), and then that is the smallest.
 pub const MIN_WINDOW: (f64, f64) = (768.0, 432.0);
 
 fn dedupe(list: Vec<PathBuf>) -> Vec<PathBuf> {
     let mut seen = std::collections::HashSet::new();
-    let mut out: Vec<PathBuf> = list.into_iter().filter(|p| seen.insert(key(p))).collect();
-    out.truncate(RECENT_MAX);
-    out
+    list.into_iter().filter(|p| seen.insert(key(p))).collect()
 }
 
-/// `dir` moved to the front of `list`, once.
-pub fn add_recent(list: &[PathBuf], dir: &Path) -> Vec<PathBuf> {
-    dedupe(
+/// `dir` moved to the front of `list`, once, and the list cut to
+/// [`RECENT_MAX`]. The oldest lines not in `present` (the games listed now)
+/// are cut first, so kept offline lines never push out a game that is there.
+pub fn add_recent(list: &[PathBuf], dir: &Path, present: &[Game]) -> Vec<PathBuf> {
+    let out = dedupe(
         std::iter::once(dir.to_path_buf())
             .chain(list.iter().cloned())
             .collect(),
-    )
+    );
+    let here: std::collections::HashSet<String> = present.iter().map(|g| key(&g.dir)).collect();
+    let mut extra = out.len().saturating_sub(RECENT_MAX);
+    let mut keep = vec![true; out.len()];
+    for i in (1..out.len()).rev() {
+        if extra == 0 {
+            break;
+        }
+        if !here.contains(&key(&out[i])) {
+            keep[i] = false;
+            extra -= 1;
+        }
+    }
+    let mut out: Vec<PathBuf> = out
+        .into_iter()
+        .zip(keep)
+        .filter_map(|(p, k)| k.then_some(p))
+        .collect();
+    out.truncate(RECENT_MAX);
+    out
 }
 
 pub fn save_recent(home: &Path, list: &[PathBuf]) -> std::io::Result<()> {
@@ -160,23 +225,80 @@ pub fn save_recent(home: &Path, list: &[PathBuf]) -> std::io::Result<()> {
     std::fs::write(home.join("recent.txt"), text)
 }
 
+/// How long the recent folders get to answer, all together. A folder on a
+/// network share that does not answer (an unplugged NAS) holds Windows for
+/// about 30 s; it is left out like an unplugged drive until the next refresh.
+const RECENT_WAIT: std::time::Duration = std::time::Duration::from_millis(1500);
+
+/// Each folder read on its own thread, so a dead one costs at most
+/// [`RECENT_WAIT`]. `None` for a folder that did not answer in time.
+fn load_all(list: &[PathBuf]) -> Vec<Option<Result<Game, String>>> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    for (i, p) in list.iter().enumerate() {
+        let (tx, p) = (tx.clone(), p.clone());
+        // A thread that hangs is left to finish on its own.
+        let _ = std::thread::Builder::new()
+            .stack_size(256 << 10)
+            .spawn(move || {
+                let _ = tx.send((i, load_game(&p)));
+            });
+    }
+    drop(tx);
+    let mut out = vec![None; list.len()];
+    let end = std::time::Instant::now() + RECENT_WAIT;
+    let left = || end.saturating_duration_since(std::time::Instant::now());
+    while let Ok((i, r)) = rx.recv_timeout(left()) {
+        out[i] = Some(r);
+    }
+    out
+}
+
 /// The games to list: recent ones first (newest first), then every other
-/// folder under `<home>/games` by title.
-pub fn merged(home: &Path) -> Vec<Game> {
+/// folder under `<home>/games` by title. Also a "folder: why" line for each
+/// game folder left out because its run.toml is broken.
+pub fn merged(home: &Path) -> (Vec<Game>, Vec<String>) {
     let recent = load_recent(home);
-    let mut out: Vec<Game> = recent
-        .iter()
-        .filter_map(|p| load_game(p).ok())
-        .map(|g| Game { recent: true, ..g })
-        .collect();
+    let mut out = Vec::new();
+    let mut bad = Vec::new();
+    for (p, r) in recent.iter().zip(load_all(&recent)) {
+        match r {
+            Some(Ok(g)) => out.push(Game { recent: true, ..g }),
+            Some(Err(why)) if broken(&why) => bad.push(bad_line(p, &why)),
+            _ => {}
+        }
+    }
     let keys: std::collections::HashSet<String> = recent.iter().map(|p| key(p)).collect();
-    let mut rest: Vec<Game> = discover(home)
+    let (found, here_bad) = discover(home);
+    let mut rest: Vec<Game> = found
         .into_iter()
         .filter(|g| !keys.contains(&key(&g.dir)))
         .collect();
     rest.sort_by_cached_key(|g| (g.title.to_lowercase(), key(&g.dir)));
     out.extend(rest);
-    out
+    let here_bad = here_bad.iter().filter(|(d, _)| !keys.contains(&key(d)));
+    bad.extend(here_bad.map(|(d, why)| bad_line(d, why)));
+    (out, bad)
+}
+
+/// Whether the game in `dir` is running now, started by any launcher (one
+/// closed since, or another on the same home): Windows does not let a
+/// running program's file be opened for writing.
+pub fn is_running(dir: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        // Opening for writing without writing changes nothing.
+        let r = std::fs::OpenOptions::new()
+            .write(true)
+            .open(dir.join("game.exe"));
+        // ERROR_SHARING_VIOLATION.
+        r.is_err_and(|e| e.raw_os_error() == Some(32))
+    }
+    #[cfg(not(windows))]
+    {
+        // shortcut: no check off Windows, add one if the launcher runs there.
+        let _ = dir;
+        false
+    }
 }
 
 /// The folder a dropped path means: the folder itself, or the folder of a
@@ -283,8 +405,8 @@ pub(crate) mod tests {
         std::fs::create_dir_all(g.join("not-a-game")).unwrap();
 
         // Add to front, dedupe (loosely: case and trailing separator).
-        let r = add_recent(&[], &g.join("1"));
-        let r = add_recent(&r, &elsewhere);
+        let r = add_recent(&[], &g.join("1"), &[]);
+        let r = add_recent(&r, &elsewhere, &[]);
         // Case differs only where the file system ignores it.
         let one = g.join("1").to_string_lossy().into_owned();
         let one = if cfg!(windows) {
@@ -293,8 +415,18 @@ pub(crate) mod tests {
             one
         };
         let same = PathBuf::from(format!("{one}{}", std::path::MAIN_SEPARATOR));
-        let r = add_recent(&r, &same);
+        let r = add_recent(&r, &same, &[]);
         assert_eq!(r, [same.clone(), elsewhere.clone()]);
+        // A \\?\ prefix and . and .. parts name the same folder.
+        let one = g.join("1").to_string_lossy().into_owned();
+        for alias in [format!(r"\\?\{one}"), format!(r"{one}\..\1\."), one.clone()] {
+            assert_eq!(key(Path::new(&alias)), key(&g.join("1")), "{alias}");
+        }
+        assert_eq!(
+            key(Path::new(r"\\?\UNC\nas\g\x")),
+            key(Path::new(r"\\nas\g\x"))
+        );
+        assert_eq!(key(Path::new(r"C:\..\x")), key(Path::new(r"C:\x")));
         // A line that is not a game now is kept (its drive may be
         // unplugged), but not listed.
         let mut lines = r.clone();
@@ -303,6 +435,7 @@ pub(crate) mod tests {
         assert_eq!(load_recent(&home), lines);
 
         let titles: Vec<_> = merged(&home)
+            .0
             .into_iter()
             .map(|g| (g.title, g.recent))
             .collect();
@@ -325,10 +458,73 @@ pub(crate) mod tests {
         // The cap.
         let mut r = Vec::new();
         for i in 0..RECENT_MAX + 5 {
-            r = add_recent(&r, Path::new(&format!("C:\\{i}")));
+            r = add_recent(&r, Path::new(&format!("C:\\{i}")), &[]);
         }
         assert_eq!(r.len(), RECENT_MAX);
         assert_eq!(r[0], Path::new(&format!("C:\\{}", RECENT_MAX + 4)));
+    }
+
+    /// Many offline lines before a game that is there: it is still recent,
+    /// and starting another game cuts the offline lines, not it.
+    #[test]
+    fn offline_lines_do_not_crowd_out() {
+        let home = temp("crowd");
+        let (here, other) = (home.join("here"), home.join("other"));
+        make_game(&here, "title='Here'\nexe='e'\ngame='g'\n");
+        make_game(&other, "title='Other'\nexe='e'\ngame='g'\n");
+        let mut lines: Vec<PathBuf> = (0..300).map(|i| home.join(format!("gone{i}"))).collect();
+        lines.push(here.clone());
+        save_recent(&home, &lines).unwrap();
+        let (games, bad) = merged(&home);
+        assert_eq!(games.len(), 1);
+        assert!(games[0].recent && bad.is_empty());
+        let r = add_recent(&load_recent(&home), &other, &games);
+        assert_eq!(r.len(), RECENT_MAX);
+        assert_eq!((&r[0], r.last()), (&other, Some(&here)));
+        assert_eq!(r[1], home.join("gone0"), "the newest offline lines stay");
+    }
+
+    /// A broken run.toml is named with its reason, a folder that is not a
+    /// game at all is not.
+    #[test]
+    fn broken_run_toml_is_named() {
+        let home = temp("broken");
+        let g = home.join("games");
+        make_game(&g.join("ok"), "title='Fine'\nexe='e'\ngame='g'\n");
+        make_game(&g.join("num"), "title = 42\nexe='e'\ngame='g'\n");
+        std::fs::create_dir_all(g.join("empty")).unwrap();
+        save_recent(&home, &[g.join("num")]).unwrap();
+        let (games, bad) = merged(&home);
+        assert_eq!(games.len(), 1);
+        assert_eq!(bad.len(), 1, "{bad:?}");
+        assert!(bad[0].starts_with("num: run.toml: TOML parse error at line 1"));
+        assert!(bad[0].contains("invalid type: integer"), "{}", bad[0]);
+    }
+
+    #[test]
+    fn titles_on_one_line() {
+        assert_eq!(
+            one_line("First Line\nSecond\r\nThird\tx\u{200b}y\u{202e} "),
+            "First Line Second Third xy"
+        );
+        let home = temp("title");
+        make_game(&home, "title = '\u{200b}\t'\nexe='e'\ngame='C:\\a\\Name'\n");
+        assert_eq!(load_game(&home).unwrap().title, "Name");
+    }
+
+    /// A program that runs is seen as running; a plain file is not.
+    #[test]
+    fn running_game_is_seen() {
+        let home = temp("running");
+        make_game(&home, "exe='e'\ngame='g'\n");
+        assert!(!is_running(&home));
+        // This test program is running: a game.exe that is another name for it
+        // (a hard link needs the same volume; the temp folder usually is).
+        let dir = temp("running-me");
+        let me = std::env::current_exe().unwrap();
+        if cfg!(windows) && std::fs::hard_link(me, dir.join("game.exe")).is_ok() {
+            assert!(is_running(&dir));
+        }
     }
 
     #[test]
@@ -340,7 +536,12 @@ pub(crate) mod tests {
             assert!(h + 120.0 <= screen.1 && w <= screen.0, "{screen:?}");
             assert_eq!((w * 9.0 / 16.0).round(), h);
         }
-        assert_eq!(window_size((320.0, 200.0)), MIN_WINDOW);
+        // Screens too small for the smallest window: 1280x800 and 1280x720
+        // at 150%, 1920x1080 at 200%. The window shrinks to fit.
+        for screen in [(853.3, 533.3), (853.3, 480.0), (960.0, 540.0)] {
+            let (w, h) = window_size(screen);
+            assert!(h + 120.0 <= screen.1 && w <= screen.0, "{screen:?}");
+        }
     }
 
     #[test]

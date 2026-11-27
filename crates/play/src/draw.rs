@@ -74,8 +74,12 @@ pub enum Hit {
     Info,
     /// A settings row's `<` (-1) or `>` (+1) arrow.
     Step(usize, i32),
-    /// A footer hint: 0 Refresh, 1 Back, 2 Start or Change, 3 Page.
+    /// A footer hint: 0 Refresh, 1 Back, 2 Start or Change, 3 Page, 4 Full
+    /// screen.
     Hint(usize),
+    /// The list's scroll bar (there only while the list is longer than
+    /// [`ROWS`]): [`bar_at`] says where along it.
+    Bar,
 }
 
 // Layout on the board.
@@ -201,6 +205,33 @@ fn preview_rect(l: &Lay) -> Rect {
     (l.dx, LIST_Y, l.dw, PREVIEW_H)
 }
 
+/// The scroll bar's track, as drawn.
+fn bar_rect(l: &Lay) -> Rect {
+    (
+        l.list_x + l.list_w + 10.0,
+        LIST_Y,
+        6.0,
+        ROWS as f32 * ROW_H - ROW_GAP,
+    )
+}
+
+/// The scroll bar's thumb for `len` rows from `scroll`: at least 24 board
+/// units tall, so a long list's thumb is not a dot.
+fn thumb_rect(l: &Lay, len: usize, scroll: usize) -> Rect {
+    let (bx, by, bw, bh) = bar_rect(l);
+    let th = (bh * ROWS as f32 / len.max(1) as f32).clamp(24.0, bh);
+    let ty = by + (bh - th) * scroll as f32 / len.saturating_sub(ROWS).max(1) as f32;
+    (bx, ty, bw, th)
+}
+
+/// Where window height `y` is along `page`'s scroll bar: 0 at the top, 1
+/// at the bottom, clamped (a drag can leave the bar).
+pub fn bar_at(w: usize, h: usize, page: Page, y: f32) -> f32 {
+    let (k, _, oy) = fit(w, h);
+    let (_, by, _, bh) = bar_rect(&lay(page));
+    (((y - oy) / k - by) / bh).clamp(0.0, 1.0)
+}
+
 fn info_rect(l: &Lay) -> Rect {
     let bottom = LIST_Y + ROWS as f32 * ROW_H - ROW_GAP;
     (l.dx, bottom - INFO_H, l.dw, INFO_H)
@@ -236,6 +267,11 @@ pub fn hit(w: usize, h: usize, page: Page, x: f32, y: f32) -> Option<Hit> {
     }
     if let Some(i) = hint_rects(page).into_iter().position(inside) {
         return Some(Hit::Hint(i));
+    }
+    // The thin bar with room round it to click.
+    let (bx, by, bw, bh) = bar_rect(&l);
+    if inside((bx - 5.0, by, bw + 10.0, bh)) {
+        return Some(Hit::Bar);
     }
     let r = (0..ROWS).find(|&r| inside(row_rect(&l, r)))?;
     if page == Page::Settings {
@@ -1024,12 +1060,23 @@ fn page_hint_w() -> f32 {
     pill_w(22.0, "LB") + pill_w(22.0, "RB") + 12.0 + text_w(2.0, "Page")
 }
 
-/// What is clicked for each footer hint: Refresh, Back, Start, Page.
-fn hint_rects(page: Page) -> [Rect; 4] {
+/// The footer's full screen caption, under the drop line.
+const FULL_HINT: &str = "F11 full screen";
+
+/// What is clicked for each footer hint: Refresh, Back, Start, Page, and
+/// the full screen caption (its line only: the drop line above is text).
+fn hint_rects(page: Page) -> [Rect; 5] {
     let (hs, end) = hints(page);
     let r = |x: f32, w: f32| (x - 6.0, FOOT_Y, w + 12.0, FOOT_H);
     let h = |i: usize| r(hs[i].0, 32.0 + text_w(2.0, hs[i].3));
-    [h(0), h(1), h(2), r(end, page_hint_w())]
+    let ky = FOOT_Y + FOOT_H / 2.0 + 5.0;
+    let full = (
+        M + 22.0,
+        ky - 2.0,
+        text_w(1.4, FULL_HINT) + 12.0,
+        7.0 * 1.4 + 6.0,
+    );
+    [h(0), h(1), h(2), r(end, page_hint_w()), full]
 }
 
 /// The slim bar of button hints at the bottom.
@@ -1048,7 +1095,7 @@ fn footer(cv: &mut Cv, page: Page) {
     let cy = y + h / 2.0;
     let (ly, ky) = (cy - 12.0, cy + 5.0);
     cv.text(x + 28.0, ly, 2.0, DIM, "Drop a game folder here to add it");
-    cv.text(x + 28.0, ky, 1.4, DIM, "F11 full screen");
+    cv.text(x + 28.0, ky, 1.4, DIM, FULL_HINT);
     let (hints, mut hx) = hints(page);
     for (hx, button, c, label, key) in hints {
         cv.button(hx + 13.0, cy, 13.0, c, button);
@@ -1433,15 +1480,8 @@ pub fn overlay(px: &mut [u32], w: usize, h: usize, v: &View, t: f32) {
     }
     // Scroll bar.
     if rows.len() > ROWS {
-        let (bx, by, bh) = (
-            l.list_x + l.list_w + 10.0,
-            LIST_Y,
-            ROWS as f32 * ROW_H - ROW_GAP,
-        );
-        cv.fill((bx, by, 6.0, bh), 3.0, BLACK, 0.3);
-        let th = bh * ROWS as f32 / rows.len() as f32;
-        let ty = by + (bh - th) * v.scroll as f32 / (rows.len() - ROWS) as f32;
-        cv.fill((bx, ty, 6.0, th), 3.0, 0xeaffd4, 0.9);
+        cv.fill(bar_rect(&l), 3.0, BLACK, 0.3);
+        cv.fill(thumb_rect(&l, rows.len(), v.scroll), 3.0, 0xeaffd4, 0.9);
     }
 
     details(&mut cv, &l, v, pulse);
@@ -1743,6 +1783,14 @@ mod tests {
                     assert_eq!(at(x + hw / 2.0, y + hh / 2.0), Some(Hit::Hint(i)));
                 }
                 assert_eq!(at(M + 40.0, FOOT_Y + FOOT_H / 2.0), None);
+                // The scroll bar, and where along it.
+                let (bx, by, bw, bh) = bar_rect(&l);
+                assert_eq!(at(bx + bw / 2.0, by + bh / 4.0), Some(Hit::Bar));
+                let along = bar_at(w, h, page, (by + bh / 4.0) * k);
+                assert!((along - 0.25).abs() < 0.01, "{along}");
+                assert_eq!(bar_at(w, h, page, 0.0), 0.0);
+                let (_, ty, _, th) = thumb_rect(&l, 300, 293);
+                assert!(th >= 24.0 && (ty + th - (by + bh)).abs() < 0.01);
                 let (x, y, iw, ih) = info_rect(&l);
                 let info = (page == Page::Games).then_some(Hit::Info);
                 assert_eq!(at(x + iw / 2.0, y + ih / 2.0), info);

@@ -43,7 +43,19 @@ fn main() {
         .ok()
         .and_then(|p| p.parent().map(Path::to_path_buf))
         .unwrap_or_else(|| PathBuf::from("."));
-    *LOG.lock().unwrap() = File::create(exe_dir.join("rustxenon-play-launcher.log")).ok();
+    // Appended to, so a second launcher beside the first does not cut its
+    // lines; started again once it passes 1 MB.
+    let log_path = exe_dir.join("rustxenon-play-launcher.log");
+    let fresh = std::fs::metadata(&log_path).is_ok_and(|m| m.len() > 1 << 20);
+    let mut o = std::fs::OpenOptions::new();
+    o.create(true);
+    if fresh {
+        o.write(true).truncate(true);
+    } else {
+        o.append(true);
+    }
+    *LOG.lock().unwrap() = o.open(log_path).ok();
+    log(&format!("launcher pid {}", std::process::id()));
     // No console in the GUI subsystem, so panics go to the log file.
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -130,6 +142,16 @@ fn run(exe_dir: PathBuf) -> Result<(), String> {
     Ok(())
 }
 
+/// Why game.exe did not start, in words a player reads: Windows' own text
+/// for some errors has a `%1` where the program's name goes.
+fn spawn_error(e: &std::io::Error) -> String {
+    match e.raw_os_error() {
+        // ERROR_BAD_EXE_FORMAT.
+        Some(193) => "game.exe is not a Windows program (it may be damaged or incomplete).".into(),
+        _ => format!("game.exe: {}", e.to_string().replace("%1", "it")),
+    }
+}
+
 fn write_png(path: &Path, w: usize, h: usize, px: &[u32]) -> Result<(), String> {
     let err = |e: &dyn std::fmt::Display| format!("{}: {e}", path.display());
     let file = File::create(path).map_err(|e| err(&e))?;
@@ -182,6 +204,10 @@ struct App {
     /// The controller is read only while the window has focus.
     focused: bool,
     cursor: (f32, f32),
+    /// The mouse button down and what it went down on.
+    pressed: Option<(MouseButton, Option<Hit>)>,
+    /// The scroll bar is being dragged.
+    drag_bar: bool,
     /// Wheel or touchpad scroll not yet turned into a whole row, in rows.
     wheel: f32,
     started: Instant,
@@ -206,6 +232,8 @@ impl App {
             held: None,
             focused: false,
             cursor: (-1.0, -1.0),
+            pressed: None,
+            drag_bar: false,
             wheel: 0.0,
             started: Instant::now(),
         };
@@ -269,7 +297,18 @@ impl App {
     /// the place in the list if it is gone.
     fn refresh(&mut self) {
         let keep = self.games.get(self.sel[0]).map(|g| g.dir.clone());
-        self.games = xenon_play::merged(&self.home);
+        let bad;
+        (self.games, bad) = xenon_play::merged(&self.home);
+        for b in &bad {
+            log(&format!("not listed: {b}"));
+        }
+        // Told once a note about something else has gone.
+        if let (Some(first), None) = (bad.first(), &self.note) {
+            self.note = Some(match bad.len() {
+                1 => format!("Not listed, its run.toml is broken: {first}"),
+                n => format!("{n} games not listed, run.toml broken. First: {first}"),
+            });
+        }
         self.load_settings();
         let at = keep.and_then(|d| self.games.iter().position(|g| g.dir == d));
         let page = std::mem::replace(&mut self.page, Page::Games);
@@ -300,7 +339,8 @@ impl App {
         let dir = std::path::absolute(&dir).unwrap_or(dir);
         match xenon_play::load_game(&dir) {
             Ok(_) => {
-                let recent = xenon_play::add_recent(&xenon_play::load_recent(&self.home), &dir);
+                let recent =
+                    xenon_play::add_recent(&xenon_play::load_recent(&self.home), &dir, &self.games);
                 if let Err(e) = xenon_play::save_recent(&self.home, &recent) {
                     self.note = Some(format!("recent.txt not saved: {e}"));
                 } else {
@@ -326,16 +366,29 @@ impl App {
             return;
         };
         self.note = None;
-        // Its folder may have gone since the list was read.
-        let spawned = xenon_play::load_game(&g.dir).and_then(|_| {
-            let c = xenon_play::command(&self.home, &g).spawn();
-            c.map_err(|e| format!("game.exe: {e}"))
+        // Its folder may have changed or gone since the list was read: start
+        // it as it is now.
+        let spawned = xenon_play::load_game(&g.dir).and_then(|fresh| {
+            // Two copies would share saves and profile under one home.
+            if xenon_play::is_running(&g.dir) {
+                return Err(
+                    "it is running already (from another launcher, or one closed while it ran)"
+                        .into(),
+                );
+            }
+            let fresh = Game {
+                recent: g.recent,
+                ..fresh
+            };
+            let c = xenon_play::command(&self.home, &fresh).spawn();
+            c.map(|c| (fresh, c)).map_err(|e| spawn_error(&e))
         });
         match spawned {
-            Ok(child) => {
+            Ok((g, child)) => {
                 log(&format!("started {} (pid {})", g.dir.display(), child.id()));
                 // Only a game that started goes to the top of the list.
-                let recent = xenon_play::add_recent(&xenon_play::load_recent(&self.home), &g.dir);
+                let recent = xenon_play::load_recent(&self.home);
+                let recent = xenon_play::add_recent(&recent, &g.dir, &self.games);
                 if let Err(e) = xenon_play::save_recent(&self.home, &recent) {
                     log(&format!("recent.txt: {e}"));
                 }
@@ -396,7 +449,14 @@ impl App {
             return;
         }
         let mut next = self.settings.clone();
-        next.step(self.sel[1], dir);
+        if !next.step(self.sel[1], dir) {
+            let f = &FIELDS[self.sel[1]];
+            self.note = Some(format!(
+                "settings.toml: [{}] {} is not a plain table and value, so the game skips it. Fix it by hand.",
+                f.table, f.key
+            ));
+            return;
+        }
         match next.save(&self.home.join("settings.toml")) {
             Ok(()) => self.settings = next,
             Err(e) => {
@@ -493,6 +553,61 @@ impl App {
         self.held = pad_dir(&p, None).map(|d| (d, never));
     }
 
+    /// A click on `at`.
+    fn click(&mut self, button: MouseButton, at: Option<Hit>) {
+        let idle = self.running.is_none();
+        let (first, len) = (self.scroll[self.page as usize], self.len());
+        let row = |r: usize| Some(first + r).filter(|&i| i < len);
+        match (button, at) {
+            (MouseButton::Left, Some(Hit::Tab(p))) if idle => self.set_page(p),
+            (MouseButton::Left, Some(Hit::Row(r))) if idle => {
+                if let Some(i) = row(r) {
+                    self.pick(i);
+                    // A settings row changes only through its arrows.
+                    if self.page == Page::Games {
+                        self.act(Act::Go);
+                    }
+                }
+            }
+            (MouseButton::Left, Some(Hit::Step(r, dir))) if idle => {
+                if let Some(i) = row(r) {
+                    self.pick(i);
+                    self.change(dir);
+                }
+            }
+            (MouseButton::Left, Some(Hit::Info)) if idle => self.act(if self.games.is_empty() {
+                Act::Refresh
+            } else {
+                Act::Go
+            }),
+            (MouseButton::Left, Some(Hit::Hint(i))) => {
+                let a = [Act::Refresh, Act::Back, Act::Go, Act::Page, Act::Full];
+                self.act(a[i.min(4)]);
+            }
+            // A right click on a settings row, arrows too, steps its value down.
+            (MouseButton::Right, Some(Hit::Row(r) | Hit::Step(r, _)))
+                if idle && self.page == Page::Settings =>
+            {
+                if let Some(i) = row(r) {
+                    self.pick(i);
+                    self.change(-1);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Scrolls to where the pointer is along the scroll bar.
+    fn bar(&mut self) {
+        let (w, h) = self.size();
+        let n = self.len();
+        if self.running.is_some() || n <= ROWS {
+            return;
+        }
+        let along = draw::bar_at(w, h, self.page, self.cursor.1);
+        self.pick((along * (n - 1) as f32).round() as usize);
+    }
+
     fn size(&self) -> (usize, usize) {
         self.window.as_ref().map_or((0, 0), |(w, _)| {
             let s = w.inner_size();
@@ -530,7 +645,9 @@ impl ApplicationHandler for App {
             let s = m.size().to_logical::<f64>(m.scale_factor());
             xenon_play::window_size((s.width, s.height))
         });
+        // A screen too small for the usual smallest window gets a smaller one.
         let (mw, mh) = xenon_play::MIN_WINDOW;
+        let (mw, mh) = (mw.min(w), mh.min(h));
         let attrs = xenon_window::with_icon(Window::default_attributes())
             .with_title("RustXenon")
             .with_inner_size(winit::dpi::LogicalSize::new(w, h))
@@ -564,6 +681,8 @@ impl ApplicationHandler for App {
                 self.focused = f;
                 if f {
                     self.pad_settle();
+                    // Another launcher on this home may have changed it.
+                    self.load_settings();
                 }
             }
             // A synthetic press is a key already down when focus came back
@@ -598,7 +717,10 @@ impl ApplicationHandler for App {
             WindowEvent::CursorMoved { position, .. } => {
                 let (w, h) = self.size();
                 self.cursor = (position.x as f32, position.y as f32);
-                if let Some(Hit::Row(r)) = draw::hit(w, h, self.page, self.cursor.0, self.cursor.1)
+                if self.drag_bar {
+                    self.bar();
+                } else if let Some(Hit::Row(r)) =
+                    draw::hit(w, h, self.page, self.cursor.0, self.cursor.1)
                 {
                     let i = self.scroll[self.page as usize] + r;
                     // Hover only selects: a note (say a refused folder) stays
@@ -608,58 +730,27 @@ impl ApplicationHandler for App {
                     }
                 }
             }
-            WindowEvent::MouseInput {
-                state: ElementState::Pressed,
-                button: MouseButton::Left,
-                ..
-            } => {
+            // A click is a press and a release on the same thing, as with any
+            // button: letting go somewhere else cancels. The scroll bar acts
+            // from the press and drags.
+            WindowEvent::MouseInput { state, button, .. } => {
                 let (w, h) = self.size();
-                match draw::hit(w, h, self.page, self.cursor.0, self.cursor.1) {
-                    Some(Hit::Tab(p)) if self.running.is_none() => self.set_page(p),
-                    Some(Hit::Row(r))
-                        if self.running.is_none()
-                            && self.scroll[self.page as usize] + r < self.len() =>
-                    {
-                        self.pick(self.scroll[self.page as usize] + r);
-                        // A settings row changes only through its arrows.
-                        if self.page == Page::Games {
-                            self.act(Act::Go);
+                let at = draw::hit(w, h, self.page, self.cursor.0, self.cursor.1);
+                match state {
+                    ElementState::Pressed => {
+                        if button == MouseButton::Left && at == Some(Hit::Bar) {
+                            self.drag_bar = true;
+                            self.bar();
                         }
+                        self.pressed = Some((button, at));
                     }
-                    Some(Hit::Step(r, dir))
-                        if self.running.is_none()
-                            && self.scroll[self.page as usize] + r < self.len() =>
-                    {
-                        self.pick(self.scroll[self.page as usize] + r);
-                        self.change(dir);
-                    }
-                    Some(Hit::Info) if self.running.is_none() => {
-                        self.act(if self.games.is_empty() {
-                            Act::Refresh
-                        } else {
-                            Act::Go
-                        })
-                    }
-                    Some(Hit::Hint(i)) => {
-                        let a = [Act::Refresh, Act::Back, Act::Go, Act::Page];
-                        self.act(a[i.min(3)]);
-                    }
-                    _ => {}
-                }
-            }
-            // A right click on a settings row, arrows too, steps its value down.
-            WindowEvent::MouseInput {
-                state: ElementState::Pressed,
-                button: MouseButton::Right,
-                ..
-            } if self.page == Page::Settings && self.running.is_none() => {
-                let (w, h) = self.size();
-                if let Some(Hit::Row(r) | Hit::Step(r, _)) =
-                    draw::hit(w, h, self.page, self.cursor.0, self.cursor.1)
-                {
-                    if self.scroll[self.page as usize] + r < self.len() {
-                        self.pick(self.scroll[self.page as usize] + r);
-                        self.change(-1);
+                    ElementState::Released => {
+                        if button == MouseButton::Left {
+                            self.drag_bar = false;
+                        }
+                        if self.pressed.take() == Some((button, at)) {
+                            self.click(button, at);
+                        }
                     }
                 }
             }
