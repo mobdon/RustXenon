@@ -17,6 +17,8 @@ use winit::keyboard::PhysicalKey;
 use winit::window::{Fullscreen, Window, WindowId};
 use xenon_input::{filtered, merge, Keyboard, Pad};
 
+mod pace;
+
 /// Pixels shared with whoever made them, so a frame reaches the window
 /// without being copied.
 pub type Pixels = Arc<dyn AsRef<[u8]> + Send + Sync>;
@@ -149,6 +151,8 @@ struct App {
     /// Text shown instead of frames, and whether the close buttons have
     /// been seen up since (so a button held at the stop does not close it).
     text: Option<(Vec<String>, bool)>,
+    /// Intervals between new frames as they are presented.
+    pace: pace::Pacing,
 }
 
 impl App {
@@ -162,6 +166,7 @@ impl App {
             window: None,
             last: None,
             text: None,
+            pace: pace::Pacing::default(),
         }
     }
 
@@ -271,6 +276,9 @@ impl ApplicationHandler for App {
         if let Some(img) = fresh.filter(|_| self.text.is_none()) {
             self.last = Some(img);
             self.draw();
+            if let Some(s) = self.pace.frame(Instant::now()) {
+                eprintln!("window: {s}");
+            }
         }
         // Read input at about 250 Hz; frames arrive far slower.
         ev.set_control_flow(ControlFlow::WaitUntil(
