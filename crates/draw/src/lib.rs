@@ -7232,7 +7232,8 @@ impl Drawer {
             }
             apart
         });
-        if s > 1 && self.sharp_front && entry == 0 && dest_bytes == 4 {
+        // Only 8_8_8_8 and 2_10_10_10 copies can be the presented front buffer.
+        if s > 1 && self.sharp_front && entry == 0 && params[6] <= 1 {
             self.resolve_scaled(params, rect, pitch, tex, pipeline, i, (lo, hi), spare)?;
         }
         self.forget_guest(lo, hi);
