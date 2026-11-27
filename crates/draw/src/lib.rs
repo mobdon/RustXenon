@@ -1483,6 +1483,9 @@ pub struct Drawer {
     /// replay that last used them, for least recently used eviction.
     texture_cache: HashMap<([u32; 6], u64), (wgpu::TextureView, u64, u64)>,
     texture_cache_bytes: u64,
+    /// The hash last uploaded for each decode key in `texture_cache`, so a
+    /// new upload of the key drops the entry it replaces.
+    texture_latest: HashMap<[u32; 6], u64>,
     /// Hashes of keys evicted from `texture_cache`, to count uploads of a
     /// texture the cache held before (cache too small) apart from new ones.
     texture_evicted: HashSet<u64>,
@@ -2658,6 +2661,7 @@ impl Drawer {
             resolved_endian: HashMap::default(),
             texture_cache: HashMap::default(),
             texture_cache_bytes: 0,
+            texture_latest: HashMap::default(),
             texture_evicted: HashSet::default(),
             replays: 0,
             texture_memo: HashMap::default(),
@@ -5646,6 +5650,8 @@ impl Drawer {
         if self.texture_evicted.remove(&key_hash) {
             report.timings.textures_reuploaded += 1;
         }
+        self.texture_cache_bytes -=
+            drop_stale(&mut self.texture_latest, &mut self.texture_cache, key);
         let limit = self.texture_cache_limit;
         if self.texture_cache_bytes + len > limit
             || self.texture_cache.len() >= self.texture_cache_count
@@ -5691,6 +5697,9 @@ impl Drawer {
             }
             self.texture_cache.remove(&k);
             self.texture_cache_bytes -= len;
+            if self.texture_latest.get(&k.0) == Some(&k.1) {
+                self.texture_latest.remove(&k.0);
+            }
             self.texture_evicted
                 .insert(hash_bytes(&to_bytes(&k.0)) ^ k.1);
             report.timings.textures_evicted += 1;
@@ -7557,6 +7566,21 @@ fn detile_front(
 
 impl Drawer {}
 
+/// Records `key` as the latest upload of its decode key and removes the
+/// cache entry of the hash it replaces (a texture the guest rewrote, such as
+/// a render target resolved every frame), returning that entry's bytes.
+/// Views still bound in the open batch stay alive through their clones.
+fn drop_stale<V>(
+    latest: &mut HashMap<[u32; 6], u64>,
+    cache: &mut HashMap<([u32; 6], u64), (V, u64, u64)>,
+    key: ([u32; 6], u64),
+) -> u64 {
+    match latest.insert(key.0, key.1) {
+        Some(old) if old != key.1 => cache.remove(&(key.0, old)).map_or(0, |e| e.1),
+        _ => 0,
+    }
+}
+
 /// The base level of `fetch` from its guest bytes as host texels: host
 /// format, width, height and texel bytes. BC blocks when `bc` and
 /// [`bc_blocks`] takes them; Rgba8Unorm, or floats where
@@ -7576,6 +7600,17 @@ fn decode_level(
     if host == wgpu::TextureFormat::Rgba8Unorm {
         let img = xenon_texture::decode_base_level(fetch, bytes)?;
         return Ok((host, img.width, img.height, img.rgba8));
+    }
+    use xenon_texture::TextureFormat as F;
+    let half = matches!(
+        fetch.format.data_format(),
+        F::K16Float | F::K16_16Float | F::K16_16_16_16Float
+    );
+    if half && host == wgpu::TextureFormat::Rgba16Float {
+        // Halves straight through: the f32 round trip is the identity for them.
+        let rgba = xenon_texture::decode_base_level_f16(fetch, bytes)?;
+        let data = rgba.iter().flat_map(|h| h.to_le_bytes()).collect();
+        return Ok((host, fetch.width(), fetch.height(), data));
     }
     let img = xenon_texture::decode_base_level_f32(fetch, bytes)?;
     let data = if host == wgpu::TextureFormat::Rgba32Float {
@@ -8478,6 +8513,97 @@ mod tests {
         assert!(!m.write_bytes(0x13, &[1, 2]));
         assert!(!m.write_bytes(0x0F, &[1]));
         assert_eq!(m.data, vec![0, 0, 1, 2]);
+    }
+
+    /// The half fast path of `decode_level` gives the bytes of the f32
+    /// round trip it replaces: random halves, denormals, infinities, NaNs,
+    /// constant swizzles, on the base and each mip level.
+    #[test]
+    fn half_textures_decode_as_through_f32() {
+        use xenon_texture::{Endian, TextureFetch, TextureFormat as F};
+        let specials = [
+            0x0000, 0x8000, 0x0001, 0x8001, 0x03FF, 0x0400, 0x3C00, 0x7BFF, 0x7C00, 0xFC00, 0x7C01,
+            0x7E00, 0x7FFF, 0xFC01, 0xFFFF,
+        ];
+        let mut seed = 0x9E37_79B9u32;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed
+        };
+        let swz = |s: [u32; 4]| s[0] | s[1] << 3 | s[2] << 6 | s[3] << 9;
+        for format in [
+            F::K16Float,
+            F::K16_16Float,
+            F::K16_16_16_16Float,
+            F::K16_16Expand,
+        ] {
+            for swizzle in [swz([0, 1, 2, 3]), swz([0, 1, 5, 5]), swz([2, 4, 0, 5])] {
+                let words = [
+                    2 | (64 >> 5) << 22 | 1 << 31,
+                    format as u32 | (Endian::K8in32 as u32) << 6 | 0x1234 << 12,
+                    63 | 31 << 13,
+                    swizzle << 1,
+                    3 << 6,
+                    1 << 9 | 0x0008_0000,
+                ];
+                let base = TextureFetch::decode(words);
+                let levels: Vec<_> = std::iter::once(base)
+                    .chain(xenon_texture::mip_fetches(&base))
+                    .collect();
+                assert_eq!(levels.len(), 4);
+                for fetch in levels {
+                    let len = xenon_texture::bytes_needed(&fetch).unwrap();
+                    let bytes: Vec<u8> = (0..len / 2)
+                        .flat_map(|_| {
+                            let r = next();
+                            let h = match r % 4 {
+                                0 => specials[(r >> 8) as usize % specials.len()],
+                                _ => (r >> 16) as u16,
+                            };
+                            h.to_le_bytes()
+                        })
+                        .collect();
+                    let img = xenon_texture::decode_base_level_f32(&fetch, &bytes).unwrap();
+                    let want: Vec<u8> = img
+                        .rgba
+                        .iter()
+                        .flat_map(|&v| formats::f32_to_half(v).to_le_bytes())
+                        .collect();
+                    for float32 in [false, true] {
+                        let (host, w, h, data) =
+                            decode_level(&fetch, &bytes, false, float32).unwrap();
+                        assert_eq!(host, wgpu::TextureFormat::Rgba16Float);
+                        assert_eq!((w, h), (img.width, img.height));
+                        assert!(data == want, "{format:?} swizzle {swizzle:#x} {w}x{h}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// A decode key uploaded with new bytes drops the entry of its last
+    /// hash, and only that one.
+    #[test]
+    fn new_upload_of_a_key_drops_its_stale_entry() {
+        let mut latest = HashMap::default();
+        let mut cache: HashMap<([u32; 6], u64), ((), u64, u64)> = HashMap::default();
+        let (a, b) = ([1; 6], [2; 6]);
+        let mut bytes = 0;
+        for (key, len) in [((a, 10), 100), ((b, 10), 7), ((a, 11), 100), ((a, 12), 100)] {
+            bytes -= drop_stale(&mut latest, &mut cache, key);
+            bytes += len;
+            cache.insert(key, ((), len, 0));
+        }
+        assert_eq!(bytes, 107);
+        let mut keys: Vec<_> = cache.keys().copied().collect();
+        keys.sort();
+        assert_eq!(keys, [(a, 12), (b, 10)]);
+        // An entry evicted already frees nothing more.
+        cache.remove(&(a, 12));
+        assert_eq!(drop_stale(&mut latest, &mut cache, (a, 13)), 0);
+        assert_eq!(drop_stale(&mut latest, &mut cache, (b, 10)), 0);
     }
 
     #[test]
