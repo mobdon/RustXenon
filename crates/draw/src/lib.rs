@@ -5730,7 +5730,10 @@ impl Drawer {
                 flag.store(false, Ordering::Relaxed);
             }
         }
-        (self.texture_sets).retain(|_, (_, _, kept, ..)| kept.load(Ordering::Relaxed));
+        // Sets of an older memo epoch can never bind again but would pin their views.
+        let epoch = self.texture_memo_epoch;
+        (self.texture_sets)
+            .retain(|_, (_, e, kept, ..)| *e == epoch && kept.load(Ordering::Relaxed));
         (self.texture_groups).retain(|(_, slots), _| !slots.iter().any(|(v, _)| gone.contains(v)));
     }
 
