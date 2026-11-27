@@ -3247,6 +3247,7 @@ dependencies = [
  "serde",
  "softbuffer",
  "toml",
+ "toml_edit 0.22.27",
  "winit",
  "xenon-icon",
  "xenon-input",

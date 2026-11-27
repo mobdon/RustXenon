@@ -647,10 +647,13 @@ fn restore_target_is_dropped_after_the_depth_draw() {
         assert_eq!((report.draws, report.resolves), (2, 1), "{report:?}");
         assert!(report.warnings.is_empty(), "{report:?}");
         let m = d.memory_line();
-        let drops = format!("targets 1 MB in 1, {} dropped,", frame + 1);
+        // 1 MB at scale 1, scale^2 times that above (XENON_SCALE).
+        let mb = d.scale() * d.scale();
+        let drops = format!("targets {mb} MB in 1, {} dropped,", frame + 1);
         assert!(m.contains(&drops), "{m}");
         // The next frame's colour target takes the dropped one's texture.
-        let reuse = format!(" 2 made, {frame} reused, 1 spare (0 MB),");
+        // The spare colour target is half the depth target's bytes.
+        let reuse = format!(" 2 made, {frame} reused, 1 spare ({} MB),", mb / 2);
         assert!(m.contains(&reuse), "{m}");
         assert!(d.read_render_target(colour, 0, 0, 1, 1).is_err());
         assert_eq!(word_at(&mem, DEST2, 50, 10), 0x4000_0078);
@@ -679,7 +682,9 @@ fn dropped_and_recreated_targets_do_not_leak() {
         assert_eq!(d.gpu_live(), live, "replay {frame}");
     }
     let m = d.memory_line();
-    assert!(m.contains("targets 1 MB in 1, 30 dropped,"), "{m}");
+    let mb = d.scale() * d.scale();
+    let drops = format!("targets {mb} MB in 1, 30 dropped,");
+    assert!(m.contains(&drops), "{m}");
 }
 
 /// A colour restore of the depth words at tile 0, a depth-only draw over
@@ -872,4 +877,95 @@ fn repeated_transfers_reuse_their_setup() {
         counts.push((r.timings.transfers, r.timings.transfer_setups));
     }
     assert_eq!(counts, [(1, 1), (1, 0), (1, 0)]);
+}
+
+/// The word of colour column `x` drawn by `colour_bands`: 10-pixel bands,
+/// each its own depth and stencil.
+fn band_word(x: u32) -> u32 {
+    let b = 16 - x / 10;
+    (0x0800_0000 * b) | b
+}
+
+/// Draws `band_word` into the 1x colour target at tile 0, pitch `WIDE`:
+/// rectangles (0, 0)-(160 - 10 i, H), narrowing, depth off.
+fn colour_bands(s: &mut Stream, mem: &mut SliceMemory) {
+    s.regs(RB_SURFACE_INFO, &[WIDE, 0, D24S8_AT_0])
+        .regs(PA_SC_WINDOW_SCISSOR_TL, &[1 << 31, WIDE | (H << 16)])
+        .shader(false, &vs_color())
+        .shader(true, &ps_const())
+        .regs(RB_DEPTHCONTROL, &[0]);
+    let c = [0; 4];
+    for i in 0..16 {
+        let (at, x1) = (VERTS + 0x40 * i, (WIDE - 10 * i) as f32);
+        mem.write_words(
+            at,
+            &color_verts(&[(0.0, 0.0, 0.0, c), (x1, 0.0, 0.0, c), (0.0, 64.0, 0.0, c)]),
+        );
+        let word = band_word(WIDE - 10 * i - 1);
+        s.regs(SHADER_CONSTANT_FLOAT + 256 * 4, &word_color(word).map(f))
+            .vertex_fetch(0, at, 12)
+            .draw_auto(PRIM_RECT_LIST, 3);
+    }
+}
+
+/// `colour_bands` read back as depth at tile 0 at `scale` host pixels per
+/// guest pixel: at pitch `WIDE` 1x, or (`msaa`) at half the pitch with 4x
+/// MSAA, the tiled frame's restore. Returns the raw depth resolve's words
+/// of the first rows, or None without a device for the scale.
+fn bands_as_depth(scale: u32, msaa: bool) -> Option<Vec<u32>> {
+    let mut d = drawer()?;
+    if d.set_scale(scale) != scale {
+        eprintln!("SKIP: the device cannot draw at scale {scale}");
+        return None;
+    }
+    let mut mem = memory();
+    let mut s = Stream::default();
+    s.setup();
+    colour_bands(&mut s, &mut mem);
+    let (pitch, rows) = if msaa { (WIDE / 2, H / 2) } else { (WIDE, H) };
+    s.regs(RB_SURFACE_INFO, &[pitch | ((u32::from(msaa) * 2) << 16)]);
+    s.resolve_with(
+        &mut mem,
+        (pitch, rows),
+        4 | COPY_RAW,
+        (DEST2, WIDE | (rows << 16), dest_info(6, 0, false)),
+        [0; 3],
+    );
+    let report = run(&mut d, &s, &mut mem);
+    assert_eq!((report.draws, report.resolves), (16, 1), "{report:?}");
+    assert!(
+        !report.warnings.iter().any(|w| w.contains("aliases")),
+        "{report:?}"
+    );
+    let img = detiled(&mem, DEST2, pitch, rows, WIDE, 4);
+    Some(
+        (0..rows / 2)
+            .flat_map(|y| (0..pitch).map(move |x| (x, y)))
+            .map(|(x, y)| u32::from_le_bytes(px(&img, pitch, x, y)))
+            .collect(),
+    )
+}
+
+/// Depth restored through colour at twice the guest resolution: the tile
+/// halves swapped are 40 guest samples, not 40 host ones, so the depth
+/// words equal scale 1's, at one pitch and from a 1x colour target into
+/// the 4x MSAA depth at half its pitch (a pixel takes its first sample's
+/// colour column).
+#[test]
+fn colour_to_depth_at_scale_2_equals_scale_1() {
+    let swap = |x: u32| x - x % 80 + (x % 80 + 40) % 80;
+    for msaa in [false, true] {
+        let Some(one) = bands_as_depth(1, msaa) else {
+            return;
+        };
+        let (pitch, first) = if msaa { (WIDE / 2, 2) } else { (WIDE, 1) };
+        let want: Vec<u32> = (0..one.len() as u32)
+            .map(|i| band_word(swap(i % pitch * first)))
+            .collect();
+        assert_eq!(one, want, "scale 1, msaa {msaa}");
+        let Some(two) = bands_as_depth(2, msaa) else {
+            return;
+        };
+        assert_eq!(two, one, "scale 2 against scale 1, msaa {msaa}");
+    }
 }
