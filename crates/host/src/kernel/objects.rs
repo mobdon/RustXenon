@@ -237,7 +237,10 @@ pub fn nt_release_mutant(rt: &Runtime, c: &mut Context) {
     };
     match &*get(rt, a) {
         // The console returns this status when the caller does not own it.
-        KObj::Mutant(m) if m.try_leave() => ret(c, STATUS_SUCCESS),
+        KObj::Mutant(m) if m.try_leave() => {
+            xenon_rt::sync::signal_any();
+            ret(c, STATUS_SUCCESS)
+        }
         _ => ret(c, STATUS_MUTANT_NOT_OWNED),
     }
 }
@@ -346,7 +349,7 @@ fn wait_many(rt: &Runtime, objs: &[u32], all: bool, t: Option<Duration>) -> u32 
     let os: Vec<_> = objs.iter().map(|&a| get(rt, a)).collect();
     let _w = crate::waiting(objs.first().copied().unwrap_or(0), objs.len() as u32);
     // Every signalled-state change goes through Event::set,
-    // Semaphore::release or CriticalSection::try_leave, which wake this.
+    // Semaphore::release or nt_release_mutant, which wake this.
     let ready = || {
         os.iter()
             .position(|o| o.wait(Some(Duration::ZERO)))

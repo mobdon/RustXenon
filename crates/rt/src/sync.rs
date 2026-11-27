@@ -19,8 +19,10 @@ static ANY: (Mutex<u64>, Condvar) = (Mutex::new(0), Condvar::new());
 
 /// Wakes [`wait_any`] callers. Call after an object's state change that may
 /// satisfy a wait, with the object's own lock released. Costs one atomic
-/// load when nobody waits for several objects.
-fn signal_any() {
+/// load when nobody waits for several objects. [`CriticalSection`] does not
+/// call it, since guest critical sections are never in such a wait; mutant
+/// releases call it themselves.
+pub fn signal_any() {
     if ANY_WAITERS.load(Ordering::SeqCst) > 0 {
         *ANY.0.lock().unwrap() += 1;
         ANY.1.notify_all();
@@ -256,8 +258,6 @@ impl CriticalSection {
         if g.1 == 0 {
             g.0 = None;
             self.cv.notify_one();
-            drop(g);
-            signal_any();
         }
         true
     }
@@ -308,7 +308,7 @@ mod tests {
     }
 
     #[test]
-    fn wait_any_wakes_for_a_critical_section_leave() {
+    fn wait_any_wakes_for_a_mutant_release() {
         let cs = std::sync::Arc::new(CriticalSection::new());
         let (held, take) = std::sync::mpsc::channel();
         let cs2 = cs.clone();
@@ -317,6 +317,7 @@ mod tests {
             held.send(()).unwrap();
             thread::sleep(Duration::from_millis(20));
             cs2.leave();
+            signal_any();
         });
         take.recv().unwrap();
         assert_eq!(wait_any(LONG, || cs.try_enter().then_some(0)), Some(0));
@@ -325,7 +326,7 @@ mod tests {
     }
 
     #[test]
-    fn set_release_and_leave_bump_the_generation_while_someone_waits() {
+    fn set_and_release_bump_the_generation_while_someone_waits() {
         let bumps = |f: &dyn Fn()| {
             ANY_WAITERS.fetch_add(1, Ordering::SeqCst);
             let before = *ANY.0.lock().unwrap();
@@ -342,10 +343,6 @@ mod tests {
         assert!(bumps(&|| {
             s.release(1);
         }));
-        let cs = CriticalSection::new();
-        assert!(cs.enter(None) && cs.enter(None));
-        cs.leave();
-        assert!(bumps(&|| cs.leave()));
     }
 
     #[test]
