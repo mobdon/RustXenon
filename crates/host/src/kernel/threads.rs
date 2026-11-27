@@ -278,10 +278,37 @@ pub fn timeout(rt: &Runtime, p: u32) -> Option<std::time::Duration> {
     Some(std::time::Duration::from_nanos(ticks.saturating_mul(100)))
 }
 
+/// What a zero delay does after `run` back-to-back zero delays on one thread:
+/// yield for the first few so short waits stay fast, then sleep briefly so a
+/// guest polling loop stops burning a whole core.
+fn zero_delay_sleep(run: u32) -> Option<std::time::Duration> {
+    (run >= 64).then(|| std::time::Duration::from_micros(200))
+}
+
 pub fn ke_delay_execution_thread(rt: &Runtime, c: &mut Context) {
+    thread_local! {
+        static RUN: std::cell::Cell<(u32, Option<std::time::Instant>)> =
+            const { std::cell::Cell::new((0, None)) };
+    }
     match timeout(rt, arg(rt, c, 2)) {
-        Some(d) if !d.is_zero() => std::thread::sleep(d),
-        _ => std::thread::yield_now(),
+        Some(d) if !d.is_zero() => {
+            RUN.set((0, None));
+            std::thread::sleep(d)
+        }
+        _ => {
+            let now = std::time::Instant::now();
+            let (run, last) = RUN.get();
+            // A gap means the thread did real work in between: start over.
+            let run = match last {
+                Some(t) if now - t < std::time::Duration::from_millis(2) => run.saturating_add(1),
+                _ => 0,
+            };
+            RUN.set((run, Some(now)));
+            match zero_delay_sleep(run) {
+                Some(d) => std::thread::sleep(d),
+                None => std::thread::yield_now(),
+            }
+        }
     }
     ret(c, STATUS_SUCCESS);
 }
@@ -330,4 +357,18 @@ pub fn ke_tls_set_value(rt: &Runtime, c: &mut Context) {
 /// Shared by the main thread start in `lib.rs`.
 pub fn register_main(rt: &Arc<Runtime>, entry: u32) -> u32 {
     create(rt, k().default_stack, entry, 0, 0, false, 0).1
+}
+
+#[cfg(test)]
+mod tests {
+    use super::zero_delay_sleep;
+
+    #[test]
+    fn zero_delay_yields_then_sleeps() {
+        assert_eq!(zero_delay_sleep(0), None);
+        assert_eq!(zero_delay_sleep(63), None);
+        let d = zero_delay_sleep(64).unwrap();
+        assert!(!d.is_zero() && d.as_millis() < 1);
+        assert_eq!(zero_delay_sleep(u32::MAX), Some(d));
+    }
 }
