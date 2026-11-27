@@ -3252,6 +3252,10 @@ impl Drawer {
         let t = Instant::now();
         let replay = self.replays;
         (self.texture_groups).retain(|_, &mut (_, used)| used + 1 >= replay);
+        // A set a guest write invalidated still holds its old views (a resolve
+        // rewritten each frame is a new texture each frame): free them now.
+        let epoch = self.texture_memo_epoch;
+        (self.texture_sets).retain(|_, (_, e, kept)| *e == epoch && kept.load(Ordering::Relaxed));
         self.timings.edges += t.elapsed();
         if !self.watching || done.is_err() {
             self.wrap();
