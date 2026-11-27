@@ -1,5 +1,5 @@
-// Resolve of a colour render target to a 32bpp (or 16_16_16_16_FLOAT)
-// guest destination: the same conversion as formats::edram_rgba +
+// Resolve of a colour render target to a 32bpp (16_16_FLOAT included, or
+// 16_16_16_16_FLOAT) guest destination: the same conversion as formats::edram_rgba +
 // formats::resolve_pixel, then the 32x32 tiling and the destination endian,
 // one invocation per pixel.
 
@@ -15,7 +15,7 @@ struct Params {
     // snorm / 32), 9 16_16 float, 10 32_32 float.
     src_format: u32,
     // 0 8_8_8_8, 1 2_10_10_10, 2 32_FLOAT, 3 16_16, 4 16_16_16_16_FLOAT
-    // (64bpp).
+    // (64bpp), 5 16_16_FLOAT.
     dest_format: u32,
     swap: u32,
     // xenos::Endian128; 4 (8in64) only for 64bpp.
@@ -195,6 +195,8 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
         w = bitcast<u32>(c.r);
     } else if p.dest_format == 3u {
         w = to_unorm(c.r, 65535.0) | (to_unorm(c.g, 65535.0) << 16u);
+    } else if p.dest_format == 5u {
+        w = to_half(c.r) | (to_half(c.g) << 16u);
     } else {
         w = to_unorm(c.r, 1023.0) | (to_unorm(c.g, 1023.0) << 10u) | (to_unorm(c.b, 1023.0) << 20u)
             | (to_unorm(c.a, 3.0) << 30u);
@@ -281,7 +283,7 @@ struct DecodeParams {
     // decode_float only: 0 k_32_FLOAT to Rgba32Float, 1 k_32_FLOAT to
     // Rgba16Float, 2 k_16_16_16_16_FLOAT to Rgba16Float, 3 k_24_8 and 5
     // k_24_8_FLOAT to Rgba32Float, 4 k_24_8 and 6 k_24_8_FLOAT to
-    // Rgba16Float.
+    // Rgba16Float, 7 k_16_16_FLOAT to Rgba16Float.
     mode: u32,
     pad0: u32,
     pad1: u32,
@@ -334,13 +336,14 @@ fn from_20e4(f24: u32) -> f32 {
     return bitcast<f32>(((e + 112u) << 23u) | (m << 3u));
 }
 
-// A tiled k_32_FLOAT, k_16_16_16_16_FLOAT, k_24_8 or k_24_8_FLOAT texture
-// decoded from guest bytes kept on the GPU, as
+// A tiled k_32_FLOAT, k_16_16_FLOAT, k_16_16_16_16_FLOAT, k_24_8 or
+// k_24_8_FLOAT texture decoded from guest bytes kept on the GPU, as
 // xenon_texture::decode_base_level_f32 and the host conversion in
 // Drawer::guest_texture do on the CPU: the fetch endian, the tiling, the
 // texel as RRRR (k_32_FLOAT; the depth of k_24_8 and k_24_8_FLOAT, bits
-// 8..31, as unorm24 or 20e4) or four halves, the fetch swizzle, then f32
-// bits or halves (formats::f32_to_half) per host texel.
+// 8..31, as unorm24 or 20e4), four halves, or two as XYYY (k_16_16_FLOAT),
+// the fetch swizzle, then f32 bits or halves (formats::f32_to_half) per
+// host texel.
 @compute @workgroup_size(8, 8)
 fn decode_float(@builtin(global_invocation_id) id: vec3<u32>) {
     if id.x >= dp.w || id.y >= dp.h {
@@ -349,11 +352,17 @@ fn decode_float(@builtin(global_invocation_id) id: vec3<u32>) {
     let y = dp.y0 + id.y;
     var v: array<u32, 4>;
     var one = 0x3F800000u;
-    if dp.mode == 2u {
-        let o = dp.offset + (tiled_b(id.x, y, dp.pitch, 3u) >> 2u);
-        let lo = swap_endian(guest[o], dp.endian);
-        let hi = swap_endian(guest[o + 1u], dp.endian);
-        v = array<u32, 4>(lo & 0xFFFFu, lo >> 16u, hi & 0xFFFFu, hi >> 16u);
+    let halves = dp.mode == 2u || dp.mode == 7u;
+    if halves {
+        if dp.mode == 2u {
+            let o = dp.offset + (tiled_b(id.x, y, dp.pitch, 3u) >> 2u);
+            let lo = swap_endian(guest[o], dp.endian);
+            let hi = swap_endian(guest[o + 1u], dp.endian);
+            v = array<u32, 4>(lo & 0xFFFFu, lo >> 16u, hi & 0xFFFFu, hi >> 16u);
+        } else {
+            let w = swap_endian(guest[dp.offset + (tiled(id.x, y, dp.pitch) >> 2u)], dp.endian);
+            v = array<u32, 4>(w & 0xFFFFu, w >> 16u, w >> 16u, w >> 16u);
+        }
         // f32_to_half(half_to_f32(h)) keeps every half but NaNs: the
         // texture crate's half_to_f32 drops their sign, so all of them
         // become the positive quiet NaN 0x7E00.
@@ -389,7 +398,7 @@ fn decode_float(@builtin(global_invocation_id) id: vec3<u32>) {
         }
         return;
     }
-    if dp.mode != 2u {
+    if !halves {
         for (var i = 0u; i < 4u; i++) {
             out[i] = half_bits(out[i]);
         }

@@ -1588,9 +1588,6 @@ pub struct Drawer {
     snorm16: bool,
     /// The snorm16 targets blend (else their blending is dropped).
     snorm16_blend: bool,
-    /// [`formats::half_lut`] tables by source format and exponent bias, for
-    /// CPU resolves to 16-bit float destinations.
-    half_luts: HashMap<(TargetFormat, i32), Option<Vec<[u16; 2]>>>,
     /// Resolve destinations kept on the GPU, disjoint and not adjacent.
     mirrors: Vec<Mirror>,
     /// Entry points decode_8888 and decode_float of resolve.wgsl.
@@ -2763,7 +2760,6 @@ impl Drawer {
             float_stencil,
             snorm16,
             snorm16_blend,
-            half_luts: HashMap::default(),
             mirrors: Vec::new(),
             decode_pipelines: [None, None],
             skip_resolve_writeback: std::env::var("XENON_RESOLVE_WRITEBACK").as_deref() == Ok("skip"),
@@ -5174,6 +5170,7 @@ impl Drawer {
             (F::K32Float, H::Rgba32Float) => (Some(0), 4, 16),
             (F::K32Float, H::Rgba16Float) => (Some(1), 4, 8),
             (F::K16_16_16_16Float, H::Rgba16Float) => (Some(2), 8, 8),
+            (F::K16_16Float, H::Rgba16Float) => (Some(7), 4, 8),
             (F::K24_8, H::Rgba32Float) => (Some(3), 4, 16),
             (F::K24_8, H::Rgba16Float) => (Some(4), 4, 8),
             (F::K24_8Float, H::Rgba32Float) => (Some(5), 4, 16),
@@ -5529,6 +5526,24 @@ impl Drawer {
             .sum();
         report.timings.textures_uploaded += 1;
         report.timings.texture_bytes += uploaded;
+        if uploaded >= 8 << 20 {
+            // Names the textures that cost most to decode, once each.
+            let a = u64::from(fetch.base_address & PHYSICAL_MASK);
+            let near: Vec<String> = self
+                .mirrors
+                .iter()
+                .filter(|m| m.lo < a + base_len as u64 + (16 << 20) && a < m.hi + (16 << 20))
+                .map(|m| format!("{:#x}..{:#x}", m.lo, m.hi))
+                .collect();
+            report.warn(format!(
+                "large texture decoded from guest memory: {:?} {width}x{height} -> {host:?}, at {a:#x}, tiled {}, pitch {}, {} MB; kept resolves near it: [{}]",
+                fetch.format.data_format(),
+                fetch.tiled,
+                fetch.pitch_texels(),
+                uploaded >> 20,
+                near.join(", ")
+            ));
+        }
         let bucket = match host {
             wgpu::TextureFormat::Rgba8Unorm => 0,
             _ if host.is_compressed() => 1,
@@ -6886,15 +6901,13 @@ impl Drawer {
         if rect.is_empty() {
             return Ok(());
         }
-        // shortcut: 16_16_FLOAT copies, and 64bpp copies but
-        // 16_16_16_16_FLOAT from 7e3 / 16_16_16_16_FLOAT sources, take the
-        // CPU path; add them to resolve.wgsl if they show up in profiles.
-        let gpu = if dest_bytes == 4 {
-            r.is_depth || r.dest_format != formats::DEST_16_16_FLOAT
-        } else {
-            r.dest_format == formats::DEST_16_16_16_16_FLOAT
-                && matches!(format, TargetFormat::Float7e3 | TargetFormat::Rgba16Float)
-        };
+        // shortcut: 64bpp copies to k_16_16_16_16 and k_32_32_FLOAT, and to
+        // k_16_16_16_16_FLOAT from sources but 7e3 and 16_16_16_16_FLOAT,
+        // take the CPU path; add them to resolve.wgsl if they show up in
+        // profiles.
+        let gpu = dest_bytes == 4
+            || (r.dest_format == formats::DEST_16_16_16_16_FLOAT
+                && matches!(format, TargetFormat::Float7e3 | TargetFormat::Rgba16Float));
         if gpu {
             self.resolve_gpu(r, rect, format, dest_bytes as u32, &tex, mem)?;
             if dest_bytes == 4 {
@@ -6920,29 +6933,12 @@ impl Drawer {
         self.timings.readback_bytes += px.len() as u64;
         let src_bytes = px.len() / (rect.width() * rect.height()) as usize;
         let mut out = vec![0; px.len() / src_bytes * dest_bytes];
-        let half_dest = matches!(
-            r.dest_format,
-            formats::DEST_16_16_FLOAT | formats::DEST_16_16_16_16_FLOAT
-        );
-        let lut = if half_dest {
-            self.half_luts
-                .entry((format, r.dest_exp_bias))
-                .or_insert_with(|| formats::half_lut(format, r.dest_exp_bias))
-                .as_ref()
-        } else {
-            None
-        };
         for (src, dst) in px
             .chunks_exact(src_bytes)
             .zip(out.chunks_exact_mut(dest_bytes))
         {
-            match lut {
-                Some(lut) => formats::resolve_half_pixel(lut, src, r.dest_swap, dst),
-                None => {
-                    let rgba = formats::edram_rgba(format, src);
-                    formats::resolve_pixel(rgba, r.dest_exp_bias, r.dest_swap, r.dest_format, dst);
-                }
-            }
+            let rgba = formats::edram_rgba(format, src);
+            formats::resolve_pixel(rgba, r.dest_exp_bias, r.dest_swap, r.dest_format, dst);
         }
         let done = resolve::write_tiled_texels(
             mem,
@@ -6963,8 +6959,8 @@ impl Drawer {
         done
     }
 
-    /// 32bpp (or 16_16_16_16_FLOAT, `dest_bytes` 8) colour copy on the
-    /// GPU: resolve.wgsl converts, tiles and
+    /// 32bpp (16_16_FLOAT included, or 16_16_16_16_FLOAT, `dest_bytes` 8)
+    /// colour copy on the GPU: resolve.wgsl converts, tiles and
     /// swaps each pixel into the destination's guest bytes kept on the GPU
     /// (see [`Mirror`]). Same result as the CPU path in
     /// [`Self::resolve_copy`]. Nothing waits here: the bytes reach guest
@@ -7043,6 +7039,7 @@ impl Drawer {
                 formats::DEST_2_10_10_10 => 1,
                 formats::DEST_16_16 => 3,
                 formats::DEST_16_16_16_16_FLOAT => 4,
+                formats::DEST_16_16_FLOAT => 5,
                 _ => 2,
             },
             u32::from(r.dest_swap),

@@ -845,6 +845,99 @@ fn float_resolve_is_kept_for_the_next_replay() {
     }
 }
 
+const RT_16_16_FLOAT: u32 = 6;
+const FETCH_16_16_FLOAT: u32 = 31;
+/// Z, W, constant 0, constant 1: k_16_16_FLOAT's Z and W repeat its Y.
+const ZW01: u16 = 2 | (3 << 3) | (4 << 6) | (5 << 9);
+
+/// A 7e3 target resolved to k_16_16_FLOAT and fetched as k_16_16_FLOAT.
+const HALF2: FloatCase = FloatCase {
+    dest_format: FETCH_16_16_FLOAT,
+    fetch_format: FETCH_16_16_FLOAT,
+    ..HALF4
+};
+
+/// [`HALF2`] from a half target holding NaNs, infinities and negatives.
+const HALF2_SPECIALS: FloatCase = FloatCase {
+    rt: RT_16_16_16_16_FLOAT,
+    paint: paint_specials,
+    ..HALF2
+};
+
+/// [`HALF2_SPECIALS`] from a k_16_16_FLOAT target.
+const HALF2_FROM_RG16F: FloatCase = FloatCase {
+    rt: RT_16_16_FLOAT,
+    ..HALF2_SPECIALS
+};
+
+/// 7e3 and half NaNs, infinities, negatives and denormals resolved to
+/// k_16_16_FLOAT and fetched as k_16_16_FLOAT in the same replay at every
+/// 32bpp endian and several swizzles (Z and W included): decoded on the
+/// GPU, nothing read back or uploaded, and bit for bit the halves the guest
+/// path samples. The next replay still samples it from the GPU.
+#[test]
+fn half2_resolves_are_kept_and_match_the_guest_path() {
+    for (case, endian, swizzle) in [
+        (&HALF2, 2, IDENTITY),
+        (&HALF2, 0, BGR1),
+        (&HALF2, 1, ZW01),
+        (&HALF2, 3, IDENTITY),
+        (&HALF2_SPECIALS, 2, IDENTITY),
+        (&HALF2_SPECIALS, 3, ZW01),
+        (&HALF2_FROM_RG16F, 2, BGR1),
+        (&HALF2_FROM_RG16F, 1, IDENTITY),
+    ] {
+        let f = fetch(case.fetch_format, endian, swizzle);
+        let Some(mut d) = case.drawer() else { return };
+        let mut mem = memory();
+        vertices(&mut mem);
+        let mut s = Stream::default();
+        case.paint_and_resolve(s.setup(), &mut mem, endian);
+        case.sample(&mut s, f);
+        let r = run(&mut d, &s, &mut mem);
+        assert!(r.unsupported.is_empty(), "{r:?}");
+        if case.rt != HALF2.rt && endian == 2 {
+            // 8in32 leaves each half big-endian: negative NaNs, which the
+            // guest path decodes as positive NaNs.
+            let dest = &mem.data[DEST as usize..(DEST + W * H * 4) as usize];
+            assert!(
+                dest.chunks(2)
+                    .any(|h| h[0] >= 0xFC && (h[0] & 3, h[1]) != (0, 0)),
+                "no negative NaN"
+            );
+        }
+        let t = &r.timings;
+        assert_eq!(
+            (t.textures_kept, t.kept_bytes),
+            (1, u64::from(W * H * 4)),
+            "{r:?}"
+        );
+        assert_eq!((t.textures_uploaded, t.hashed_bytes), (0, 0), "{r:?}");
+        let kept = d
+            .read_render_target_raw(case.out_key(), 0, 0, W, H)
+            .unwrap();
+        let distinct: std::collections::HashSet<_> = kept.chunks(8).collect();
+        assert!(distinct.len() >= 64, "{}", distinct.len());
+        // The next replay samples the same texture, still kept.
+        let mut s = Stream::default();
+        case.sample(s.setup(), f);
+        let r = run(&mut d, &s, &mut mem);
+        let t = &r.timings;
+        assert_eq!(
+            (t.textures_kept, t.textures_uploaded, t.hashed_bytes),
+            (1, 0, 0),
+            "{r:?}"
+        );
+        let next = d
+            .read_render_target_raw(case.out_key(), 0, 0, W, H)
+            .unwrap();
+        drop(d);
+        let guest = case.guest_path(&mem, f);
+        assert!(kept == guest, "rt {} endian {endian}", case.rt);
+        assert!(next == guest, "next replay: rt {} endian {endian}", case.rt);
+    }
+}
+
 const FETCH_24_8: u32 = 22;
 const FETCH_24_8_FLOAT: u32 = 23;
 /// The depth gradient quad of [`depth_resolve`], after the other vertex data.

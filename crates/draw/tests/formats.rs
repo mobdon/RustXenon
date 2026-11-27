@@ -672,6 +672,133 @@ fn gpu_half4_resolve_matches_cpu_reference() {
     }
 }
 
+/// The GPU resolve of every colour source format to k_16_16_FLOAT matches
+/// the CPU packer ([`xenon_draw::formats::edram_rgba`],
+/// [`xenon_draw::formats::resolve_pixel`], then
+/// [`xenon_draw::resolve::write_tiled_texels`]) byte for byte, over a
+/// gradient and a corner of a negative NaN, a negative, -inf and a negative
+/// denormal, with biases that overflow to infinity and reach half
+/// denormals, the red/blue swap and every 32bpp endian.
+#[test]
+fn gpu_half2_resolve_matches_cpu_reference() {
+    use xenon_draw::{formats, resolve};
+    let Some(mut d) = drawer() else { return };
+    let (w2, h2) = ((2 * W) as f32, (2 * H) as f32);
+    let verts = color_verts(&[
+        (0.0, 0.0, 0.0, [0, 0, 0, 0]),
+        (w2, 0.0, 0.0, [255, 128, 3, 255]),
+        (0.0, h2, 0.0, [7, 255, 255, 64]),
+    ]);
+    const SPECIAL: u32 = VERTS + 0x100;
+    let corner = color_verts(&[
+        (0.0, 0.0, 0.0, [0; 4]),
+        (8.0, 0.0, 0.0, [0; 4]),
+        (0.0, 8.0, 0.0, [0; 4]),
+    ]);
+    // (exponent bias, swap, endian)
+    let cases = [
+        (0, false, 0),
+        (3, true, 1),
+        (-2, false, 2),
+        (15, true, 3),
+        (-20, false, 2),
+        (31, false, 0),
+        (-12, true, 2),
+    ];
+    let snorm16 = d.snorm16();
+    let mut failed = Vec::new();
+    for (rt, format) in [
+        (0, TargetFormat::Rgba8),
+        (RT_2_10_10_10, TargetFormat::Rgb10a2),
+        (3, TargetFormat::Float7e3),
+        (RT_2_10_10_10_FLOAT_AS_16_16_16_16, TargetFormat::Float7e3),
+        (RT_16_16_16_16_FLOAT, TargetFormat::Rgba16Float),
+        (RT_16_16, TargetFormat::Rg16Fixed),
+        (RT_16_16_16_16, TargetFormat::Rgba16Fixed),
+        (RT_16_16_FLOAT, TargetFormat::Rg16Float),
+        (RT_32_FLOAT, TargetFormat::Float32),
+        (RT_32_32_FLOAT, TargetFormat::Rg32Float),
+    ]
+    .into_iter()
+    .filter(|(rt, _)| snorm16 || !matches!(*rt, RT_16_16 | RT_16_16_16_16))
+    {
+        let mut mem = memory();
+        mem.write_words(VERTS, &verts);
+        mem.write_words(SPECIAL, &corner);
+        let mut s = Stream::default();
+        s.setup()
+            .regs(RB_COLOR_INFO, &[rt << 16])
+            .shader(false, &vs_color())
+            .shader(true, &ps_interp())
+            .vertex_fetch(0, VERTS, 12)
+            .draw_auto(PRIM_TRI_LIST, 3)
+            .shader(true, &ps_const())
+            .regs(
+                SHADER_CONSTANT_FLOAT + 256 * 4,
+                &[0xFFC0_0000, f(-1.5), 0xFF80_0000, f(-(2f32).powi(-24))],
+            )
+            .vertex_fetch(0, SPECIAL, 12)
+            .draw_auto(PRIM_RECT_LIST, 3);
+        let dest = |i: usize| DEST + 0x1_0000 * i as u32;
+        for (i, &(bias, swap, endian)) in cases.iter().enumerate() {
+            s.resolve_with(
+                &mut mem,
+                (W, H),
+                COPY_CONVERT,
+                (
+                    dest(i),
+                    W | (H << 16),
+                    (dest_info(formats::DEST_16_16_FLOAT, bias, swap) & !3) | endian,
+                ),
+                [0; 3],
+            );
+        }
+        let report = run(&mut d, &s, &mut mem);
+        assert_eq!(report.resolves, cases.len() as u32, "{report:?}");
+        assert!(report.unsupported.is_empty(), "{report:?}");
+        let raw = d.read_render_target_raw(key(format), 0, 0, W, H).unwrap();
+        let src_bytes = raw.len() / (W * H) as usize;
+        let mut expected = memory();
+        for (i, &(bias, swap, endian)) in cases.iter().enumerate() {
+            let mut out = vec![0; (W * H * 4) as usize];
+            for (src, dst) in raw.chunks_exact(src_bytes).zip(out.chunks_exact_mut(4)) {
+                let rgba = formats::edram_rgba(format, src);
+                formats::resolve_pixel(rgba, bias, swap, formats::DEST_16_16_FLOAT, dst);
+            }
+            let rect = resolve::Rect {
+                x0: 0,
+                y0: 0,
+                x1: W,
+                y1: H,
+            };
+            resolve::write_tiled_texels(&mut expected, dest(i), W, rect, &out, 2, endian).unwrap();
+            let range = dest(i) as usize..(dest(i) + W * H * 4) as usize;
+            let distinct: std::collections::HashSet<_> =
+                mem.data[range.clone()].chunks(4).collect();
+            // Bias 31 overflows every non-zero value to infinity; the swap
+            // leaves a k_32_FLOAT source's two channels zero.
+            let blank = bias == 31 || (swap && format == TargetFormat::Float32);
+            let want = if blank { 0 } else { 8 };
+            assert!(
+                distinct.len() > want,
+                "{format:?} rt {rt} case {i}: {}",
+                distinct.len()
+            );
+            let got = &mem.data[range.clone()];
+            if let Some(at) = (0..got.len() / 4).find(|&k| {
+                got[4 * k..4 * k + 4] != expected.data[range.start + 4 * k..range.start + 4 * k + 4]
+            }) {
+                failed.push(format!(
+                    "{format:?} rt {rt} case {i} word {at}: {:02x?} want {:02x?}",
+                    &got[4 * at..4 * at + 4],
+                    &expected.data[range.start + 4 * at..range.start + 4 * at + 4]
+                ));
+            }
+        }
+    }
+    assert!(failed.is_empty(), "{failed:#?}");
+}
+
 /// Draws a quad over the whole k_16_16_16_16_FLOAT target sampling a 1x1
 /// linear texture of `format` (endian none, swizzle RGBA, point filter)
 /// whose guest bytes are `texel_bytes`, and returns the halves at (8, 8).
