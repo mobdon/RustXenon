@@ -3662,10 +3662,17 @@ impl Drawer {
     }
 
     /// Index of the kept resolve buffer holding `[lo, hi)`, which a resolve
-    /// is about to write, made from guest memory if there is none. Kept buffers it overlaps or touches are
+    /// is about to write (`resolve`) or a texture to read, made from guest
+    /// memory if there is none. Kept buffers it overlaps or touches are
     /// written back and merged into it, so a texture over several resolves
     /// (tiles, one under the other) is in one buffer.
-    fn mirror(&mut self, mem: &mut Tracked, lo: u64, hi: u64) -> Result<Option<usize>, Error> {
+    fn mirror(
+        &mut self,
+        mem: &mut Tracked,
+        lo: u64,
+        hi: u64,
+        resolve: bool,
+    ) -> Result<Option<usize>, Error> {
         if let Some(i) = self.mirrors.iter().position(|m| m.lo <= lo && hi <= m.hi) {
             if self.verify(i, mem, lo, hi) {
                 return Ok(Some(i));
@@ -3723,7 +3730,7 @@ impl Drawer {
         // it writes them back.
         let covers = |k: u64| {
             let s = a + k * KEPT_BLOCK;
-            !self.skip_resolve_writeback && lo <= s && (s + KEPT_BLOCK).min(b) <= hi
+            resolve && !self.skip_resolve_writeback && lo <= s && (s + KEPT_BLOCK).min(b) <= hi
         };
         let covered: Vec<bool> = (0..(b - a).div_ceil(KEPT_BLOCK)).map(covers).collect();
         let hashes = bytes
@@ -5237,16 +5244,12 @@ impl Drawer {
         constant: [u32; 6],
         addr: u64,
         end: u64,
-        mem: &Tracked,
+        mem: &mut Tracked,
     ) -> Result<Option<(wgpu::TextureView, u64, u64)>, Skip> {
         use xenon_texture::{Dimension, TextureFormat as F};
-        let Some(i) = self
-            .mirrors
-            .iter()
-            .position(|m| m.lo <= addr && end <= m.hi)
-        else {
+        if !self.mirrors.iter().any(|m| m.lo < end && addr < m.hi) {
             return Ok(None);
-        };
+        }
         use wgpu::TextureFormat as H;
         let (w, h) = (fetch.width(), fetch.height());
         let pitch = xenon_texture::tile::align_to_tile(fetch.pitch_texels());
@@ -5268,12 +5271,29 @@ impl Drawer {
         if !fetch.tiled
             || fetch.dimension != Dimension::D2OrStacked
             || fetch.stacked
-            || !(addr - self.mirrors[i].lo).is_multiple_of(4)
             || pitch < w
             || w > self.max_dim
             || h > self.max_dim
-            || !self.verify(i, mem, addr, end)
         {
+            return Ok(None);
+        }
+        // A texture over kept resolves and bytes no resolve wrote (resolves
+        // into tiles of a larger surface) gets one kept buffer over all of
+        // it, made from guest memory with the resolves merged in, so it is
+        // decoded on the GPU too and later resolves into it stay there.
+        let i = match self
+            .mirrors
+            .iter()
+            .position(|m| m.lo <= addr && end <= m.hi)
+        {
+            Some(i) => i,
+            None if end - addr <= self.max_storage => match self.mirror(mem, addr, end, false)? {
+                Some(i) => i,
+                None => return Ok(None),
+            },
+            None => return Ok(None),
+        };
+        if !(addr - self.mirrors[i].lo).is_multiple_of(4) || !self.verify(i, mem, addr, end) {
             return Ok(None);
         }
         // (width, height, pitch, guest address) of each level decoded.
@@ -7068,7 +7088,7 @@ impl Drawer {
             return unsupported(format!("resolve destination of {extent} bytes"));
         }
         let (lo, hi) = (u64::from(base), u64::from(base) + u64::from(extent));
-        let Some(i) = self.mirror(mem, lo, hi)? else {
+        let Some(i) = self.mirror(mem, lo, hi, true)? else {
             return unsupported(format!("resolve destination 0x{base:08X} is not readable"));
         };
         let src_format = match format {
