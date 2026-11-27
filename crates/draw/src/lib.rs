@@ -5220,7 +5220,7 @@ impl Drawer {
     /// all of its guest bytes `[addr, end)`, as [`Self::guest_texture`]
     /// would decode them; `None` for the guest path. Only tiled 2D
     /// k_8_8_8_8 layouts that host as `Rgba8Unorm`, k_32_FLOAT,
-    /// k_16_16_16_16_FLOAT and the depth formats k_24_8 and k_24_8_FLOAT
+    /// k_16_16_FLOAT, k_16_16_16_16_FLOAT and the depth formats k_24_8 and k_24_8_FLOAT
     /// (any endian, swizzle and resolve format, as the bytes are the
     /// guest's) are decoded here. Mip levels before the packed tail, up to
     /// the fetch's last one, that the same kept resolve holds are decoded
@@ -5253,6 +5253,7 @@ impl Drawer {
             (F::K32Float, H::Rgba32Float) => (Some(0), 4, 16),
             (F::K32Float, H::Rgba16Float) => (Some(1), 4, 8),
             (F::K16_16_16_16Float, H::Rgba16Float) => (Some(2), 8, 8),
+            (F::K16_16Float, H::Rgba16Float) => (Some(7), 4, 8),
             (F::K24_8, H::Rgba32Float) => (Some(3), 4, 16),
             (F::K24_8, H::Rgba16Float) => (Some(4), 4, 8),
             (F::K24_8Float, H::Rgba32Float) => (Some(5), 4, 16),
@@ -6943,15 +6944,12 @@ impl Drawer {
         if rect.is_empty() {
             return Ok(());
         }
-        // shortcut: 16_16_FLOAT copies, and 64bpp copies but
-        // 16_16_16_16_FLOAT from 7e3 / 16_16_16_16_FLOAT sources, take the
-        // CPU path; add them to resolve.wgsl if they show up in profiles.
-        let gpu = if dest_bytes == 4 {
-            r.is_depth || r.dest_format != formats::DEST_16_16_FLOAT
-        } else {
-            r.dest_format == formats::DEST_16_16_16_16_FLOAT
-                && matches!(format, TargetFormat::Float7e3 | TargetFormat::Rgba16Float)
-        };
+        // shortcut: 64bpp copies but 16_16_16_16_FLOAT from 7e3 /
+        // 16_16_16_16_FLOAT sources take the CPU path; add them to
+        // resolve.wgsl if they show up in profiles.
+        let gpu = dest_bytes == 4
+            || (r.dest_format == formats::DEST_16_16_16_16_FLOAT
+                && matches!(format, TargetFormat::Float7e3 | TargetFormat::Rgba16Float));
         if gpu {
             self.resolve_gpu(r, rect, format, dest_bytes as u32, &tex, mem)?;
             if dest_bytes == 4 {
@@ -7095,6 +7093,7 @@ impl Drawer {
                 formats::DEST_2_10_10_10 => 1,
                 formats::DEST_16_16 => 3,
                 formats::DEST_16_16_16_16_FLOAT => 4,
+                formats::DEST_16_16_FLOAT => 5,
                 _ => 2,
             },
             u32::from(r.dest_swap),

@@ -672,6 +672,100 @@ fn gpu_half4_resolve_matches_cpu_reference() {
     }
 }
 
+/// The GPU resolve of 7e3 and k_16_16_FLOAT targets to k_16_16_FLOAT
+/// matches the CPU packer ([`xenon_draw::formats::edram_rgba`] and
+/// [`xenon_draw::formats::resolve_pixel`], then
+/// [`xenon_draw::resolve::write_tiled_texels`]) byte for byte, with
+/// biases, the red/blue swap and every 32bpp endian.
+#[test]
+fn gpu_half2_resolve_matches_cpu_reference() {
+    use xenon_draw::{formats, resolve};
+    let Some(mut d) = drawer() else { return };
+    let (w2, h2) = ((2 * W) as f32, (2 * H) as f32);
+    let verts = color_verts(&[
+        (0.0, 0.0, 0.0, [0, 0, 0, 0]),
+        (w2, 0.0, 0.0, [255, 128, 3, 255]),
+        (0.0, h2, 0.0, [7, 255, 255, 64]),
+    ]);
+    // (exponent bias, swap, endian)
+    let cases = [
+        (0, false, 0),
+        (3, true, 1),
+        (-2, false, 2),
+        (15, true, 3),
+        (-20, false, 2),
+        (31, false, 2),
+    ];
+    for (rt, format, texel) in [
+        (3, TargetFormat::Float7e3, 8),
+        (RT_16_16_FLOAT, TargetFormat::Rg16Float, 4),
+    ] {
+        let mut mem = memory();
+        mem.write_words(VERTS, &verts);
+        let mut s = Stream::default();
+        s.setup()
+            .regs(RB_COLOR_INFO, &[rt << 16])
+            .shader(false, &vs_color())
+            .shader(true, &ps_interp())
+            .vertex_fetch(0, VERTS, 12)
+            .draw_auto(PRIM_TRI_LIST, 3);
+        let dest = |i: usize| DEST + 0x1_0000 * i as u32;
+        for (i, &(bias, swap, endian)) in cases.iter().enumerate() {
+            s.resolve_with(
+                &mut mem,
+                (W, H),
+                COPY_CONVERT,
+                (
+                    dest(i),
+                    W | (H << 16),
+                    (dest_info(formats::DEST_16_16_FLOAT, bias, swap) & !7) | endian,
+                ),
+                [0; 3],
+            );
+        }
+        let report = run(&mut d, &s, &mut mem);
+        assert_eq!(report.resolves, cases.len() as u32, "{report:?}");
+        assert!(report.unsupported.is_empty(), "{report:?}");
+        // Taken on the GPU: no resolve readback.
+        assert_eq!(report.timings.submits_by_site[0], 0, "{report:?}");
+        let raw = d.read_render_target_raw(key(format), 0, 0, W, H).unwrap();
+        let mut expected = memory();
+        for (i, &(bias, swap, endian)) in cases.iter().enumerate() {
+            let mut out = vec![0; (W * H * 4) as usize];
+            for (src, dst) in raw.chunks_exact(texel).zip(out.chunks_exact_mut(4)) {
+                let rgba = formats::edram_rgba(format, src);
+                formats::resolve_pixel(rgba, bias, swap, formats::DEST_16_16_FLOAT, dst);
+            }
+            let rect = resolve::Rect {
+                x0: 0,
+                y0: 0,
+                x1: W,
+                y1: H,
+            };
+            resolve::write_tiled_texels(&mut expected, dest(i), W, rect, &out, 2, endian).unwrap();
+            let range = dest(i) as usize..(dest(i) + W * H * 4) as usize;
+            let distinct: std::collections::HashSet<_> =
+                mem.data[range.clone()].chunks(4).collect();
+            // Bias 31 overflows every non-zero value to infinity; -20
+            // leaves two channels of mostly half denormals.
+            let want = match bias {
+                31 => 0,
+                -20 => 50,
+                _ => 200,
+            };
+            assert!(
+                distinct.len() > want,
+                "{format:?} case {i}: {}",
+                distinct.len()
+            );
+            assert!(
+                mem.data[range.clone()] == expected.data[range],
+                "{format:?} case {i}"
+            );
+        }
+    }
+}
+
 /// At scale 2 a guest pixel of a 7e3 target averages its host pixels as
 /// the EDRAM holds them: an additive blend leaves 64.0 in the covered host
 /// pixels of the rectangle's edge, which count as 31.875. The CPU read and
@@ -1112,8 +1206,8 @@ fn clear_draw_resolve(
 /// holds the shader output / 32. A clear writes the raw 16-bit values
 /// (0x7FFF is 32, 0xC000 is -16.0005), a resolve unpacks x * 32 / 32767
 /// floored at -1 (Xenia XeUnpackR16G16Edram) and packs it with the
-/// exponent bias: to 8_8_8_8 and 16_16 (unorm) and 32_FLOAT on the GPU,
-/// to 16_16_FLOAT on the CPU.
+/// exponent bias: to 8_8_8_8, 16_16 (unorm), 32_FLOAT and 16_16_FLOAT on
+/// the GPU.
 #[test]
 fn fixed16_target_clear_draw_and_resolve() {
     use xenon_draw::formats::*;

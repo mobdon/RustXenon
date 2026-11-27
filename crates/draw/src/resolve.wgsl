@@ -15,7 +15,7 @@ struct Params {
     // snorm / 32), 9 16_16 float, 10 32_32 float.
     src_format: u32,
     // 0 8_8_8_8, 1 2_10_10_10, 2 32_FLOAT, 3 16_16, 4 16_16_16_16_FLOAT
-    // (64bpp).
+    // (64bpp), 5 16_16_FLOAT.
     dest_format: u32,
     swap: u32,
     // xenos::Endian128; 4 (8in64) only for 64bpp.
@@ -308,6 +308,8 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
         w = bitcast<u32>(c.r);
     } else if p.dest_format == 3u {
         w = to_unorm(c.r, 65535.0) | (to_unorm(c.g, 65535.0) << 16u);
+    } else if p.dest_format == 5u {
+        w = to_half(c.r) | (to_half(c.g) << 16u);
     } else {
         w = to_unorm(c.r, 1023.0) | (to_unorm(c.g, 1023.0) << 10u) | (to_unorm(c.b, 1023.0) << 20u)
             | (to_unorm(c.a, 3.0) << 30u);
@@ -396,7 +398,7 @@ struct DecodeParams {
     // decode_float only: 0 k_32_FLOAT to Rgba32Float, 1 k_32_FLOAT to
     // Rgba16Float, 2 k_16_16_16_16_FLOAT to Rgba16Float, 3 k_24_8 and 5
     // k_24_8_FLOAT to Rgba32Float, 4 k_24_8 and 6 k_24_8_FLOAT to
-    // Rgba16Float.
+    // Rgba16Float, 7 k_16_16_FLOAT to Rgba16Float.
     mode: u32,
     pad0: u32,
     pad1: u32,
@@ -464,11 +466,17 @@ fn decode_float(@builtin(global_invocation_id) id: vec3<u32>) {
     let y = dp.y0 + id.y;
     var v: array<u32, 4>;
     var one = 0x3F800000u;
-    if dp.mode == 2u {
-        let o = dp.offset + (tiled_b(id.x, y, dp.pitch, 3u) >> 2u);
-        let lo = swap_endian(guest[o], dp.endian);
-        let hi = swap_endian(guest[o + 1u], dp.endian);
-        v = array<u32, 4>(lo & 0xFFFFu, lo >> 16u, hi & 0xFFFFu, hi >> 16u);
+    if dp.mode == 2u || dp.mode == 7u {
+        if dp.mode == 2u {
+            let o = dp.offset + (tiled_b(id.x, y, dp.pitch, 3u) >> 2u);
+            let lo = swap_endian(guest[o], dp.endian);
+            let hi = swap_endian(guest[o + 1u], dp.endian);
+            v = array<u32, 4>(lo & 0xFFFFu, lo >> 16u, hi & 0xFFFFu, hi >> 16u);
+        } else {
+            // k_16_16_FLOAT reads as XYYY (xenon_texture convert::texel).
+            let w = swap_endian(guest[dp.offset + (tiled(id.x, y, dp.pitch) >> 2u)], dp.endian);
+            v = array<u32, 4>(w & 0xFFFFu, w >> 16u, w >> 16u, w >> 16u);
+        }
         // f32_to_half(half_to_f32(h)) keeps every half but NaNs: the
         // texture crate's half_to_f32 drops their sign, so all of them
         // become the positive quiet NaN 0x7E00.
@@ -504,7 +512,7 @@ fn decode_float(@builtin(global_invocation_id) id: vec3<u32>) {
         }
         return;
     }
-    if dp.mode != 2u {
+    if dp.mode != 2u && dp.mode != 7u {
         for (var i = 0u; i < 4u; i++) {
             out[i] = half_bits(out[i]);
         }

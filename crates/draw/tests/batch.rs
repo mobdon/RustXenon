@@ -694,7 +694,7 @@ fn resolve_clears_join_the_next_batch() {
     assert_eq!(t.submits, 4, "{t:?}");
 }
 
-/// A resolve copy taken on the CPU (16_16_FLOAT destination) counts its
+/// A resolve copy taken on the CPU (16_16_16_16 destination) counts its
 /// readback submit as a resolve submit.
 #[test]
 fn cpu_resolve_readback_counts_as_resolve_submit() {
@@ -712,7 +712,7 @@ fn cpu_resolve_readback_counts_as_resolve_submit() {
             &mut mem,
             (W, H),
             COPY_RAW,
-            (DEST, W | (H << 16), dest_info(31, 0, false)),
+            (DEST, W | (H << 16), dest_info(26, 0, false)),
             [0; 3],
         );
     let report = run(&mut d, &s, &mut mem);

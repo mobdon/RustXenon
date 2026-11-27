@@ -25,6 +25,8 @@ const OUT: RenderTargetKey = RenderTargetKey {
 const IDENTITY: u16 = (1 << 3) | (2 << 6) | (3 << 9);
 /// B, G, R, constant 1.
 const BGR1: u16 = 2 | (1 << 3) | (5 << 9);
+/// R, G, constant 1, constant 1.
+const XY11: u16 = (1 << 3) | (5 << 6) | (5 << 9);
 
 /// Fetch constant of a tiled 64x64 texture at DEST, point sampled.
 fn fetch(format: u32, endian: u32, swizzle: u16) -> [u32; 6] {
@@ -632,6 +634,8 @@ fn wider_destination_pitch_keeps_the_columns() {
 const RT_2_10_10_10_FLOAT: u32 = 3;
 const RT_16_16_16_16_FLOAT: u32 = 7;
 const RT_32_FLOAT: u32 = 14;
+const RT_16_16_FLOAT: u32 = 6;
+const FETCH_16_16_FLOAT: u32 = 31;
 const FETCH_16_16_16_16_FLOAT: u32 = 32;
 const FETCH_32_FLOAT: u32 = 36;
 
@@ -658,6 +662,19 @@ const HALF4: FloatCase = FloatCase {
     out: TargetFormat::Rgba16Float,
     paint,
     float32: true,
+};
+
+/// A 7e3 target resolved to and fetched as k_16_16_FLOAT.
+const HALF2: FloatCase = FloatCase {
+    dest_format: FETCH_16_16_FLOAT,
+    fetch_format: FETCH_16_16_FLOAT,
+    ..HALF4
+};
+
+/// [`HALF2`] from a k_16_16_FLOAT target.
+const HALF2_RG: FloatCase = FloatCase {
+    rt: RT_16_16_FLOAT,
+    ..HALF2
 };
 
 /// [`HALF4`] from a half target holding NaNs, infinities and negatives.
@@ -765,6 +782,32 @@ fn float_resolves_are_kept_and_match_the_guest_path() {
         (&FLOAT32_AS_HALF, 2, IDENTITY, 4),
         (&FLOAT32_AS_HALF, 3, BGR1, 4),
     ] {
+        kept_matches_guest_path(case, endian, swizzle, bytes);
+    }
+}
+
+/// 7e3 and k_16_16_FLOAT targets resolved to k_16_16_FLOAT and fetched as
+/// k_16_16_FLOAT (XYYY, uploaded as `Rgba16Float`) at several endians and
+/// swizzles: kept on the GPU and bit for bit what the guest path samples.
+#[test]
+fn half2_resolves_are_kept_and_match_the_guest_path() {
+    for (case, endian, swizzle) in [
+        (&HALF2, 2, IDENTITY),
+        (&HALF2, 0, XY11),
+        (&HALF2, 1, BGR1),
+        (&HALF2, 3, IDENTITY),
+        (&HALF2_RG, 2, XY11),
+        (&HALF2_RG, 0, IDENTITY),
+    ] {
+        kept_matches_guest_path(case, endian, swizzle, 4);
+    }
+}
+
+/// Resolves `case` with `endian`, samples it with `swizzle` in the same
+/// replay and checks it is kept (`bytes` per texel) and matches the guest
+/// path.
+fn kept_matches_guest_path(case: &FloatCase, endian: u32, swizzle: u16, bytes: u32) {
+    {
         // The fetch endian undoes the resolve's within each word; 8in64
         // also swaps the words, which a fetch cannot undo.
         let fetch_endian = if endian == 4 { 2 } else { endian };
