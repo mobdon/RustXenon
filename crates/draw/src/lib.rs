@@ -1248,6 +1248,15 @@ type TextureGroupKey = (u32, Vec<(wgpu::TextureView, wgpu::Sampler)>);
 /// each slot's packed fetch filter overrides ([`pack_filters`]).
 type TextureSetKey = (u32, Vec<([u32; 6], u32)>);
 
+/// A [`Drawer::texture_sets`] entry.
+type TextureSet = (
+    wgpu::BindGroup,
+    u64,
+    Arc<AtomicBool>,
+    Vec<([u32; 6], u64)>,
+    u64,
+);
+
 /// A fetch instruction's filter overrides as one word: 0 for none, else
 /// bit 31 with mag, min, mip and aniso in bytes 0 to 3.
 fn pack_filters(f: Option<[u8; 4]>) -> u32 {
@@ -1510,17 +1519,18 @@ pub struct Drawer {
     /// samplers, with the replay that last bound each. Kept across flushes
     /// and replays (a new texture has a new view, so a stale entry never
     /// matches); at the end of a replay those not bound in it or the one
-    /// before go, and all go when textures are evicted and past
-    /// [`TEXTURE_GROUP_CAP`], so they keep dropped textures alive no longer
-    /// than that. (Cleared at every replay's end, a frame made its
+    /// before go, those binding a texture go when it is evicted, and all go
+    /// past [`TEXTURE_GROUP_CAP`], so they keep dropped textures alive no
+    /// longer than that. (Cleared at every replay's end, a frame made its
     /// thousands again: a tenth of the draw thread.)
     texture_groups: HashMap<TextureGroupKey, (wgpu::BindGroup, u64)>,
     /// A draw's texture bind group by its slot mask and the fetch constants
     /// of those slots, with the [`Drawer::texture_memo_epoch`] it was found
-    /// in and a flag that stays set while the memo keeps its textures: a
+    /// in, a flag that stays set while the memo keeps its textures, and its
+    /// textures' cache keys with the replay that last marked them used: a
     /// later draw with the same constants binds it without looking each
     /// texture up again.
-    texture_sets: HashMap<TextureSetKey, (wgpu::BindGroup, u64, Arc<AtomicBool>)>,
+    texture_sets: HashMap<TextureSetKey, TextureSet>,
     /// The flags of the sets each fetch constant is in: a guest write that
     /// drops the constant's memo entry clears them, so only the sets using
     /// that texture go (dropping them all made a third of draws miss).
@@ -1693,7 +1703,7 @@ pub struct Drawer {
     decode_in_batch: bool,
     late: Option<(Vec<Vec<Option<u64>>>, WriteBack)>,
     /// Bytes of decoded guest textures the texture cache keeps before
-    /// evicting the least recently used ones (default 256 MiB).
+    /// evicting the least recently used ones (default 512 MiB).
     pub texture_cache_limit: u64,
     /// Decoded guest textures the texture cache keeps however small
     /// (default [`TEXTURE_CACHE_COUNT`]).
@@ -2021,12 +2031,13 @@ type TextureMemo = (wgpu::TextureView, u64, u64, Option<([u32; 6], u64)>);
 /// Entries [`Drawer::texture_memo`] holds before it starts over.
 const TEXTURE_MEMO_CAP: usize = 1 << 14;
 
-/// Cached textures are dropped wholesale past this many bytes.
-const TEXTURE_CACHE_LIMIT: u64 = 256 << 20;
+/// Cached textures past this many bytes are evicted, least recently used
+/// first. Host memory, not guest: modest for small GPUs and lavapipe.
+const TEXTURE_CACHE_LIMIT: u64 = 512 << 20;
 
 /// Cached textures past this many are dropped too: small ones each cost a
 /// texture and view in the driver however few bytes they hold.
-const TEXTURE_CACHE_COUNT: usize = 2048;
+const TEXTURE_CACHE_COUNT: usize = 8192;
 
 fn to_bytes(words: &[u32]) -> Vec<u8> {
     let mut out = Vec::with_capacity(4 * words.len());
@@ -5678,24 +5689,23 @@ impl Drawer {
             .map(|(k, &(_, len, used))| (used, len, *k))
             .collect();
         by_age.sort_unstable_by_key(|e| e.0);
-        // Groups and the memo hold views; drop them so evicted textures go too.
-        self.texture_groups.clear();
-        self.texture_sets.clear();
-        self.texture_set_flags.clear();
-        self.texture_memo.clear();
-        self.texture_memo_epoch += 1;
         // shortcut: the evicted-key set only feeds a counter; cleared
         // when large, which undercounts re-uploads after that.
         if self.texture_evicted.len() > 1 << 16 {
             self.texture_evicted.clear();
         }
+        // A view hashes by its id, which never changes.
+        #[allow(clippy::mutable_key_type)]
+        let mut gone = HashSet::default();
         for (_, len, k) in by_age {
             if self.texture_cache_bytes <= goal
                 && self.texture_cache.len() <= self.texture_cache_count * 3 / 4
             {
                 break;
             }
-            self.texture_cache.remove(&k);
+            if let Some((view, _, _)) = self.texture_cache.remove(&k) {
+                gone.insert(view);
+            }
             self.texture_cache_bytes -= len;
             if self.texture_latest.get(&k.0) == Some(&k.1) {
                 self.texture_latest.remove(&k.0);
@@ -5704,6 +5714,23 @@ impl Drawer {
                 .insert(hash_bytes(&to_bytes(&k.0)) ^ k.1);
             report.timings.textures_evicted += 1;
         }
+        // Only the memo entries, sets and groups holding evicted views go:
+        // dropping them all made every later draw hash and bind again.
+        let mut dropped = Vec::new();
+        self.texture_memo.retain(|c, (view, ..)| {
+            let keep = !gone.contains(view);
+            if !keep {
+                dropped.push(*c);
+            }
+            keep
+        });
+        for c in dropped {
+            for flag in self.texture_set_flags.remove(&c).into_iter().flatten() {
+                flag.store(false, Ordering::Relaxed);
+            }
+        }
+        (self.texture_sets).retain(|_, (_, _, kept, ..)| kept.load(Ordering::Relaxed));
+        (self.texture_groups).retain(|(_, slots), _| !slots.iter().any(|(v, _)| gone.contains(v)));
     }
 
     fn sampler(
@@ -6388,9 +6415,8 @@ impl Drawer {
                 report.warn(texture_log_line(ps.hash, n, c, lod, bias));
             }
         }
-        // shortcut: a set found here neither reports its textures'
-        // warnings again nor marks them used for eviction; the first draw
-        // of the set in each memo epoch does both.
+        // shortcut: a set found here does not report its textures'
+        // warnings again; the first draw of the set in each memo epoch does.
         // The key is built in a kept list: a new one only when a set is
         // recorded below.
         let mut key = (tex_mask, std::mem::take(&mut self.texture_set_key));
@@ -6401,11 +6427,22 @@ impl Drawer {
                 .filter(|n| tex_mask & (1 << n) != 0)
                 .map(|n| (regs.fetch_constant(n), pack_filters(filters(n)))),
         );
-        let set = (self.texture_sets.get(&key))
-            .filter(|(_, epoch, kept)| {
+        let set = (self.texture_sets.get_mut(&key))
+            .filter(|(_, epoch, kept, _, _)| {
                 *epoch == self.texture_memo_epoch && kept.load(Ordering::Relaxed)
             })
-            .map(|(g, _, _)| g.clone());
+            .map(|(g, _, _, keys, used)| {
+                // Once a replay: eviction would take its textures for old ones.
+                if *used != self.replays {
+                    *used = self.replays;
+                    for k in keys.iter() {
+                        if let Some((_, _, u)) = self.texture_cache.get_mut(k) {
+                            *u = self.replays;
+                        }
+                    }
+                }
+                g.clone()
+            });
         self.texture_set_key = key.1;
         let mut textures = Vec::new();
         if set.is_none() {
@@ -6494,9 +6531,13 @@ impl Drawer {
                     }
                     flags.push(kept.clone());
                 }
+                let keys = (constants.iter())
+                    .filter_map(|(c, _)| self.texture_memo.get(c).and_then(|m| m.3))
+                    .collect();
                 let epoch = self.texture_memo_epoch;
                 let key = (tex_mask, constants);
-                (self.texture_sets).insert(key, (g.clone(), epoch, kept));
+                let set = (g.clone(), epoch, kept, keys, self.replays);
+                (self.texture_sets).insert(key, set);
             }
             g
         };

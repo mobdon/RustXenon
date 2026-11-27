@@ -606,6 +606,63 @@ fn texture_cache_evicts_past_its_count() {
     assert_eq!(draw(&mut d, &mut mem, 2), (0, 0));
 }
 
+/// With guest memory listing its writes, an eviction drops only the memo
+/// entries of evicted textures: the textures that stay are still found
+/// without hashing their bytes, and an evicted one is read and uploaded again.
+#[test]
+fn eviction_keeps_memo_entries_of_kept_textures() {
+    let Some(mut d) = drawer() else { return };
+    let n = 32u32;
+    d.texture_cache_count = 4;
+    let mut w = Watched {
+        mem: memory(),
+        written: Some(vec![]),
+    };
+    let verts: Vec<u32> = [(0.0, 0.0), (8.0, 0.0), (8.0, 8.0), (0.0, 8.0)]
+        .iter()
+        .flat_map(|&(x, y)| [f(x), f(y), f(0.0), f(0.5), f(0.5)])
+        .collect();
+    w.mem.write_words(VERTS, &verts);
+    let draw = |d: &mut xenon_draw::Drawer, w: &mut Watched, k: u32| {
+        let fetch = [
+            2 | ((n >> 5) << 22) | (1 << 31),
+            6 | (2 << 6) | (TEXTURE + k * 0x1000),
+            (n - 1) | ((n - 1) << 13),
+            ((1 << 3) | (2 << 6) | (3 << 9)) << 1,
+            0,
+            1 << 9,
+        ];
+        let mut s = Stream::default();
+        s.setup()
+            .shader(false, &vs_uv())
+            .shader(true, &ps_texture(1))
+            .vertex_fetch(0, VERTS, 20)
+            .regs(SHADER_CONSTANT_FETCH + 6, &fetch)
+            .draw_auto(PRIM_QUAD_LIST, 4);
+        w.mem.write_words(CMD, &s.0);
+        let mut rec = xenon_gpu::Recorder::new();
+        rec.record_buffer(&w.mem, CMD, s.0.len() as u32).unwrap();
+        let r = d
+            .replay(&rec.commands, w as &mut dyn xenon_draw::GuestMemory)
+            .unwrap();
+        let t = r.timings;
+        (t.textures_uploaded, t.textures_evicted, t.hashed_bytes)
+    };
+    let bytes = u64::from(n * n * 4);
+    for k in 0..4 {
+        assert_eq!(draw(&mut d, &mut w, k), (1, 0, bytes), "texture {k}");
+    }
+    assert_eq!(draw(&mut d, &mut w, 0), (0, 0, 0));
+    // Full: evicts 1, the least recently drawn.
+    assert_eq!(draw(&mut d, &mut w, 4), (1, 1, bytes));
+    // Kept textures: still in the memo, nothing hashed.
+    for k in [0, 2, 3, 4] {
+        assert_eq!(draw(&mut d, &mut w, k), (0, 0, 0), "texture {k}");
+    }
+    // The evicted one is gone from the memo: read and uploaded again.
+    assert_eq!(draw(&mut d, &mut w, 1), (1, 1, bytes));
+}
+
 /// A texture slot without a texture fetch constant, or with a format that
 /// cannot be decoded, samples zeros (Xenia's null image) and the draw still
 /// happens, with one warning per kind.
