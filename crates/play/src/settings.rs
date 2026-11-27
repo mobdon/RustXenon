@@ -154,14 +154,19 @@ impl Settings {
     }
 
     /// False when the field's table or key is there but is not a table and
-    /// a value (`[[window]]`, `window = 5`, `[window.width]`): the game
-    /// ignores it, and a step would replace what the player wrote.
+    /// a value (`[[window]]`, `window = 5`, `[window.width]`,
+    /// `width = { x = 1 }`, `width = [1]`): the game ignores it, and a step
+    /// would replace what the player wrote.
     fn plain(&self, f: &Field) -> bool {
+        let scalar = |v: &Item| {
+            v.as_value()
+                .is_some_and(|v| !v.is_inline_table() && !v.is_array())
+        };
         match self.0.get(f.table) {
             None => true,
             Some(t) => t
                 .as_table_like()
-                .is_some_and(|t| t.get(f.key).map_or(true, Item::is_value)),
+                .is_some_and(|t| t.get(f.key).map_or(true, scalar)),
         }
     }
 
@@ -233,9 +238,32 @@ impl Settings {
                 next.into()
             }
         };
+        if !self.0.get(f.table).is_some_and(Item::is_table_like) {
+            let mut t = toml_edit::Table::new();
+            // Comments in a file with no keys yet are the document's trailing
+            // text, written after every table: keep them on top.
+            let lead = self.0.trailing().as_str().unwrap_or("").to_string();
+            if self.0.as_table().is_empty() && !lead.is_empty() {
+                let nl = if lead.ends_with('\n') { "" } else { "\n" };
+                t.decor_mut().set_prefix(lead + nl);
+                self.0.set_trailing("");
+            }
+            self.0.as_table_mut().insert(f.table, Item::Table(t));
+        }
         let root = self.0.as_table_mut();
-        if !root.get(f.table).is_some_and(Item::is_table_like) {
-            root.insert(f.table, toml_edit::table());
+        if let Some(it) = root.get_mut(f.table).and_then(Item::as_inline_table_mut) {
+            if !it.contains_key(f.key) {
+                // The last value's space before `}` goes after the new one,
+                // not before its comma.
+                let mut v = v;
+                if let Some((_, last)) = it.iter_mut().last() {
+                    let end = last.decor().suffix().and_then(|s| s.as_str());
+                    v.decor_mut().set_suffix(end.unwrap_or("").to_string());
+                    last.decor_mut().set_suffix("");
+                }
+                it.insert(f.key, v);
+                return true;
+            }
         }
         let Some(t) = root.get_mut(f.table).and_then(Item::as_table_like_mut) else {
             return false;
@@ -387,6 +415,8 @@ mod tests {
             "[[window]]\nwidth = 1920\nnote = 'mine'\n",
             "window = 5\n",
             "[window.width]\nx = 1\n",
+            "[window]\nwidth = { mine = 1, note = 'keep' }\n",
+            "[window]\nwidth = [1920, 1080]\n",
         ] {
             let mut s = Settings(text.parse().unwrap());
             assert_eq!((s.show(0), s.valid(0)), ("1280".into(), false), "{text}");
@@ -397,6 +427,26 @@ mod tests {
         let mut s = Settings("window = { width = 1920 }\n".parse().unwrap());
         assert!(s.valid(0) && s.step(0, 1));
         assert_eq!(s.int(0), 2560);
+        // A new key in it goes in its layout.
+        assert!(s.step(3, 1));
+        assert_eq!(
+            s.0.to_string(),
+            "window = { width = 2560, refresh = 120 }\n"
+        );
+    }
+
+    /// A file of comments only keeps them on top when tables are added.
+    #[test]
+    fn comments_only_stay_on_top() {
+        for text in ["# only a comment", "# only a comment\n\n"] {
+            let mut s = Settings(text.parse().unwrap());
+            s.step(3, 1);
+            s.step(4, 1);
+            let out = s.0.to_string();
+            assert!(out.starts_with("# only a comment\n"), "{out:?}");
+            assert_eq!(out.matches("# only").count(), 1, "{out:?}");
+            assert!(out.contains("[window]\nrefresh = 120\n"), "{out:?}");
+        }
     }
 
     /// CRLF line endings, a byte order mark and the hidden attribute stay.
