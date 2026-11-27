@@ -1172,8 +1172,10 @@ fn transferable(a: TargetFormat, b: TargetFormat) -> bool {
 /// about 1.6 MB of driver memory.
 const PIPELINE_CAP: usize = 1024;
 
-/// New pipelines between writes of the pipeline cache file.
-const PIPELINE_SAVE_EVERY: u32 = 16;
+/// A pipeline cache file past this size is not loaded, so the next save
+/// holds only this build's pipelines: the driver keeps every pipeline it
+/// loaded, so pipelines of old builds would pile up (about 10 MB a build).
+const PIPELINE_CACHE_MAX: u64 = 64 << 20;
 
 /// A pipeline cache loaded from and saved to a file.
 struct DiskCache {
@@ -1181,6 +1183,8 @@ struct DiskCache {
     path: std::path::PathBuf,
     /// Pipelines created since the file was last written.
     unsaved: u32,
+    /// The last save's write of the file.
+    writing: Option<std::thread::JoinHandle<std::io::Result<()>>>,
 }
 
 /// A draw's texture slot mask and its slots' views and samplers, in slot
@@ -1674,8 +1678,11 @@ pub struct Drawer {
 
 impl Drop for Drawer {
     fn drop(&mut self) {
-        if let Err(e) = self.save_pipeline_cache() {
-            eprintln!("[draw] pipeline cache not saved: {e}");
+        // The second call waits for the first's write.
+        for _ in 0..2 {
+            if let Err(e) = self.save_pipeline_cache() {
+                eprintln!("[draw] pipeline cache not saved: {e}");
+            }
         }
     }
 }
@@ -2794,8 +2801,8 @@ impl Drawer {
     }
 
     /// Keeps compiled pipelines in a file under `dir` (made if missing),
-    /// loaded now and written every few new pipelines, when the drawer
-    /// drops and on [`Drawer::save_pipeline_cache`] (an owner that never
+    /// loaded now (unless past [`PIPELINE_CACHE_MAX`]) and written when
+    /// the drawer drops and on [`Drawer::save_pipeline_cache`] (an owner that never
     /// drops the drawer calls it now and then), so pipelines compiled in
     /// earlier runs are not compiled again. Returns the file, or `None`
     /// where the device has no pipeline cache (GL). A file from another
@@ -2809,7 +2816,9 @@ impl Drawer {
         };
         std::fs::create_dir_all(dir)?;
         let path = dir.join(key);
+        let too_big = std::fs::metadata(&path).is_ok_and(|m| m.len() > PIPELINE_CACHE_MAX);
         let data = match std::fs::read(&path) {
+            _ if too_big => None,
             Ok(d) => Some(d),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
             Err(e) => return Err(e),
@@ -2838,37 +2847,52 @@ impl Drawer {
             cache,
             path: path.clone(),
             unsaved: 0,
+            writing: None,
         });
         Ok(Some(path))
     }
 
     /// Writes the pipeline cache file, if there is one (see
     /// [`Drawer::set_pipeline_cache_dir`]) and pipelines were created since
-    /// it was last written, so it is cheap to call often; through a
-    /// temporary file of its
-    /// own so a crash, or another process saving to the same directory,
+    /// it was last written, so it is cheap to call often. The write runs on
+    /// a thread of its own (the next save waits for it and returns its
+    /// error), through a temporary file of its own so a crash, or another process saving to the same directory,
     /// leaves a whole file (the last one renamed wins).
     pub fn save_pipeline_cache(&mut self) -> std::io::Result<()> {
         static SAVES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let Some(c) = &mut self.disk_cache else {
             return Ok(());
         };
+        // The previous save's write, finished long ago at the host's 5 s
+        // pace; its error is this call's.
+        let previous = c.writing.take().map_or(Ok(()), |w| {
+            w.join()
+                .unwrap_or_else(|_| Err(std::io::Error::other("cache writer panicked")))
+        });
         if c.unsaved == 0 {
-            return Ok(());
+            return previous;
         }
         c.unsaved = 0;
-        let Some(data) = c.cache.get_data() else {
-            return Ok(());
-        };
         let n = SAVES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let tmp = c
             .path
             .with_extension(format!("{}-{n}.tmp", std::process::id()));
-        let r = std::fs::write(&tmp, data).and_then(|()| std::fs::rename(&tmp, &c.path));
-        if r.is_err() {
-            let _ = std::fs::remove_file(&tmp);
-        }
-        r
+        let path = c.path.clone();
+        let cache = c.cache.clone();
+        // The data is tens of MB (get_data took 12-16 ms for 28 MB): read
+        // and written off the draw thread so a save does not stall a frame.
+        // A Vulkan pipeline cache is internally synchronised.
+        c.writing = Some(std::thread::spawn(move || {
+            let Some(data) = cache.get_data() else {
+                return Ok(());
+            };
+            let r = std::fs::write(&tmp, data).and_then(|()| std::fs::rename(&tmp, &path));
+            if r.is_err() {
+                let _ = std::fs::remove_file(&tmp);
+            }
+            r
+        }));
+        previous
     }
 
     /// The pipeline cache, for pipeline descriptors.
@@ -2891,18 +2915,12 @@ impl Drawer {
         )
     }
 
-    /// Counts a pipeline created since `t0` and writes the cache file every
-    /// [`PIPELINE_SAVE_EVERY`] new ones.
+    /// Counts a pipeline created since `t0` for the next
+    /// [`Drawer::save_pipeline_cache`] (not saved here: mid-replay).
     fn pipeline_made(&mut self, t0: Instant) {
         self.timings.pipeline += t0.elapsed();
-        let Some(c) = &mut self.disk_cache else {
-            return;
-        };
-        c.unsaved += 1;
-        if c.unsaved >= PIPELINE_SAVE_EVERY {
-            if let Err(e) = self.save_pipeline_cache() {
-                eprintln!("[draw] pipeline cache not saved: {e}");
-            }
+        if let Some(c) = &mut self.disk_cache {
+            c.unsaved += 1;
         }
     }
 
