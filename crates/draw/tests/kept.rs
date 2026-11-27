@@ -927,6 +927,38 @@ fn half2_tiles_of_a_larger_surface_are_kept() {
     assert!(kept == HALF2.guest_path(&mem, f));
 }
 
+/// A CPU write between replays to a block of a kept surface no resolve
+/// wrote, then a resolve into another tile and a sample of the whole
+/// surface: the failed check of the surface writes the tile back before it
+/// drops the buffer, so guest memory and the sample both have the resolve.
+#[test]
+fn cpu_write_beside_a_kept_tile_keeps_the_resolve() {
+    let f = fetch(FETCH_16_16_FLOAT, 2, XY11);
+    let Some(mut d) = HALF2.drawer() else { return };
+    let mut mem = memory();
+    vertices(&mut mem);
+    mem.data[DEST as usize..][..(W * H * 4) as usize].fill(0x3C);
+    let tile = 32 * 32 * 4;
+    let mut s = Stream::default();
+    HALF2.paint_and_resolve_to(s.setup(), &mut mem, 2, 32, DEST + tile);
+    HALF2.sample(&mut s, f);
+    let r = run(&mut d, &s, &mut mem);
+    assert_eq!(r.timings.textures_kept, 1, "{r:?}");
+    mem.data[(DEST + 3 * tile) as usize..][..256].fill(0x55);
+    let mut s = Stream::default();
+    HALF2.paint_and_resolve_to(s.setup(), &mut mem, 2, 32, DEST);
+    HALF2.sample(&mut s, f);
+    let r = run(&mut d, &s, &mut mem);
+    assert!(r.unsupported.is_empty(), "{r:?}");
+    let out = d
+        .read_render_target_raw(HALF2.out_key(), 0, 0, W, H)
+        .unwrap();
+    drop(d);
+    assert!(mem.data[DEST as usize..][..tile as usize] != [0x3C; 32 * 32 * 4]);
+    assert_eq!(mem.data[(DEST + 3 * tile) as usize], 0x55);
+    assert!(out == HALF2.guest_path(&mem, f));
+}
+
 /// A float resolve sampled by the next replay is still on the GPU.
 #[test]
 fn float_resolve_is_kept_for_the_next_replay() {
@@ -1183,6 +1215,33 @@ fn kept_mip_level_is_sampled() {
     run(&mut d, &s, &mut mem);
     drop(d);
     assert!(outputs[0] == case.guest_path(&mem, mip_fetch(0)));
+}
+
+/// A resolve into one tile of a chain's base, with its mip in older guest
+/// memory: the kept buffer made for the texture covers the mip too, so a
+/// fetch of level 1 samples the guest's mip as the guest path does.
+#[test]
+fn texture_past_the_resolve_keeps_its_mips() {
+    let case = &HALF4;
+    let Some(mut d) = case.drawer() else { return };
+    let mut mem = memory();
+    vertices(&mut mem);
+    mem.data[MIP as usize..][..32 * 32 * 8].fill(0x3C);
+    let mut s = Stream::default();
+    case.paint_and_resolve_to(s.setup(), &mut mem, 2, 32, DEST);
+    case.sample(&mut s, mip_fetch(1));
+    let r = run(&mut d, &s, &mut mem);
+    assert!(r.unsupported.is_empty(), "{r:?}");
+    assert_eq!(
+        (r.timings.textures_kept, r.timings.textures_uploaded),
+        (1, 0),
+        "{r:?}"
+    );
+    let out = d
+        .read_render_target_raw(case.out_key(), 0, 0, W, H)
+        .unwrap();
+    drop(d);
+    assert!(out == case.guest_path(&mem, mip_fetch(1)));
 }
 
 /// A resolve into the mip of a kept chain after it was sampled decodes the

@@ -3465,6 +3465,39 @@ impl Drawer {
     /// it (in `skip_resolve_writeback` mode with its unwritten pixels, as
     /// the CPU wrote after them).
     fn verify(&mut self, i: usize, mem: &Tracked, lo: u64, hi: u64) -> bool {
+        let ok = self.matches(i, mem, lo, hi);
+        if !ok {
+            self.mirrors.remove(i);
+        }
+        ok
+    }
+
+    /// [`Self::verify`] that loses no unwritten resolve pixels: on a
+    /// mismatch it writes back the buffer's dirty ranges (which a texture
+    /// read or a later resolve may not cover) and returns false without the
+    /// drop, which the next check makes.
+    fn verify_read(
+        &mut self,
+        i: usize,
+        mem: &mut Tracked,
+        lo: u64,
+        hi: u64,
+    ) -> Result<bool, Error> {
+        let (m_lo, m_hi, dirty) = {
+            let m = &self.mirrors[i];
+            (m.lo, m.hi, !m.dirty.is_empty())
+        };
+        if !self.skip_resolve_writeback && dirty && !self.matches(i, mem, lo, hi) {
+            self.sync(mem, m_lo, m_hi)?;
+            return Ok(false);
+        }
+        Ok(self.verify(i, mem, lo, hi))
+    }
+
+    /// Whether the blocks of kept resolve `i` over `[lo, hi)` match guest
+    /// memory, marking those that do checked; [`Self::verify`] without the
+    /// drop.
+    fn matches(&mut self, i: usize, mem: &Tracked, lo: u64, hi: u64) -> bool {
         let (m_lo, m_hi) = (self.mirrors[i].lo, self.mirrors[i].hi);
         let k0 = (lo.max(m_lo) - m_lo) / KEPT_BLOCK;
         let k1 = (hi.min(m_hi) - m_lo).div_ceil(KEPT_BLOCK);
@@ -3478,7 +3511,6 @@ impl Drawer {
                 .read_bytes(a as u32, (b - a) as usize)
                 .map(|b| self.block_hash(&b));
             if now.is_none() || now != self.mirrors[i].hashes[k] {
-                self.mirrors.remove(i);
                 return false;
             }
             self.mirrors[i].checked[k] = true;
@@ -3674,7 +3706,7 @@ impl Drawer {
         resolve: bool,
     ) -> Result<Option<usize>, Error> {
         if let Some(i) = self.mirrors.iter().position(|m| m.lo <= lo && hi <= m.hi) {
-            if self.verify(i, mem, lo, hi) {
+            if self.verify_read(i, mem, lo, hi)? {
                 return Ok(Some(i));
             }
         }
@@ -5279,21 +5311,28 @@ impl Drawer {
         }
         // A texture over kept resolves and bytes no resolve wrote (resolves
         // into tiles of a larger surface) gets one kept buffer over all of
-        // it, made from guest memory with the resolves merged in, so it is
-        // decoded on the GPU too and later resolves into it stay there.
+        // it and its mips, made from guest memory with the resolves merged
+        // in, so it is decoded on the GPU too and later resolves into it
+        // stay there.
         let i = match self
             .mirrors
             .iter()
             .position(|m| m.lo <= addr && end <= m.hi)
         {
             Some(i) => i,
-            None if end - addr <= self.max_storage => match self.mirror(mem, addr, end, false)? {
-                Some(i) => i,
-                None => return Ok(None),
-            },
-            None => return Ok(None),
+            None => {
+                let (lo, hi) =
+                    chain_range(fetch).map_or((addr, end), |(a, b)| (a.min(addr), b.max(end)));
+                if hi - lo > self.max_storage {
+                    return Ok(None);
+                }
+                match self.mirror(mem, lo, hi, false)? {
+                    Some(i) => i,
+                    None => return Ok(None),
+                }
+            }
         };
-        if !(addr - self.mirrors[i].lo).is_multiple_of(4) || !self.verify(i, mem, addr, end) {
+        if !(addr - self.mirrors[i].lo).is_multiple_of(4) || !self.verify_read(i, mem, addr, end)? {
             return Ok(None);
         }
         // (width, height, pitch, guest address) of each level decoded.
@@ -5312,7 +5351,7 @@ impl Drawer {
             if a < mirror.lo || mirror.hi < b || !(a - mirror.lo).is_multiple_of(4) {
                 break;
             }
-            if !self.verify(i, mem, a, b) {
+            if !self.verify_read(i, mem, a, b)? {
                 return Ok(None);
             }
             levels.push((m.width, m.height, m.pitch_blocks, a));
