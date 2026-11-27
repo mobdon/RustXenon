@@ -1,12 +1,36 @@
 //! A built-in 5x7 pixel font with lower case. Capitals sit in rows 0-6;
-//! the descenders of g, j, p, q and y use rows 7-8. Anything without a glyph
-//! draws as `?`.
+//! the descenders of g, j, p, q and y use rows 7-8. An accented Latin letter
+//! draws as its plain letter, curly quotes and a backtick as straight ones,
+//! and anything else without a glyph as `?`.
 
 /// Glyph rows: 7 above the baseline, 2 below.
 pub const ROWS: usize = 9;
 
+/// The letter under each of U+00C0 to U+017F (Latin-1 and Latin
+/// Extended-A): accents dropped, so a title with them stays readable.
+const LATIN: &str = concat!(
+    "AAAAAAACEEEEIIIIDNOOOOOxOUUUUYTsaaaaaaaceeeeiiiidnooooo/ouuuuyty",
+    "AaAaAaCcCcCcCcDdDdEeEeEeEeEeGgGgGgGgHhHhIiIiIiIiIiIiJjKkkLlLlLlLlLl",
+    "NnNnNnnNnOoOoOoOoRrRrRrSsSsSsSsTtTtTtUuUuUuUuUuUuWwYyYZzZzZzs",
+);
+
+/// A character with no glyph of its own drawn as a near one.
+fn fold(c: char) -> char {
+    match c {
+        '\u{c0}'..='\u{17f}' => LATIN
+            .as_bytes()
+            .get(c as usize - 0xc0)
+            .map_or('?', |&b| b as char),
+        '`' | '\u{b4}' | '\u{2018}' | '\u{2019}' => '\'',
+        '\u{201c}' | '\u{201d}' => '"',
+        '\u{a0}' => ' ',
+        _ => c,
+    }
+}
+
 /// Rows top to bottom, bit 4 the leftmost column.
 pub fn glyph(c: char) -> [u8; ROWS] {
+    let c = fold(c);
     let g: [u8; 7] = match c {
         'a' => return low([0x0E, 0x01, 0x0F, 0x11, 0x0F], [0, 0]),
         'b' => [0x10, 0x10, 0x16, 0x19, 0x11, 0x11, 0x1E],
@@ -166,6 +190,30 @@ mod tests {
         assert_eq!(glyph('A')[7..], [0, 0]);
         // Descenders hang below the baseline.
         assert_ne!(glyph('g')[7..], [0, 0]);
+    }
+
+    #[test]
+    fn accents_and_quotes_fold() {
+        assert_eq!(LATIN.len(), 0x180 - 0xc0);
+        for (c, base) in [
+            ('\u{c0}', 'A'),
+            ('é', 'e'),
+            ('Ö', 'O'),
+            ('ß', 's'),
+            ('ÿ', 'y'),
+            ('Ł', 'L'),
+            ('ő', 'o'),
+            ('Š', 'S'),
+            ('ž', 'z'),
+            ('\u{17f}', 's'),
+            ('`', '\''),
+            ('\u{2019}', '\''),
+        ] {
+            assert_eq!(fold(c), base, "{c}");
+            assert_eq!(glyph(c), glyph(base), "{c}");
+        }
+        // Still no glyph: the question mark.
+        assert_eq!(glyph('\u{4e2d}'), glyph('?'));
     }
 
     #[test]
