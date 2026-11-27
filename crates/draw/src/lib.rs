@@ -562,6 +562,16 @@ pub struct Timings {
     /// Draws that bound a texture bind group found by their fetch
     /// constants, without looking each texture up.
     pub texture_sets_reused: u32,
+    /// Texture lookups whose guest bytes, read and hashed again after a
+    /// write dropped their memo entry, found the texture already cached;
+    /// and the bytes they hashed.
+    pub rehash_hits: u32,
+    pub rehash_hit_bytes: u64,
+    /// Texture memo entries a guest write met only between their levels
+    /// (in no level the texture reads).
+    pub gap_writes: u32,
+    /// Replays that found the texture memo at [`TEXTURE_MEMO_CAP`].
+    pub memo_cap_hits: u32,
     /// Render passes begun for draws: each target change or flush ends one.
     pub render_passes: u32,
     /// GPU time measured by timestamps around the batch's draw passes,
@@ -617,6 +627,10 @@ impl std::ops::AddAssign<&Timings> for Timings {
         self.indices_reused += t.indices_reused;
         self.texture_groups_reused += t.texture_groups_reused;
         self.texture_sets_reused += t.texture_sets_reused;
+        self.rehash_hits += t.rehash_hits;
+        self.rehash_hit_bytes += t.rehash_hit_bytes;
+        self.gap_writes += t.gap_writes;
+        self.memo_cap_hits += t.memo_cap_hits;
         self.queue += t.queue;
         self.upload += t.upload;
         for (a, b) in self.submit_parts.iter_mut().zip(t.submit_parts) {
@@ -2027,8 +2041,30 @@ const INDEX_MEMO_BYTES: usize = 32 << 20;
 /// ranges are staged apart, so the gap between them is not uploaded.
 const WINDOW_GAP: u64 = 4096;
 
-/// A [`Drawer::texture_memo`] entry: view, guest range, cache key.
-type TextureMemo = (wgpu::TextureView, u64, u64, Option<([u32; 6], u64)>);
+/// A [`Drawer::texture_memo`] entry.
+struct TextureMemo {
+    view: wgpu::TextureView,
+    /// The physical guest range `[lo, hi)` spanning `levels`.
+    span: (u64, u64),
+    /// The physical guest ranges the texture was read from, one per level.
+    levels: Vec<(u64, u64)>,
+    /// The `texture_cache` key (none for kept-resolve decodes).
+    key: Option<([u32; 6], u64)>,
+}
+
+impl TextureMemo {
+    fn new(view: wgpu::TextureView, levels: Vec<(u64, u64)>, key: Option<([u32; 6], u64)>) -> Self {
+        let span = (levels.iter().copied())
+            .reduce(|a, b| (a.0.min(b.0), a.1.max(b.1)))
+            .unwrap_or_default();
+        Self {
+            view,
+            span,
+            levels,
+            key,
+        }
+    }
+}
 
 /// Entries [`Drawer::texture_memo`] holds before it starts over.
 const TEXTURE_MEMO_CAP: usize = 1 << 14;
@@ -3271,7 +3307,10 @@ impl Drawer {
                     self.uncheck(lo, hi);
                 }
             }
-            _ => {
+            written => {
+                if written.is_some() {
+                    self.timings.memo_cap_hits += 1;
+                }
                 self.watching = false;
                 self.texture_memo.clear();
                 self.texture_memo_epoch += 1;
@@ -3480,13 +3519,16 @@ impl Drawer {
             return;
         }
         let mut gone = Vec::new();
-        self.texture_memo.retain(|c, &mut (_, a, b, _)| {
-            let keep = !meets(ranges, a, b);
+        let mut gaps = 0;
+        self.texture_memo.retain(|c, m| {
+            let keep = !meets(ranges, m.span.0, m.span.1);
             if !keep {
+                gaps += u32::from(!m.levels.iter().any(|&(a, b)| meets(ranges, a, b)));
                 gone.push(*c);
             }
             keep
         });
+        self.timings.gap_writes += gaps;
         // The sets that used those textures; the others stay bound.
         for c in gone {
             for flag in self.texture_set_flags.remove(&c).into_iter().flatten() {
@@ -5289,10 +5331,10 @@ impl Drawer {
         }
         let sampler = self.sampler(&fetch, filters, report);
         let constant = self.regs.fetch_constant(n);
-        if let Some((view, _, _, key)) = self.texture_memo.get(&constant) {
-            let view = view.clone();
+        if let Some(m) = self.texture_memo.get(&constant) {
+            let view = m.view.clone();
             // Kept in use, so eviction does not take it for an old one.
-            if let Some((_, _, used)) = key.and_then(|k| self.texture_cache.get_mut(&k)) {
+            if let Some((_, _, used)) = m.key.and_then(|k| self.texture_cache.get_mut(&k)) {
                 *used = self.replays;
             }
             return Ok((view, sampler));
@@ -5303,8 +5345,10 @@ impl Drawer {
             if let Some((view, lo, hi)) = self.kept_texture(&fetch, constant, addr, end, mem)? {
                 self.timings.textures_kept += 1;
                 self.timings.kept_bytes += hi - lo;
-                self.texture_memo
-                    .insert(constant, (view.clone(), lo, hi, None));
+                self.texture_memo.insert(
+                    constant,
+                    TextureMemo::new(view.clone(), vec![(lo, hi)], None),
+                );
                 return Ok((view, sampler));
             }
             // One sync over the whole chain: at most one writeback wait.
@@ -5648,7 +5692,10 @@ impl Drawer {
         // shortcut: one range spans the base, the mips and any gap between
         // them, so a write into the gap decodes the chain again; keep a
         // range per level if mips far from their base show up.
-        let range = chain_range(fetch).ok_or("texture without levels to read")?;
+        let ranges = level_ranges(fetch);
+        if ranges.is_empty() {
+            return Err("texture without levels to read".into());
+        }
         // (fetch, offset in `bytes`, length) of each mip level read.
         let mut mips = Vec::new();
         let mut at = base_len;
@@ -5670,8 +5717,10 @@ impl Drawer {
         if let Some((view, _, used)) = self.texture_cache.get_mut(&key) {
             *used = self.replays;
             let view = view.clone();
+            report.timings.rehash_hits += 1;
+            report.timings.rehash_hit_bytes += bytes.len() as u64;
             self.texture_memo
-                .insert(constant, (view.clone(), range.0, range.1, Some(key)));
+                .insert(constant, TextureMemo::new(view.clone(), ranges, Some(key)));
             return Ok(view);
         }
         let mut bc = self.bc_textures && !fetch.sign.contains(&1);
@@ -5799,7 +5848,7 @@ impl Drawer {
         self.texture_cache
             .insert(key, (view.clone(), len, self.replays));
         self.texture_memo
-            .insert(constant, (view.clone(), range.0, range.1, Some(key)));
+            .insert(constant, TextureMemo::new(view.clone(), ranges, Some(key)));
         Ok(view)
     }
 
@@ -5843,8 +5892,8 @@ impl Drawer {
         // Only the memo entries, sets and groups holding evicted views go:
         // dropping them all made every later draw hash and bind again.
         let mut dropped = Vec::new();
-        self.texture_memo.retain(|c, (view, ..)| {
-            let keep = !gone.contains(view);
+        self.texture_memo.retain(|c, m| {
+            let keep = !gone.contains(&m.view);
             if !keep {
                 dropped.push(*c);
             }
@@ -6665,7 +6714,7 @@ impl Drawer {
                     flags.push(kept.clone());
                 }
                 let keys = (constants.iter())
-                    .filter_map(|(c, _)| self.texture_memo.get(c).and_then(|m| m.3))
+                    .filter_map(|(c, _)| self.texture_memo.get(c).and_then(|m| m.key))
                     .collect();
                 let epoch = self.texture_memo_epoch;
                 let key = (tex_mask, constants);
@@ -7810,11 +7859,15 @@ fn reads_base(fetch: &xenon_texture::TextureFetch) -> bool {
 /// [`xenon_texture::mip_fetches`] that [`level_range`] places; `None` when
 /// there are none.
 fn chain_range(fetch: &xenon_texture::TextureFetch) -> Option<(u64, u64)> {
+    (level_ranges(fetch).into_iter()).reduce(|a, b| (a.0.min(b.0), a.1.max(b.1)))
+}
+
+/// The physical guest ranges `[lo, hi)` of the levels [`chain_range`] spans,
+/// one per level.
+fn level_ranges(fetch: &xenon_texture::TextureFetch) -> Vec<(u64, u64)> {
     let base = level_range(fetch).filter(|_| reads_base(fetch));
     let mips = xenon_texture::mip_fetches(fetch).map_while(|m| level_range(&m));
-    base.into_iter()
-        .chain(mips)
-        .reduce(|a, b| (a.0.min(b.0), a.1.max(b.1)))
+    base.into_iter().chain(mips).collect()
 }
 
 /// The physical guest range `[lo, hi)` the base level of `fetch` reads.
