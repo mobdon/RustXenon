@@ -171,7 +171,7 @@ pub struct Gpu {
     /// Renders every command when set (`--render`), see [`Gpu::set_drawer`].
     draw: Option<Draw>,
     /// The newest frame the drawer produced.
-    pub last_frame: Arc<Mutex<Option<xenon_draw::Frame>>>,
+    pub last_frame: Arc<Mutex<Option<Arc<xenon_draw::Frame>>>>,
 }
 
 enum Draw {
@@ -185,7 +185,7 @@ struct DrawSide {
     drawer: xenon_draw::Drawer,
     stats: DrawStats,
     frames_drawn: u32,
-    last_frame: Arc<Mutex<Option<xenon_draw::Frame>>>,
+    last_frame: Arc<Mutex<Option<Arc<xenon_draw::Frame>>>>,
 }
 
 impl DrawSide {
@@ -221,6 +221,7 @@ impl DrawSide {
                 }
                 for f in r.frames {
                     self.frames_drawn += 1;
+                    let f = Arc::new(f);
                     capture::frame_done(self.frames_drawn, &f);
                     *self.last_frame.lock().unwrap() = Some(f);
                 }
@@ -658,9 +659,10 @@ pub mod capture {
         std::sync::OnceLock::new();
 
     /// Writes the drawer's frame number `n` when it was asked for.
-    pub fn frame_done(n: u32, f: &xenon_draw::Frame) {
+    pub fn frame_done(n: u32, f: &Arc<xenon_draw::Frame>) {
         if let Some(w) = super::super::input::WINDOW.get() {
-            w.show(f.width, f.height, f.rgba8.clone());
+            // Shared, not copied: a copy of every frame was 3.7 MB at 720p.
+            w.show(f.width, f.height, f.clone());
         }
         let Some((dir, want)) = FRAMES.get() else {
             return;

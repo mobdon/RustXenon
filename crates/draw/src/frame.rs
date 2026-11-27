@@ -32,3 +32,10 @@ impl Frame {
         std::fs::write(path, self.to_png_bytes()?).map_err(|e| Error::Io(e.to_string()))
     }
 }
+
+/// The pixels, so a shared frame can be shown without copying them.
+impl AsRef<[u8]> for Frame {
+    fn as_ref(&self) -> &[u8] {
+        &self.rgba8
+    }
+}
