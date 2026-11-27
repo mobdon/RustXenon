@@ -520,13 +520,13 @@ pub fn rtl_leave_critical_section(rt: &Runtime, c: &mut Context) {
     }
     rt.mem
         .write_u32(a + 0x10, rt.mem.read_u32(a + 0x10).wrapping_sub(1));
-    // The guest words above are what the game reads; a leave by a thread
-    // the host lock does not see as owner (seen while driving, in a game
-    // thread) is let through as the console would, and said once.
+    // The console only counts: a game thread (seen while driving) leaves a
+    // section another thread entered, which frees it there. Do the same,
+    // and say so once.
     if let KObj::Section(cs) = &*section(rt, a) {
-        if !cs.try_leave() && !LEFT_UNOWNED.swap(true, Ordering::Relaxed) {
+        if !cs.try_leave() && cs.leave_for_owner() && !LEFT_UNOWNED.swap(true, Ordering::Relaxed) {
             crate::log(&format!(
-                "critical section {a:#010x} left by a thread that does not own it; ignored"
+                "critical section {a:#010x} left by a thread that does not own it; released for its owner"
             ));
         }
     }

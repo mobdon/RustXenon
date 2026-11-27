@@ -261,6 +261,22 @@ impl CriticalSection {
         }
         true
     }
+
+    /// Leaves once on behalf of whichever thread holds the lock, as the
+    /// console's critical sections allow (they only count); false if it
+    /// is free.
+    pub fn leave_for_owner(&self) -> bool {
+        let mut g = self.state.lock().unwrap();
+        if g.0.is_none() {
+            return false;
+        }
+        g.1 -= 1;
+        if g.1 == 0 {
+            g.0 = None;
+            self.cv.notify_one();
+        }
+        true
+    }
 }
 
 #[cfg(test)]
@@ -407,5 +423,33 @@ mod tests {
             .unwrap());
         assert!(cs.try_leave());
         assert!(!cs.try_leave());
+    }
+
+    #[test]
+    fn leave_for_owner_frees_a_lock_another_thread_holds() {
+        let cs = std::sync::Arc::new(CriticalSection::new());
+        assert!(!cs.leave_for_owner(), "free");
+        assert!(cs.enter(None) && cs.enter(None));
+        let other = cs.clone();
+        assert!(std::thread::spawn(move || other.leave_for_owner())
+            .join()
+            .unwrap());
+        // Once more held, then free: another thread can take it.
+        let other = cs.clone();
+        assert!(!std::thread::spawn(move || other.try_enter())
+            .join()
+            .unwrap());
+        let other = cs.clone();
+        assert!(std::thread::spawn(move || other.leave_for_owner())
+            .join()
+            .unwrap());
+        let other = cs.clone();
+        assert!(std::thread::spawn(move || {
+            let ok = other.try_enter();
+            other.leave();
+            ok
+        })
+        .join()
+        .unwrap());
     }
 }
