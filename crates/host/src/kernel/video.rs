@@ -212,11 +212,17 @@ pub fn start(rt: std::sync::Arc<Runtime>) {
                         if d.late_writeback {
                             crate::log("[draw] resolve write-back: late (the CPU sees resolves a frame later)");
                         }
-                        // Opt-in: loading the cache cost about 900 MB of host
-                        // memory in a warm run and gained no speed over the
-                        // driver's own shader cache.
-                        if let Some(dir) = std::env::var_os("XENON_PIPELINE_CACHE") {
-                            let dir = std::path::PathBuf::from(dir);
+                        // Compiled pipelines persist across runs, beside the
+                        // title's saves unless XENON_PIPELINE_CACHE names a
+                        // directory (0 turns it off). The driver's own cache
+                        // starts cold for every new build: without this, its
+                        // first run stalled seconds creating pipelines.
+                        let dir = match std::env::var_os("XENON_PIPELINE_CACHE") {
+                            Some(v) if v == "0" => None,
+                            Some(v) => Some(std::path::PathBuf::from(v)),
+                            None => Some(k().data_dir.join("pipeline-cache")),
+                        };
+                        if let Some(dir) = dir {
                             match d.set_pipeline_cache_dir(&dir) {
                                 Ok(Some(f)) => {
                                     crate::log(&format!("[draw] pipeline cache: {}", f.display()))
