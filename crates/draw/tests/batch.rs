@@ -694,10 +694,10 @@ fn resolve_clears_join_the_next_batch() {
     assert_eq!(t.submits, 4, "{t:?}");
 }
 
-/// A resolve copy taken on the CPU (16_16_16_16 destination) counts its
-/// readback submit as a resolve submit.
+/// A 64bpp resolve copy (16_16_16_16 destination) runs on the GPU: no
+/// readback of its own, so no resolve submit.
 #[test]
-fn cpu_resolve_readback_counts_as_resolve_submit() {
+fn resolve_to_64bpp_takes_no_readback() {
     let Some(mut d) = drawer() else { return };
     let mut mem = memory();
     let wf = W as f32;
@@ -719,7 +719,7 @@ fn cpu_resolve_readback_counts_as_resolve_submit() {
     assert_eq!((report.draws, report.resolves), (1, 1), "{report:?}");
     let t = &report.timings;
     assert_eq!(t.submits_by_site.iter().sum::<u32>(), t.submits, "{t:?}");
-    assert_eq!(t.submits_by_site[0], 1, "{t:?}");
+    assert_eq!(t.submits_by_site[0], 0, "{t:?}");
 }
 
 /// A texture bind group outlives the replay: the next replay drawing the

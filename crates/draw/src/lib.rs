@@ -1116,6 +1116,22 @@ fn unsupported<T>(why: impl Into<String>) -> Result<T, Skip> {
     Err(Skip::Unsupported(why.into()))
 }
 
+/// resolve.wgsl's `dest_format` code for a colour resolve destination, or
+/// None for one it does not write.
+fn gpu_dest(dest_format: u32) -> Option<u32> {
+    Some(match dest_format {
+        formats::DEST_8_8_8_8 => 0,
+        formats::DEST_2_10_10_10 => 1,
+        formats::DEST_32_FLOAT => 2,
+        formats::DEST_16_16 => 3,
+        formats::DEST_16_16_16_16_FLOAT => 4,
+        formats::DEST_16_16_FLOAT => 5,
+        formats::DEST_16_16_16_16 => 6,
+        formats::DEST_32_32_FLOAT => 7,
+        _ => return None,
+    })
+}
+
 #[derive(Clone)]
 struct Program {
     /// Shared, so a draw takes the loaded programs without copying them.
@@ -7125,13 +7141,9 @@ impl Drawer {
         if rect.is_empty() {
             return Ok(());
         }
-        // shortcut: 64bpp copies but 16_16_16_16_FLOAT from 7e3 /
-        // 16_16_16_16_FLOAT sources take the CPU path; add them to
-        // resolve.wgsl if they show up in profiles.
-        let gpu = dest_bytes == 4
-            || (r.dest_format == formats::DEST_16_16_16_16_FLOAT
-                && matches!(format, TargetFormat::Float7e3 | TargetFormat::Rgba16Float));
-        if gpu {
+        // The CPU path below stays for a destination resolve.wgsl does not
+        // write (none of those formats::dest_bytes takes today).
+        if r.is_depth || gpu_dest(r.dest_format).is_some() {
             self.resolve_gpu(r, rect, format, dest_bytes as u32, &tex, mem)?;
             if dest_bytes == 4 {
                 self.resolved_endian
@@ -7199,8 +7211,7 @@ impl Drawer {
         done
     }
 
-    /// 32bpp (or 16_16_16_16_FLOAT, `dest_bytes` 8) colour copy on the
-    /// GPU: resolve.wgsl converts, tiles and
+    /// Colour or depth copy on the GPU: resolve.wgsl converts, tiles and
     /// swaps each pixel into the destination's guest bytes kept on the GPU
     /// (see [`Mirror`]). Same result as the CPU path in
     /// [`Self::resolve_copy`]. Nothing waits here: the bytes reach guest
@@ -7269,14 +7280,8 @@ impl Drawer {
             rect.height(),
             pitch,
             src_format,
-            match r.dest_format {
-                formats::DEST_8_8_8_8 => 0,
-                formats::DEST_2_10_10_10 => 1,
-                formats::DEST_16_16 => 3,
-                formats::DEST_16_16_16_16_FLOAT => 4,
-                formats::DEST_16_16_FLOAT => 5,
-                _ => 2,
-            },
+            // A depth copy writes raw words whatever this says.
+            gpu_dest(r.dest_format).unwrap_or(2),
             u32::from(r.dest_swap),
             r.dest_endian,
             2f32.powi(r.dest_exp_bias).to_bits(),
@@ -9000,5 +9005,19 @@ mod tests {
         // Entirely past the buffer: nothing, and clipped.
         let (lo, hi, clipped) = fetch_range(a, 16, 2, &[r(4, true, 0, 1)], Some((20, 30)));
         assert_eq!((lo == hi, clipped), (true, true));
+    }
+
+    /// Every destination the drawer writes resolves on the GPU, with the
+    /// texel size resolve.wgsl writes for its code.
+    #[test]
+    fn every_resolve_destination_is_on_the_gpu() {
+        for f in 0..64 {
+            let Some(bytes) = formats::dest_bytes(f) else {
+                assert_eq!(gpu_dest(f), None, "{f}");
+                continue;
+            };
+            let code = gpu_dest(f).unwrap_or_else(|| panic!("{f}"));
+            assert_eq!(bytes == 8, matches!(code, 4 | 6 | 7), "{f}");
+        }
     }
 }

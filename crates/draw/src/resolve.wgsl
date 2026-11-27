@@ -1,5 +1,5 @@
-// Resolve of a colour render target to a 32bpp (or 16_16_16_16_FLOAT)
-// guest destination: the same conversion as formats::edram_rgba +
+// Resolve of a colour render target to a 32bpp or 64bpp guest
+// destination: the same conversion as formats::edram_rgba +
 // formats::resolve_pixel, then the 32x32 tiling and the destination endian,
 // one invocation per pixel.
 
@@ -15,7 +15,7 @@ struct Params {
     // snorm / 32), 9 16_16 float, 10 32_32 float.
     src_format: u32,
     // 0 8_8_8_8, 1 2_10_10_10, 2 32_FLOAT, 3 16_16, 4 16_16_16_16_FLOAT
-    // (64bpp), 5 16_16_FLOAT.
+    // (64bpp), 5 16_16_FLOAT, 6 16_16_16_16 (64bpp), 7 32_32_FLOAT (64bpp).
     dest_format: u32,
     swap: u32,
     // xenos::Endian128; 4 (8in64) only for 64bpp.
@@ -219,10 +219,16 @@ fn mean_recip(s: u32) -> f32 {
 fn load_guest(x: u32, y: u32) -> vec4<f32> {
     let s = p.px_scale;
     let c0 = textureLoad(src, vec2<u32>(x, y) * s, 0);
-    if s == 1u {
-        return c0;
-    }
     let q = int_max(p.src_format);
+    // The host loads k / max correctly rounded; formats::edram_rgba is
+    // k * (1 / max), an ulp apart that a 32_32_FLOAT copy keeps.
+    var k0 = c0;
+    if q.x > 0.0 {
+        k0 = round(c0 * q) * int_recip(p.src_format);
+    }
+    if s == 1u {
+        return k0;
+    }
     var sum = vec4<f32>(0.0);
     var k = vec4<i32>(0);
     var same = vec4<bool>(true);
@@ -252,7 +258,7 @@ fn load_guest(x: u32, y: u32) -> vec4<f32> {
             );
         }
     }
-    return select(m, c0, same);
+    return select(m, k0, same);
 }
 
 // The host pixel a point-sampled guest pixel (x, y) reads: s / 2 into it
@@ -282,13 +288,26 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     } else if p.src_format >= 9u {
         c = vec4<f32>(c.rg, 0.0, 0.0);
     }
-    c = c * p.scale;
+    // NaN * scale may lose its sign on the host; the CPU path keeps it.
+    let nan = (bitcast<vec4<u32>>(c) & vec4<u32>(0x7FFFFFFFu)) > vec4<u32>(0x7F800000u);
+    c = select(c * p.scale, c, nan);
     if p.swap != 0u {
         c = c.bgra;
     }
-    if p.dest_format == 4u {
-        let lo = to_half(c.r) | (to_half(c.g) << 16u);
-        let hi = to_half(c.b) | (to_half(c.a) << 16u);
+    if p.dest_format == 4u || p.dest_format == 6u || p.dest_format == 7u {
+        var lo: u32;
+        var hi: u32;
+        if p.dest_format == 4u {
+            lo = to_half(c.r) | (to_half(c.g) << 16u);
+            hi = to_half(c.b) | (to_half(c.a) << 16u);
+        } else if p.dest_format == 6u {
+            lo = to_unorm(c.r, 65535.0) | (to_unorm(c.g, 65535.0) << 16u);
+            hi = to_unorm(c.b, 65535.0) | (to_unorm(c.a, 65535.0) << 16u);
+        } else {
+            // XePack64bpp: red and green bits, not saturated.
+            lo = bitcast<u32>(c.r);
+            hi = bitcast<u32>(c.g);
+        }
         let o = p.offset + (tiled_b(x, y, p.pitch, 3u) >> 2u);
         // 8in64: the two words swapped, then 8in32.
         if p.endian == 4u {
