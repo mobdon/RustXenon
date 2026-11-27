@@ -1127,7 +1127,8 @@ struct PipelineKey {
     vs_extra: u16,
     vs_variant: Variant,
     ps: u64,
-    /// 1 when the pixel shader's depth export is dropped (no depth target).
+    /// Bit 0 when the pixel shader's depth export is dropped (no depth
+    /// target), then the alpha test bits of [`alpha_extra`].
     ps_extra: u16,
     ps_variant: Variant,
     ps_param_gen: Option<ParamGen>,
@@ -1267,7 +1268,8 @@ fn pack_filters(f: Option<[u8; 4]>) -> u32 {
 type Translation = Result<Arc<Translated>, String>;
 
 /// Key of a shader module: program hash, vertex stage, extra vertex
-/// outputs (pixel stage: 1 when the depth export is dropped), variant and
+/// outputs (pixel stage: bit 0 when the depth export is dropped, then the
+/// alpha test bits of `alpha_extra`), variant and
 /// pixel parameter generation.
 type ModuleKey = (u64, bool, u16, Variant, Option<ParamGen>);
 
@@ -2091,7 +2093,8 @@ const CONSTS_REGS: [std::ops::Range<u32>; 3] = [
 ];
 
 /// Words of a `Consts` block's suffix: the window base, the index offset,
-/// two of padding and the 96 rebase words.
+/// RB_ALPHA_REF (the alpha test reference, f32 bits), one word of padding
+/// and the 96 rebase words.
 const CONSTS_SUFFIX: usize = 4 + 96;
 
 /// Bytes of a `Consts` block: its prefix (see [`consts_prefix`]) and suffix.
@@ -2113,14 +2116,18 @@ fn consts_prefix(r: &regs::RegisterFile) -> Vec<u8> {
 }
 
 /// The rest of a `Consts` block, which each draw's window sets: the window
-/// base, the index offset and the 96 vertex fetch constants' rebase words.
+/// base, the index offset, the alpha test reference and the 96 vertex fetch constants' rebase words.
 fn consts_suffix(
     r: &regs::RegisterFile,
     window_base: u32,
     rebase: &[i32; 96],
 ) -> [u32; CONSTS_SUFFIX] {
     let mut s = [0; CONSTS_SUFFIX];
-    s[..2].copy_from_slice(&[window_base, r.get(regs::VGT_INDX_OFFSET)]);
+    s[..3].copy_from_slice(&[
+        window_base,
+        r.get(regs::VGT_INDX_OFFSET),
+        r.get(regs::RB_ALPHA_REF),
+    ]);
     for (o, &w) in s[4..].iter_mut().zip(rebase) {
         *o = w as u32;
     }
@@ -2280,6 +2287,56 @@ fn output_pixel_wgsl(
         &format!("    out.c{rt} = vec4<f32>({rgb}, {a}){scaled};\n"),
         1,
     ))
+}
+
+/// The pixel module extra bits of RB_COLORCONTROL's alpha test and alpha to
+/// mask, as Xenia applies them: only to a shader that writes oC0, on its
+/// alpha before the exponent bias. Bit 1: alpha test on, bits 2..5: its
+/// `xenos::CompareFunction`; bit 5: alpha to mask. (Bit 0 is the dropped
+/// depth export.)
+fn alpha_extra(colorcontrol: u32, writes_c0: bool) -> u16 {
+    if !writes_c0 {
+        return 0;
+    }
+    let func = colorcontrol & 7;
+    let test = colorcontrol & 8 != 0 && func != 7;
+    let mask = colorcontrol & 0x10 != 0;
+    (if test { 2 | (func as u16) << 2 } else { 0 }) | if mask { 1 << 5 } else { 0 }
+}
+
+/// A translated pixel shader that discards the pixels failing the alpha
+/// test and alpha to mask of `extra` (see [`alpha_extra`]), compared with
+/// `consts.alpha_ref`.
+fn alpha_test_wgsl(ps: &str, extra: u16) -> Result<String, String> {
+    const STORE: &str = "    out.c0 = o_col[0];
+";
+    if !ps.contains(STORE) {
+        return Err("pixel shader colour output 0 not recognised".into());
+    }
+    let mut test = String::new();
+    if extra & 2 != 0 {
+        let pass = match (extra >> 2) & 7 {
+            0 => "false",
+            1 => "o_col[0].w < consts.alpha_ref",
+            2 => "o_col[0].w == consts.alpha_ref",
+            3 => "o_col[0].w <= consts.alpha_ref",
+            4 => "o_col[0].w > consts.alpha_ref",
+            5 => "o_col[0].w != consts.alpha_ref",
+            _ => "o_col[0].w >= consts.alpha_ref",
+        };
+        test += &format!(
+            "    if !({pass}) {{ discard; }}
+"
+        );
+    }
+    if extra & (1 << 5) != 0 {
+        // shortcut: alpha to mask on a single-sampled target covers the
+        // pixel from alpha 0.5, without the guest's 2x2 dither offsets
+        // (RB_COLORCONTROL bits 24..32); add them if cut-outs look jagged.
+        test += "    if !(o_col[0].w >= 0.5) { discard; }
+";
+    }
+    Ok(ps.replacen(STORE, &(test + STORE), 1))
 }
 
 /// A translated pixel shader without its oDepth output, for a pass with no
@@ -4937,9 +4994,13 @@ impl Drawer {
             (true, Variant::RectList) => patch_vertex_wgsl(&t.wgsl, extra)
                 .and_then(|vs| rect_list_wgsl(&vs, t.info.interpolators_written | extra)),
             (true, _) => patch_vertex_wgsl(&t.wgsl, extra),
-            (false, _) if extra != 0 => drop_depth_wgsl(&t.wgsl),
+            (false, _) if extra & 1 != 0 => drop_depth_wgsl(&t.wgsl),
             (false, _) => Ok(t.wgsl.clone()),
         }
+        .and_then(|src| match vertex {
+            false if extra >> 1 != 0 => alpha_test_wgsl(&src, extra),
+            _ => Ok(src),
+        })
         .and_then(|src| match variant {
             Variant::Output(c) if !vertex => {
                 c.iter().enumerate().try_fold(src, |ps, (rt, c)| match c {
@@ -6144,7 +6205,11 @@ impl Drawer {
             report.warn("texture fetches of one slot with different filters drawn with one");
         }
         let extra = ps_t.info.interpolators_read & !vs_t.info.interpolators_written;
-        let ps_extra = u16::from(ps_t.info.writes_depth && depth_format.is_none());
+        let ps_extra = u16::from(ps_t.info.writes_depth && depth_format.is_none())
+            | alpha_extra(
+                self.regs.get(regs::RB_COLORCONTROL),
+                ps_t.info.colour_targets_written & 1 != 0,
+            );
 
         let key_stencil = stencil
             .as_ref()
@@ -8122,13 +8187,14 @@ mod tests {
             r.set(i, i.wrapping_mul(0x9E37_79B9));
         }
         r.set(regs::VGT_INDX_OFFSET, 77);
+        r.set(regs::RB_ALPHA_REF, 0x3F00_0000);
         let r = &r;
         let block = |base: u32, n: u32| (0..n).map(move |i| r.get(base + i));
         let mut want: Vec<u32> = block(regs::SHADER_CONSTANT_FETCH, 192)
             .chain(block(regs::SHADER_CONSTANT_BOOL, 8))
             .chain(block(regs::SHADER_CONSTANT_LOOP, 32))
             .collect();
-        want.extend([0x1234_5678, 77, 0, 0]);
+        want.extend([0x1234_5678, 77, 0x3F00_0000, 0]);
         let rebase = std::array::from_fn(|k| k as i32 - 3);
         want.extend(rebase.map(|w: i32| w as u32));
         let mut got = consts_prefix(r);
@@ -8795,6 +8861,39 @@ mod tests {
             "struct PsOut {\n}\n    return out;\n"
         );
         assert!(drop_depth_wgsl(DEPTH_MEMBER).is_err());
+    }
+
+    /// RB_COLORCONTROL's alpha test needs bit 3 and a function other than
+    /// always, and both it and alpha to mask need a shader writing oC0.
+    #[test]
+    fn alpha_test_bits_and_wgsl() {
+        // Greater (4), test on: bit 1 and the function in bits 2..5.
+        assert_eq!(alpha_extra(0x0C, true), 2 | 4 << 2);
+        assert_eq!(alpha_extra(0x0C, false), 0);
+        assert_eq!(alpha_extra(0x04, true), 0, "test off");
+        assert_eq!(alpha_extra(0x0F, true), 0, "always");
+        assert_eq!(alpha_extra(0x08, true), 2, "never");
+        assert_eq!(alpha_extra(0x10, true), 1 << 5, "alpha to mask");
+        let store = "    out.c0 = o_col[0];
+";
+        let ps = alpha_test_wgsl(store, alpha_extra(0x0E, true)).unwrap();
+        assert_eq!(
+            ps,
+            "    if !(o_col[0].w >= consts.alpha_ref) { discard; }
+    out.c0 = o_col[0];
+"
+        );
+        let ps = alpha_test_wgsl(store, alpha_extra(0x08 | 0x10, true)).unwrap();
+        assert!(ps.starts_with(
+            "    if !(false) { discard; }
+    if !(o_col[0].w >= 0.5)"
+        ));
+        assert!(alpha_test_wgsl(
+            "    out.c1 = o_col[1];
+",
+            2
+        )
+        .is_err());
     }
 
     #[test]

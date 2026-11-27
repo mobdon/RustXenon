@@ -909,12 +909,13 @@ pub mod capture {
     /// Render state that places a draw or resolve in EDRAM and on screen,
     /// raw register values in hex: surface, colour targets 0..3, depth,
     /// mode, window offset, window and screen scissors, mode control,
-    /// viewport transform control, depth control and colour mask.
+    /// viewport transform control, depth control, colour mask, colour
+    /// control (alpha test), alpha reference and target 0 blend.
     fn state(regs: &RegisterFile) -> String {
         use xenon_gpu::regs::*;
         let r = |a: u32| regs.get(a);
         format!(
-            "surf {:x} rt {:x} {:x} {:x} {:x} depth {:x} mode {:x} woff {:x} wsc {:x}-{:x} ssc {:x}-{:x} sc_mode {:x} vte {:x} zc {:x} mask {:x}",
+            "surf {:x} rt {:x} {:x} {:x} {:x} depth {:x} mode {:x} woff {:x} wsc {:x}-{:x} ssc {:x}-{:x} sc_mode {:x} vte {:x} zc {:x} mask {:x} cc {:x} aref {:x} blend {:x}",
             r(RB_SURFACE_INFO),
             r(RB_COLOR_INFO_RT[0]),
             r(RB_COLOR_INFO_RT[1]),
@@ -931,6 +932,9 @@ pub mod capture {
             r(PA_CL_VTE_CNTL),
             r(RB_DEPTHCONTROL),
             r(RB_COLOR_MASK),
+            r(RB_COLORCONTROL),
+            r(RB_ALPHA_REF),
+            r(RB_BLENDCONTROL0),
         )
     }
 

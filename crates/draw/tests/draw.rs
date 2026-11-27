@@ -1234,6 +1234,76 @@ fn colour_write_mask() {
     assert_eq!(px(&img, W, 10, 10), [255, 20, 255, 40]);
 }
 
+/// RB_COLORCONTROL's alpha test discards the pixels whose oC0 alpha fails
+/// against RB_ALPHA_REF, with blending off (alpha-tested cut-out cards draw
+/// opaque black around their shapes without it), and alpha to mask covers
+/// from alpha 0.5.
+#[test]
+fn alpha_test_discards_failing_pixels() {
+    let Some(mut d) = drawer() else { return };
+    let mut mem = memory();
+    let faint = [255, 0, 0, 64];
+    let solid = [0, 255, 0, 200];
+    mem.write_words(
+        VERTS,
+        &[
+            color_verts(&[
+                (0.0, 0.0, 0.0, faint),
+                (32.0, 0.0, 0.0, faint),
+                (0.0, 32.0, 0.0, faint),
+            ]),
+            color_verts(&[
+                (32.0, 32.0, 0.0, solid),
+                (64.0, 32.0, 0.0, solid),
+                (32.0, 64.0, 0.0, solid),
+            ]),
+        ]
+        .concat(),
+    );
+    let draw_both = |s: &mut Stream, colorcontrol: u32| {
+        s.regs(RB_COLORCONTROL, &[colorcontrol])
+            .vertex_fetch(0, VERTS, 12)
+            .draw_auto(PRIM_TRI_LIST, 3)
+            .vertex_fetch(0, VERTS + 48, 12)
+            .draw_auto(PRIM_TRI_LIST, 3);
+    };
+    for (colorcontrol, faint_drawn) in [
+        // Off, then always: both drawn.
+        (0x04, true),
+        (0x0F, true),
+        // Greater than 0.5: only the alpha 200 one.
+        (0x0C, false),
+        // Less than 0.5: only the alpha 64 one.
+        (0x09, true),
+        // Alpha to mask.
+        (0x10, false),
+    ] {
+        let mut s = Stream::default();
+        s.setup()
+            .resolve(&mut mem, W, H, false, Some((rgba(CLEAR), 0)))
+            .shader(false, &vs_color())
+            .shader(true, &ps_interp())
+            .regs(RB_ALPHA_REF, &[f(0.5)]);
+        draw_both(&mut s, colorcontrol);
+        let report = run(&mut d, &s, &mut mem);
+        assert_eq!(report.draws, 2, "{report:?}");
+        let img = d.read_render_target(COLOR_KEY, 0, 0, W, H).unwrap();
+        let want_faint = if faint_drawn { faint } else { CLEAR };
+        let solid_drawn = colorcontrol & 0x0F != 0x09;
+        let want_solid = if solid_drawn { solid } else { CLEAR };
+        assert_eq!(
+            px(&img, W, 4, 4),
+            want_faint,
+            "colorcontrol {colorcontrol:#x}"
+        );
+        assert_eq!(
+            px(&img, W, 36, 36),
+            want_solid,
+            "colorcontrol {colorcontrol:#x}"
+        );
+    }
+}
+
 /// z_write_enable without z_enable writes no depth (Xenia ignores it), so
 /// a later depth-tested draw behind the first one still passes.
 #[test]
