@@ -558,6 +558,50 @@ fn opt(args: &[String], name: &str) -> Option<String> {
         .cloned()
 }
 
+/// CPU features that matter for speed, as `(name, compiled in, this CPU has it)`.
+/// `cfg!` here is how xenon-host was compiled, which is how the whole game
+/// was: the generated workspace builds the host as a path dependency in the
+/// same `cargo build`, so its `.cargo/config.toml` rustflags reach it too.
+fn cpu_features() -> [(&'static str, bool, bool); 3] {
+    macro_rules! feature {
+        ($f:tt) => {
+            (
+                $f,
+                cfg!(target_feature = $f),
+                #[cfg(target_arch = "x86_64")]
+                std::arch::is_x86_feature_detected!($f),
+                #[cfg(not(target_arch = "x86_64"))]
+                false,
+            )
+        };
+    }
+    [feature!("fma"), feature!("avx2"), feature!("ssse3")]
+}
+
+/// The startup log lines for `features`: what was compiled in, and a warning
+/// when FMA was left out although this CPU has it.
+fn cpu_lines(features: &[(&str, bool, bool)]) -> Vec<String> {
+    let built: Vec<&str> = features.iter().filter(|f| f.1).map(|f| f.0).collect();
+    let built = if built.is_empty() {
+        "none".to_string()
+    } else {
+        built.join(" ")
+    };
+    let mut lines = vec![format!("cpu features built in: {built}")];
+    if features
+        .iter()
+        .any(|&(n, built, has)| n == "fma" && !built && has)
+    {
+        lines.push(
+            "warning: built without FMA for this CPU; vector maths and sound run slowly. \
+             Build with RUSTFLAGS=-C target-cpu=native (xenon-recomp writes this to \
+             .cargo/config.toml)"
+                .into(),
+        );
+    }
+    lines
+}
+
 /// Entry point of a generated game crate.
 pub fn run(sha256: &str, regs: &[fn(&mut Runtime)]) -> ExitCode {
     START.get_or_init(Instant::now);
@@ -570,6 +614,9 @@ pub fn run(sha256: &str, regs: &[fn(&mut Runtime)]) -> ExitCode {
     let opened = std::fs::File::create(me_dir.join("rustxenon-play.log"))
         .map(|f| LOG_FILE.set(Mutex::new(f)));
     log(&format!("build {BUILD}"));
+    for l in cpu_lines(&cpu_features()) {
+        log(&l);
+    }
     // Early, so a panic while starting up reaches the log and the stop screen.
     std::panic::set_hook(Box::new(|info| stop(&info.to_string())));
     if let Err(e) = opened {
@@ -1016,6 +1063,31 @@ fn start_clock(rt: Arc<Runtime>) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn cpu_lines_warn_only_when_fma_is_left_out_but_available() {
+        use super::cpu_lines;
+        let native = cpu_lines(&[
+            ("fma", true, true),
+            ("avx2", true, true),
+            ("ssse3", true, true),
+        ]);
+        assert_eq!(native, ["cpu features built in: fma avx2 ssse3"]);
+        let generic = cpu_lines(&[
+            ("fma", false, true),
+            ("avx2", false, true),
+            ("ssse3", false, true),
+        ]);
+        assert_eq!(generic.len(), 2);
+        assert_eq!(generic[0], "cpu features built in: none");
+        assert!(generic[1].starts_with("warning: built without FMA"));
+        // An old CPU without FMA: nothing to gain, so no warning.
+        let old = cpu_lines(&[("fma", false, false), ("ssse3", true, true)]);
+        assert_eq!(old, ["cpu features built in: ssse3"]);
+        // The features this build reports are the three that matter.
+        let names: Vec<_> = super::cpu_features().iter().map(|f| f.0).collect();
+        assert_eq!(names, ["fma", "avx2", "ssse3"]);
+    }
+
     #[test]
     fn rust_heap_counts_allocations_and_frees() {
         // Other tests allocate and free at the same time, so one clean try
