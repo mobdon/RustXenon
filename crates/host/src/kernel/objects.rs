@@ -10,6 +10,7 @@
 
 use super::threads::{current, timeout};
 use super::*;
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use xenon_rt::{CriticalSection, Event, Semaphore};
@@ -519,10 +520,20 @@ pub fn rtl_leave_critical_section(rt: &Runtime, c: &mut Context) {
     }
     rt.mem
         .write_u32(a + 0x10, rt.mem.read_u32(a + 0x10).wrapping_sub(1));
+    // The guest words above are what the game reads; a leave by a thread
+    // the host lock does not see as owner (seen while driving, in a game
+    // thread) is let through as the console would, and said once.
     if let KObj::Section(cs) = &*section(rt, a) {
-        cs.leave();
+        if !cs.try_leave() && !LEFT_UNOWNED.swap(true, Ordering::Relaxed) {
+            crate::log(&format!(
+                "critical section {a:#010x} left by a thread that does not own it; ignored"
+            ));
+        }
     }
 }
+
+/// Whether an unowned critical section leave has been reported.
+static LEFT_UNOWNED: AtomicBool = AtomicBool::new(false);
 
 // ---- spin locks and interrupt levels -----------------------------------------
 
