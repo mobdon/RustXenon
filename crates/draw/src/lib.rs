@@ -268,6 +268,28 @@ struct LateFront {
     /// The submitter's batch number of the batch that decodes into `buf`.
     sent: u64,
     size: (u32, u32),
+    /// Set when `buf` is mapped: the submit thread asks right after it
+    /// submits that batch, and the poll thread waits for it.
+    mapped: Mapped,
+}
+
+/// A map request's result, set by whichever thread's poll maps the buffer.
+type Mapped = Arc<Mutex<Option<Result<(), wgpu::BufferAsyncError>>>>;
+
+/// Asks for `buf` to be mapped for reading; see [`Drawer::read_mapped`].
+fn map_later(buf: &wgpu::Buffer) -> Mapped {
+    let slot: Mapped = Arc::default();
+    map_to(buf, slot.clone());
+    slot
+}
+
+/// Asks for `buf` to be mapped for reading, the result into `slot`.
+fn map_to(buf: &wgpu::Buffer, slot: Mapped) {
+    buf.slice(..).map_async(wgpu::MapMode::Read, move |r| {
+        if let Ok(mut s) = slot.lock() {
+            *s = Some(r);
+        }
+    });
 }
 
 /// Guest bytes that GPU resolves wrote, kept in a GPU buffer so that
@@ -657,6 +679,7 @@ const SPARE_STAGED: usize = 8;
 type SubmitJob = (
     Option<(wgpu::Buffer, u64, Vec<u8>)>,
     Vec<wgpu::CommandEncoder>,
+    Option<(wgpu::Buffer, Mapped)>,
 );
 
 #[derive(Default)]
@@ -676,6 +699,23 @@ impl Submitter {
     fn new(device: wgpu::Device, queue: wgpu::Queue) -> Submitter {
         let (tx, jobs) = std::sync::mpsc::channel::<SubmitJob>();
         let (done, rx) = std::sync::mpsc::channel();
+        // Waits for the submissions of buffers asked to be mapped, so the
+        // map callback and the retiring of finished work (a fifteenth of
+        // the draw thread when it polled at each swap) happen here.
+        let (poll_tx, polls) = std::sync::mpsc::channel::<wgpu::SubmissionIndex>();
+        let poller = device.clone();
+        let poll_thread = std::thread::Builder::new()
+            .name("xenon-draw poll".into())
+            .spawn(move || {
+                while let Ok(first) = polls.recv() {
+                    let index = polls.try_iter().last().unwrap_or(first);
+                    let _ = poller.poll(wgpu::PollType::Wait {
+                        submission_index: Some(index),
+                        timeout: Some(Duration::from_secs(5)),
+                    });
+                }
+            })
+            .expect("spawn poll thread");
         let thread = std::thread::Builder::new()
             .name("xenon-draw submit".into())
             .spawn(move || {
@@ -691,7 +731,9 @@ impl Submitter {
                     // Error scopes are per thread.
                     let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
                     let mut finished = Vec::with_capacity(batch.len());
-                    for (upload, encs) in batch {
+                    let mut maps = Vec::new();
+                    for (upload, encs, map) in batch {
+                        maps.extend(map);
                         let t = Instant::now();
                         let bufs: Vec<wgpu::CommandBuffer> =
                             encs.into_iter().map(|e| e.finish()).collect();
@@ -731,6 +773,12 @@ impl Submitter {
                     belt.finish();
                     let index = queue.submit(cmds);
                     belt.recall();
+                    if !maps.is_empty() {
+                        for (buf, slot) in maps {
+                            map_to(&buf, slot);
+                        }
+                        let _ = poll_tx.send(index.clone());
+                    }
                     let error = finish_error.or(block_on(scope.pop()).map(|e| e.to_string()));
                     // The submit time goes to the first batch of the merge.
                     let mut busy = t.elapsed();
@@ -753,11 +801,16 @@ impl Submitter {
             tx: Some(tx),
             rx: Mutex::new(rx),
             state: Mutex::new(SubmitState::default()),
-            threads: vec![thread],
+            threads: vec![thread, poll_thread],
         }
     }
 
-    fn send(&self, upload: Option<(wgpu::Buffer, u64, Vec<u8>)>, encs: Vec<wgpu::CommandEncoder>) {
+    fn send(
+        &self,
+        upload: Option<(wgpu::Buffer, u64, Vec<u8>)>,
+        encs: Vec<wgpu::CommandEncoder>,
+        map: Option<(wgpu::Buffer, Mapped)>,
+    ) {
         let mut st = self.state.lock().expect("submit state");
         st.pending += 1;
         st.sent += 1;
@@ -765,7 +818,7 @@ impl Submitter {
         self.tx
             .as_ref()
             .expect("submit thread")
-            .send((upload, encs))
+            .send((upload, encs, map))
             .expect("submit thread alive");
     }
 
@@ -1609,6 +1662,9 @@ pub struct Drawer {
     /// decode buffer, kept for the next swap of the same size: creating
     /// both every frame allocated 7 MB of GPU memory a frame at 720p.
     front_spare: Option<wgpu::Buffer>,
+    /// The late front buffer copy the next flush's batch writes, for the
+    /// submit thread to ask to map after it submits that batch.
+    map_after: Option<(wgpu::Buffer, Mapped)>,
     front_rows: Option<wgpu::Buffer>,
     /// At a [`Drawer::scale`] above 1, keep each 32bpp colour resolve at
     /// the drawing scale too and make a swap's frame from the
@@ -2663,6 +2719,7 @@ impl Drawer {
             late_front_buffer: std::env::var("XENON_LATE_FRAME").as_deref() == Ok("1"),
             late_front: None,
             front_spare: None,
+            map_after: None,
             front_rows: None,
             sharp_front: false,
             scaled_clock: 0,
@@ -3731,7 +3788,7 @@ impl Drawer {
                 b.enc
             }))
             .collect();
-        self.submitter.send(upload, encs);
+        self.submitter.send(upload, encs, self.map_after.take());
         self.submitted(site);
         // One reading for both, so `queue` never exceeds `submit`.
         let e = t.elapsed();
@@ -4161,13 +4218,37 @@ impl Drawer {
         buf: &wgpu::Buffer,
         index: wgpu::SubmissionIndex,
     ) -> Result<Vec<u8>, Error> {
-        let slot = Arc::new(Mutex::new(None));
-        let sink = slot.clone();
-        buf.slice(..).map_async(wgpu::MapMode::Read, move |r| {
-            if let Ok(mut s) = sink.lock() {
-                *s = Some(r);
-            }
-        });
+        let mapped = map_later(buf);
+        self.read_mapped(buf, index, mapped)
+    }
+
+    /// Copies out `buf` once `mapped` (from [`map_later`]) reports it
+    /// mapped. Another thread's poll may already have mapped it; if not,
+    /// this thread polls for submission `index` itself.
+    fn read_mapped(
+        &self,
+        buf: &wgpu::Buffer,
+        index: wgpu::SubmissionIndex,
+        mapped: Mapped,
+    ) -> Result<Vec<u8>, Error> {
+        let early = mapped.lock().map_err(|e| Error::Gpu(e.to_string()))?.take();
+        match early {
+            Some(r) => r.map_err(|e| Error::Gpu(e.to_string()))?,
+            None => self.poll_mapped(index, &mapped)?,
+        }
+        let data = buf
+            .slice(..)
+            .get_mapped_range()
+            .map_err(|e| Error::Gpu(e.to_string()))?;
+        let out = data.to_vec();
+        drop(data);
+        buf.unmap();
+        self.check_uncaptured()?;
+        Ok(out)
+    }
+
+    /// Polls until `mapped` reports or the drawer's timeout passes.
+    fn poll_mapped(&self, index: wgpu::SubmissionIndex, slot: &Mapped) -> Result<(), Error> {
         let deadline = Instant::now() + self.timeout;
         let mut poll = wgpu::PollType::Wait {
             submission_index: Some(index),
@@ -4187,15 +4268,7 @@ impl Drawer {
             }
             poll = wgpu::PollType::Poll;
         }
-        let data = buf
-            .slice(..)
-            .get_mapped_range()
-            .map_err(|e| Error::Gpu(e.to_string()))?;
-        let out = data.to_vec();
-        drop(data);
-        buf.unmap();
-        self.check_uncaptured()?;
-        Ok(out)
+        Ok(())
     }
 
     /// The texture of render target `key`, drawn with `msaa` samples, made
@@ -7373,6 +7446,8 @@ impl Drawer {
             }
             b.enc.copy_buffer_to_buffer(&rows, 0, &buf, 0, size);
             self.front_rows = Some(rows);
+            let mapped = Mapped::default();
+            self.map_after = Some((buf.clone(), mapped.clone()));
             self.flush().map_err(|e| match e {
                 Skip::Fatal(e) => e,
                 Skip::Unsupported(why) => Error::Gpu(why),
@@ -7382,13 +7457,14 @@ impl Drawer {
                 buf,
                 sent,
                 size: (width, height),
+                mapped,
             };
             let Some(old) = self.late_front.replace(new) else {
                 return Ok(Err("first late front buffer: no frame yet".into()));
             };
             // A frame later, its batch is most likely submitted already.
             let index = self.submitter.wait_for(old.sent);
-            let rgba8 = self.map_submitted(&old.buf, index)?;
+            let rgba8 = self.read_mapped(&old.buf, index, old.mapped)?;
             self.front_spare = Some(old.buf);
             let (width, height) = old.size;
             return Ok(Ok(Frame {
