@@ -31,8 +31,15 @@ fn transfer_vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
 // The source pixel under destination pixel `pos`, `swap` between colour
 // and depth. A sample past the source's row (rows not a whole number of
 // tiles wide) is not hosted: the destination keeps its pixel.
+//
+// Targets are drawn at p.px_scale host pixels per guest pixel: the guest
+// pixel is mapped as at scale 1 (samples and tile halves are guest ones)
+// and the host pixel keeps its place inside it, so a transfer between
+// targets of one sample count moves every host pixel unchanged.
 fn src_at(pos: vec4<f32>, swap: bool) -> vec2<u32> {
-    var s = vec2<u32>(pos.xy) * vec2<u32>(p.x0, p.y0);
+    let k = p.px_scale;
+    let host = vec2<u32>(pos.xy);
+    var s = host / k * vec2<u32>(p.x0, p.y0);
     if swap {
         s.x = s.x - s.x % 80u + (s.x % 80u + 40u) % 80u;
     }
@@ -40,7 +47,7 @@ fn src_at(pos: vec4<f32>, swap: bool) -> vec2<u32> {
     if at.x >= p.pitch {
         discard;
     }
-    return at;
+    return at * k + host % k;
 }
 
 // The colour texel as its EDRAM word: red in the low byte.

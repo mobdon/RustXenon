@@ -19,7 +19,7 @@ jobs:
           XENON_REQUIRE_GPU: "1"
       # The drawer suites again with render targets at twice the guest
       # resolution: what the guest sees must not change.
-      - run: cargo test -p xenon-draw --test draw --test kept --test formats
+      - run: cargo test -p xenon-draw --test draw --test kept --test formats --test edram
         env:
           XENON_REQUIRE_GPU: "1"
           XENON_SCALE: "2"

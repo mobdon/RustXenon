@@ -24,8 +24,9 @@ struct Params {
     // Word index of the destination's first byte in `dest`.
     offset: u32,
     // Host pixels per guest pixel on each axis of the source (main,
-    // depth_main and depth_stencil_main; 0 in transfer.wgsl, which does
-    // not read it). x0, y0, w and h are guest pixels.
+    // depth_main and depth_stencil_main) and of both targets in
+    // transfer.wgsl. x0, y0, w and h are guest pixels (samples per pixel
+    // in transfer.wgsl).
     px_scale: u32,
 }
 

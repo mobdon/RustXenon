@@ -2084,3 +2084,69 @@ fn half_pixel_edges_decimate_to_the_same_pixels_at_scale_2() {
     );
     assert_eq!(*resolved, *img);
 }
+
+/// The other Direct3D convention: corners on guest pixel centres (integer
+/// window coordinates), where the scale 1 tie rule takes the whole first
+/// column and row and leaves the last. At scale 2 the same guest pixels are
+/// drawn whole, not half: a rectangle inside the target, one over all of
+/// it, and one in a 1x1 window scissor (the last pass of a luminance chain).
+#[test]
+fn centre_edges_decimate_to_the_same_pixels_at_scale_2() {
+    let Some(mut d) = drawer() else { return };
+    let cases = [
+        ((10, 20), (40, 50), (W, H)),
+        ((0, 0), (W, H), (W, H)),
+        ((0, 0), (1, 1), (1, 1)),
+    ];
+    for ((x0, y0), (x1, y1), (sx, sy)) in cases {
+        let mut out = Vec::new();
+        for scale in [1, 2] {
+            if d.set_scale(scale) != scale {
+                eprintln!("SKIP: the device cannot draw at scale {scale}");
+                return;
+            }
+            let mut mem = memory();
+            let (fx0, fy0, fx1, fy1) = (x0 as f32, y0 as f32, x1 as f32, y1 as f32);
+            mem.write_words(
+                VERTS,
+                &color_verts(&[
+                    (fx0, fy0, 0.0, RED),
+                    (fx1, fy0, 0.0, RED),
+                    (fx0, fy1, 0.0, RED),
+                ]),
+            );
+            let mut s = Stream::default();
+            s.setup()
+                .resolve(&mut mem, W, H, false, Some((rgba(CLEAR), 0)))
+                .shader(false, &vs_color())
+                .shader(true, &ps_interp())
+                .vertex_fetch(0, VERTS, 12)
+                .regs(PA_SU_VTX_CNTL, &[0])
+                .regs(PA_SC_WINDOW_SCISSOR_TL, &[1 << 31, sx | (sy << 16)])
+                .draw_auto(PRIM_RECT_LIST, 3)
+                .regs(PA_SC_WINDOW_SCISSOR_TL, &[1 << 31, W | (H << 16)])
+                .regs(PA_SU_VTX_CNTL, &[1])
+                .resolve(&mut mem, W, H, true, None);
+            let report = run(&mut d, &s, &mut mem);
+            assert_eq!((report.draws, report.resolves), (1, 2), "{report:?}");
+            let img = d.read_render_target(COLOR_KEY, 0, 0, W, H).unwrap();
+            out.push((img, detiled(&mem, DEST, W, H, W, 4)));
+        }
+        let (img, resolved) = &out[0];
+        for y in 0..H {
+            for x in 0..W {
+                let inside = (x0..x1).contains(&x) && (y0..y1).contains(&y);
+                let want = if inside { RED } else { CLEAR };
+                assert_eq!(px(img, W, x, y), want, "({x}, {y}) of {x0},{y0}-{x1},{y1}");
+            }
+        }
+        assert!(
+            *img == out[1].0,
+            "scale 2 target differs, {x0},{y0}-{x1},{y1}"
+        );
+        assert!(
+            *resolved == out[1].1,
+            "scale 2 resolve differs, {x0},{y0}-{x1},{y1}"
+        );
+    }
+}
