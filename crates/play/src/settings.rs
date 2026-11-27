@@ -70,12 +70,13 @@ pub const FIELDS: [Field; 7] = [
         key: "scale",
         label: "Render scale",
         help: "Draw at this many times the console's resolution. Higher is sharper and slower.",
-        kind: Kind::Int(&[1, 2, 3, 4], 1, false),
+        // The drawer takes 1 to 4 and draws at 1 for anything else.
+        kind: Kind::Int(&[1, 2, 3, 4], 1, true),
     },
 ];
 
 /// The first line of a TOML error and its reason, without the source snippet.
-fn toml_error(e: &toml_edit::TomlError) -> String {
+pub(crate) fn toml_error(e: &impl std::fmt::Display) -> String {
     let text = e.to_string();
     let mut parts = text
         .lines()
@@ -105,14 +106,43 @@ impl Settings {
         }
     }
 
-    /// Writes a new file and renames it over the old one, so a crash part
-    /// way leaves the old file whole.
+    /// Writes a new file, flushes it to the disk and renames it over the old
+    /// one, so a crash or power cut part way leaves the old file whole. A
+    /// symlink is followed (the file it names gets the new text), and the
+    /// old file's line endings, byte order mark and hidden attribute are
+    /// kept. shortcut: a hard link to settings.toml is split off and the
+    /// file gets the folder's default permissions; write in place if a
+    /// player ever needs either.
     pub fn save(&self, path: &Path) -> Result<(), String> {
-        if std::fs::metadata(path).is_ok_and(|m| m.permissions().readonly()) {
+        let path = &std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        let old = std::fs::metadata(path).ok();
+        if old.as_ref().is_some_and(|m| m.permissions().readonly()) {
             return Err("the file is read-only".into());
         }
+        let was = std::fs::read(path).unwrap_or_default();
+        let mut text = self.0.to_string();
+        if was.windows(2).any(|w| w == b"\r\n") {
+            text = text.replace("\r\n", "\n").replace('\n', "\r\n");
+        }
+        if was.starts_with("\u{feff}".as_bytes()) && !text.starts_with('\u{feff}') {
+            text.insert(0, '\u{feff}');
+        }
         let tmp = path.with_extension("toml.new");
-        let r = std::fs::write(&tmp, self.0.to_string()).and_then(|()| std::fs::rename(&tmp, path));
+        let mut o = std::fs::OpenOptions::new();
+        o.write(true).create(true).truncate(true);
+        #[cfg(windows)]
+        if let Some(m) = &old {
+            use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+            // Hidden, system, archive and not-indexed.
+            o.attributes(m.file_attributes() & 0x2026);
+        }
+        let r = o
+            .open(&tmp)
+            .and_then(|mut f| {
+                std::io::Write::write_all(&mut f, text.as_bytes())?;
+                f.sync_all()
+            })
+            .and_then(|()| std::fs::rename(&tmp, path));
         if r.is_err() {
             let _ = std::fs::remove_file(&tmp);
         }
@@ -123,11 +153,30 @@ impl Settings {
         self.0.get(f.table)?.as_table_like()?.get(f.key)
     }
 
+    /// False when the field's table or key is there but is not a table and
+    /// a value (`[[window]]`, `window = 5`, `[window.width]`): the game
+    /// ignores it, and a step would replace what the player wrote.
+    fn plain(&self, f: &Field) -> bool {
+        match self.0.get(f.table) {
+            None => true,
+            Some(t) => t
+                .as_table_like()
+                .is_some_and(|t| t.get(f.key).map_or(true, Item::is_value)),
+        }
+    }
+
     /// The value the game uses, by the host's rules (a flag is true or false,
     /// a number is a whole number above 0), and whether the file's value, if
     /// it has one, is taken. A value the game does not take gives the default.
     fn value(&self, i: usize) -> (i64, bool) {
         let f = &FIELDS[i];
+        if !self.plain(f) {
+            let d = match f.kind {
+                Kind::Bool(d) => d as i64,
+                Kind::Int(_, d, _) => d,
+            };
+            return (d, false);
+        }
         let (d, got) = match f.kind {
             Kind::Bool(d) => (d as i64, self.get(f).map(|v| v.as_bool().map(i64::from))),
             Kind::Int(choices, d, only) => {
@@ -163,8 +212,13 @@ impl Settings {
 
     /// Moves field `i` one value up (`dir` > 0) or down, wrapping round at
     /// either end so a single button reaches every value; a bool flips.
-    pub fn step(&mut self, i: usize, dir: i32) {
+    /// False, and nothing changed, when its table or key is not a plain
+    /// table and value: what the player wrote there is kept.
+    pub fn step(&mut self, i: usize, dir: i32) -> bool {
         let f = &FIELDS[i];
+        if !self.plain(f) {
+            return false;
+        }
         let v: toml_edit::Value = match f.kind {
             Kind::Bool(_) => (self.int(i) == 0).into(),
             Kind::Int(choices, ..) => {
@@ -184,7 +238,7 @@ impl Settings {
             root.insert(f.table, toml_edit::table());
         }
         let Some(t) = root.get_mut(f.table).and_then(Item::as_table_like_mut) else {
-            return;
+            return false;
         };
         // Keep a comment after the old value.
         match t.get_mut(f.key).and_then(Item::as_value_mut) {
@@ -197,6 +251,7 @@ impl Settings {
                 t.insert(f.key, Item::Value(v));
             }
         }
+        true
     }
 }
 
@@ -319,6 +374,56 @@ mod tests {
         assert_eq!((s.show(2), s.valid(2)), ("On".into(), true));
         assert_eq!((s.show(4), s.valid(4)), ("8".into(), true));
         assert!(Settings::default().valid(0));
+        // The drawer takes scale 1 to 4 only.
+        let s = load("[draw]\nscale = 8\n");
+        assert_eq!((s.show(6), s.valid(6)), ("1".into(), false));
+    }
+
+    /// A table that is not a plain table, or a key that is a table, is not
+    /// what the game reads: marked, and a step keeps what the player wrote.
+    #[test]
+    fn tables_that_are_not_tables() {
+        for text in [
+            "[[window]]\nwidth = 1920\nnote = 'mine'\n",
+            "window = 5\n",
+            "[window.width]\nx = 1\n",
+        ] {
+            let mut s = Settings(text.parse().unwrap());
+            assert_eq!((s.show(0), s.valid(0)), ("1280".into(), false), "{text}");
+            assert!(!s.step(0, 1), "{text}");
+            assert_eq!(s.0.to_string(), text);
+        }
+        // An inline table is a table to the game.
+        let mut s = Settings("window = { width = 1920 }\n".parse().unwrap());
+        assert!(s.valid(0) && s.step(0, 1));
+        assert_eq!(s.int(0), 2560);
+    }
+
+    /// CRLF line endings, a byte order mark and the hidden attribute stay.
+    #[test]
+    fn save_keeps_file_form() {
+        let dir = crate::tests::temp("settings-form");
+        let path = dir.join("settings.toml");
+        let text = "\u{feff}# my settings\r\n[window]\r\nwidth = 1920 # wide\r\n";
+        let mut o = std::fs::OpenOptions::new();
+        o.write(true).create(true);
+        #[cfg(windows)]
+        std::os::windows::fs::OpenOptionsExt::attributes(&mut o, 2);
+        std::io::Write::write_all(&mut o.open(&path).unwrap(), text.as_bytes()).unwrap();
+        let mut s = Settings::load(&path).unwrap();
+        s.step(0, 1);
+        s.step(3, 1);
+        s.save(&path).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            text.replace("1920", "2560") + "refresh = 120\r\n"
+        );
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt;
+            let a = std::fs::metadata(&path).unwrap().file_attributes();
+            assert_ne!(a & 2, 0, "still hidden");
+        }
     }
 
     #[test]
