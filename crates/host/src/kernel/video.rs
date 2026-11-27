@@ -214,9 +214,10 @@ pub fn start(rt: std::sync::Arc<Runtime>) {
                         }
                         // Compiled pipelines persist across runs, beside the
                         // title's saves unless XENON_PIPELINE_CACHE names a
-                        // directory (0 turns it off). The driver's own cache
-                        // starts cold for every new build: without this, its
-                        // first run stalled seconds creating pipelines.
+                        // directory (0 turns it off). It spares the seconds-long
+                        // pipeline stall of a cold driver cache only when the
+                        // shaders match the file (a copied exe, an evicted
+                        // driver cache), not after a rebuild that changes them.
                         let dir = match std::env::var_os("XENON_PIPELINE_CACHE") {
                             Some(v) if v == "0" => None,
                             Some(v) => Some(std::path::PathBuf::from(v)),

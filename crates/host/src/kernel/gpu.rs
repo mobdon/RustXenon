@@ -209,8 +209,15 @@ impl DrawSide {
         static SAVE: AtomicU32 = AtomicU32::new(0);
         if crate::ms() >= SAVE.load(Ordering::Relaxed) {
             SAVE.store(crate::ms() + 5_000, Ordering::Relaxed);
+            let t = std::time::Instant::now();
             if let Err(e) = self.drawer.save_pipeline_cache() {
                 crate::log(&format!("[draw] pipeline cache not saved: {e}"));
+            }
+            let t = t.elapsed();
+            if t.as_millis() >= 2 {
+                crate::log(&format!(
+                    "[draw] pipeline cache save took {t:?} on the draw thread"
+                ));
             }
         }
         match replayed {

@@ -1860,6 +1860,8 @@ fn pipeline_cache_persists_across_drawers() {
     assert!(!file.exists());
     draw_triangle(&mut d);
     d.save_pipeline_cache().unwrap();
+    // The write runs on its own thread: the next save waits for it.
+    d.save_pipeline_cache().unwrap();
     assert!(file.exists());
     std::fs::remove_file(&file).unwrap();
     d.save_pipeline_cache().unwrap();
