@@ -217,7 +217,10 @@ layout, with its interleaved hash tables), refusing unsafe names.
   ranges alone;
 - parallel compile jobs capped by a memory budget (`--mem-gb`, about 3 GB
   a job) in the workspace's `.cargo/config.toml`, and a profile without
-  debug info or incremental state.
+  debug info or incremental state. The same file sets
+  `-C target-cpu=native`; a copied build folder must keep
+  `.cargo/config.toml`, or the game builds without FMA, runs its vector
+  maths and sound slowly, and says so in the log at startup.
 
 The game crate calls `xenon_host::run` with the executable's SHA-256; the
 host refuses any other executable. Everything under the build folder is
