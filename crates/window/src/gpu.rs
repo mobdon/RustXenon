@@ -18,7 +18,7 @@ pub struct Gpu {
 /// bilinear and clamped at the edges, as [`crate::blit`] does on the CPU.
 const SHADER: &str = r"
 @group(0) @binding(0) var frame: texture_2d<f32>;
-@group(0) @binding(1) var smooth: sampler;
+@group(0) @binding(1) var linear_sampler: sampler;
 
 struct Out {
     @builtin(position) pos: vec4<f32>,
@@ -37,7 +37,7 @@ fn vs(@builtin(vertex_index) i: u32) -> Out {
 
 @fragment
 fn fs(v: Out) -> @location(0) vec4<f32> {
-    return vec4<f32>(textureSample(frame, smooth, v.uv).rgb, 1.0);
+    return vec4<f32>(textureSample(frame, linear_sampler, v.uv).rgb, 1.0);
 }
 ";
 
@@ -65,7 +65,7 @@ impl Presenter {
         } = gpu;
         let size = window.inner_size();
         let surface = instance
-            .create_surface(wgpu::SurfaceTarget::from_window_without_display(window))
+            .create_surface(wgpu::SurfaceTarget::from(window))
             .map_err(|e| e.to_string())?;
         if !adapter.is_surface_supported(&surface) {
             return Err("the drawer's adapter cannot present to this window".into());
@@ -117,7 +117,7 @@ impl Presenter {
             ..Default::default()
         });
         if let Some(e) = pollster::block_on(scope.pop()) {
-            return Err(e.to_string());
+            return Err(format!("{e:?}"));
         }
         eprintln!(
             "window: frames presented on the GPU ({:?}, {:?})",
