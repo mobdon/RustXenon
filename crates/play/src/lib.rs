@@ -55,7 +55,12 @@ pub fn load_game(dir: &Path) -> Result<Game, String> {
     if !dir.join("game.exe").is_file() {
         return Err("no game.exe in it".into());
     }
-    let text = std::fs::read_to_string(dir.join("run.toml")).map_err(|_| "no run.toml in it")?;
+    let run = dir.join("run.toml");
+    let text = read_text(&run).map_err(|e| match e.kind() {
+        std::io::ErrorKind::NotFound => "no run.toml in it".into(),
+        _ if run.is_dir() => "run.toml: it is a folder, not a file".into(),
+        _ => format!("run.toml: {e}"),
+    })?;
     let r: RunToml =
         toml::from_str(&text).map_err(|e| format!("run.toml: {}", settings::toml_error(&e)))?;
     let title = r.title.map(|t| one_line(&t)).filter(|t| !t.is_empty());
@@ -77,6 +82,32 @@ pub fn load_game(dir: &Path) -> Result<Game, String> {
         update: r.update,
         data: r.data,
         recent: false,
+    })
+}
+
+/// A text file a player may have saved from Notepad: UTF-8 with or without
+/// a byte order mark, or UTF-16 with one. Anything else is an
+/// `InvalidData` error that says how to fix it.
+fn read_text(path: &Path) -> std::io::Result<String> {
+    let bytes = std::fs::read(path)?;
+    let utf16 = |b: &[u8], from: fn([u8; 2]) -> u16| {
+        let units: Vec<u16> = b.chunks_exact(2).map(|c| from([c[0], c[1]])).collect();
+        (b.len() % 2 == 0)
+            .then(|| String::from_utf16(&units).ok())
+            .flatten()
+    };
+    let text = match bytes.as_slice() {
+        [0xff, 0xfe, rest @ ..] => utf16(rest, u16::from_le_bytes),
+        [0xfe, 0xff, rest @ ..] => utf16(rest, u16::from_be_bytes),
+        b => std::str::from_utf8(b)
+            .ok()
+            .map(|s| s.trim_start_matches('\u{feff}').into()),
+    };
+    text.ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "it is not UTF-8 text; save it as UTF-8",
+        )
     })
 }
 
@@ -139,8 +170,8 @@ fn key(p: &Path) -> String {
     for part in s.split('\\') {
         match part {
             "" | "." => {}
-            // Never above the drive or share.
-            ".." if parts.len() > 1 => {
+            // Never above the drive, or a UNC path's server and share.
+            ".." if parts.len() > if lead >= 2 { 2 } else { 1 } => {
                 parts.pop();
             }
             ".." => {}
@@ -152,18 +183,23 @@ fn key(p: &Path) -> String {
 
 /// `recent.txt`. Lines that are not built game folders now are kept (the
 /// drive may be unplugged): [`merged`] leaves them out. A relative line is
-/// under `home`.
-pub fn load_recent(home: &Path) -> Vec<PathBuf> {
-    let text = std::fs::read_to_string(home.join("recent.txt")).unwrap_or_default();
+/// under `home`. A missing file is an empty list; a file that cannot be
+/// read says why, and must not be overwritten (its lines would be lost).
+pub fn load_recent(home: &Path) -> Result<Vec<PathBuf>, String> {
+    let text = match read_text(&home.join("recent.txt")) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(e.to_string()),
+    };
     let list: Vec<PathBuf> = text
-        .trim_start_matches('\u{feff}')
         .lines()
-        .map(str::trim)
+        // Explorer's "Copy as path" puts the path in quotes.
+        .map(|l| l.trim().trim_matches('"').trim())
         .filter(|l| !l.is_empty())
         // A trailing separator would show in the list.
         .map(|l| home.join(l.trim_end_matches(['\\', '/'])))
         .collect();
-    dedupe(list)
+    Ok(dedupe(list))
 }
 
 /// The launcher window's first size in logical pixels: 1280x720, or 16:9
@@ -255,19 +291,23 @@ fn load_all(list: &[PathBuf]) -> Vec<Option<Result<Game, String>>> {
 
 /// The games to list: recent ones first (newest first), then every other
 /// folder under `<home>/games` by title. Also a "folder: why" line for each
-/// game folder left out because its run.toml is broken.
-pub fn merged(home: &Path) -> (Vec<Game>, Vec<String>) {
-    let recent = load_recent(home);
+/// game folder left out because its run.toml is broken. `recent` is
+/// [`load_recent`]'s list.
+pub fn merged(home: &Path, recent: &[PathBuf]) -> (Vec<Game>, Vec<String>) {
     let mut out = Vec::new();
     let mut bad = Vec::new();
-    for (p, r) in recent.iter().zip(load_all(&recent)) {
+    // Only the lines that answered: a slow folder under <home>/games (a disk
+    // spinning up) is still listed below, once it is waited for.
+    let mut keys = std::collections::HashSet::new();
+    for (p, r) in recent.iter().zip(load_all(recent)) {
         match r {
             Some(Ok(g)) => out.push(Game { recent: true, ..g }),
             Some(Err(why)) if broken(&why) => bad.push(bad_line(p, &why)),
-            _ => {}
+            Some(Err(_)) => {}
+            None => continue,
         }
+        keys.insert(key(p));
     }
-    let keys: std::collections::HashSet<String> = recent.iter().map(|p| key(p)).collect();
     let (found, here_bad) = discover(home);
     let mut rest: Vec<Game> = found
         .into_iter()
@@ -287,11 +327,15 @@ pub fn is_running(dir: &Path) -> bool {
     #[cfg(windows)]
     {
         // Opening for writing without writing changes nothing.
-        let r = std::fs::OpenOptions::new()
-            .write(true)
-            .open(dir.join("game.exe"));
-        // ERROR_SHARING_VIOLATION.
-        r.is_err_and(|e| e.raw_os_error() == Some(32))
+        let exe = dir.join("game.exe");
+        match std::fs::OpenOptions::new().write(true).open(&exe) {
+            // ERROR_SHARING_VIOLATION.
+            Err(e) if e.raw_os_error() == Some(32) => true,
+            // ERROR_ACCESS_DENIED: a read-only file, or one the player may
+            // not write, is refused before the running check.
+            Err(e) if e.raw_os_error() == Some(5) => image_running(&exe),
+            _ => false,
+        }
     }
     #[cfg(not(windows))]
     {
@@ -299,6 +343,45 @@ pub fn is_running(dir: &Path) -> bool {
         let _ = dir;
         false
     }
+}
+
+/// Whether a running process's program file is `exe`, by its path.
+/// shortcut: another path to the same file (a hard link, a `subst` drive, an
+/// 8.3 name) is not seen; compare file ids if a player ever starts games so.
+#[cfg(windows)]
+fn image_running(exe: &Path) -> bool {
+    use std::os::windows::ffi::OsStringExt;
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn K32EnumProcesses(ids: *mut u32, size: u32, needed: *mut u32) -> i32;
+        fn OpenProcess(access: u32, inherit: i32, pid: u32) -> isize;
+        fn QueryFullProcessImageNameW(h: isize, flags: u32, name: *mut u16, size: *mut u32) -> i32;
+        fn CloseHandle(h: isize) -> i32;
+    }
+    let mut ids = vec![0u32; 1 << 14];
+    let mut needed = 0;
+    // SAFETY: `ids` is a buffer of the size passed, `needed` a valid u32.
+    if unsafe { K32EnumProcesses(ids.as_mut_ptr(), (ids.len() * 4) as u32, &mut needed) } == 0 {
+        return false;
+    }
+    ids.truncate(needed as usize / 4);
+    let want = key(exe);
+    ids.into_iter().any(|pid| {
+        // PROCESS_QUERY_LIMITED_INFORMATION.
+        // SAFETY: a plain call; the handle is closed below.
+        let h = unsafe { OpenProcess(0x1000, 0, pid) };
+        if h == 0 {
+            return false;
+        }
+        let mut name = [0u16; 1024];
+        let mut n = name.len() as u32;
+        // SAFETY: `name` holds `n` units, as passed.
+        let ok = unsafe { QueryFullProcessImageNameW(h, 0, name.as_mut_ptr(), &mut n) } != 0;
+        // SAFETY: `h` is an open handle from OpenProcess.
+        unsafe { CloseHandle(h) };
+        let name = OsString::from_wide(&name[..(n as usize).min(name.len())]);
+        ok && key(Path::new(&name)) == want
+    })
 }
 
 /// The folder a dropped path means: the folder itself, or the folder of a
@@ -432,9 +515,9 @@ pub(crate) mod tests {
         let mut lines = r.clone();
         lines.push(home.join("gone"));
         save_recent(&home, &lines).unwrap();
-        assert_eq!(load_recent(&home), lines);
+        assert_eq!(load_recent(&home).unwrap(), lines);
 
-        let titles: Vec<_> = merged(&home)
+        let titles: Vec<_> = merged(&home, &load_recent(&home).unwrap())
             .0
             .into_iter()
             .map(|g| (g.title, g.recent))
@@ -454,7 +537,42 @@ pub(crate) mod tests {
             format!("\u{feff}{}\r\ngames/2\r\n", elsewhere.display()),
         )
         .unwrap();
-        assert_eq!(load_recent(&home), [elsewhere.clone(), g.join("2")]);
+        assert_eq!(
+            load_recent(&home).unwrap(),
+            [elsewhere.clone(), g.join("2")]
+        );
+        // A line in quotes, as Explorer's "Copy as path" gives it.
+        std::fs::write(
+            home.join("recent.txt"),
+            format!("\"{}\"\n", elsewhere.display()),
+        )
+        .unwrap();
+        assert_eq!(
+            load_recent(&home).unwrap(),
+            std::slice::from_ref(&elsewhere)
+        );
+        // Notepad's "Unicode" (UTF-16 with a byte order mark).
+        let utf16 = |s: &str| {
+            let mut b = vec![0xff, 0xfe];
+            b.extend(s.encode_utf16().flat_map(u16::to_le_bytes));
+            b
+        };
+        std::fs::write(home.join("recent.txt"), utf16("games/3\r\ngames/1\r\n")).unwrap();
+        assert_eq!(load_recent(&home).unwrap(), [g.join("3"), g.join("1")]);
+        // Anything else (Notepad's "ANSI") is not read, so it is not
+        // overwritten either.
+        std::fs::write(home.join("recent.txt"), b"games\\1\r\nE:\\Sp\xe8le\r\n").unwrap();
+        let e = load_recent(&home).unwrap_err();
+        assert!(e.contains("not UTF-8"), "{e}");
+        // `..` stays inside a UNC share.
+        assert_ne!(
+            key(Path::new(r"\\nas\share\..\other\g")),
+            key(Path::new(r"\\nas\other\g"))
+        );
+        assert_eq!(
+            key(Path::new(r"\\nas\share\..\..\g")),
+            key(Path::new(r"\\nas\share\g"))
+        );
         // The cap.
         let mut r = Vec::new();
         for i in 0..RECENT_MAX + 5 {
@@ -475,10 +593,10 @@ pub(crate) mod tests {
         let mut lines: Vec<PathBuf> = (0..300).map(|i| home.join(format!("gone{i}"))).collect();
         lines.push(here.clone());
         save_recent(&home, &lines).unwrap();
-        let (games, bad) = merged(&home);
+        let (games, bad) = merged(&home, &load_recent(&home).unwrap());
         assert_eq!(games.len(), 1);
         assert!(games[0].recent && bad.is_empty());
-        let r = add_recent(&load_recent(&home), &other, &games);
+        let r = add_recent(&load_recent(&home).unwrap(), &other, &games);
         assert_eq!(r.len(), RECENT_MAX);
         assert_eq!((&r[0], r.last()), (&other, Some(&here)));
         assert_eq!(r[1], home.join("gone0"), "the newest offline lines stay");
@@ -494,11 +612,44 @@ pub(crate) mod tests {
         make_game(&g.join("num"), "title = 42\nexe='e'\ngame='g'\n");
         std::fs::create_dir_all(g.join("empty")).unwrap();
         save_recent(&home, &[g.join("num")]).unwrap();
-        let (games, bad) = merged(&home);
+        let (games, bad) = merged(&home, &load_recent(&home).unwrap());
         assert_eq!(games.len(), 1);
         assert_eq!(bad.len(), 1, "{bad:?}");
         assert!(bad[0].starts_with("num: run.toml: TOML parse error at line 1"));
         assert!(bad[0].contains("invalid type: integer"), "{}", bad[0]);
+
+        // A run.toml that is not UTF-8, or is a folder, is named too; UTF-16
+        // with a byte order mark is read.
+        let g = temp("broken-form").join("games");
+        make_game(&g.join("ansi"), "");
+        std::fs::write(
+            g.join("ansi/run.toml"),
+            b"title='Caf\xe9'\nexe='e'\ngame='g'\n",
+        )
+        .unwrap();
+        make_game(&g.join("utf16"), "");
+        let mut b = vec![0xff, 0xfe];
+        b.extend(
+            "title='Caf\u{e9}'\nexe='e'\ngame='g'\n"
+                .encode_utf16()
+                .flat_map(u16::to_le_bytes),
+        );
+        std::fs::write(g.join("utf16/run.toml"), b).unwrap();
+        make_game(&g.join("dir"), "");
+        std::fs::remove_file(g.join("dir/run.toml")).unwrap();
+        std::fs::create_dir(g.join("dir/run.toml")).unwrap();
+        let (games, mut bad) = discover(g.parent().unwrap());
+        assert_eq!(games.len(), 1);
+        assert_eq!(games[0].title, "Caf\u{e9}");
+        bad.sort();
+        let why: Vec<_> = bad.iter().map(|(_, why)| why.as_str()).collect();
+        assert_eq!(
+            why,
+            [
+                "run.toml: it is not UTF-8 text; save it as UTF-8",
+                "run.toml: it is a folder, not a file"
+            ]
+        );
     }
 
     #[test]
@@ -525,6 +676,39 @@ pub(crate) mod tests {
         if cfg!(windows) && std::fs::hard_link(me, dir.join("game.exe")).is_ok() {
             assert!(is_running(&dir));
         }
+    }
+
+    /// Stands in for a game that runs, for the read-only test below.
+    #[test]
+    #[ignore]
+    fn sleeper() {
+        std::thread::sleep(std::time::Duration::from_secs(60));
+    }
+
+    /// A game.exe the player may not write (read-only, or under a folder
+    /// they do not own) is still seen as running.
+    #[cfg(windows)]
+    #[test]
+    fn running_read_only_game_is_seen() {
+        let dir = temp("running-ro");
+        let exe = dir.join("game.exe");
+        std::fs::copy(std::env::current_exe().unwrap(), &exe).unwrap();
+        let mut p = std::fs::metadata(&exe).unwrap().permissions();
+        p.set_readonly(true);
+        std::fs::set_permissions(&exe, p.clone()).unwrap();
+        assert!(!is_running(&dir));
+        let mut child = std::process::Command::new(&exe)
+            .args(["--ignored", "--exact", "tests::sleeper"])
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let seen = is_running(&dir);
+        let _ = child.kill();
+        let _ = child.wait();
+        #[allow(clippy::permissions_set_readonly_false)]
+        p.set_readonly(false);
+        let _ = std::fs::set_permissions(&exe, p);
+        assert!(seen);
     }
 
     #[test]

@@ -44,17 +44,15 @@ fn main() {
         .and_then(|p| p.parent().map(Path::to_path_buf))
         .unwrap_or_else(|| PathBuf::from("."));
     // Appended to, so a second launcher beside the first does not cut its
-    // lines; started again once it passes 1 MB.
+    // lines; started again once it passes 1 MB. Emptied, then appended to
+    // too: a launcher already writing it then writes at the new end, not
+    // over this one's lines.
     let log_path = exe_dir.join("rustxenon-play-launcher.log");
-    let fresh = std::fs::metadata(&log_path).is_ok_and(|m| m.len() > 1 << 20);
-    let mut o = std::fs::OpenOptions::new();
-    o.create(true);
-    if fresh {
-        o.write(true).truncate(true);
-    } else {
-        o.append(true);
+    if std::fs::metadata(&log_path).is_ok_and(|m| m.len() > 1 << 20) {
+        let _ = File::create(&log_path);
     }
-    *LOG.lock().unwrap() = o.open(log_path).ok();
+    let mut o = std::fs::OpenOptions::new();
+    *LOG.lock().unwrap() = o.create(true).append(true).open(log_path).ok();
     log(&format!("launcher pid {}", std::process::id()));
     // No console in the GUI subsystem, so panics go to the log file.
     let default_hook = std::panic::take_hook();
@@ -194,20 +192,26 @@ struct App {
     scroll: [usize; 2],
     /// A message about the last thing done; it goes when the player moves on.
     note: Option<String>,
+    /// The problems with the list last told in a note (broken run.toml
+    /// files, an unread recent.txt): told again only when they change.
+    told: Vec<String>,
     running: Option<(Game, Child)>,
     window: Option<(Rc<Window>, Surface)>,
     /// The backdrop of each page seen at this size, so a page switch is free.
     back: Vec<(usize, usize, Page, Vec<u32>)>,
     pad: xinput::Reader,
+    /// The next pad read only takes the pad as it is (see `read_pad`).
+    pad_settle: bool,
     buttons: u16,
     held: Option<(Act, Instant)>,
     /// The controller is read only while the window has focus.
     focused: bool,
     cursor: (f32, f32),
-    /// The mouse button down and what it went down on.
-    pressed: Option<(MouseButton, Option<Hit>)>,
-    /// The scroll bar is being dragged.
-    drag_bar: bool,
+    /// The mouse button down and what it went down on: the page and first
+    /// row shown then, and the hit.
+    pressed: Option<(MouseButton, Page, usize, Option<Hit>)>,
+    /// The scroll bar is being dragged, held this far below the thumb's top.
+    drag_bar: Option<f32>,
     /// Wheel or touchpad scroll not yet turned into a whole row, in rows.
     wheel: f32,
     started: Instant,
@@ -224,16 +228,18 @@ impl App {
             sel: [0; 2],
             scroll: [0; 2],
             note: None,
+            told: Vec::new(),
             running: None,
             window: None,
             back: Vec::new(),
             pad: xinput::Reader::default(),
+            pad_settle: true,
             buttons: 0,
             held: None,
             focused: false,
             cursor: (-1.0, -1.0),
             pressed: None,
-            drag_bar: false,
+            drag_bar: None,
             wheel: 0.0,
             started: Instant::now(),
         };
@@ -297,17 +303,40 @@ impl App {
     /// the place in the list if it is gone.
     fn refresh(&mut self) {
         let keep = self.games.get(self.sel[0]).map(|g| g.dir.clone());
+        let (recent, recent_err) = match xenon_play::load_recent(&self.home) {
+            Ok(r) => (r, None),
+            Err(e) => {
+                log(&format!("recent.txt: {e}"));
+                (
+                    Vec::new(),
+                    Some(format!("recent.txt not read (it is kept as it is): {e}")),
+                )
+            }
+        };
         let bad;
-        (self.games, bad) = xenon_play::merged(&self.home);
+        (self.games, bad) = xenon_play::merged(&self.home, &recent);
         for b in &bad {
             log(&format!("not listed: {b}"));
         }
-        // Told once a note about something else has gone.
-        if let (Some(first), None) = (bad.first(), &self.note) {
-            self.note = Some(match bad.len() {
-                1 => format!("Not listed, its run.toml is broken: {first}"),
-                n => format!("{n} games not listed, run.toml broken. First: {first}"),
+        // Told once a note about something else has gone, and again only
+        // when they change.
+        let problems: Vec<String> = recent_err.iter().chain(&bad).cloned().collect();
+        if problems.is_empty() {
+            self.told.clear();
+        } else if self.note.is_none() && problems != self.told {
+            // Not empty: if recent.txt was read, a run.toml is broken.
+            self.note = Some(match recent_err {
+                Some(e) => e,
+                None if bad.len() == 1 => {
+                    format!("Not listed, its run.toml is broken: {}", bad[0])
+                }
+                None => format!(
+                    "{} games not listed, run.toml broken. First: {}",
+                    bad.len(),
+                    bad[0]
+                ),
             });
+            self.told = problems;
         }
         self.load_settings();
         let at = keep.and_then(|d| self.games.iter().position(|g| g.dir == d));
@@ -339,13 +368,7 @@ impl App {
         let dir = std::path::absolute(&dir).unwrap_or(dir);
         match xenon_play::load_game(&dir) {
             Ok(_) => {
-                let recent =
-                    xenon_play::add_recent(&xenon_play::load_recent(&self.home), &dir, &self.games);
-                if let Err(e) = xenon_play::save_recent(&self.home, &recent) {
-                    self.note = Some(format!("recent.txt not saved: {e}"));
-                } else {
-                    self.note = None;
-                }
+                self.note = self.add_recent(&dir);
                 log(&format!("added {}", dir.display()));
                 self.refresh();
                 self.page = Page::Games;
@@ -359,6 +382,21 @@ impl App {
                 self.note = Some(format!("{name} is not a built game folder: {e}"));
             }
         }
+    }
+
+    /// Puts `dir` at the top of recent.txt; why not, if it could not. A
+    /// recent.txt that cannot be read is left as it is: its lines would go.
+    fn add_recent(&self, dir: &Path) -> Option<String> {
+        let r = xenon_play::load_recent(&self.home)
+            .map_err(|e| format!("recent.txt not changed (it is kept as it is): {e}"))
+            .and_then(|recent| {
+                let recent = xenon_play::add_recent(&recent, dir, &self.games);
+                xenon_play::save_recent(&self.home, &recent)
+                    .map_err(|e| format!("recent.txt not saved: {e}"))
+            });
+        let e = r.err()?;
+        log(&e);
+        Some(e)
     }
 
     fn start(&mut self) {
@@ -387,11 +425,7 @@ impl App {
             Ok((g, child)) => {
                 log(&format!("started {} (pid {})", g.dir.display(), child.id()));
                 // Only a game that started goes to the top of the list.
-                let recent = xenon_play::load_recent(&self.home);
-                let recent = xenon_play::add_recent(&recent, &g.dir, &self.games);
-                if let Err(e) = xenon_play::save_recent(&self.home, &recent) {
-                    log(&format!("recent.txt: {e}"));
-                }
+                self.note = self.add_recent(&g.dir);
                 self.running = Some((g, child));
             }
             Err(e) => {
@@ -509,8 +543,20 @@ impl App {
     }
 
     /// The controller: buttons on press, directions repeating while held.
+    /// A pad that comes back (a wireless drop-out, a USB re-seat) is settled
+    /// like one after a game: a button held through it is not a new press.
     fn read_pad(&mut self) {
-        let p = xenon_input::filtered(self.pad.read());
+        let Some(p) = self.pad.read() else {
+            self.pad_settle = true;
+            return;
+        };
+        let p = xenon_input::filtered(p);
+        if std::mem::take(&mut self.pad_settle) {
+            self.buttons = p.buttons;
+            let never = Instant::now() + Duration::from_secs(3600);
+            self.held = pad_dir(&p, None).map(|d| (d, never));
+            return;
+        }
         let pressed = p.buttons & !self.buttons;
         self.buttons = p.buttons;
         for (bit, a) in [
@@ -543,14 +589,11 @@ impl App {
         }
     }
 
-    /// Takes the pad as it is now without acting, so a button still held
-    /// when a game exits (Start, say) does not count as a new press, and a
-    /// direction still held waits for its release.
+    /// The next read takes the pad as it is then without acting, so a
+    /// button still held when a game exits (Start, say) does not count as a
+    /// new press, and a direction still held waits for its release.
     fn pad_settle(&mut self) {
-        let p = xenon_input::filtered(self.pad.read());
-        self.buttons = p.buttons;
-        let never = Instant::now() + Duration::from_secs(3600);
-        self.held = pad_dir(&p, None).map(|d| (d, never));
+        self.pad_settle = true;
     }
 
     /// A click on `at`.
@@ -597,15 +640,29 @@ impl App {
         }
     }
 
-    /// Scrolls to where the pointer is along the scroll bar.
-    fn bar(&mut self) {
+    /// Scrolls so the scroll bar's thumb is under the pointer, held at `grab`.
+    fn bar(&mut self, grab: f32) {
         let (w, h) = self.size();
-        let n = self.len();
-        if self.running.is_some() || n <= ROWS {
+        let s = draw::bar_scroll(w, h, self.page, self.len(), self.cursor.1, grab);
+        self.scroll_to(s);
+    }
+
+    /// Shows the list from row `s`, as the scroll bar and the wheel do. The
+    /// row under the pointer is the one selected, as with a hover; else the
+    /// selection stays, moved only to stay on screen.
+    fn scroll_to(&mut self, s: usize) {
+        let (len, p) = (self.len(), self.page as usize);
+        if self.running.is_some() || len <= ROWS {
             return;
         }
-        let along = draw::bar_at(w, h, self.page, self.cursor.1);
-        self.pick((along * (n - 1) as f32).round() as usize);
+        let s = s.min(len - ROWS);
+        self.scroll[p] = s;
+        let (w, h) = self.size();
+        let sel = match draw::hit(w, h, self.page, self.cursor.0, self.cursor.1) {
+            Some(Hit::Row(r)) if self.drag_bar.is_none() => s + r,
+            _ => self.sel[p].clamp(s, s + ROWS - 1),
+        };
+        self.pick(sel);
     }
 
     fn size(&self) -> (usize, usize) {
@@ -679,6 +736,10 @@ impl ApplicationHandler for App {
             WindowEvent::CloseRequested => ev.exit(),
             WindowEvent::Focused(f) => {
                 self.focused = f;
+                // The button-up of a press or drag may never come now (Alt+Tab
+                // while it is held): that press is over.
+                self.pressed = None;
+                self.drag_bar = None;
                 if f {
                     self.pad_settle();
                     // Another launcher on this home may have changed it.
@@ -717,8 +778,8 @@ impl ApplicationHandler for App {
             WindowEvent::CursorMoved { position, .. } => {
                 let (w, h) = self.size();
                 self.cursor = (position.x as f32, position.y as f32);
-                if self.drag_bar {
-                    self.bar();
+                if let Some(grab) = self.drag_bar {
+                    self.bar(grab);
                 } else if let Some(Hit::Row(r)) =
                     draw::hit(w, h, self.page, self.cursor.0, self.cursor.1)
                 {
@@ -731,24 +792,29 @@ impl ApplicationHandler for App {
                 }
             }
             // A click is a press and a release on the same thing, as with any
-            // button: letting go somewhere else cancels. The scroll bar acts
-            // from the press and drags.
+            // button: letting go somewhere else, or after the page or the
+            // rows shown changed, cancels. The scroll bar acts from the press
+            // and drags.
             WindowEvent::MouseInput { state, button, .. } => {
                 let (w, h) = self.size();
                 let at = draw::hit(w, h, self.page, self.cursor.0, self.cursor.1);
+                let p = self.page as usize;
+                let now = (button, self.page, self.scroll[p], at);
                 match state {
                     ElementState::Pressed => {
                         if button == MouseButton::Left && at == Some(Hit::Bar) {
-                            self.drag_bar = true;
-                            self.bar();
+                            let (len, s) = (self.len(), self.scroll[p]);
+                            let grab = draw::bar_grab(w, h, self.page, len, s, self.cursor.1);
+                            self.drag_bar = Some(grab);
+                            self.bar(grab);
                         }
-                        self.pressed = Some((button, at));
+                        self.pressed = Some((button, self.page, self.scroll[p], at));
                     }
                     ElementState::Released => {
                         if button == MouseButton::Left {
-                            self.drag_bar = false;
+                            self.drag_bar = None;
                         }
-                        if self.pressed.take() == Some((button, at)) {
+                        if self.pressed.take() == Some(now) {
                             self.click(button, at);
                         }
                     }
@@ -762,10 +828,9 @@ impl ApplicationHandler for App {
                 };
                 let rows = self.wheel.trunc();
                 self.wheel -= rows;
-                let a = if rows > 0.0 { Act::Up } else { Act::Down };
-                for _ in 0..rows.abs() as usize {
-                    self.act(a);
-                }
+                // The wheel moves the list under the pointer, as in other apps.
+                let s = self.scroll[self.page as usize] as f32 - rows;
+                self.scroll_to(s.max(0.0) as usize);
             }
             WindowEvent::DroppedFile(p) => {
                 if self.running.is_none() {
@@ -861,26 +926,27 @@ mod xinput {
     }
 
     impl Reader {
-        pub fn read(&mut self) -> Pad {
+        /// None while no controller is connected.
+        pub fn read(&mut self) -> Option<Pad> {
             if let Some(p) = self.port.and_then(get) {
-                return p;
+                return Some(p);
             }
             self.port = None;
             if self
                 .searched
                 .is_some_and(|t| t.elapsed() < Duration::from_secs(1))
             {
-                return Pad::default();
+                return None;
             }
             self.searched = Some(Instant::now());
             for user in 0..4 {
                 if let Some(p) = get(user) {
                     super::log(&format!("controller on XInput port {user}"));
                     self.port = Some(user);
-                    return p;
+                    return Some(p);
                 }
             }
-            Pad::default()
+            None
         }
     }
 }
@@ -892,8 +958,8 @@ mod xinput {
     pub struct Reader(());
 
     impl Reader {
-        pub fn read(&mut self) -> xenon_input::Pad {
-            xenon_input::Pad::default()
+        pub fn read(&mut self) -> Option<xenon_input::Pad> {
+            None
         }
     }
 }
@@ -902,6 +968,43 @@ mod xinput {
 mod tests {
     use super::*;
     use xenon_input::Pad;
+
+    /// A broken run.toml is told once, not again on every refresh (a game
+    /// start, a game exit, F5), and again when another breaks. A recent.txt
+    /// that cannot be read is told and kept as it is.
+    #[test]
+    fn list_problems_told_once() {
+        let home = std::env::temp_dir().join(format!("xenon-play-told-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let game = |name: &str, run: &str| {
+            let d = home.join("games").join(name);
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(d.join("game.exe"), b"").unwrap();
+            std::fs::write(d.join("run.toml"), run).unwrap();
+            d
+        };
+        let ok = game("ok", "title='Fine'\nexe='e'\ngame='g'\n");
+        game("bad", "title = 42\nexe='e'\ngame='g'\n");
+        let mut app = App::new(home.clone());
+        assert!(app
+            .note
+            .as_ref()
+            .is_some_and(|n| n.contains("bad: run.toml")));
+        app.note = None;
+        app.refresh();
+        assert_eq!(app.note, None);
+        game("bad2", "exe='e'\n");
+        app.refresh();
+        assert!(app.note.as_ref().is_some_and(|n| n.starts_with("2 games")));
+
+        let ansi = b"E:\\Sp\xe8le\r\n".to_vec();
+        std::fs::write(home.join("recent.txt"), &ansi).unwrap();
+        app.note = None;
+        app.refresh();
+        assert!(app.note.as_ref().is_some_and(|n| n.contains("not UTF-8")));
+        assert!(app.add_recent(&ok).is_some());
+        assert_eq!(std::fs::read(home.join("recent.txt")).unwrap(), ansi);
+    }
 
     #[test]
     fn pad_direction_lets_go_lower() {

@@ -78,7 +78,7 @@ pub enum Hit {
     /// screen.
     Hint(usize),
     /// The list's scroll bar (there only while the list is longer than
-    /// [`ROWS`]): [`bar_at`] says where along it.
+    /// [`ROWS`]): [`bar_grab`] and [`bar_scroll`] say where along it.
     Bar,
 }
 
@@ -224,12 +224,29 @@ fn thumb_rect(l: &Lay, len: usize, scroll: usize) -> Rect {
     (bx, ty, bw, th)
 }
 
-/// Where window height `y` is along `page`'s scroll bar: 0 at the top, 1
-/// at the bottom, clamped (a drag can leave the bar).
-pub fn bar_at(w: usize, h: usize, page: Page, y: f32) -> f32 {
+/// Where a press at window height `y` holds the thumb of `page`'s scroll
+/// bar, from the thumb's top in board units: where it is on the thumb, or
+/// its middle for a press on the track (the thumb jumps there).
+pub fn bar_grab(w: usize, h: usize, page: Page, len: usize, scroll: usize, y: f32) -> f32 {
     let (k, _, oy) = fit(w, h);
-    let (_, by, _, bh) = bar_rect(&lay(page));
-    (((y - oy) / k - by) / bh).clamp(0.0, 1.0)
+    let (_, ty, _, th) = thumb_rect(&lay(page), len, scroll);
+    let at = (y - oy) / k - ty;
+    if (0.0..th).contains(&at) {
+        at
+    } else {
+        th / 2.0
+    }
+}
+
+/// The first row shown when the thumb is held at `grab` ([`bar_grab`]) with
+/// the pointer at window height `y`, clamped (a drag can leave the bar).
+pub fn bar_scroll(w: usize, h: usize, page: Page, len: usize, y: f32, grab: f32) -> usize {
+    let (k, _, oy) = fit(w, h);
+    let l = lay(page);
+    let (_, by, _, bh) = bar_rect(&l);
+    let th = thumb_rect(&l, len, 0).3;
+    let along = (((y - oy) / k - grab - by) / (bh - th).max(1.0)).clamp(0.0, 1.0);
+    (along * len.saturating_sub(ROWS) as f32).round() as usize
 }
 
 fn info_rect(l: &Lay) -> Rect {
@@ -1467,11 +1484,15 @@ pub fn overlay(px: &mut [u32], w: usize, h: usize, v: &View, t: f32) {
                 text(&mut cv, ax(up), y + 17.0, 3.0, tc, ">");
                 let val = setting(v, i);
                 let mid = (ax(down) + ax(up) + text_w(3.0, ">")) / 2.0;
+                // A long value a player typed (4294967295) is drawn smaller,
+                // clear of the arrows.
+                let room = ax(up) - ax(down) - text_w(3.0, "<") - 24.0;
+                let size = (3.0 * room / text_w(3.0, &val).max(1.0)).min(3.0);
                 text(
                     &mut cv,
-                    mid - text_w(3.0, &val) / 2.0,
-                    y + 17.0,
-                    3.0,
+                    mid - text_w(size, &val) / 2.0,
+                    y + 17.0 + 3.5 * (3.0 - size),
+                    size,
                     tc,
                     &val,
                 );
@@ -1786,11 +1807,23 @@ mod tests {
                 // The scroll bar, and where along it.
                 let (bx, by, bw, bh) = bar_rect(&l);
                 assert_eq!(at(bx + bw / 2.0, by + bh / 4.0), Some(Hit::Bar));
-                let along = bar_at(w, h, page, (by + bh / 4.0) * k);
-                assert!((along - 0.25).abs() < 0.01, "{along}");
-                assert_eq!(bar_at(w, h, page, 0.0), 0.0);
                 let (_, ty, _, th) = thumb_rect(&l, 300, 293);
                 assert!(th >= 24.0 && (ty + th - (by + bh)).abs() < 0.01);
+                // A press on the thumb holds it where it is: no scroll until
+                // a drag. One on the track centres the thumb there.
+                for (scroll, at_y) in [(293, ty + th / 2.0), (293, ty + 1.0), (0, by + 1.0)] {
+                    let y = at_y * k;
+                    let grab = bar_grab(w, h, page, 300, scroll, y);
+                    assert_eq!(bar_scroll(w, h, page, 300, y, grab), scroll);
+                }
+                let y = (by + bh / 2.0) * k;
+                let grab = bar_grab(w, h, page, 300, 0, y);
+                assert_eq!(grab, th / 2.0);
+                assert_eq!(bar_scroll(w, h, page, 300, y, grab), 293 / 2 + 1);
+                // The last pixel of the track reaches the end.
+                let y = (by + bh) * k - 1.0;
+                assert_eq!(bar_scroll(w, h, page, 300, y, grab), 293);
+                assert_eq!(bar_scroll(w, h, page, 300, 0.0, grab), 0);
                 let (x, y, iw, ih) = info_rect(&l);
                 let info = (page == Page::Games).then_some(Hit::Info);
                 assert_eq!(at(x + iw / 2.0, y + ih / 2.0), info);
