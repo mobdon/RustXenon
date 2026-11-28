@@ -79,8 +79,6 @@ impl Presenter {
         config.format = (caps.formats.iter().copied())
             .find(|f| !f.is_srgb())
             .unwrap_or(config.format);
-        // Vsync, and at most two frames queued: a present never stalls the
-        // drawer, which hands frames over from another thread.
         // Mailbox: each refresh shows the newest frame and a present never
         // waits; with Fifo the window blocked on the swapchain long enough to
         // show only about 42 of 60 frames a second. XENON_PRESENT=fifo,
