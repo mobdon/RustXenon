@@ -6,6 +6,8 @@ use crate::Error;
 
 /// One presented frame: `rgba8` is `width * height * 4` bytes, rows top to
 /// bottom, R G B A per pixel.
+/// It is empty when the frame went to a window on the GPU instead (see
+/// `Drawer::present`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Frame {
     pub width: u32,
@@ -30,5 +32,12 @@ impl Frame {
     /// Writes [`Frame::to_png_bytes`] to `path`.
     pub fn write_png(&self, path: impl AsRef<Path>) -> Result<(), Error> {
         std::fs::write(path, self.to_png_bytes()?).map_err(|e| Error::Io(e.to_string()))
+    }
+}
+
+/// The pixels, so a shared frame can be shown without copying them.
+impl AsRef<[u8]> for Frame {
+    fn as_ref(&self) -> &[u8] {
+        &self.rgba8
     }
 }

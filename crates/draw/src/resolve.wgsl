@@ -1,5 +1,5 @@
-// Resolve of a colour render target to a 32bpp (or 16_16_16_16_FLOAT)
-// guest destination: the same conversion as formats::edram_rgba +
+// Resolve of a colour render target to a 32bpp or 64bpp guest
+// destination: the same conversion as formats::edram_rgba +
 // formats::resolve_pixel, then the 32x32 tiling and the destination endian,
 // one invocation per pixel.
 
@@ -15,7 +15,7 @@ struct Params {
     // snorm / 32), 9 16_16 float, 10 32_32 float.
     src_format: u32,
     // 0 8_8_8_8, 1 2_10_10_10, 2 32_FLOAT, 3 16_16, 4 16_16_16_16_FLOAT
-    // (64bpp).
+    // (64bpp), 5 16_16_FLOAT, 6 16_16_16_16 (64bpp), 7 32_32_FLOAT (64bpp).
     dest_format: u32,
     swap: u32,
     // xenos::Endian128; 4 (8in64) only for 64bpp.
@@ -23,7 +23,11 @@ struct Params {
     scale: f32,
     // Word index of the destination's first byte in `dest`.
     offset: u32,
-    pad1: u32,
+    // Host pixels per guest pixel on each axis of the source (main,
+    // depth_main and depth_stencil_main) and of both targets in
+    // transfer.wgsl. x0, y0, w and h are guest pixels (samples per pixel
+    // in transfer.wgsl).
+    px_scale: u32,
 }
 
 @group(0) @binding(0) var src: texture_2d<f32>;
@@ -61,6 +65,17 @@ fn from_7e3(f10: u32) -> f32 {
 
 fn q7e3(f: f32) -> f32 {
     return from_7e3(to_7e3(f));
+}
+
+// A 7e3 host texel as the EDRAM holds it (formats::edram_rgba): 7e3 RGB,
+// 2-bit alpha.
+fn edram_7e3(c: vec4<f32>) -> vec4<f32> {
+    var a = 0.0;
+    if c.a > 0.0 {
+        a = min(c.a, 1.0);
+    }
+    let a2 = u32(a * 3.0 + 0.5);
+    return vec4<f32>(q7e3(c.r), q7e3(c.g), q7e3(c.b), f32(a2) * (1.0 / 3.0));
 }
 
 // Saturate (NaN to 0), scale, +0.5 and truncate.
@@ -143,6 +158,115 @@ fn swap_endian(w: u32, e: u32) -> u32 {
     }
 }
 
+// Per channel, the integer maximum of a unorm or snorm source format (its
+// texels are k / max), or 0 for a float one.
+fn int_max(f: u32) -> vec4<f32> {
+    switch f {
+        case 0u: {
+            return vec4<f32>(255.0);
+        }
+        case 1u: {
+            return vec4<f32>(1023.0, 1023.0, 1023.0, 3.0);
+        }
+        case 7u, 8u: {
+            return vec4<f32>(32767.0);
+        }
+        default: {
+            return vec4<f32>(0.0);
+        }
+    }
+}
+
+// 1 / max of int_max, as formats::edram_rgba multiplies by it.
+fn int_recip(f: u32) -> vec4<f32> {
+    switch f {
+        case 0u: {
+            return vec4<f32>(1.0 / 255.0);
+        }
+        case 1u: {
+            return vec4<f32>(1.0 / 1023.0, 1.0 / 1023.0, 1.0 / 1023.0, 1.0 / 3.0);
+        }
+        default: {
+            return vec4<f32>(1.0 / 32767.0);
+        }
+    }
+}
+
+// 1 / (s * s), the f32 the CPU path rounds it to.
+fn mean_recip(s: u32) -> f32 {
+    switch s {
+        case 2u: {
+            return 0.25;
+        }
+        case 3u: {
+            return 1.0 / 9.0;
+        }
+        case 4u: {
+            return 0.0625;
+        }
+        default: {
+            return 1.0;
+        }
+    }
+}
+
+// Guest pixel (x, y) of the colour source, as formats::decimate takes it
+// from its p.px_scale x p.px_scale host pixels: a channel that is the same
+// bits in all keeps them; else unorm and snorm channels are the mean of
+// their integers (halves away from zero), float ones the f32 sum in row
+// order times mean_recip, rounded to half for the half-float formats; 7e3
+// sums its texels through edram_7e3.
+fn load_guest(x: u32, y: u32) -> vec4<f32> {
+    let s = p.px_scale;
+    let c0 = textureLoad(src, vec2<u32>(x, y) * s, 0);
+    let q = int_max(p.src_format);
+    // The host loads k / max correctly rounded; formats::edram_rgba is
+    // k * (1 / max), an ulp apart that a 32_32_FLOAT copy keeps.
+    var k0 = c0;
+    if q.x > 0.0 {
+        k0 = round(c0 * q) * int_recip(p.src_format);
+    }
+    if s == 1u {
+        return k0;
+    }
+    var sum = vec4<f32>(0.0);
+    var k = vec4<i32>(0);
+    var same = vec4<bool>(true);
+    for (var j = 0u; j < s; j++) {
+        for (var i = 0u; i < s; i++) {
+            let c = textureLoad(src, vec2<u32>(x * s + i, y * s + j), 0);
+            same = same & (bitcast<vec4<u32>>(c) == bitcast<vec4<u32>>(c0));
+            if p.src_format == 2u {
+                // Blending leaves a 7e3 half unclamped; average EDRAM values.
+                sum += edram_7e3(c);
+            } else {
+                sum += c;
+            }
+            k += vec4<i32>(round(c * q));
+        }
+    }
+    let n = i32(s * s);
+    var m: vec4<f32>;
+    if q.x > 0.0 {
+        m = vec4<f32>(sign(k) * ((abs(k) + vec4<i32>(n / 2)) / vec4<i32>(n))) * int_recip(p.src_format);
+    } else {
+        m = sum * mean_recip(s);
+        if p.src_format == 2u || p.src_format == 3u || p.src_format == 9u {
+            m = vec4<f32>(
+                unpack2x16float(to_half(m.x) | (to_half(m.y) << 16u)),
+                unpack2x16float(to_half(m.z) | (to_half(m.w) << 16u)),
+            );
+        }
+    }
+    return select(m, k0, same);
+}
+
+// The host pixel a point-sampled guest pixel (x, y) reads: s / 2 into it
+// on each axis (formats::point_sub_pixel).
+fn point_at(x: u32, y: u32) -> vec2<u32> {
+    return vec2<u32>(x, y) * p.px_scale + vec2<u32>(p.px_scale / 2u);
+}
+
 @compute @workgroup_size(8, 8)
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     if id.x >= p.w || id.y >= p.h {
@@ -150,14 +274,9 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     }
     let x = p.x0 + id.x;
     let y = p.y0 + id.y;
-    var c = textureLoad(src, vec2<u32>(x, y), 0);
+    var c = load_guest(x, y);
     if p.src_format == 2u {
-        var a = 0.0;
-        if c.a > 0.0 {
-            a = min(c.a, 1.0);
-        }
-        let a2 = u32(a * 3.0 + 0.5);
-        c = vec4<f32>(q7e3(c.r), q7e3(c.g), q7e3(c.b), f32(a2) * (1.0 / 3.0));
+        c = edram_7e3(c);
     } else if p.src_format == 4u {
         c = vec4<f32>(c.r, 0.0, 0.0, 0.0);
     } else if p.src_format == 7u || p.src_format == 8u {
@@ -169,13 +288,26 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     } else if p.src_format >= 9u {
         c = vec4<f32>(c.rg, 0.0, 0.0);
     }
-    c = c * p.scale;
+    // NaN * scale may lose its sign on the host; the CPU path keeps it.
+    let nan = (bitcast<vec4<u32>>(c) & vec4<u32>(0x7FFFFFFFu)) > vec4<u32>(0x7F800000u);
+    c = select(c * p.scale, c, nan);
     if p.swap != 0u {
         c = c.bgra;
     }
-    if p.dest_format == 4u {
-        let lo = to_half(c.r) | (to_half(c.g) << 16u);
-        let hi = to_half(c.b) | (to_half(c.a) << 16u);
+    if p.dest_format == 4u || p.dest_format == 6u || p.dest_format == 7u {
+        var lo: u32;
+        var hi: u32;
+        if p.dest_format == 4u {
+            lo = to_half(c.r) | (to_half(c.g) << 16u);
+            hi = to_half(c.b) | (to_half(c.a) << 16u);
+        } else if p.dest_format == 6u {
+            lo = to_unorm(c.r, 65535.0) | (to_unorm(c.g, 65535.0) << 16u);
+            hi = to_unorm(c.b, 65535.0) | (to_unorm(c.a, 65535.0) << 16u);
+        } else {
+            // XePack64bpp: red and green bits, not saturated.
+            lo = bitcast<u32>(c.r);
+            hi = bitcast<u32>(c.g);
+        }
         let o = p.offset + (tiled_b(x, y, p.pitch, 3u) >> 2u);
         // 8in64: the two words swapped, then 8in32.
         if p.endian == 4u {
@@ -195,6 +327,8 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
         w = bitcast<u32>(c.r);
     } else if p.dest_format == 3u {
         w = to_unorm(c.r, 65535.0) | (to_unorm(c.g, 65535.0) << 16u);
+    } else if p.dest_format == 5u {
+        w = to_half(c.r) | (to_half(c.g) << 16u);
     } else {
         w = to_unorm(c.r, 1023.0) | (to_unorm(c.g, 1023.0) << 10u) | (to_unorm(c.b, 1023.0) << 20u)
             | (to_unorm(c.a, 3.0) << 30u);
@@ -249,7 +383,8 @@ fn depth_main(@builtin(global_invocation_id) id: vec3<u32>) {
     }
     let x = p.x0 + id.x;
     let y = p.y0 + id.y;
-    store(x, y, depth_word(x, y));
+    let h = point_at(x, y);
+    store(x, y, depth_word(h.x, h.y));
 }
 
 @compute @workgroup_size(8, 8)
@@ -259,7 +394,8 @@ fn depth_stencil_main(@builtin(global_invocation_id) id: vec3<u32>) {
     }
     let x = p.x0 + id.x;
     let y = p.y0 + id.y;
-    store(x, y, depth_word(x, y) | (textureLoad(stencil_src, vec2<u32>(x, y), 0).r & 0xFFu));
+    let h = point_at(x, y);
+    store(x, y, depth_word(h.x, h.y) | (textureLoad(stencil_src, h, 0).r & 0xFFu));
 }
 
 // A tiled k_8_8_8_8 texture decoded from guest bytes kept on the GPU, as
@@ -281,7 +417,7 @@ struct DecodeParams {
     // decode_float only: 0 k_32_FLOAT to Rgba32Float, 1 k_32_FLOAT to
     // Rgba16Float, 2 k_16_16_16_16_FLOAT to Rgba16Float, 3 k_24_8 and 5
     // k_24_8_FLOAT to Rgba32Float, 4 k_24_8 and 6 k_24_8_FLOAT to
-    // Rgba16Float.
+    // Rgba16Float, 7 k_16_16_FLOAT to Rgba16Float.
     mode: u32,
     pad0: u32,
     pad1: u32,
@@ -349,11 +485,17 @@ fn decode_float(@builtin(global_invocation_id) id: vec3<u32>) {
     let y = dp.y0 + id.y;
     var v: array<u32, 4>;
     var one = 0x3F800000u;
-    if dp.mode == 2u {
-        let o = dp.offset + (tiled_b(id.x, y, dp.pitch, 3u) >> 2u);
-        let lo = swap_endian(guest[o], dp.endian);
-        let hi = swap_endian(guest[o + 1u], dp.endian);
-        v = array<u32, 4>(lo & 0xFFFFu, lo >> 16u, hi & 0xFFFFu, hi >> 16u);
+    if dp.mode == 2u || dp.mode == 7u {
+        if dp.mode == 2u {
+            let o = dp.offset + (tiled_b(id.x, y, dp.pitch, 3u) >> 2u);
+            let lo = swap_endian(guest[o], dp.endian);
+            let hi = swap_endian(guest[o + 1u], dp.endian);
+            v = array<u32, 4>(lo & 0xFFFFu, lo >> 16u, hi & 0xFFFFu, hi >> 16u);
+        } else {
+            // k_16_16_FLOAT reads as XYYY (xenon_texture convert::texel).
+            let w = swap_endian(guest[dp.offset + (tiled(id.x, y, dp.pitch) >> 2u)], dp.endian);
+            v = array<u32, 4>(w & 0xFFFFu, w >> 16u, w >> 16u, w >> 16u);
+        }
         // f32_to_half(half_to_f32(h)) keeps every half but NaNs: the
         // texture crate's half_to_f32 drops their sign, so all of them
         // become the positive quiet NaN 0x7E00.
@@ -389,7 +531,7 @@ fn decode_float(@builtin(global_invocation_id) id: vec3<u32>) {
         }
         return;
     }
-    if dp.mode != 2u {
+    if dp.mode != 2u && dp.mode != 7u {
         for (var i = 0u; i < 4u; i++) {
             out[i] = half_bits(out[i]);
         }

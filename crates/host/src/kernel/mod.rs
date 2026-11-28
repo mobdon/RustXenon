@@ -103,8 +103,9 @@ pub struct Kernel {
     pub threads: Mutex<HashMap<u32, threads::ThreadInfo>>,
     pub tls_used: Mutex<Vec<bool>>,
     pub links: Mutex<Vec<(String, PathBuf, bool)>>,
-    /// Import calls by thunk address: (name, count).
-    pub calls: Mutex<HashMap<u32, (String, u64)>>,
+    /// Import calls by thunk address: (name, count). Fixed at install, so
+    /// the per-import-call count needs no lock.
+    pub calls: HashMap<u32, (String, AtomicU64)>,
     pub swaps: AtomicU64,
     pub video: Mutex<video::Video>,
     pub time_stamp_bundle: u32,
@@ -267,13 +268,7 @@ const PHYS: (u32, u32) = (0xA000_0000, 0xC000_0000);
 /// The function every unknown import gets: stops with its name.
 fn missing(_: &Runtime, _: &mut Context) {
     let at = crate::last_call();
-    let name = k()
-        .calls
-        .lock()
-        .unwrap()
-        .get(&at)
-        .map(|x| x.0.clone())
-        .unwrap_or_default();
+    let name = k().calls.get(&at).map(|x| x.0.clone()).unwrap_or_default();
     panic!("unimplemented import {name} (thunk {at:#010x})");
 }
 
@@ -327,7 +322,7 @@ pub fn install(rt: &mut Runtime, s: &Setup) {
         let name = found.map_or(format!("{short}#{}", i.ordinal), |e| e.1.to_string());
         if i.thunk {
             rt.set_override(i.address, found.map_or(missing as GuestFn, |e| e.2));
-            calls.insert(i.address, (name, 0));
+            calls.insert(i.address, (name, AtomicU64::new(0)));
         } else if i.library == "xboxkrnl.exe" {
             vars.insert(i.ordinal, i.address);
         }
@@ -399,7 +394,7 @@ pub fn install(rt: &mut Runtime, s: &Setup) {
             &s.data_dir,
             s.update_dir.as_deref(),
         )),
-        calls: Mutex::new(calls),
+        calls,
         swaps: AtomicU64::new(0),
         video: Mutex::new(video::Video::default()),
         time_stamp_bundle: tsb,
@@ -408,15 +403,13 @@ pub fn install(rt: &mut Runtime, s: &Setup) {
 }
 
 pub fn import_name(addr: u32) -> Option<String> {
-    k().calls.lock().unwrap().get(&addr).map(|x| x.0.clone())
+    k().calls.get(&addr).map(|x| x.0.clone())
 }
 
 /// Name of the import this thread called last.
 pub fn current_import() -> String {
     let at = crate::last_call();
     k().calls
-        .lock()
-        .unwrap()
         .get(&at)
         .map_or_else(|| format!("{at:#x}"), |x| x.0.clone())
 }
@@ -436,9 +429,8 @@ pub fn count_call(addr: u32) -> Option<String> {
             }
         })
     });
-    let mut calls = k().calls.lock().unwrap();
-    let e = calls.get_mut(&addr)?;
-    e.1 += 1;
+    let e = k().calls.get(&addr)?;
+    e.1.fetch_add(1, Ordering::Relaxed);
     let f = filter.as_ref()?;
     let show = if f.is_empty() {
         !e.0.contains("CriticalSection")
@@ -452,11 +444,9 @@ pub fn count_call(addr: u32) -> Option<String> {
 pub fn call_report() -> Vec<(String, u64)> {
     let mut v: Vec<_> = k()
         .calls
-        .lock()
-        .unwrap()
         .values()
+        .map(|x| (x.0.clone(), x.1.load(Ordering::Relaxed)))
         .filter(|x| x.1 > 0)
-        .cloned()
         .collect();
     v.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
     v

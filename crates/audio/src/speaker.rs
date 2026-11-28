@@ -11,6 +11,11 @@
 //! by up to [`MAX_STEER`] from how full the ring is, so a host clock that
 //! runs a little fast or slow does not drift into either.
 //!
+//! The device is kept on its own thread (`keep_open`): when there is no
+//! output device, or the one playing is lost, that thread tries the current
+//! default device again every [`RETRY`], and [`Speaker::poll`] takes up each
+//! device it opens with an empty ring at that device's rate.
+//!
 //! Everything but [`Speaker::open`] is pure and tests anywhere. The device
 //! side uses `cpal` on Windows only; elsewhere [`Speaker::open`] reports that
 //! no output is available.
@@ -18,7 +23,9 @@
 use crate::{Sink, SAMPLE_RATE};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 /// Sound the ring may hold before it cuts back to its target, unless the
 /// device pulls more than half of this at once.
@@ -31,6 +38,10 @@ pub const START_MS: usize = 50;
 pub const MAX_STEER: f64 = 0.005;
 /// Rate change per unit of fill error ((fill - target) / target).
 const STEER_GAIN: f64 = 0.01;
+/// Time between attempts to open a device while none is open.
+pub const RETRY: Duration = Duration::from_secs(2);
+/// How often the device thread checks whether its device was lost.
+const HOLD: Duration = Duration::from_secs(1);
 
 /// Interleaved stereo at the device rate, between the mixer and the device.
 pub struct Ring {
@@ -197,9 +208,58 @@ impl Shared {
     }
 }
 
-/// A [`Sink`] that plays on the default output device.
+/// What the device thread tells the mixer side.
+enum Event {
+    /// A device opened at this rate, its ring empty.
+    Opened(Arc<Shared>, u32),
+    /// No device opened, for this reason (sent on every attempt).
+    Failed(String),
+}
+
+/// The device thread: opens a device with `start`, keeps its stream until
+/// the device is lost, and tries again every [`RETRY`] while none opens.
+/// It reports each attempt to `tx` and ends once the [`Speaker`] is gone.
+/// `wait` sleeps (it is the clock in tests).
+#[cfg_attr(not(windows), allow(dead_code))] // only open and tests run it
+fn keep_open<S>(
+    mut start: impl FnMut() -> Result<(S, u32, Arc<Shared>), String>,
+    tx: Sender<Event>,
+    mut wait: impl FnMut(Duration),
+) {
+    loop {
+        match start() {
+            Ok((stream, rate, shared)) => {
+                if tx.send(Event::Opened(shared.clone(), rate)).is_err() {
+                    return;
+                }
+                // The stream plays while it lives, and it may not move to
+                // another thread, so this one keeps it until the device is
+                // lost. It waits before each check, so a device that fails
+                // as soon as it starts is reopened once a HOLD, not in a spin.
+                let _stream = stream;
+                loop {
+                    wait(HOLD);
+                    if shared.dead.load(Ordering::Relaxed) {
+                        break;
+                    }
+                }
+            }
+            Err(e) => {
+                if tx.send(Event::Failed(e)).is_err() {
+                    return;
+                }
+                wait(RETRY);
+            }
+        }
+    }
+}
+
+/// A [`Sink`] that plays on the default output device, and on the new
+/// default one after that is lost.
 pub struct Speaker {
-    shared: Arc<Shared>,
+    events: Receiver<Event>,
+    /// The device playing; none while the device thread looks for one.
+    shared: Option<Arc<Shared>>,
     resampler: Resampler,
     scratch: Vec<f32>,
     rate: u32,
@@ -207,6 +267,8 @@ pub struct Speaker {
     base: f64,
     /// Ring level after each write, smoothed, in samples.
     fill: f64,
+    /// Why the last attempt failed, so each reason is logged once.
+    failed: Option<String>,
 }
 
 fn lock(r: &Mutex<Ring>) -> std::sync::MutexGuard<'_, Ring> {
@@ -215,57 +277,80 @@ fn lock(r: &Mutex<Ring>) -> std::sync::MutexGuard<'_, Ring> {
 
 impl Speaker {
     #[cfg_attr(not(windows), allow(dead_code))] // only open and tests make one
-    fn new(shared: Arc<Shared>, rate: u32) -> Self {
-        let resampler = Resampler::new(SAMPLE_RATE, rate);
+    fn new(events: Receiver<Event>) -> Self {
         Self {
-            shared,
-            base: resampler.step,
-            resampler,
+            events,
+            shared: None,
+            resampler: Resampler::new(SAMPLE_RATE, SAMPLE_RATE),
             scratch: Vec::new(),
-            rate,
+            rate: SAMPLE_RATE,
+            base: 1.0,
             fill: 0.0,
+            failed: None,
         }
     }
 
-    /// The device's rate in frames a second.
+    /// The rate of the device last opened, in frames a second.
     pub fn rate(&self) -> u32 {
         self.rate
     }
 
-    /// (underflow, overflow) so far, in milliseconds of sound.
-    pub fn counts_ms(&self) -> (u64, u64) {
+    /// (underflow, overflow) on the device playing, in milliseconds of
+    /// sound; none while no device plays.
+    pub fn counts_ms(&self) -> Option<(u64, u64)> {
+        let shared = self.shared.as_ref()?;
         let (u, o) = {
-            let r = lock(&self.shared.ring);
+            let r = lock(&shared.ring);
             (r.underflow, r.overflow)
         };
         let ms = |f: u64| f * 1000 / self.rate as u64;
-        (ms(u + self.shared.busy.load(Ordering::Relaxed)), ms(o))
+        Some((ms(u + shared.busy.load(Ordering::Relaxed)), ms(o)))
     }
 
-    /// Opens the default output device and starts it playing silence.
+    /// Takes up what the device thread reported, without waiting: drops a
+    /// lost device, and starts on a newly opened one from an empty ring and
+    /// fresh steering at its rate. Returns a line to log when whether, or
+    /// why not, sound plays changed: once per change, not per attempt.
+    pub fn poll(&mut self) -> Option<String> {
+        if self
+            .shared
+            .as_ref()
+            .is_some_and(|s| s.dead.load(Ordering::Relaxed))
+        {
+            self.shared = None;
+            self.failed = None;
+            return Some("speaker lost; reopening the default device".into());
+        }
+        match self.events.try_recv().ok()? {
+            Event::Opened(shared, rate) => {
+                self.resampler = Resampler::new(SAMPLE_RATE, rate);
+                self.base = self.resampler.step;
+                self.rate = rate;
+                self.fill = 0.0;
+                self.shared = Some(shared);
+                self.failed = None;
+                Some(format!("playing at {rate} Hz"))
+            }
+            Event::Failed(e) if self.failed.as_ref() != Some(&e) => {
+                let line = format!("no speaker ({e}); trying again every {} s", RETRY.as_secs());
+                self.failed = Some(e);
+                Some(line)
+            }
+            Event::Failed(_) => None,
+        }
+    }
+
+    /// Opens the default output device on its own thread, which keeps it
+    /// (or, while there is none, tries again); [`Speaker::poll`] reports how
+    /// that goes.
     #[cfg(windows)]
     pub fn open() -> Result<Self, String> {
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::Builder::new()
             .name("speaker".into())
-            .spawn(move || match device::start() {
-                Ok((stream, rate, shared)) => {
-                    let _ = tx.send(Ok((rate, shared.clone())));
-                    // The stream plays while it lives, and it may not move
-                    // to another thread, so this one keeps it until the
-                    // device is lost.
-                    let _stream = stream;
-                    while !shared.dead.load(Ordering::Relaxed) {
-                        std::thread::park_timeout(std::time::Duration::from_secs(1));
-                    }
-                }
-                Err(e) => {
-                    let _ = tx.send(Err(e));
-                }
-            })
+            .spawn(move || keep_open(device::start, tx, std::thread::park_timeout))
             .map_err(|e| e.to_string())?;
-        let (rate, shared) = rx.recv().map_err(|e| e.to_string())??;
-        Ok(Self::new(shared, rate))
+        Ok(Self::new(rx))
     }
 
     /// No output device support on this platform.
@@ -276,16 +361,16 @@ impl Speaker {
 }
 
 impl Sink for Speaker {
-    /// Fails once the device is lost; until then a full ring drops and
-    /// counts instead.
+    /// Never fails: a full ring drops and counts, and with no device open
+    /// the sound is dropped until [`Speaker::poll`] takes up a new one.
     fn write(&mut self, stereo: &[f32]) -> std::io::Result<()> {
-        if self.shared.dead.load(Ordering::Relaxed) {
-            return Err(std::io::Error::other("the output device stopped"));
-        }
+        let Some(shared) = &self.shared else {
+            return Ok(());
+        };
         self.scratch.clear();
         self.resampler.process(stereo, &mut self.scratch);
         let (len, target) = {
-            let mut r = lock(&self.shared.ring);
+            let mut r = lock(&shared.ring);
             r.push(&self.scratch);
             (r.len(), r.target())
         };
@@ -538,10 +623,23 @@ mod tests {
         );
     }
 
+    /// A speaker playing on a fresh device at `rate`, and the sender the
+    /// device thread would hold.
+    fn opened(rate: u32) -> (Arc<Shared>, Speaker, Sender<Event>) {
+        let shared = Shared::new(rate);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut sp = Speaker::new(rx);
+        tx.send(Event::Opened(shared.clone(), rate)).unwrap();
+        assert_eq!(
+            sp.poll().as_deref(),
+            Some(&*format!("playing at {rate} Hz"))
+        );
+        (shared, sp, tx)
+    }
+
     #[test]
     fn speaker_resamples_into_ring() {
-        let shared = Shared::new(44_100);
-        let mut sp = Speaker::new(shared.clone(), 44_100);
+        let (shared, mut sp, _tx) = opened(44_100);
         for _ in 0..10 {
             sp.write(&[0.1; 512]).unwrap();
         }
@@ -549,13 +647,12 @@ mod tests {
         // Within the steering range of 2560 frames at 44.1 kHz.
         let want = 2560 * 441 / 480;
         assert!(frames.abs_diff(want) <= want / 100, "{frames}");
-        assert_eq!(sp.counts_ms(), (0, 0));
+        assert_eq!(sp.counts_ms(), Some((0, 0)));
     }
 
     #[test]
     fn speaker_steers_rate_from_fill() {
-        let shared = Shared::new(48_000);
-        let mut sp = Speaker::new(shared.clone(), 48_000);
+        let (shared, mut sp, _tx) = opened(48_000);
         // Nearly empty: play slower than the mix arrives, to fill up.
         sp.write(&[0.1; 512]).unwrap();
         assert!((sp.resampler.step - (1.0 - MAX_STEER)).abs() < 1e-9);
@@ -582,11 +679,114 @@ mod tests {
     }
 
     #[test]
-    fn speaker_fails_once_device_is_lost() {
-        let shared = Shared::new(48_000);
-        let mut sp = Speaker::new(shared.clone(), 48_000);
+    fn speaker_reopens_after_device_is_lost() {
+        let (old, mut sp, tx) = opened(48_000);
+        // Nobody pulls, so the old ring fills and steering speeds up.
+        for _ in 0..500 {
+            sp.write(&[0.1; 512]).unwrap();
+        }
+        assert!(sp.resampler.step > 1.0);
+        old.dead.store(true, Ordering::Relaxed);
+        assert_eq!(
+            sp.poll().as_deref(),
+            Some("speaker lost; reopening the default device")
+        );
+        assert_eq!(sp.counts_ms(), None);
+        // With no device the mix is dropped, not an error.
+        let len = lock(&old.ring).len();
         sp.write(&[0.1; 512]).unwrap();
+        assert_eq!(lock(&old.ring).len(), len, "nothing goes to a lost device");
+        // The new default runs at another rate: an empty ring, steered from
+        // empty again (slower than the mix, to fill), at the new base.
+        let new = Shared::new(44_100);
+        tx.send(Event::Opened(new.clone(), 44_100)).unwrap();
+        assert_eq!(sp.poll().as_deref(), Some("playing at 44100 Hz"));
+        sp.write(&[0.1; 512]).unwrap();
+        let base = 48_000.0 / 44_100.0;
+        assert!((sp.resampler.step - base * (1.0 - MAX_STEER)).abs() < 1e-9);
+        let frames = lock(&new.ring).len() / 2;
+        assert!(frames.abs_diff(256 * 441 / 480) <= 2, "{frames}");
+        assert_eq!(sp.counts_ms(), Some((0, 0)));
+    }
+
+    #[test]
+    fn speaker_logs_each_change_once() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut sp = Speaker::new(rx);
+        assert_eq!(sp.poll(), None);
+        let none = || Event::Failed("no default output device".into());
+        let line = "no speaker (no default output device); trying again every 2 s";
+        tx.send(none()).unwrap();
+        tx.send(none()).unwrap();
+        assert_eq!(sp.poll().as_deref(), Some(line));
+        assert_eq!(sp.poll(), None, "the same reason again is not logged");
+        tx.send(Event::Failed("other".into())).unwrap();
+        assert!(sp.poll().is_some(), "a new reason is");
+        let shared = Shared::new(48_000);
+        tx.send(Event::Opened(shared.clone(), 48_000)).unwrap();
+        assert!(sp.poll().is_some());
         shared.dead.store(true, Ordering::Relaxed);
-        assert!(sp.write(&[0.1; 512]).is_err());
+        assert!(sp.poll().is_some());
+        assert_eq!(sp.poll(), None, "a loss is logged once");
+        tx.send(none()).unwrap();
+        assert_eq!(
+            sp.poll().as_deref(),
+            Some(line),
+            "after a loss, logged again"
+        );
+    }
+
+    #[test]
+    fn device_thread_retries_until_a_device_opens_and_after_it_is_lost() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let shared = Shared::new(48_000);
+        let mut tries = 0;
+        let start = || {
+            tries += 1;
+            match tries {
+                3 => Ok(((), 48_000, shared.clone())),
+                _ => Err(format!("try {tries}")),
+            }
+        };
+        let (mut rx, mut seen, mut waits) = (Some(rx), Vec::new(), Vec::new());
+        keep_open(start, tx, |d| {
+            waits.push(d);
+            seen.extend(rx.as_ref().unwrap().try_iter().map(|e| match e {
+                Event::Opened(_, r) => format!("opened {r}"),
+                Event::Failed(e) => e,
+            }));
+            if d == HOLD {
+                shared.dead.store(true, Ordering::Relaxed); // the device is lost
+            }
+            if waits.len() == 4 {
+                rx = None; // the speaker is gone: the thread ends
+            }
+        });
+        assert_eq!(waits, [RETRY, RETRY, HOLD, RETRY]);
+        assert_eq!(seen, ["try 1", "try 2", "opened 48000", "try 4"]);
+        assert_eq!(tries, 5);
+    }
+
+    #[test]
+    fn device_thread_waits_before_reopening_a_device_lost_at_once() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut tries = 0;
+        // Each device fails before the thread first looks at it.
+        let start = || {
+            tries += 1;
+            assert!(tries <= 10, "reopened without waiting");
+            let shared = Shared::new(48_000);
+            shared.dead.store(true, Ordering::Relaxed);
+            Ok(((), 48_000, shared))
+        };
+        let (mut rx, mut waits) = (Some(rx), Vec::new());
+        keep_open(start, tx, |d| {
+            waits.push(d);
+            if waits.len() == 3 {
+                drop(rx.take()); // the speaker is gone: the thread ends
+            }
+        });
+        assert_eq!(waits, [HOLD; 3]);
+        assert_eq!(tries, 4);
     }
 }

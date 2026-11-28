@@ -37,7 +37,9 @@ build   Writes the executable as a Cargo workspace under --out (one crate
         per --range bytes of guest code, default 0x10000; functions longer
         than --max-part instructions, default 4000, are split; parallel
         jobs capped at --mem-gb / 3, default from 16). Files are rewritten
-        only when their text changes. Then build with `cargo build` in --out.
+        only when their text changes. Then build with `cargo build` in --out
+        (`cargo build --features game/player` for the double-click player:
+        no console window; the log goes to rustxenon-play.log).
         The output is derived from the game: keep it local, never commit it.
 
 unpack  Copies every file of the player's own disc image into <dir> (the

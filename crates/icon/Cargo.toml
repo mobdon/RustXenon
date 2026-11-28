@@ -1,0 +1,11 @@
+[package]
+name = "xenon-icon"
+description = "The programs' icon, drawn by code: RGBA pixels at any size, an .ico file and a Win32 .res file for the linker. No window, files or dependencies."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[dev-dependencies]
+png = "0.17"

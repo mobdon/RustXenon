@@ -28,7 +28,7 @@
 //!       loop_consts: array<vec4<u32>, 8>,
 //!       window_base: u32,
 //!       vertex_base: u32,
-//!       _pad0: u32,
+//!       alpha_ref: f32,
 //!       _pad1: u32,
 //!       vf_rebase: array<vec4<i32>, 24>,
 //!   }
@@ -40,6 +40,7 @@
 //!   `2k`. `bool_consts` holds 256 bits, bit `i` being bit `i % 32` of
 //!   flattened word `i / 32`. `loop_consts` holds the 32 loop constants
 //!   (count in bits 0..8, aL start in 8..16, signed aL step in 16..24).
+//!   `alpha_ref` is RB_ALPHA_REF, which the drawer's alpha test reads.
 //! - `@group(0) @binding(4)` in the vertex stage and `@binding(5)` in the
 //!   pixel stage is `var<uniform> fc: array<vec4<f32>, count>`: the float
 //!   constants of that stage that [`ShaderInfo::float_consts_bound`] names,

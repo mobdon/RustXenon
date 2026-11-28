@@ -49,34 +49,52 @@ pub enum Bind {
     Right(i8, i8),
 }
 
-/// The default keyboard layout (documented in the README).
-pub const DEFAULT_KEYS: [(&str, Bind); 26] = [
+/// The default keyboard layout, PC action-game style: WASD to move,
+/// mouse to look (see [`Mouse`]), Space to sprint, Shift to jump, F to get
+/// in or out of a vehicle. [`VEHICLE_KEYS`] override some keys while the
+/// game says the player is in one ([`Keyboard::set_vehicle`]).
+pub const DEFAULT_KEYS: [(&str, Bind); 27] = [
     ("KeyW", Bind::Left(0, 1)),
     ("KeyS", Bind::Left(0, -1)),
     ("KeyA", Bind::Left(-1, 0)),
     ("KeyD", Bind::Left(1, 0)),
-    ("ShiftLeft", Bind::Button(0x0040)),
+    ("Space", Bind::Button(0x1000)),     // A: sprint
+    ("ShiftLeft", Bind::Button(0x4000)), // X: jump
+    ("KeyF", Bind::Button(0x8000)),      // Y: enter or leave a vehicle
+    ("KeyR", Bind::Button(0x2000)),      // B: reload, melee
+    ("KeyQ", Bind::Button(0x0200)),      // RB: take cover
+    ("KeyE", Bind::Button(0x0100)),      // LB: action, pick up
+    ("KeyC", Bind::Button(0x0040)),      // left stick click: crouch
+    ("KeyX", Bind::Button(0x0080)),      // right stick click: look behind
+    ("KeyV", Bind::Button(0x0020)),      // Back: camera
+    ("Tab", Bind::Button(0x0020)),
+    ("ArrowUp", Bind::Button(0x0001)), // phone
+    ("ArrowDown", Bind::Button(0x0002)),
+    ("ArrowLeft", Bind::Button(0x0004)),
+    ("ArrowRight", Bind::Button(0x0008)),
+    ("Enter", Bind::Button(0x0010)),
+    ("Escape", Bind::Button(0x0010)),
+    ("Backspace", Bind::Button(0x0020)),
     ("KeyI", Bind::Right(0, 1)),
     ("KeyK", Bind::Right(0, -1)),
     ("KeyJ", Bind::Right(-1, 0)),
     ("KeyL", Bind::Right(1, 0)),
-    ("ShiftRight", Bind::Button(0x0080)),
-    ("ArrowUp", Bind::Button(0x0001)),
-    ("ArrowDown", Bind::Button(0x0002)),
-    ("ArrowLeft", Bind::Button(0x0004)),
-    ("ArrowRight", Bind::Button(0x0008)),
-    ("Space", Bind::Button(0x1000)),
-    ("KeyC", Bind::Button(0x2000)),
-    ("KeyF", Bind::Button(0x4000)),
-    ("KeyR", Bind::Button(0x8000)),
-    ("KeyQ", Bind::Button(0x0100)),
-    ("KeyE", Bind::Button(0x0200)),
     ("KeyZ", Bind::LeftTrigger),
-    ("KeyX", Bind::RightTrigger),
-    ("Enter", Bind::Button(0x0010)),
-    ("Escape", Bind::Button(0x0010)),
-    ("Backspace", Bind::Button(0x0020)),
-    ("Tab", Bind::Button(0x0020)),
+    ("KeyB", Bind::RightTrigger),
+];
+
+/// Keys that do something else in a vehicle: W and S drive (the triggers),
+/// Space is the handbrake, H the horn, and the numpad pitches and rolls
+/// aircraft (left stick).
+pub const VEHICLE_KEYS: [(&str, Bind); 8] = [
+    ("KeyW", Bind::RightTrigger),
+    ("KeyS", Bind::LeftTrigger),
+    ("Space", Bind::Button(0x0200)), // RB: handbrake
+    ("KeyH", Bind::Button(0x0040)),  // left stick click: horn
+    ("Numpad8", Bind::Left(0, 1)),
+    ("Numpad5", Bind::Left(0, -1)),
+    ("Numpad4", Bind::Left(-1, 0)),
+    ("Numpad6", Bind::Left(1, 0)),
 ];
 
 /// XInput's recommended dead zones.
@@ -84,16 +102,42 @@ pub const LEFT_DEAD_ZONE: i16 = 7849;
 pub const RIGHT_DEAD_ZONE: i16 = 8689;
 pub const TRIGGER_THRESHOLD: u8 = 30;
 
+/// Seconds a held movement key takes to push the left stick from centre
+/// to full, and to let it back: a key that snapped the stick to full made
+/// steering jerk from straight to full lock.
+const RAMP_UP: f32 = 0.18;
+const RAMP_DOWN: f32 = 0.08;
+
+/// Mouse speed, in counts per second, that pushes the right stick fully.
+pub const MOUSE_FULL: f32 = 1500.0;
+
 /// Keys held down, turned into a pad reading with [`DEFAULT_KEYS`].
 #[derive(Default)]
 pub struct Keyboard {
     held: HashSet<String>,
+    /// The left stick as it ramps toward the held keys, -1..=1.
+    left: (f32, f32),
+    /// The game says the player is in a vehicle: [`VEHICLE_KEYS`] apply.
+    vehicle: bool,
+}
+
+/// Moves `v` toward `target` by `dt` seconds of ramping.
+fn approach(v: f32, target: f32, dt: f32) -> f32 {
+    let pushing =
+        target != 0.0 && (v == 0.0 || v.signum() == target.signum()) && v.abs() < target.abs();
+    let step = dt / if pushing { RAMP_UP } else { RAMP_DOWN };
+    if (target - v).abs() <= step {
+        target
+    } else {
+        v + step * (target - v).signum()
+    }
 }
 
 impl Keyboard {
     /// A key went down or up. Unbound keys are ignored.
     pub fn key(&mut self, code: &str, down: bool) {
-        if !DEFAULT_KEYS.iter().any(|k| k.0 == code) {
+        let bound = |t: &[(&str, Bind)]| t.iter().any(|k| k.0 == code);
+        if !bound(&DEFAULT_KEYS) && !bound(&VEHICLE_KEYS) {
             return;
         }
         if down {
@@ -103,18 +147,53 @@ impl Keyboard {
         }
     }
 
+    /// Whether the player is in a vehicle, as the game reports it; held keys
+    /// change meaning at once.
+    pub fn set_vehicle(&mut self, on: bool) {
+        self.vehicle = on;
+    }
+
+    /// Whether the vehicle keys apply.
+    pub fn in_vehicle(&self) -> bool {
+        self.vehicle
+    }
+
     /// Lets go of every key (the window lost focus).
     pub fn release_all(&mut self) {
         self.held.clear();
+        self.left = (0.0, 0.0);
     }
 
+    /// Ramps the left stick `dt` seconds toward the held keys.
+    pub fn step(&mut self, dt: f32) {
+        let t = self.target();
+        let unit = |v: i16| v as f32 / 32767.0;
+        self.left = (
+            approach(self.left.0, unit(t.lx), dt),
+            approach(self.left.1, unit(t.ly), dt),
+        );
+    }
+
+    /// The reading, with the left stick where [`Keyboard::step`] ramped it.
     pub fn pad(&self) -> Pad {
+        let axis = |v: f32| (v.clamp(-1.0, 1.0) * 32767.0).round() as i16;
+        Pad {
+            lx: axis(self.left.0),
+            ly: axis(self.left.1),
+            ..self.target()
+        }
+    }
+
+    /// The reading the held keys ask for, sticks at once.
+    fn target(&self) -> Pad {
         let mut p = Pad::default();
         let (mut l, mut r) = ((0i32, 0i32), (0i32, 0i32));
-        for (code, bind) in DEFAULT_KEYS {
-            if !self.held.contains(code) {
+        let find = |t: &[(&str, Bind)], code: &str| t.iter().find(|k| k.0 == code).map(|k| k.1);
+        for code in &self.held {
+            let car = self.vehicle.then(|| find(&VEHICLE_KEYS, code)).flatten();
+            let Some(bind) = car.or_else(|| find(&DEFAULT_KEYS, code)) else {
                 continue;
-            }
+            };
             match bind {
                 Bind::Button(b) => p.buttons |= b,
                 Bind::LeftTrigger => p.lt = 255,
@@ -128,6 +207,65 @@ impl Keyboard {
         let axis = |v: i32| (v.clamp(-1, 1) * 32767) as i16;
         (p.lx, p.ly, p.rx, p.ry) = (axis(l.0), axis(l.1), axis(r.0), axis(r.1));
         p
+    }
+}
+
+/// Mouse motion as the right stick (the camera) and its buttons as the
+/// triggers: left fires (right trigger), right aims (left trigger).
+#[derive(Default)]
+pub struct Mouse {
+    moved: (f64, f64),
+    stick: (f32, f32),
+    pub left: bool,
+    pub right: bool,
+}
+
+impl Mouse {
+    /// Raw motion in counts, right and down positive.
+    pub fn motion(&mut self, dx: f64, dy: f64) {
+        self.moved.0 += dx;
+        self.moved.1 += dy;
+    }
+
+    /// Lets go of the buttons and stops the camera (focus lost).
+    pub fn release(&mut self) {
+        *self = Mouse::default();
+    }
+
+    /// Turns the motion since the last call, `dt` seconds ago, into a pad
+    /// reading: speed over [`MOUSE_FULL`] is a full stick, up is up. In a
+    /// vehicle the left button shoots from it (LB) and the triggers stay
+    /// with the keys that drive.
+    pub fn pad_in(&mut self, dt: f32, vehicle: bool) -> Pad {
+        let mut p = self.pad(dt);
+        if vehicle {
+            if p.rt != 0 {
+                p.buttons |= 0x0100;
+            }
+            (p.lt, p.rt) = (0, 0);
+        }
+        p
+    }
+
+    /// [`Mouse::pad_in`] on foot.
+    pub fn pad(&mut self, dt: f32) -> Pad {
+        let dt = dt.max(0.001);
+        let v = (
+            self.moved.0 as f32 / dt / MOUSE_FULL,
+            -self.moved.1 as f32 / dt / MOUSE_FULL,
+        );
+        self.moved = (0.0, 0.0);
+        // Polls every few ms see a count or two: half of the last reading
+        // keeps the camera from stuttering between polls.
+        self.stick = ((self.stick.0 + v.0) / 2.0, (self.stick.1 + v.1) / 2.0);
+        let axis = |v: f32| (v.clamp(-1.0, 1.0) * 32767.0).round() as i16;
+        Pad {
+            rx: axis(self.stick.0),
+            ry: axis(self.stick.1),
+            lt: if self.right { 255 } else { 0 },
+            rt: if self.left { 255 } else { 0 },
+            ..Pad::default()
+        }
     }
 }
 
@@ -196,16 +334,19 @@ mod tests {
         k.key("KeyW", true);
         k.key("KeyD", true);
         k.key("Space", true);
-        k.key("KeyX", true);
+        k.key("KeyB", true);
         k.key("KeyP", true); // unbound
+        k.step(1.0);
         let p = k.pad();
         assert_eq!((p.lx, p.ly), (32767, 32767));
         assert_eq!(p.buttons, 0x1000);
         assert_eq!((p.lt, p.rt), (0, 255));
         k.key("KeyA", true); // opposite of D cancels
+        k.step(1.0);
         assert_eq!(k.pad().lx, 0);
         k.key("KeyW", false);
         k.key("KeyK", true);
+        k.step(1.0);
         let p = k.pad();
         assert_eq!((p.ly, p.ry), (0, -32767));
         k.key("Enter", true);
@@ -213,7 +354,92 @@ mod tests {
         k.key("Enter", false);
         assert_eq!(k.pad().buttons & 0x0010, 0x0010); // Escape still holds Start
         k.release_all();
+        k.step(1.0);
         assert_eq!(k.pad(), Pad::default());
+    }
+
+    #[test]
+    fn vehicle_keys_follow_the_game() {
+        let mut k = Keyboard::default();
+        for _ in 0..3 {
+            k.key("KeyF", true); // F, H and Shift no longer switch anything
+            k.key("KeyF", false);
+            k.key("KeyH", true);
+            k.key("KeyH", false);
+        }
+        assert!(!k.in_vehicle());
+        k.key("KeyW", true);
+        k.step(1.0);
+        assert_eq!((k.pad().rt, k.pad().ly), (0, 32767)); // W walks
+        k.set_vehicle(true); // the game says the player got in
+        k.key("Space", true);
+        k.key("KeyD", true);
+        k.step(1.0);
+        let p = k.pad();
+        assert_eq!((p.rt, p.lt, p.ly, p.lx), (255, 0, 0, 32767)); // held W is gas now
+        assert_eq!(p.buttons, 0x0200); // handbrake
+        k.key("KeyW", false);
+        k.key("KeyS", true);
+        assert_eq!((k.pad().rt, k.pad().lt), (0, 255)); // S brakes
+        k.key("KeyH", true);
+        assert_eq!(k.pad().buttons & 0x0040, 0x0040); // horn
+        k.key("KeyF", true);
+        assert_eq!(k.pad().buttons & 0x8000, 0x8000); // F is still Y: get out
+        assert!(k.in_vehicle());
+        k.set_vehicle(false); // the game says on foot
+        k.step(1.0);
+        let p = k.pad();
+        assert_eq!((p.lt, p.ly), (0, -32767)); // S walks back again
+        assert_eq!(p.buttons & 0x0040, 0); // H does nothing on foot
+        let mut m = Mouse {
+            left: true,
+            ..Mouse::default()
+        };
+        assert_eq!(
+            (m.pad_in(0.01, true).buttons, m.pad_in(0.01, true).rt),
+            (0x0100, 0)
+        );
+    }
+
+    #[test]
+    fn steering_ramps_in_and_out() {
+        let mut k = Keyboard::default();
+        k.key("KeyD", true);
+        k.step(RAMP_UP / 2.0);
+        let half = k.pad().lx;
+        assert!((15000..18000).contains(&half), "{half}");
+        k.step(RAMP_UP);
+        assert_eq!(k.pad().lx, 32767);
+        k.key("KeyD", false);
+        k.step(RAMP_DOWN);
+        assert_eq!(k.pad().lx, 0);
+        // Straight from right to left goes through the centre at the
+        // release rate, then ramps in.
+        k.key("KeyD", true);
+        k.step(1.0);
+        k.key("KeyD", false);
+        k.key("KeyA", true);
+        k.step(RAMP_DOWN);
+        assert_eq!(k.pad().lx, 0);
+        k.step(1.0);
+        assert_eq!(k.pad().lx, -32767);
+    }
+
+    #[test]
+    fn mouse_turns_the_camera_and_holds_triggers() {
+        let mut m = Mouse::default();
+        m.motion(MOUSE_FULL as f64 * 0.01, 0.0);
+        let p = m.pad(0.01);
+        assert_eq!(p.rx, 16384); // half: half of the last reading is kept
+        let p = m.pad(0.01);
+        assert_eq!((p.rx, p.ry), (8192, 0));
+        m.motion(0.0, -(MOUSE_FULL as f64) * 0.1);
+        m.left = true;
+        let p = m.pad(0.01);
+        assert_eq!(p.ry, 32767); // mouse up looks up, clamped
+        assert_eq!((p.lt, p.rt), (0, 255));
+        m.release();
+        assert_eq!(m.pad(0.01), Pad::default());
     }
 
     #[test]
@@ -224,6 +450,14 @@ mod tests {
                 "{name} has no key"
             );
         }
+        let mut car: Vec<_> = VEHICLE_KEYS.iter().map(|k| k.0).collect();
+        car.sort();
+        car.dedup();
+        assert_eq!(
+            car.len(),
+            VEHICLE_KEYS.len(),
+            "a vehicle key is bound twice"
+        );
         let mut codes: Vec<_> = DEFAULT_KEYS.iter().map(|k| k.0).collect();
         codes.sort();
         codes.dedup();

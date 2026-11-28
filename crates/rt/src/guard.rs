@@ -149,7 +149,7 @@ fn fault(host: usize) -> bool {
     f(g)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 mod os {
     use std::sync::OnceLock;
 
@@ -254,7 +254,7 @@ mod os {
     }
 }
 
-#[cfg(not(any(target_os = "linux", windows)))]
+#[cfg(not(any(target_os = "linux", target_os = "android", windows)))]
 mod os {
     pub fn reserve(_: usize) -> *mut u8 {
         panic!("guarded guest memory is only built for Linux and Windows")

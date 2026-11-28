@@ -52,6 +52,8 @@ See [DATA-RULES.md](DATA-RULES.md).
 | `crates/host` | `xenon-host`: loads the player's files, runs recompiled code, replaces system calls; later graphics, input and audio |
 | `crates/input` | `xenon-input`: the pad state the game reads: keyboard layout, stick dead zones, merging controller and keyboard. No window or GPU |
 | `crates/window` | `xenon-window`: the game window (`--window`): shows drawn frames, reads an XInput controller and the keyboard |
+| `crates/play` | `xenon-play`: the double-click launcher `rustxenon-play.exe`: lists built game folders (`games/<sha256>/` with `game.exe` and `run.toml`), keeps `recent.txt`, edits `settings.toml`, starts a game and waits for it. The list, files and screen drawing are headless; `--screenshot <out.png>` draws one frame without a window |
+| `crates/icon` | `xenon-icon`: the programs' icon, drawn by code (no picture in git): RGBA at any size, an .ico file and a Win32 .res file that the launcher's and each generated game's build script hand to the linker. `cargo run -p xenon-icon --example preview -- <dir>` writes PNG previews |
 | `crates/compare` | `xenon-compare`: diff two frames with a tolerance (side-by-side sheet) and make a blink image. No window or GPU |
 | `crates/regress` | `xenon-regress`: runs game-level regression tests headless and reports pass or fail per frame with pictures. See `games/README.md` |
 | `games/<sha256>/hooks.toml` | Per-game hook addresses with role names. The only per-game file in git |
@@ -91,6 +93,34 @@ Default keys:
 Keys are physical positions, so they sit in the same place on any keyboard
 layout. Stick keys push the stick fully; controller sticks use XInput's
 standard dead zones.
+
+Everything the game logs also goes to `rustxenon-play.log` beside the
+program. If the game stops with an error while the window is open, the
+window shows the last lines of the log until you close it (Esc, B or Back).
+
+Settings files (all keys optional; a bad value is logged and ignored):
+`<home>\settings.toml` holds your defaults and `<home>\games\<sha256>\run.toml`
+(or a `run.toml` beside the program) one game's paths and overrides.
+`<home>` is `--home`, else the folder above `games\<sha256>\` when the
+program is `game.exe` there, else the program's folder.
+
+```toml
+title = "shown in the launcher"
+exe = 'C:\path\to\patched executable'   # used when --exe is not given
+game = 'C:\path\to\unpacked game folder' # likewise --game, update, data
+[window]
+width = 1280
+height = 720
+fullscreen = false   # true: that mode at refresh Hz if the monitor has it, else borderless
+refresh = 60
+[draw]
+aniso = 16           # XENON_ANISO
+force_linear = false # XENON_FORCE_LINEAR
+scale = 1            # XENON_SCALE
+```
+
+`run.toml` wins over `settings.toml`; the environment variables, when set,
+win over both.
 
 Diagnostic sampler flags (environment variables, off by default):
 
@@ -165,6 +195,8 @@ xenon-recomp unpack <your disc image> <game folder>
 xenon-recomp unpack <your title update package> <update folder>
 xenon-recomp build <executable> --out <build folder> [--mem-gb 16]
 cd <build folder> && cargo build
+# or, for the double-click player (no console window):
+cd <build folder> && cargo build --features game/player
 ```
 
 `unpack` reads the console's disc file system (at any of the disc
@@ -185,7 +217,10 @@ layout, with its interleaved hash tables), refusing unsafe names.
   ranges alone;
 - parallel compile jobs capped by a memory budget (`--mem-gb`, about 3 GB
   a job) in the workspace's `.cargo/config.toml`, and a profile without
-  debug info or incremental state.
+  debug info or incremental state. The same file sets
+  `-C target-cpu=native`; a copied build folder must keep
+  `.cargo/config.toml`, or the game builds without FMA, runs its vector
+  maths and sound slowly, and says so in the log at startup.
 
 The game crate calls `xenon_host::run` with the executable's SHA-256; the
 host refuses any other executable. Everything under the build folder is

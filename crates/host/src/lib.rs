@@ -11,13 +11,16 @@
 pub mod cpu_profile;
 pub mod heap;
 pub mod kernel;
+pub mod settings;
+pub mod vehicle;
 
 use sha2::{Digest, Sha256};
-use std::cell::Cell;
+use std::collections::VecDeque;
+use std::io::Write;
 use std::path::PathBuf;
 use std::process::ExitCode;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use xenon_rt::{Context, GuestMemory, Runtime};
 
@@ -30,9 +33,8 @@ static THUNKS: (AtomicU32, AtomicU32) = (AtomicU32::new(0), AtomicU32::new(0));
 static START: OnceLock<Instant> = OnceLock::new();
 
 thread_local! {
-    /// Guest stack pointer at the newest call.
-    static SP: Cell<u32> = const { Cell::new(0) };
-    /// This thread's entry in [`ACTIVITY`].
+    /// This thread's entry in [`ACTIVITY`]. Entries are never removed, so
+    /// a pointer to one (kept in [`Context::host`]) stays valid.
     static MINE: Arc<Activity> = {
         let a = Arc::new(Activity::default());
         let t = std::thread::current();
@@ -171,7 +173,7 @@ fn activity_report() {
 /// newest call (each frame links to its caller's; the caller's saved link
 /// register sits 8 bytes below that).
 fn backtrace(rt: &Runtime) -> Vec<u32> {
-    backtrace_from(rt, SP.with(Cell::get))
+    backtrace_from(rt, MINE.with(|m| m.sp.load(Ordering::Relaxed)))
 }
 
 fn backtrace_from(rt: &Runtime, mut sp: u32) -> Vec<u32> {
@@ -367,23 +369,32 @@ fn watch(c: &Context, addr: u32) {
     }
 }
 
-fn trace(c: &Context, addr: u32) {
+fn trace(c: &mut Context, addr: u32) {
     if DEBUG_HOOKS.load(Ordering::Relaxed) {
         profile_call(addr);
         watch(c, addr);
     }
-    SP.with(|s| s.set(c.r[1] as u32));
-    MINE.with(|m| {
-        let h = m.head.load(Ordering::Relaxed);
-        m.ring[(h % 8) as usize].store(addr, Ordering::Relaxed);
-        m.head.store(h.wrapping_add(1), Ordering::Relaxed);
-        m.call.store(addr, Ordering::Relaxed);
-        m.sp.store(c.r[1] as u32, Ordering::Relaxed);
-        m.r3.store(c.r[3] as u32, Ordering::Relaxed);
-        if is_thunk(addr) {
-            import_call(m, c, addr);
-        }
-    });
+    // This thread's entry, found once per context instead of per call: a
+    // thread-local lookup is a libc call on Android.
+    if c.host.get().is_null() {
+        // SAFETY: every thread's entry is kept in `ACTIVITY` and
+        // never freed, so the pointer stays valid on any thread.
+        unsafe { c.host.set(MINE.with(Arc::as_ptr).cast()) };
+    }
+    // SAFETY: only `set` above stores a non-null slot (the field is private
+    // to xenon-rt), and those entries are never freed. A context moved to
+    // another host thread without a reset keeps logging to its first
+    // thread's entry; spawn and clone reset the slot.
+    let m = unsafe { &*c.host.get().cast::<Activity>() };
+    let h = m.head.load(Ordering::Relaxed);
+    m.ring[(h % 8) as usize].store(addr, Ordering::Relaxed);
+    m.head.store(h.wrapping_add(1), Ordering::Relaxed);
+    m.call.store(addr, Ordering::Relaxed);
+    m.sp.store(c.r[1] as u32, Ordering::Relaxed);
+    m.r3.store(c.r[3] as u32, Ordering::Relaxed);
+    if is_thunk(addr) {
+        import_call(m, c, addr);
+    }
 }
 
 /// The import half of [`trace`], out of line so the per-call hook stays small.
@@ -416,10 +427,87 @@ fn log_call(c: &Context, name: &str) {
     ));
 }
 
-/// A line on stderr with the time since start.
+/// A line on stderr and in the log file with the time since start.
 pub fn log(s: &str) {
     let t = START.get_or_init(Instant::now).elapsed();
-    eprintln!("[{:8.3}] {s}", t.as_secs_f64());
+    say(&format!("[{:8.3}] {s}", t.as_secs_f64()));
+}
+
+/// `rustxenon-play.log` beside the program, once opened.
+static LOG_FILE: OnceLock<Mutex<std::fs::File>> = OnceLock::new();
+/// The newest log lines, for the stop screen.
+static TAIL: Mutex<VecDeque<String>> = Mutex::new(VecDeque::new());
+const TAIL_LINES: usize = 40;
+
+/// Text on stderr and in the log file. Locks are taken even if poisoned:
+/// this runs inside the panic hook.
+fn say(s: &str) {
+    eprintln!("{s}");
+    if let Some(f) = LOG_FILE.get() {
+        let _ = writeln!(f.lock().unwrap_or_else(|e| e.into_inner()), "{s}");
+    }
+    let mut t = TAIL.lock().unwrap_or_else(|e| e.into_inner());
+    for line in s.lines() {
+        if t.len() == TAIL_LINES {
+            t.pop_front();
+        }
+        t.push_back(line.into());
+    }
+}
+
+/// Exit code of a run that stopped (0 while running), for the window's
+/// close handler.
+static STOPPED: AtomicI32 = AtomicI32::new(0);
+
+/// Marks the run stopped with `code`. Only the first stop goes on: a
+/// later one (another thread faulting behind the stop screen) parks for
+/// good, so the first reason stays on screen.
+fn claim_stop(code: i32) {
+    if STOPPED
+        .compare_exchange(0, code, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        if std::thread::current().name() == Some("window") {
+            std::process::exit(STOPPED.load(Ordering::SeqCst));
+        }
+        loop {
+            std::thread::park();
+        }
+    }
+}
+
+/// The log's newest lines.
+fn tail() -> Vec<String> {
+    let t = TAIL.lock().unwrap_or_else(|e| e.into_inner());
+    t.iter().cloned().collect()
+}
+
+/// Ends the run with `code` (see [`show`]).
+fn hold(code: i32) -> ! {
+    claim_stop(code);
+    show(code, tail())
+}
+
+/// Ends a claimed stop. With a window open (and this not its thread) the
+/// sound stops and the window shows `lines` until the player closes it;
+/// its close handler then exits.
+fn show(code: i32, lines: Vec<String>) -> ! {
+    if let Some(w) = kernel::input::WINDOW.get() {
+        if std::thread::current().name() != Some("window") {
+            kernel::sound::silence();
+            w.show_text(lines);
+            loop {
+                std::thread::park();
+            }
+        }
+    }
+    std::process::exit(code);
+}
+
+/// Logs why the run cannot go on and ends it (see [`hold`]).
+fn fail(why: &str) -> ExitCode {
+    log(why);
+    hold(1)
 }
 
 const USAGE: &str = "\
@@ -428,7 +516,7 @@ USAGE: game --exe <patched executable> --game <unpacked game folder>
             [--seconds <n>] [--press <ms>:<button>[+<button>],...]
             [--no-controller] [--window] [--capture <dir> [--capture-at <s>,<s>...] [--capture-bundle]] [--render]
             [--capture-frames <n>,<n>... --capture-dir <dir>] [--audio-wav <file>]
-            [--sound] [--mute] [--guard-memory]
+            [--sound] [--mute] [--guard-memory] [--home <dir>]
 
 Runs the title headless for --seconds (default 30) and reports how far it
 got: frames presented, threads, imports called, memory in use. A
@@ -459,7 +547,17 @@ in kernel calls and waiting, the top kernel calls by time, and a frame rate
 bound with drawing free; run it without --render to keep drawing off.
 With --render, drawing runs on a thread of its own and the GPU command
 processor runs up to XENON_DRAW_AHEAD=<frames> frames ahead of it (default
-1); XENON_DRAW_AHEAD=0 draws inline.";
+1); XENON_DRAW_AHEAD=0 draws inline.
+
+Everything logged also goes to rustxenon-play.log beside this program;
+with a window open, a stop shows the log's last lines in it until it is
+closed (Esc, B or Back). --home is the player's folder (default: the folder
+above games\\<sha256>\\ when this program is game.exe there, else its own
+folder). Its settings.toml, then this game's run.toml (beside this program,
+else <home>\\games\\<sha256>\\run.toml), give [window] width, height,
+fullscreen and refresh, and [draw] aniso, force_linear and scale
+(XENON_ANISO, XENON_FORCE_LINEAR and XENON_SCALE when set win); run.toml
+also gives exe, game, update and data when the options do not.";
 
 fn opt(args: &[String], name: &str) -> Option<String> {
     args.iter()
@@ -468,16 +566,90 @@ fn opt(args: &[String], name: &str) -> Option<String> {
         .cloned()
 }
 
+/// CPU features that matter for speed, as `(name, compiled in, this CPU has it)`.
+/// `cfg!` here is how xenon-host was compiled, which is how the whole game
+/// was: the generated workspace builds the host as a path dependency in the
+/// same `cargo build`, so its `.cargo/config.toml` rustflags reach it too.
+fn cpu_features() -> [(&'static str, bool, bool); 3] {
+    macro_rules! feature {
+        ($f:tt) => {
+            (
+                $f,
+                cfg!(target_feature = $f),
+                #[cfg(target_arch = "x86_64")]
+                std::arch::is_x86_feature_detected!($f),
+                #[cfg(not(target_arch = "x86_64"))]
+                false,
+            )
+        };
+    }
+    [feature!("fma"), feature!("avx2"), feature!("ssse3")]
+}
+
+/// The startup log lines for `features`: what was compiled in, and a warning
+/// when FMA was left out although this CPU has it.
+fn cpu_lines(features: &[(&str, bool, bool)]) -> Vec<String> {
+    let built: Vec<&str> = features.iter().filter(|f| f.1).map(|f| f.0).collect();
+    let built = if built.is_empty() {
+        "none".to_string()
+    } else {
+        built.join(" ")
+    };
+    let mut lines = vec![format!("cpu features built in: {built}")];
+    if features
+        .iter()
+        .any(|&(n, built, has)| n == "fma" && !built && has)
+    {
+        lines.push(
+            "warning: built without FMA for this CPU; vector maths and sound run slowly. \
+             Build with RUSTFLAGS=-C target-cpu=native (xenon-recomp writes this to \
+             .cargo/config.toml)"
+                .into(),
+        );
+    }
+    lines
+}
+
 /// Entry point of a generated game crate.
 pub fn run(sha256: &str, regs: &[fn(&mut Runtime)]) -> ExitCode {
     START.get_or_init(Instant::now);
-    log(&format!("build {BUILD}"));
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let (Some(exe), Some(game)) = (opt(&args, "--exe"), opt(&args, "--game")) else {
-        eprintln!("{USAGE}");
+    let me = std::env::current_exe().unwrap_or_default();
+    let me_dir = me
+        .parent()
+        .unwrap_or(std::path::Path::new("."))
+        .to_path_buf();
+    let opened = std::fs::File::create(me_dir.join("rustxenon-play.log"))
+        .map(|f| LOG_FILE.set(Mutex::new(f)));
+    log(&format!("build {BUILD}"));
+    for l in cpu_lines(&cpu_features()) {
+        log(&l);
+    }
+    // Early, so a panic while starting up reaches the log and the stop screen.
+    std::panic::set_hook(Box::new(|info| stop(&info.to_string())));
+    if let Err(e) = opened {
+        log(&format!("rustxenon-play.log: {e}; logging to stderr only"));
+    }
+    let home = settings::home(opt(&args, "--home").as_deref(), &me);
+    let mut warn = Vec::new();
+    let conf = settings::load(&home, &me_dir, sha256, &mut warn);
+    for w in &warn {
+        log(w);
+    }
+    // Before any thread starts: the drawer reads these when it opens.
+    for (k, v) in conf
+        .layer
+        .draw_env(|k| std::env::var_os(k).is_some_and(|v| !v.is_empty()))
+    {
+        log(&format!("{k}={v} from the settings files"));
+        std::env::set_var(k, v);
+    }
+    let arg_or = |name: &str, file: &Option<String>| opt(&args, name).or_else(|| file.clone());
+    let (Some(exe), Some(game)) = (arg_or("--exe", &conf.exe), arg_or("--game", &conf.game)) else {
+        say(USAGE);
         return ExitCode::FAILURE;
     };
-    let data = opt(&args, "--data").map_or_else(
+    let data = arg_or("--data", &conf.data).map_or_else(
         || PathBuf::from(&game).with_extension("data"),
         PathBuf::from,
     );
@@ -513,9 +685,12 @@ pub fn run(sha256: &str, regs: &[fn(&mut Runtime)]) -> ExitCode {
         if opt(&args, "--press").is_none() && !args.iter().any(|a| a == "--no-controller") {
             kernel::input::set_script(kernel::input::Script::Live);
         }
-        let link = xenon_window::spawn(format!("RustXenon {BUILD}"), || {
-            report();
-            std::process::exit(0);
+        let link = xenon_window::spawn(format!("RustXenon {BUILD}"), conf.layer.window(), || {
+            let code = STOPPED.load(Ordering::SeqCst);
+            if code == 0 {
+                report();
+            }
+            std::process::exit(code);
         });
         let _ = kernel::input::WINDOW.set(link);
     }
@@ -524,19 +699,13 @@ pub fn run(sha256: &str, regs: &[fn(&mut Runtime)]) -> ExitCode {
     } else if let Some(p) = opt(&args, "--press") {
         match kernel::input::parse(&p) {
             Ok(s) => kernel::input::set_script(s),
-            Err(e) => {
-                eprintln!("--press: {e}");
-                return ExitCode::FAILURE;
-            }
+            Err(e) => return fail(&format!("--press: {e}")),
         }
     }
 
     let file = match std::fs::read(&exe) {
         Ok(f) => f,
-        Err(e) => {
-            eprintln!("{exe}: {e}");
-            return ExitCode::FAILURE;
-        }
+        Err(e) => return fail(&format!("{exe}: {e}")),
     };
     let got: String = Sha256::digest(&file)
         .iter()
@@ -544,15 +713,13 @@ pub fn run(sha256: &str, regs: &[fn(&mut Runtime)]) -> ExitCode {
         .collect();
     log(&format!("executable sha256 {got}"));
     if !got.eq_ignore_ascii_case(sha256) {
-        eprintln!("this build is for executable {sha256}; refusing a different one");
-        return ExitCode::FAILURE;
+        return fail(&format!(
+            "this build is for executable {sha256}; refusing a different one"
+        ));
     }
     let image = match xenon_recomp::xex::load(&file, &[]) {
         Ok(i) => i,
-        Err(e) => {
-            eprintln!("{exe}: {e}");
-            return ExitCode::FAILURE;
-        }
+        Err(e) => return fail(&format!("{exe}: {e}")),
     };
 
     let guarded = args.iter().any(|a| a == "--guard-memory")
@@ -597,14 +764,14 @@ pub fn run(sha256: &str, regs: &[fn(&mut Runtime)]) -> ExitCode {
             image: &image,
             game_dir: game.into(),
             data_dir: data,
-            update_dir: opt(&args, "--update").map(PathBuf::from),
+            update_dir: arg_or("--update", &conf.update).map(PathBuf::from),
         },
     );
+    vehicle::install(&mut rt, sha256);
     let rt = rt.share();
     set_runtime(rt.clone());
     log(&format!("call table: {} MB", rt.table_bytes() >> 20));
 
-    std::panic::set_hook(Box::new(|info| stop(&info.to_string())));
     xenon_rt::guard::on_wild_access(|a| {
         stop(&format!(
             "wild guest access at {a:#010x}, never allocated{}",
@@ -614,8 +781,7 @@ pub fn run(sha256: &str, regs: &[fn(&mut Runtime)]) -> ExitCode {
 
     if let Some(w) = opt(&args, "--audio-wav") {
         if let Err(e) = kernel::audio::start_wav(w.as_ref()) {
-            eprintln!("{w}: {e}");
-            return ExitCode::FAILURE;
+            return fail(&format!("{w}: {e}"));
         }
     }
     if (window || args.iter().any(|a| a == "--sound")) && !args.iter().any(|a| a == "--mute") {
@@ -640,6 +806,7 @@ pub fn run(sha256: &str, regs: &[fn(&mut Runtime)]) -> ExitCode {
             kernel::k().usage_line(),
             growth_line()
         ));
+        log(&kernel::video::pace_line());
         if swaps == last {
             stalled += 1;
             // A stall with memory to spare is a wait, not exhaustion: say
@@ -732,7 +899,7 @@ fn growth_line() -> String {
 }
 
 /// Resident memory of this process in bytes.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 fn host_rss() -> Option<u64> {
     let s = std::fs::read_to_string("/proc/self/statm").ok()?;
     Some(s.split_whitespace().nth(1)?.parse::<u64>().ok()? * 4096)
@@ -763,7 +930,7 @@ fn host_rss() -> Option<u64> {
     (ok != 0).then_some(c.working_set as u64)
 }
 
-#[cfg(not(any(target_os = "linux", windows)))]
+#[cfg(not(any(target_os = "linux", target_os = "android", windows)))]
 fn host_rss() -> Option<u64> {
     None
 }
@@ -771,6 +938,7 @@ fn host_rss() -> Option<u64> {
 /// Stops the run: the reason, this thread's last calls and guest return
 /// addresses, then the full report (every thread). Never returns.
 fn stop(why: &str) -> ! {
+    claim_stop(101);
     let name = std::thread::current().name().unwrap_or("?").to_string();
     log(&format!("STOP in {name}: {why}"));
     log(&format!(
@@ -793,8 +961,15 @@ fn stop(why: &str) -> ! {
             ));
         }
     }
-    report();
-    std::process::exit(101);
+    // Taken before the report, whose lines would push these off the screen.
+    let mut lines = tail();
+    lines.push("The full report follows in rustxenon-play.log.".into());
+    // The kernel is installed before RT is set; without it there is
+    // nothing to report.
+    if RT.get().is_some() {
+        report();
+    }
+    show(101, lines)
 }
 
 fn report() {
@@ -899,6 +1074,31 @@ fn start_clock(rt: Arc<Runtime>) {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn cpu_lines_warn_only_when_fma_is_left_out_but_available() {
+        use super::cpu_lines;
+        let native = cpu_lines(&[
+            ("fma", true, true),
+            ("avx2", true, true),
+            ("ssse3", true, true),
+        ]);
+        assert_eq!(native, ["cpu features built in: fma avx2 ssse3"]);
+        let generic = cpu_lines(&[
+            ("fma", false, true),
+            ("avx2", false, true),
+            ("ssse3", false, true),
+        ]);
+        assert_eq!(generic.len(), 2);
+        assert_eq!(generic[0], "cpu features built in: none");
+        assert!(generic[1].starts_with("warning: built without FMA"));
+        // An old CPU without FMA: nothing to gain, so no warning.
+        let old = cpu_lines(&[("fma", false, false), ("ssse3", true, true)]);
+        assert_eq!(old, ["cpu features built in: ssse3"]);
+        // The features this build reports are the three that matter.
+        let names: Vec<_> = super::cpu_features().iter().map(|f| f.0).collect();
+        assert_eq!(names, ["fma", "avx2", "ssse3"]);
+    }
+
+    #[test]
     fn rust_heap_counts_allocations_and_frees() {
         // Other tests allocate and free at the same time, so one clean try
         // out of a few is enough.
@@ -915,12 +1115,48 @@ mod tests {
         assert!(clean);
     }
 
+    /// Cost of one guest call through `Runtime::call` with the host's trace
+    /// hook, on a guest thread: `cargo test -p xenon-host --release --lib
+    /// -- --ignored traced_call_speed --nocapture`.
+    #[test]
+    #[ignore]
+    fn traced_call_speed() {
+        use std::sync::atomic::AtomicU64;
+        use xenon_rt::{Context, GuestMemory, Runtime};
+        const N: u64 = 1_000_000;
+        static NS: AtomicU64 = AtomicU64::new(0);
+        fn leaf(_: &Runtime, c: &mut Context) {
+            c.r[3] += 1;
+        }
+        fn entry(rt: &Runtime, c: &mut Context) {
+            let t = std::time::Instant::now();
+            for i in 0..N {
+                c.r[1] = 0x7000_0000 - (i & 0xF0);
+                rt.call(c, 0x8200_0010);
+            }
+            NS.store(t.elapsed().as_nanos() as u64, super::Ordering::Relaxed);
+        }
+        let mut rt = Runtime::new(GuestMemory::new(16));
+        rt.register(0x8200_0000, entry);
+        rt.register(0x8200_0010, leaf);
+        super::install_trace(&mut rt);
+        let rt = rt.share();
+        let id = rt.spawn(0x8200_0000, Context::new(), false);
+        assert_eq!(rt.join(id), N);
+        let ns = NS.load(super::Ordering::Relaxed) as f64;
+        eprintln!(
+            "traced call: {:.2} ns per call, {:.1} ms per million",
+            ns / N as f64,
+            ns / 1e6 * (1e6 / N as f64)
+        );
+    }
+
     #[test]
     fn ring_keeps_the_last_eight_calls_and_wait_marker_clears() {
         let mut c = xenon_rt::Context::new();
         for a in 1..=10u32 {
             c.r[3] = u64::from(0x4000_0000 + a);
-            super::trace(&c, 0x8200_0000 + 4 * a);
+            super::trace(&mut c, 0x8200_0000 + 4 * a);
         }
         assert_eq!(
             super::MINE.with(|m| m.r3.load(super::Ordering::Relaxed)),
@@ -929,6 +1165,10 @@ mod tests {
         let want: Vec<u32> = (3..=10).map(|a| 0x8200_0000 + 4 * a).collect();
         assert_eq!(super::MINE.with(|m| m.recent()), want);
         assert_eq!(super::last_call(), 0x8200_0028);
+        // The hook found this thread's entry once and kept it in the context.
+        let mine = super::MINE.with(super::Arc::as_ptr).cast::<()>();
+        assert_eq!(c.host.get(), mine);
+        assert!(c.clone().host.get().is_null());
         {
             let _w = super::waiting(0x4000_0010, 3);
             assert_eq!(

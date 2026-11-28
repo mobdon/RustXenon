@@ -13,6 +13,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
+use crate::cpu::ThreadSlot;
 use crate::thread::{self, GuestThread};
 use crate::{Context, GuestMemory};
 
@@ -44,7 +45,8 @@ pub struct Runtime {
     /// this (counted in [`Context::calls`]); catches runaway loops in tests.
     pub call_budget: u64,
     /// Called before every guest call with the caller's context and target.
-    pub trace: Option<fn(&Context, u32)>,
+    /// Mutable only so the hook can fill [`Context::host`].
+    pub trace: Option<fn(&mut Context, u32)>,
     /// Called after every guest call returns (not when it unwinds), with
     /// the callee's context and the target; for timing calls.
     pub after: Option<fn(&Context, u32)>,
@@ -81,6 +83,12 @@ impl Runtime {
     /// Registers a recompiled function at its guest address.
     pub fn register(&mut self, addr: u32, f: GuestFn) {
         self.functions.insert(addr, f);
+    }
+
+    /// The game function registered at `addr`, ignoring overrides: what a
+    /// hook that wraps it calls.
+    pub fn function(&self, addr: u32) -> Option<GuestFn> {
+        self.functions.get(&addr).copied()
     }
 
     /// Replaces the function at `addr` with a hook.
@@ -136,6 +144,13 @@ impl Runtime {
         if addr & 3 == 0 && i < self.table.len() {
             return self.table[i];
         }
+        self.lookup_maps(addr)
+    }
+
+    /// [`Runtime::lookup`] outside the flat table (import thunks, or before
+    /// `share`): out of line so the table path stays inline in the call.
+    #[inline(never)]
+    fn lookup_maps(&self, addr: u32) -> Option<GuestFn> {
         self.overrides
             .get(&addr)
             .or_else(|| self.functions.get(&addr))
@@ -160,7 +175,7 @@ impl Runtime {
     /// [`Runtime::call`] without hooks or budget.
     #[inline(never)]
     fn call_fast(&self, ctx: &mut Context, addr: u32) {
-        thread::checkpoint();
+        thread::checkpoint(ctx);
         let Some(f) = self.lookup(addr) else {
             missing(addr)
         };
@@ -176,7 +191,7 @@ impl Runtime {
         if let Some(trace) = self.trace {
             trace(ctx, addr);
         }
-        thread::checkpoint();
+        thread::checkpoint(ctx);
         let Some(f) = self.lookup(addr) else {
             missing(addr)
         };
@@ -203,8 +218,11 @@ impl Runtime {
             .name(format!("guest-{id}"))
             .stack_size(THREAD_STACK)
             .spawn(move || {
-                let _exit = thread::enter(t2);
-                thread::checkpoint();
+                let _exit = thread::enter(t2.clone());
+                // `t2` lives as long as `ctx`, so the slot stays valid.
+                ctx.thread = ThreadSlot::new(Arc::as_ptr(&t2).cast());
+                ctx.host = ThreadSlot::NULL;
+                thread::checkpoint(&ctx);
                 rt.call(&mut ctx, entry);
                 thread::finish(ctx.r[3]);
             })
@@ -351,6 +369,10 @@ mod tests {
         rt.set_override(0x8200_0000, add_ten);
         rt.call(&mut c, 0x8200_0000);
         assert_eq!(c.r[3], 11);
+        // The wrapped function stays reachable for the hook.
+        (rt.function(0x8200_0000).unwrap())(&rt, &mut c);
+        assert_eq!(c.r[3], 12);
+        assert!(rt.function(0x8200_0004).is_none());
     }
 
     #[test]
@@ -408,7 +430,7 @@ mod tests {
     fn shared_runtime_keeps_hooks_and_budget() {
         use std::sync::atomic::AtomicU64;
         static SEEN: AtomicU64 = AtomicU64::new(0);
-        fn before(_: &Context, _: u32) {
+        fn before(_: &mut Context, _: u32) {
             SEEN.fetch_add(1, Ordering::Relaxed);
         }
         fn after(_: &Context, _: u32) {
@@ -484,6 +506,22 @@ mod tests {
             .find_object::<crate::sync::CriticalSection>(0x40)
             .unwrap();
         assert_eq!(found.owner(), Some(std::thread::current().id()));
+    }
+
+    #[test]
+    fn spawn_binds_the_thread_slot_and_clears_the_host_slot() {
+        fn check(_: &Runtime, c: &mut Context) {
+            let fresh = c.clone();
+            c.r[3] = u64::from(!c.thread.get().is_null() && c.host.get().is_null())
+                + 2 * u64::from(fresh.thread.get().is_null());
+        }
+        let mut rt = Runtime::new(GuestMemory::new(16));
+        rt.register(0x8200_0000, check);
+        let rt = rt.share();
+        let mut c = Context::new();
+        c.host = ThreadSlot::new(0x1234 as *const ());
+        let id = rt.spawn(0x8200_0000, c, false);
+        assert_eq!(rt.join(id), 3);
     }
 
     #[test]

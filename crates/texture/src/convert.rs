@@ -334,6 +334,39 @@ pub fn to_rgba_f32_signed(
     Ok(out)
 }
 
+/// [`to_rgba_f32`] of a 16-bit float format (`k_16_FLOAT`, `k_16_16_FLOAT`,
+/// `k_16_16_16_16_FLOAT` and the expand formats that read as them) kept as
+/// halves, bit for bit what [`to_rgba_f32`] then a round to half gives,
+/// without the float round trip: every NaN becomes the quiet NaN 0x7E00, as
+/// through f32.
+pub fn to_rgba_f16(
+    format: TextureFormat,
+    data: &[u8],
+    width: u32,
+    height: u32,
+) -> Result<Vec<u16>, Error> {
+    let texels = check_len(format, data, width, height)?;
+    let n = match format.data_format() {
+        F::K16Float => 1,
+        F::K16_16Float => 2,
+        F::K16_16_16_16Float => 4,
+        _ => return Err(Error::UnsupportedFormat(format)),
+    };
+    let mut out = Vec::with_capacity(texels * 4);
+    for d in data.chunks_exact(2 * n).take(texels) {
+        let h = |i: usize| match u16::from_le_bytes([d[2 * i], d[2 * i + 1]]) {
+            h if h & 0x7FFF > 0x7C00 => 0x7E00,
+            h => h,
+        };
+        out.extend_from_slice(&match n {
+            1 => [h(0); 4],
+            2 => [h(0), h(1), h(1), h(1)],
+            _ => [h(0), h(1), h(2), h(3)],
+        });
+    }
+    Ok(out)
+}
+
 /// Decodes `width` x `height` texels to XYZW bytes (`width * height * 4`).
 /// Values are clamped to 0..1 and rounded to the nearest 8-bit step; NaN
 /// becomes 0.
@@ -371,6 +404,11 @@ pub fn apply_swizzle(rgba8: &mut [u8], swizzle: u16) {
 /// [`apply_swizzle`] for XYZW floats (constant 1 is 1.0).
 pub fn apply_swizzle_f32(rgba: &mut [f32], swizzle: u16) {
     swizzle_texels(rgba, swizzle, 0.0, 1.0);
+}
+
+/// [`apply_swizzle_f32`] on halves: constant 1 is 0x3C00.
+pub fn apply_swizzle_f16(rgba: &mut [u16], swizzle: u16) {
+    swizzle_texels(rgba, swizzle, 0, 0x3C00);
 }
 
 fn swizzle_texels<T: Copy>(texels: &mut [T], swizzle: u16, zero: T, one: T) {

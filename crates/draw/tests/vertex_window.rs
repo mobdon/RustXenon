@@ -236,6 +236,8 @@ fn growing_uploads_do_not_pile_up_staging() {
         );
         grew.push(buffer_mb(&d));
     }
-    // 16 MB arena, a few 4 MB chunks: well under the 12 MB-batch sum.
-    assert!(grew[11] - grew[3] <= 16, "{grew:?}");
+    // A few 4 MB chunks, well under the 68 MB that piling up would add (5 to
+    // 12 MB). The drawer polls without waiting, so on a slow software GPU a
+    // few chunks are still mapping when the next upload needs one.
+    assert!(grew[11] - grew[3] <= 32, "{grew:?}");
 }

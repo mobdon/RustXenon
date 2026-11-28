@@ -1643,23 +1643,21 @@ pub fn stvewx(m: &GuestMemory, ea: u32, v: V128) {
 }
 
 /// `lvlx`: bytes from `ea` to the end of its quadword, left-justified, zero filled.
+#[inline]
 pub fn lvlx(m: &GuestMemory, ea: u32) -> V128 {
-    let k = (ea & 15) as usize;
-    let mut o = [0u8; 16];
-    for (i, b) in o.iter_mut().enumerate().take(16 - k) {
-        *b = m.read_u8(ea + i as u32);
-    }
-    from_bytes(o)
+    // The whole aligned quadword is in the same page, so loading it all
+    // and shifting gives the same bytes in one access.
+    let k = ea & 15;
+    from_u128(to_u128(m.read_v128(ea & !15)) << (8 * k))
 }
 /// `lvrx`: bytes from the start of the quadword up to `ea`, right-justified.
+#[inline]
 pub fn lvrx(m: &GuestMemory, ea: u32) -> V128 {
-    let k = (ea & 15) as usize;
-    let base = ea & !15;
-    let mut o = [0u8; 16];
-    for i in 0..k {
-        o[16 - k + i] = m.read_u8(base + i as u32);
+    let k = ea & 15;
+    if k == 0 {
+        return [0; 4];
     }
-    from_bytes(o)
+    from_u128(to_u128(m.read_v128(ea & !15)) >> (8 * (16 - k)))
 }
 /// `stvlx`: the leftmost `16 - (ea & 15)` bytes to `ea` onwards.
 pub fn stvlx(m: &GuestMemory, ea: u32, v: V128) {
@@ -1687,6 +1685,40 @@ pub fn mfvscr(vscr: u32) -> V128 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn vector_loads_match_bytewise() {
+        let m = GuestMemory::new(0x100);
+        for i in 0..0x100u32 {
+            m.write_u8(i, (i * 7 + 3) as u8);
+        }
+        for ea in 0x20..0x60u32 {
+            let k = ea & 15;
+            let base = ea & !15;
+            let mut l = [0u8; 16];
+            let mut r = [0u8; 16];
+            for i in 0..16 - k {
+                l[i as usize] = m.read_u8(ea + i);
+            }
+            for i in 0..k {
+                r[(16 - k + i) as usize] = m.read_u8(base + i);
+            }
+            assert_eq!(lvlx(&m, ea), from_bytes(l), "lvlx {ea:#x}");
+            assert_eq!(lvrx(&m, ea), from_bytes(r), "lvrx {ea:#x}");
+            let mut q = [0u8; 16];
+            for i in 0..16 {
+                q[i as usize] = m.read_u8(ea + i);
+            }
+            assert_eq!(m.read_v128(ea), from_bytes(q), "read_v128 {ea:#x}");
+        }
+        for ea in [0x40u32, 0x48, 0x43] {
+            let v = [0x0102_0304, 0x0506_0708, 0x090A_0B0C, 0x0D0E_0F10];
+            m.write_v128(ea, v);
+            for i in 0..16 {
+                assert_eq!(m.read_u8(ea + i), i as u8 + 1, "write_v128 {ea:#x}");
+            }
+        }
+    }
 
     #[test]
     fn lane_order_is_big_endian() {
