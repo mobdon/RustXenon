@@ -388,6 +388,16 @@ impl ApplicationHandler for App {
             WindowEvent::KeyboardInput { event, .. } => {
                 if let PhysicalKey::Code(code) = event.physical_key {
                     let down = event.state == ElementState::Pressed;
+                    // Alt gives the mouse back; a click takes it again.
+                    if down
+                        && matches!(
+                            code,
+                            winit::keyboard::KeyCode::AltLeft | winit::keyboard::KeyCode::AltRight
+                        )
+                    {
+                        self.mouse.release();
+                        self.capture(false);
+                    }
                     if down && self.text.is_some() && code == winit::keyboard::KeyCode::Escape {
                         ev.exit();
                     }
@@ -420,6 +430,7 @@ impl ApplicationHandler for App {
             Some((b, until)) if now < until => pad.buttons |= b,
             _ => self.wheel = None,
         }
+
         *self.link.pad.lock().unwrap() = pad;
         let asked = self.link.attach.lock().unwrap().take();
         match (asked, self.window.clone()) {
