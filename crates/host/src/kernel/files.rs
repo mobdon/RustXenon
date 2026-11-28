@@ -18,6 +18,19 @@ pub struct File {
     pub pos: u64,
     /// Directory listing for `NtQueryDirectoryFile`, and the next entry.
     pub listing: Option<(Vec<(String, fs::Metadata)>, usize)>,
+    /// Written or resized through this handle: a flush or close of a save
+    /// then pushes it to the disk.
+    pub written: bool,
+}
+
+/// A save written through `f` reaches the disk when its handle closes,
+/// even if the title never flushes it. Other files are left to the OS.
+pub fn sync_save(f: &File) {
+    if f.written && f.path.starts_with(super::xam::content_root()) {
+        if let Some(Err(e)) = f.file.as_ref().map(fs::File::sync_data) {
+            crate::log(&format!("[files] {} not synced: {e}", f.path.display()));
+        }
+    }
 }
 
 /// (prefix, host folder, writable). Prefixes are lower case.
@@ -254,6 +267,7 @@ fn open_inner(
         file,
         pos: 0,
         listing: None,
+        written: false,
     }))));
     rt.mem.write_u32(out, h);
     iosb(rt, io, STATUS_SUCCESS, info);
@@ -441,6 +455,7 @@ pub fn nt_write_file(rt: &Runtime, c: &mut Context) {
     };
     let status = if r.is_ok() {
         f.pos = at + len as u64;
+        f.written = true;
         STATUS_SUCCESS
     } else {
         STATUS_ACCESS_DENIED
@@ -552,7 +567,10 @@ pub fn nt_set_information_file(rt: &Runtime, c: &mut Context) {
             STATUS_SUCCESS
         }
         19 | 20 => match f.file.as_mut().map(|x| x.set_len(rt.mem.read_u64(info))) {
-            Some(Ok(())) => STATUS_SUCCESS,
+            Some(Ok(())) => {
+                f.written = true;
+                STATUS_SUCCESS
+            }
             _ => STATUS_ACCESS_DENIED,
         },
         // FileBasicInformation: the last write time (+16) is kept on the host
@@ -719,9 +737,28 @@ pub fn nt_query_directory_file(rt: &Runtime, c: &mut Context) {
     ret(c, STATUS_SUCCESS);
 }
 
+/// (handle, status block). A file never written through its handle has
+/// nothing to flush (and a read-only handle cannot be synced on Windows).
 pub fn nt_flush_buffers_file(rt: &Runtime, c: &mut Context) {
-    iosb(rt, arg(rt, c, 1), STATUS_SUCCESS, 0);
-    ret(c, STATUS_SUCCESS);
+    let Some(f) = file(arg(rt, c, 0)) else {
+        return ret(c, STATUS_INVALID_HANDLE);
+    };
+    let f = f.lock().unwrap();
+    let s = match f
+        .file
+        .as_ref()
+        .filter(|_| f.written)
+        .map(fs::File::sync_all)
+    {
+        Some(Err(e)) => {
+            crate::log(&format!("[files] {} not flushed: {e}", f.path.display()));
+            STATUS_UNSUCCESSFUL
+        }
+        _ => STATUS_SUCCESS,
+    };
+    drop(f);
+    iosb(rt, arg(rt, c, 1), s, 0);
+    ret(c, s);
 }
 
 pub fn nt_device_io_control_file(rt: &Runtime, c: &mut Context) {

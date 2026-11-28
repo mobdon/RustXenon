@@ -163,8 +163,14 @@ fn content_name(rt: &Runtime, data: u32) -> String {
     name
 }
 
-fn content_root() -> PathBuf {
+pub(crate) fn content_root() -> PathBuf {
     k().data_dir.join("content")
+}
+
+/// Where "create always" moves the package it replaces (one copy per
+/// package): outside `content`, so it is never listed or opened as a save.
+fn backup_root() -> PathBuf {
+    k().data_dir.join("content.bak")
 }
 
 /// One content record as the guest reads it (on the hard disk, device 1).
@@ -239,7 +245,18 @@ pub fn xam_content_create_ex(rt: &Runtime, c: &mut Context) {
         Err(e) => return finish(rt, c, ov, e),
     };
     if empty {
-        let _ = std::fs::remove_dir_all(&dir);
+        // The old save is moved aside, not deleted, so a crash before the
+        // title writes the new one still leaves it on disk.
+        let bak = backup_root().join(&name);
+        let _ = std::fs::remove_dir_all(&bak);
+        let _ = std::fs::create_dir_all(backup_root());
+        // If it cannot be moved (a file in it still open, say), it stays:
+        // the title overwrites what it writes, and nothing is half deleted.
+        if let Err(e) = std::fs::rename(&dir, &bak) {
+            crate::log(&format!(
+                "[xam] cannot move the old content {name:?} aside ({e}); left in place"
+            ));
+        }
     }
     if !existed || empty {
         let meta = format!(
@@ -543,9 +560,10 @@ pub fn xam_show_gamer_card_ui_for_xuid(_: &Runtime, c: &mut Context) {
 pub fn xam_show_dirty_disc_error_ui(_: &Runtime, _: &mut Context) {
     panic!("guest reported a disc read error");
 }
-/// Picks the first button.
+/// (user, title, text, button count, buttons, focus button, flags,
+/// unused, result out, request block): picks the first button.
 pub fn xam_show_message_box_ui_ex(rt: &Runtime, c: &mut Context) {
-    let (result, ov) = (arg(rt, c, 7), arg(rt, c, 8));
+    let (result, ov) = (arg(rt, c, 8), arg(rt, c, 9));
     if result != 0 {
         rt.mem.write_u32(result, 0);
     }

@@ -404,6 +404,10 @@ pub fn nt_close(rt: &Runtime, c: &mut Context) {
             }
             STATUS_SUCCESS
         }
+        Some(Handle::File(f)) => {
+            super::files::sync_save(&f.lock().unwrap());
+            STATUS_SUCCESS
+        }
         Some(_) => STATUS_SUCCESS,
         None => STATUS_INVALID_HANDLE,
     };
