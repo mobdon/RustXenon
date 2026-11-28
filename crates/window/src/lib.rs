@@ -12,11 +12,13 @@ use std::num::NonZeroU32;
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 use winit::application::ApplicationHandler;
-use winit::event::{ElementState, WindowEvent};
+use winit::event::{
+    DeviceEvent, DeviceId, ElementState, MouseButton, MouseScrollDelta, WindowEvent,
+};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::PhysicalKey;
-use winit::window::{Fullscreen, Window, WindowId};
-use xenon_input::{filtered, merge, Keyboard, Pad};
+use winit::window::{CursorGrabMode, Fullscreen, Window, WindowId};
+use xenon_input::{filtered, merge, Keyboard, Mouse, Pad};
 
 mod gpu;
 mod pace;
@@ -190,6 +192,12 @@ struct App {
     cfg: Config,
     link: Arc<Link>,
     keys: Keyboard,
+    mouse: Mouse,
+    /// The cursor is hidden and held in the window: mouse motion is the camera.
+    captured: bool,
+    /// A d-pad press from the mouse wheel (weapon switch) and until when.
+    wheel: Option<(u16, Instant)>,
+    last_poll: Instant,
     pad: xinput::Reader,
     window: Option<Arc<Window>>,
     /// The CPU path's surface, made when first drawn to.
@@ -212,6 +220,10 @@ impl App {
             cfg,
             link,
             keys: Keyboard::default(),
+            mouse: Mouse::default(),
+            captured: false,
+            wheel: None,
+            last_poll: Instant::now(),
             pad: xinput::Reader::default(),
             window: None,
             soft: None,
@@ -220,6 +232,25 @@ impl App {
             text: None,
             pace: pace::Pacing::default(),
         }
+    }
+
+    /// Takes or gives back the mouse: hidden and held in the window while
+    /// taken. Alt-Tab (focus lost) gives it back; a click takes it again.
+    fn capture(&mut self, on: bool) {
+        let Some(w) = self.window.as_ref() else {
+            return;
+        };
+        if on {
+            let held = (w.set_cursor_grab(CursorGrabMode::Locked))
+                .or_else(|_| w.set_cursor_grab(CursorGrabMode::Confined));
+            if held.is_err() {
+                return;
+            }
+        } else {
+            let _ = w.set_cursor_grab(CursorGrabMode::None);
+        }
+        w.set_cursor_visible(!on);
+        self.captured = on;
     }
 
     /// Shows the text or the last frame; whether it reached the screen.
@@ -327,7 +358,33 @@ impl ApplicationHandler for App {
     fn window_event(&mut self, ev: &ActiveEventLoop, _: WindowId, e: WindowEvent) {
         match e {
             WindowEvent::CloseRequested => ev.exit(),
-            WindowEvent::Focused(false) => self.keys.release_all(),
+            WindowEvent::Focused(false) => {
+                self.keys.release_all();
+                self.mouse.release();
+                self.capture(false);
+            }
+            WindowEvent::MouseInput { state, button, .. } => {
+                let down = state == ElementState::Pressed;
+                // The first click only takes the mouse.
+                if down && !self.captured {
+                    self.capture(true);
+                    return;
+                }
+                match button {
+                    MouseButton::Left => self.mouse.left = down,
+                    MouseButton::Right => self.mouse.right = down,
+                    _ => {}
+                }
+            }
+            WindowEvent::MouseWheel { delta, .. } if self.captured => {
+                let y = match delta {
+                    MouseScrollDelta::LineDelta(_, y) => y,
+                    MouseScrollDelta::PixelDelta(p) => p.y as f32,
+                };
+                // Up is the next weapon (d-pad right), down the previous one.
+                let b = if y > 0.0 { 0x0008 } else { 0x0004 };
+                self.wheel = Some((b, Instant::now() + Duration::from_millis(80)));
+            }
             WindowEvent::KeyboardInput { event, .. } => {
                 if let PhysicalKey::Code(code) = event.physical_key {
                     let down = event.state == ElementState::Pressed;
@@ -344,8 +401,25 @@ impl ApplicationHandler for App {
         }
     }
 
+    fn device_event(&mut self, _: &ActiveEventLoop, _: DeviceId, e: DeviceEvent) {
+        if let DeviceEvent::MouseMotion { delta } = e {
+            if self.captured {
+                self.mouse.motion(delta.0, delta.1);
+            }
+        }
+    }
+
     fn about_to_wait(&mut self, ev: &ActiveEventLoop) {
-        let pad = merge(filtered(self.pad.read()), self.keys.pad());
+        let now = Instant::now();
+        let dt = now.duration_since(self.last_poll).as_secs_f32();
+        self.last_poll = now;
+        self.keys.step(dt);
+        let mouse = self.mouse.pad_in(dt, self.keys.in_vehicle());
+        let mut pad = merge(merge(filtered(self.pad.read()), self.keys.pad()), mouse);
+        match self.wheel {
+            Some((b, until)) if now < until => pad.buttons |= b,
+            _ => self.wheel = None,
+        }
         *self.link.pad.lock().unwrap() = pad;
         let asked = self.link.attach.lock().unwrap().take();
         match (asked, self.window.clone()) {
