@@ -6,7 +6,7 @@
 
 use super::*;
 use std::time::{Duration, Instant};
-use xenon_window::pace::{Pacing, Spread};
+use xenon_window::pace::{near_sixty, Pacing, Refreshes, Spread};
 
 /// The guest's swaps and vertical blanks as they happened, summed up each
 /// second in the run log (see [`pace_line`]).
@@ -14,8 +14,15 @@ static SWAP_PACE: Mutex<Pacing> = Mutex::new(Pacing::new());
 static VBLANK_PACE: Mutex<Pacing> = Mutex::new(Pacing::new());
 /// Vertical blanks skipped because their thread woke a whole period late.
 static VBLANKS_SKIPPED: AtomicU32 = AtomicU32::new(0);
+/// Vertical blanks raised on the display's own vertical blank.
+static VBLANKS_ON_DISPLAY: AtomicU32 = AtomicU32::new(0);
+/// New frames the window presented each display refresh.
+static REFRESHES: Mutex<Refreshes> = Mutex::new(Refreshes::new());
 
 const VBLANK_PERIOD: Duration = Duration::from_micros(16_667);
+/// How long past a period the timer waits for the display's vertical blank
+/// before raising the guest's itself.
+const DISPLAY_SLACK: Duration = Duration::from_millis(4);
 
 /// One line on how evenly the title swapped and the vertical blank came
 /// over the last second.
@@ -33,11 +40,13 @@ pub fn pace_line() -> String {
         ),
         None => "none".into(),
     };
+    let [none, one, more] = REFRESHES.lock().unwrap().take();
     format!(
-        "[pace] swaps: {}; vertical blanks: {}, skipped {}",
+        "[pace] swaps: {}; vertical blanks: {}, skipped {}, on the display's {}; display refreshes with 0 / 1 / 2+ new frames: {none} / {one} / {more}",
         f(SWAP_PACE.lock().unwrap().take()),
         f(VBLANK_PACE.lock().unwrap().take()),
-        VBLANKS_SKIPPED.swap(0, Ordering::Relaxed)
+        VBLANKS_SKIPPED.swap(0, Ordering::Relaxed),
+        VBLANKS_ON_DISPLAY.swap(0, Ordering::Relaxed)
     )
 }
 
@@ -218,24 +227,106 @@ fn next_vblank(due: Instant, now: Instant) -> Instant {
     }
 }
 
+/// Whether the display's vertical blank at `t` raises the guest's: it came
+/// a 60 Hz period after the display's one before (`prev`), and the guest's
+/// last (`raised`) is not so recent that the timer already stood in for it.
+fn display_raises(prev: Option<Instant>, raised: Instant, t: Instant) -> bool {
+    prev.is_some_and(|p| near_sixty(t.saturating_duration_since(p)))
+        && t.saturating_duration_since(raised) >= VBLANK_PERIOD / 2
+}
+
+/// The display's vertical blanks as they come, from a thread that waits on
+/// the monitor the window is on (reopened when the window moves).
+fn start_display_vsync(
+    link: std::sync::Arc<xenon_window::Link>,
+) -> std::sync::mpsc::Receiver<Instant> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let spawned = std::thread::Builder::new()
+        .name("vsync".into())
+        .spawn(move || {
+            let mut failed = None;
+            loop {
+                let Some((name, _)) = link.monitor() else {
+                    std::thread::sleep(Duration::from_millis(100));
+                    continue;
+                };
+                let Some(v) = xenon_window::vsync::Vsync::open(&name) else {
+                    if failed.replace(name.clone()).as_ref() != Some(&name) {
+                        crate::log(&format!("[video] cannot wait on {name}'s vertical blank; the guest's stays on the timer"));
+                    }
+                    std::thread::sleep(Duration::from_secs(1));
+                    continue;
+                };
+                crate::log(&format!("[video] waiting on {name}'s vertical blank"));
+                for n in 0u32.. {
+                    if !v.wait() {
+                        break;
+                    }
+                    if tx.send(Instant::now()).is_err() {
+                        return;
+                    }
+                    if n % 64 == 63 && link.monitor().map(|(m, _)| m) != Some(name.clone()) {
+                        break;
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        });
+    if let Err(e) = spawned {
+        crate::log(&format!("[video] no display vertical blank thread: {e}"));
+    }
+    rx
+}
+
 /// Raises the vertical blank at 60 Hz on a thread of its own, so it comes
 /// on time while the command processor waits on the drawer or runs a long
 /// span: raised from the processor's loop, it could come late and then
 /// several at once, and the title (which retires a swap a vertical blank)
 /// made its frames in bursts that the window could not show evenly.
+///
+/// With a window on a monitor at about 60 Hz, each of the display's
+/// vertical blanks raises one, so the title makes exactly one frame a
+/// refresh: on a timer of its own the two clocks drift, and some refreshes
+/// got two new frames (one never seen) and some none (one shown twice).
+/// The timer stands in when the display's is late by [`DISPLAY_SLACK`], at
+/// other refresh rates, headless, and with `XENON_VBLANK=timer`.
 fn start_vblank(rt: std::sync::Arc<Runtime>, irq: std::sync::Arc<Mutex<Context>>) {
+    let window = (super::input::WINDOW.get().cloned())
+        .filter(|_| std::env::var("XENON_VBLANK").as_deref() != Ok("timer"));
     let spawned = std::thread::Builder::new()
         .name("vblank".into())
         .spawn(move || {
+            use std::sync::mpsc::RecvTimeoutError;
+            let mut display = window.clone().map(start_display_vsync);
             let mut due = Instant::now() + VBLANK_PERIOD;
+            let (mut prev, mut raised) = (None, Instant::now());
             loop {
                 let now = Instant::now();
-                if now < due {
-                    std::thread::sleep(due - now);
+                if now >= due {
+                    due = next_vblank(due, now);
+                    raised = now;
+                    vblank(&rt, &irq);
                     continue;
                 }
-                due = next_vblank(due, now);
-                vblank(&rt, &irq);
+                let Some(rx) = &display else {
+                    std::thread::sleep(due - now);
+                    continue;
+                };
+                match rx.recv_timeout(due - now) {
+                    Ok(t) => {
+                        if let Some(w) = &window {
+                            REFRESHES.lock().unwrap().refresh(w.presents());
+                        }
+                        if display_raises(prev, raised, t) {
+                            (raised, due) = (t, t + VBLANK_PERIOD + DISPLAY_SLACK);
+                            VBLANKS_ON_DISPLAY.fetch_add(1, Ordering::Relaxed);
+                            vblank(&rt, &irq);
+                        }
+                        prev = Some(t);
+                    }
+                    Err(RecvTimeoutError::Timeout) => {}
+                    Err(RecvTimeoutError::Disconnected) => display = None,
+                }
             }
         });
     if let Err(e) = spawned {
@@ -424,5 +515,20 @@ mod tests {
         // A whole period late: the next is a period from now, not due.
         let now = t + ms(50);
         assert_eq!(next_vblank(t, now), now + VBLANK_PERIOD);
+    }
+
+    #[test]
+    fn the_display_raises_at_60_hz_only() {
+        let t = Instant::now();
+        let us = Duration::from_micros;
+        let at = t + us(16_683);
+        // 59.94 Hz after a raise a period ago: raised.
+        assert!(display_raises(Some(t), t, at));
+        // The first one seen, or 164 Hz, or 30 Hz: not.
+        assert!(!display_raises(None, t, at));
+        assert!(!display_raises(Some(at - us(6_098)), t, at));
+        assert!(!display_raises(Some(at - us(33_333)), t, at));
+        // The timer stood in 2 ms ago for this late one: not again.
+        assert!(!display_raises(Some(t), at - us(2_000), at));
     }
 }

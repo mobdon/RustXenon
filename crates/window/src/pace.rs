@@ -1,7 +1,8 @@
 //! How evenly frames reach the screen: the spread of the intervals between
 //! frames as they are presented, summed up once a second. The host uses the
-//! same summary for the guest's swaps and vertical blanks; and the window's
-//! frame queue, which hands every frame over in order.
+//! same summary for the guest's swaps and vertical blanks; the window's
+//! frame queue, which hands every frame over in order; and how many new
+//! frames each display refresh got.
 
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
@@ -20,6 +21,50 @@ pub fn push_bounded<T>(q: &mut VecDeque<T>, x: T, cap: usize) -> bool {
     }
     q.push_back(x);
     full
+}
+
+/// Whether a refresh every `period` is the guest's 60 Hz (59.94 and 60
+/// are; 50, 75 or 144 are not), so the guest's vertical blank can follow it.
+pub fn near_sixty(period: Duration) -> bool {
+    (15_667..=17_667).contains(&period.as_micros())
+}
+
+/// [`near_sixty`] for a refresh rate in millihertz (0: not known, no).
+pub fn near_sixty_hz(mhz: u32) -> bool {
+    mhz != 0 && near_sixty(Duration::from_nanos(1_000_000_000_000 / mhz as u64))
+}
+
+/// How many new frames each display refresh got: counted at each vertical
+/// blank from the window's running total of presents. With frames made one
+/// a refresh, all are 1; a 0 is a frame shown twice, a 2+ (with Mailbox) a
+/// frame never shown.
+#[derive(Default, Debug, PartialEq)]
+pub struct Refreshes {
+    last: Option<u32>,
+    /// Refreshes with 0, 1 and 2 or more new frames since the last take.
+    pub counts: [u32; 3],
+}
+
+impl Refreshes {
+    /// None yet, for a static.
+    pub const fn new() -> Self {
+        Refreshes {
+            last: None,
+            counts: [0; 3],
+        }
+    }
+
+    /// A vertical blank came, with `presents` presented so far in all.
+    pub fn refresh(&mut self, presents: u32) {
+        if let Some(last) = self.last.replace(presents) {
+            self.counts[(presents.wrapping_sub(last) as usize).min(2)] += 1;
+        }
+    }
+
+    /// The counts since the last take, and zero again.
+    pub fn take(&mut self) -> [u32; 3] {
+        std::mem::take(&mut self.counts)
+    }
 }
 
 /// An interval longer than this counts as a hitch: a frame shown three
@@ -184,6 +229,26 @@ mod tests {
         // Taken: the next take starts from the last mark.
         p.mark(t + ms(69));
         assert_eq!(p.take().unwrap().frames, 1);
+    }
+
+    #[test]
+    fn sixty_hz_and_refresh_counts() {
+        assert!(near_sixty_hz(60_000) && near_sixty_hz(59_940));
+        assert!(!near_sixty_hz(0) && !near_sixty_hz(50_000) && !near_sixty_hz(164_000));
+        assert!(near_sixty(Duration::from_micros(16_683)));
+        assert!(!near_sixty(Duration::from_micros(33_333)));
+        let mut r = Refreshes::default();
+        // The first only sets the start; then 1, 0, 2, 1, 3 new frames.
+        for p in [5, 6, 6, 8, 9, 12] {
+            r.refresh(p);
+        }
+        assert_eq!(r.take(), [1, 2, 2]);
+        assert_eq!(r.take(), [0, 0, 0]);
+        // The total wrapping around still counts one.
+        let mut w = Refreshes::default();
+        w.refresh(u32::MAX);
+        w.refresh(0);
+        assert_eq!(w.counts, [0, 1, 0]);
     }
 
     #[test]

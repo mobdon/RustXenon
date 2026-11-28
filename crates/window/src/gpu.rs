@@ -1,6 +1,7 @@
 //! Presents frames through a swapchain on the drawer's own device: the
 //! drawer's frame texture is scaled into the window on the GPU, with no
-//! read-back and no CPU copy, and shown at the monitor's refresh (FIFO).
+//! read-back and no CPU copy, and shown at the monitor's refresh (see
+//! [`Presenter::follow_refresh`]).
 
 use std::sync::Arc;
 use winit::window::Window;
@@ -53,6 +54,8 @@ pub struct Presenter {
     upload: Option<wgpu::Texture>,
     /// Set when the swapchain no longer matches the window.
     stale: bool,
+    /// The present modes the surface offers.
+    modes: Vec<wgpu::PresentMode>,
 }
 
 impl Presenter {
@@ -79,19 +82,7 @@ impl Presenter {
         config.format = (caps.formats.iter().copied())
             .find(|f| !f.is_srgb())
             .unwrap_or(config.format);
-        // Mailbox: each refresh shows the newest frame and a present never
-        // waits; with Fifo the window blocked on the swapchain long enough to
-        // show only about 42 of 60 frames a second. XENON_PRESENT=fifo,
-        // mailbox or immediate picks one; an unsupported choice falls back.
-        let want = match std::env::var("XENON_PRESENT").as_deref() {
-            Ok("fifo") => wgpu::PresentMode::Fifo,
-            Ok("immediate") => wgpu::PresentMode::Immediate,
-            _ => wgpu::PresentMode::Mailbox,
-        };
-        config.present_mode = [want, wgpu::PresentMode::Mailbox, wgpu::PresentMode::Fifo]
-            .into_iter()
-            .find(|m| caps.present_modes.contains(m))
-            .unwrap_or(wgpu::PresentMode::Fifo);
+        let modes = caps.present_modes.clone();
         config.desired_maximum_frame_latency = 2;
         let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
         surface.configure(&device, &config);
@@ -129,11 +120,7 @@ impl Presenter {
         if let Some(e) = pollster::block_on(scope.pop()) {
             return Err(format!("{e:?}"));
         }
-        eprintln!(
-            "window: frames presented on the GPU ({:?}, {:?})",
-            config.format, config.present_mode
-        );
-        Ok(Presenter {
+        let mut p = Presenter {
             surface,
             device,
             queue,
@@ -142,7 +129,41 @@ impl Presenter {
             sampler,
             upload: None,
             stale: false,
-        })
+            modes,
+        };
+        p.follow_refresh(0);
+        Ok(p)
+    }
+
+    /// Picks the present mode for a monitor refreshing at `mhz` millihertz
+    /// (0 for not known). At about 60 Hz the host raises the guest's
+    /// vertical blank on the display's own (see `xenon_window::vsync`), so
+    /// a frame comes each refresh and Fifo shows each once, in order. At
+    /// other rates the guest keeps its own 60 Hz clock, and Mailbox shows
+    /// the newest frame each refresh without a present ever waiting (Fifo
+    /// there blocked the window to about 42 of 60 frames a second).
+    /// XENON_PRESENT=fifo, mailbox or immediate picks one; an unsupported
+    /// choice falls back.
+    pub fn follow_refresh(&mut self, mhz: u32) {
+        let want = match std::env::var("XENON_PRESENT").as_deref() {
+            Ok("fifo") => wgpu::PresentMode::Fifo,
+            Ok("immediate") => wgpu::PresentMode::Immediate,
+            Ok("mailbox") => wgpu::PresentMode::Mailbox,
+            _ if crate::pace::near_sixty_hz(mhz) => wgpu::PresentMode::Fifo,
+            _ => wgpu::PresentMode::Mailbox,
+        };
+        let mode = [want, wgpu::PresentMode::Mailbox, wgpu::PresentMode::Fifo]
+            .into_iter()
+            .find(|m| self.modes.contains(m))
+            .unwrap_or(wgpu::PresentMode::Fifo);
+        if mode != self.config.present_mode || mhz == 0 {
+            self.config.present_mode = mode;
+            self.stale = true;
+            eprintln!(
+                "window: frames presented on the GPU ({:?}, {:?}, monitor {} mHz)",
+                self.config.format, mode, mhz
+            );
+        }
     }
 
     /// `rgba8` (`width` x `height`, rows top to bottom) in a texture to

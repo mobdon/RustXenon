@@ -24,6 +24,7 @@ use xenon_input::{filtered, merge, Keyboard, Mouse, Pad};
 
 mod gpu;
 pub mod pace;
+pub mod vsync;
 
 pub use gpu::Gpu;
 
@@ -86,6 +87,11 @@ pub struct Link {
     wake: Mutex<Option<EventLoopProxy<()>>>,
     /// A device to present with, and where to answer whether it can.
     attach: Mutex<Option<(Gpu, Answer)>>,
+    /// The GDI name of the monitor the window is on, and its refresh in
+    /// millihertz, as last seen.
+    monitor: Mutex<Option<(String, u32)>>,
+    /// Frames presented since the window opened.
+    presents: AtomicU32,
 }
 
 /// Whether the window presents with the device it was given.
@@ -140,6 +146,18 @@ impl Link {
     /// or Back closes the window.
     pub fn show_text(&self, lines: Vec<String>) {
         *self.text.lock().unwrap() = Some(lines);
+    }
+
+    /// The GDI name of the monitor the window is on (as `\\.\DISPLAY1`)
+    /// and its refresh in millihertz; none before the window opens or off
+    /// Windows.
+    pub fn monitor(&self) -> Option<(String, u32)> {
+        self.monitor.lock().unwrap().clone()
+    }
+
+    /// Frames presented since the window opened.
+    pub fn presents(&self) -> u32 {
+        self.presents.load(Ordering::Relaxed)
     }
 
     /// The controller and keyboard together, as last read.
@@ -301,6 +319,23 @@ impl App {
         self.captured = on;
     }
 
+    /// Notes the window's monitor and refresh for the host's vertical
+    /// blank, and has the presenter follow the refresh.
+    fn note_monitor(&mut self) {
+        let Some(m) = self.window.as_ref().and_then(|w| w.current_monitor()) else {
+            return;
+        };
+        let mhz = m.refresh_rate_millihertz().unwrap_or(0);
+        if let Some(g) = self.gpu.as_mut() {
+            g.follow_refresh(mhz);
+        }
+        #[cfg(windows)]
+        {
+            use winit::platform::windows::MonitorHandleExtWindows;
+            *self.link.monitor.lock().unwrap() = Some((m.native_id(), mhz));
+        }
+    }
+
     /// Shows the text or the last frame; whether it reached the screen.
     fn draw(&mut self) -> bool {
         let Some(w) = self.window.clone() else {
@@ -395,7 +430,10 @@ impl ApplicationHandler for App {
             ))
             .with_fullscreen(fullscreen);
         match ev.create_window(attrs) {
-            Ok(w) => self.window = Some(Arc::new(w)),
+            Ok(w) => {
+                self.window = Some(Arc::new(w));
+                self.note_monitor();
+            }
             Err(e) => {
                 eprintln!("window: {e}");
                 ev.exit();
@@ -499,6 +537,7 @@ impl ApplicationHandler for App {
                 // The swapchain takes the window over from the CPU path.
                 self.soft = None;
                 let made = gpu::Presenter::new(gpu, w).map(|p| self.gpu = Some(p));
+                self.note_monitor();
                 if let Err(e) = &made {
                     eprintln!("window: frames stay on the CPU: {e}");
                 }
@@ -534,6 +573,7 @@ impl ApplicationHandler for App {
             self.last = Some(img);
             if self.draw() {
                 self.presented += 1;
+                self.link.presents.fetch_add(1, Ordering::Relaxed);
                 if let Some(s) = self.pace.frame(Instant::now()) {
                     eprintln!("window: {s}");
                 }
@@ -541,6 +581,7 @@ impl ApplicationHandler for App {
         }
         if self.counted.elapsed() >= Duration::from_secs(1) {
             self.counted = Instant::now();
+            self.note_monitor();
             let handed = self.link.handed.swap(0, Ordering::Relaxed);
             let dropped = self.link.dropped.swap(0, Ordering::Relaxed);
             if handed + self.presented > 0 {
