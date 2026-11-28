@@ -214,7 +214,7 @@ impl Runtime {
             .spawn(move || {
                 let _exit = thread::enter(t2.clone());
                 // `t2` lives as long as `ctx`, so the slot stays valid.
-                ctx.thread = ThreadSlot(Arc::as_ptr(&t2).cast());
+                ctx.thread = ThreadSlot::new(Arc::as_ptr(&t2).cast());
                 ctx.host = ThreadSlot::NULL;
                 thread::checkpoint(&ctx);
                 rt.call(&mut ctx, entry);
@@ -502,14 +502,14 @@ mod tests {
     fn spawn_binds_the_thread_slot_and_clears_the_host_slot() {
         fn check(_: &Runtime, c: &mut Context) {
             let fresh = c.clone();
-            c.r[3] = u64::from(!c.thread.0.is_null() && c.host.0.is_null())
-                + 2 * u64::from(fresh.thread.0.is_null());
+            c.r[3] = u64::from(!c.thread.get().is_null() && c.host.get().is_null())
+                + 2 * u64::from(fresh.thread.get().is_null());
         }
         let mut rt = Runtime::new(GuestMemory::new(16));
         rt.register(0x8200_0000, check);
         let rt = rt.share();
         let mut c = Context::new();
-        c.host = ThreadSlot(0x1234 as *const ());
+        c.host = ThreadSlot::new(0x1234 as *const ());
         let id = rt.spawn(0x8200_0000, c, false);
         assert_eq!(rt.join(id), 3);
     }

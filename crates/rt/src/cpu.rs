@@ -68,12 +68,32 @@ pub struct Context {
 }
 
 /// A pointer that belongs to one host thread. Cloning gives null, so a
-/// context copied for use elsewhere looks its thread up again.
+/// context copied for use elsewhere looks its thread up again. Only
+/// [`ThreadSlot::set`], which is unsafe, stores a non-null pointer, so safe
+/// code cannot forge one.
 #[derive(Debug)]
-pub struct ThreadSlot(pub *const ());
+pub struct ThreadSlot(*const ());
 
 impl ThreadSlot {
     pub const NULL: Self = Self(std::ptr::null());
+
+    pub(crate) fn new(p: *const ()) -> Self {
+        Self(p)
+    }
+
+    pub fn get(&self) -> *const () {
+        self.0
+    }
+
+    /// Stores `p` for the hook that reads it back.
+    ///
+    /// # Safety
+    /// `p` must stay valid for as long as the slot holds it. A context moved
+    /// to another host thread keeps the pointer until reset with
+    /// [`ThreadSlot::NULL`], so it must also be valid to use from there.
+    pub unsafe fn set(&mut self, p: *const ()) {
+        self.0 = p;
+    }
 }
 
 impl Clone for ThreadSlot {

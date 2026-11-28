@@ -375,13 +375,16 @@ fn trace(c: &mut Context, addr: u32) {
     }
     // This thread's entry, found once per context instead of per call: a
     // thread-local lookup is a libc call on Android.
-    if c.host.0.is_null() {
-        c.host.0 = MINE.with(Arc::as_ptr).cast();
+    if c.host.get().is_null() {
+        // SAFETY: every thread's entry is kept in `ACTIVITY` and
+        // never freed, so the pointer stays valid on any thread.
+        unsafe { c.host.set(MINE.with(Arc::as_ptr).cast()) };
     }
-    // SAFETY: set just above on this host thread from an entry that is
-    // never freed; the runtime resets the slot when a context moves to a
-    // new thread or is cloned.
-    let m = unsafe { &*c.host.0.cast::<Activity>() };
+    // SAFETY: only `set` above stores a non-null slot (the field is private
+    // to xenon-rt), and those entries are never freed. A context moved to
+    // another host thread without a reset keeps logging to its first
+    // thread's entry; spawn and clone reset the slot.
+    let m = unsafe { &*c.host.get().cast::<Activity>() };
     let h = m.head.load(Ordering::Relaxed);
     m.ring[(h % 8) as usize].store(addr, Ordering::Relaxed);
     m.head.store(h.wrapping_add(1), Ordering::Relaxed);
@@ -1161,8 +1164,8 @@ mod tests {
         assert_eq!(super::last_call(), 0x8200_0028);
         // The hook found this thread's entry once and kept it in the context.
         let mine = super::MINE.with(super::Arc::as_ptr).cast::<()>();
-        assert_eq!(c.host.0, mine);
-        assert!(c.clone().host.0.is_null());
+        assert_eq!(c.host.get(), mine);
+        assert!(c.clone().host.get().is_null());
         {
             let _w = super::waiting(0x4000_0010, 3);
             assert_eq!(

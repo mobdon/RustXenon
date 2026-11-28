@@ -147,7 +147,7 @@ pub(crate) fn finish(code: u64) {
 /// `Runtime::spawn`) saves the thread-local lookup.
 #[inline]
 pub(crate) fn checkpoint(ctx: &crate::Context) {
-    let mut t = ctx.thread.0.cast::<GuestThread>();
+    let mut t = ctx.thread.get().cast::<GuestThread>();
     if t.is_null() {
         t = FAST.with(Cell::get);
     }
@@ -181,7 +181,7 @@ mod tests {
             let mut c = crate::Context::new();
             for i in 0..200_000 {
                 // Half through the context's slot, half through the lookup.
-                c.thread = crate::cpu::ThreadSlot(if i % 2 == 0 {
+                c.thread = crate::cpu::ThreadSlot::new(if i % 2 == 0 {
                     Arc::as_ptr(&t2).cast()
                 } else {
                     std::ptr::null()
