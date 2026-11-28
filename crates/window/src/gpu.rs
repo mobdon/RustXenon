@@ -81,7 +81,19 @@ impl Presenter {
             .unwrap_or(config.format);
         // Vsync, and at most two frames queued: a present never stalls the
         // drawer, which hands frames over from another thread.
-        config.present_mode = wgpu::PresentMode::Fifo;
+        // Mailbox: each refresh shows the newest frame and a present never
+        // waits; with Fifo the window blocked on the swapchain long enough to
+        // show only about 42 of 60 frames a second. XENON_PRESENT=fifo,
+        // mailbox or immediate picks one; an unsupported choice falls back.
+        let want = match std::env::var("XENON_PRESENT").as_deref() {
+            Ok("fifo") => wgpu::PresentMode::Fifo,
+            Ok("immediate") => wgpu::PresentMode::Immediate,
+            _ => wgpu::PresentMode::Mailbox,
+        };
+        config.present_mode = [want, wgpu::PresentMode::Mailbox, wgpu::PresentMode::Fifo]
+            .into_iter()
+            .find(|m| caps.present_modes.contains(m))
+            .unwrap_or(wgpu::PresentMode::Fifo);
         config.desired_maximum_frame_latency = 2;
         let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
         surface.configure(&device, &config);
