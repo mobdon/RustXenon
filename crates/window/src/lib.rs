@@ -388,11 +388,13 @@ impl ApplicationHandler for App {
             WindowEvent::KeyboardInput { event, .. } => {
                 if let PhysicalKey::Code(code) = event.physical_key {
                     let down = event.state == ElementState::Pressed;
-                    // Alt gives the mouse back; a click takes it again.
+                    // Alt or Escape gives the mouse back; a click takes it again.
                     if down
                         && matches!(
                             code,
-                            winit::keyboard::KeyCode::AltLeft | winit::keyboard::KeyCode::AltRight
+                            winit::keyboard::KeyCode::AltLeft
+                                | winit::keyboard::KeyCode::AltRight
+                                | winit::keyboard::KeyCode::Escape
                         )
                     {
                         self.mouse.release();
