@@ -572,6 +572,9 @@ pub struct Timings {
     pub gap_writes: u32,
     /// Replays that found the texture memo at [`TEXTURE_MEMO_CAP`].
     pub memo_cap_hits: u32,
+    /// Texture lookups whose memo entry a guest write dropped, found
+    /// unchanged by hashing only the written pages of their guest bytes.
+    pub textures_restored: u32,
     /// Render passes begun for draws: each target change or flush ends one.
     pub render_passes: u32,
     /// GPU time measured by timestamps around the batch's draw passes,
@@ -631,6 +634,7 @@ impl std::ops::AddAssign<&Timings> for Timings {
         self.rehash_hit_bytes += t.rehash_hit_bytes;
         self.gap_writes += t.gap_writes;
         self.memo_cap_hits += t.memo_cap_hits;
+        self.textures_restored += t.textures_restored;
         self.queue += t.queue;
         self.upload += t.upload;
         for (a, b) in self.submit_parts.iter_mut().zip(t.submit_parts) {
@@ -1539,8 +1543,16 @@ pub struct Drawer {
     /// the entries whose range they write, so later draws skip reading and
     /// hashing the guest bytes of the others. Cleared at each replay, unless
     /// guest memory lists the pages the CPU wrote between replays
-    /// ([`GuestMemory::take_written`]): then only those entries go.
+    /// ([`GuestMemory::take_written`]): then only those entries go (a write
+    /// between the levels of a texture keeps it), and past
+    /// [`TEXTURE_MEMO_CAP`] the least recently used half.
     texture_memo: HashMap<[u32; 6], TextureMemo>,
+    /// Memo entries a guest write dropped, with the indices of their
+    /// [`TextureMemo::pages`] the writes met since: the next lookup hashes
+    /// only those pages, and if they still match, takes the entry back
+    /// without reading and hashing the whole texture. (A write often leaves
+    /// the bytes as they were: the CPU rewrites a page around a texture.)
+    texture_suspect: HashMap<[u32; 6], (TextureMemo, Vec<u32>)>,
     /// Guest texture bytes are read into this buffer, kept across lookups:
     /// a fresh one per texture costs zeroing and page faults every frame.
     texture_scratch: Vec<u8>,
@@ -2066,20 +2078,77 @@ struct TextureMemo {
     levels: Vec<(u64, u64)>,
     /// The `texture_cache` key (none for kept-resolve decodes).
     key: Option<([u32; 6], u64)>,
+    /// `[lo, hi)` and [`hash_bytes`] of each piece of the levels within
+    /// one guest page, which together make the key's hash ([`page_hashes`]);
+    /// empty unless they cover every level.
+    pages: Vec<(u64, u64, u64)>,
+    /// The replay that last looked it up.
+    used: u64,
 }
 
 impl TextureMemo {
-    fn new(view: wgpu::TextureView, levels: Vec<(u64, u64)>, key: Option<([u32; 6], u64)>) -> Self {
+    fn new(
+        view: wgpu::TextureView,
+        levels: Vec<(u64, u64)>,
+        key: Option<([u32; 6], u64)>,
+        pages: Vec<(u64, u64, u64)>,
+        used: u64,
+    ) -> Self {
         let span = (levels.iter().copied())
             .reduce(|a, b| (a.0.min(b.0), a.1.max(b.1)))
             .unwrap_or_default();
+        let paged: u64 = pages.iter().map(|p| p.1 - p.0).sum();
+        let covered = paged == levels.iter().map(|&(a, b)| b - a).sum::<u64>();
         Self {
             view,
             span,
             levels,
             key,
+            pages: if covered { pages } else { Vec::new() },
+            used,
         }
     }
+}
+
+/// Splits each `(guest address, offset in bytes, length)` segment of
+/// `bytes` at guest page boundaries and hashes each piece: the pieces for
+/// [`TextureMemo::pages`] and a hash of their hashes for the cache key.
+fn page_hashes(
+    bytes: &[u8],
+    segments: impl Iterator<Item = (u64, usize, usize)>,
+) -> (Vec<(u64, u64, u64)>, u64) {
+    let mut pages = Vec::new();
+    let mut all = Vec::new();
+    for (addr, at, len) in segments {
+        let end = addr + len as u64;
+        let mut lo = addr;
+        while lo < end {
+            let hi = ((lo | (TEXTURE_PAGE - 1)) + 1).min(end);
+            let off = at + (lo - addr) as usize;
+            let h = hash_bytes(&bytes[off..off + (hi - lo) as usize]);
+            pages.push((lo, hi, h));
+            all.extend_from_slice(&h.to_le_bytes());
+            lo = hi;
+        }
+    }
+    (pages, hash_bytes(&all))
+}
+
+/// The last-used replay at or below which entries go so that at most
+/// `keep` of those with `ages` stay (fewer on ties); `None` when no more
+/// than `keep` are there.
+fn trim_cut(mut ages: Vec<u64>, keep: usize) -> Option<u64> {
+    let i = ages.len().checked_sub(keep + 1)?;
+    Some(*ages.select_nth_unstable(i).1)
+}
+
+/// The guest page size [`TextureMemo::pages`] split at: the write watch's.
+const TEXTURE_PAGE: u64 = 4096;
+
+/// Pushes the indices of the pages of `m` that meet `ranges` to `dirty`.
+fn dirty_pages(m: &TextureMemo, ranges: &[(u64, u64)], dirty: &mut Vec<u32>) {
+    let met = (m.pages.iter().enumerate()).filter(|(_, p)| meets(ranges, p.0, p.1));
+    dirty.extend(met.map(|(i, _)| i as u32));
 }
 
 /// Entries [`Drawer::texture_memo`] holds before it starts over.
@@ -2785,6 +2854,7 @@ impl Drawer {
             texture_evicted: HashSet::default(),
             replays: 0,
             texture_memo: HashMap::default(),
+            texture_suspect: HashMap::default(),
             texture_scratch: Vec::new(),
             samplers: HashMap::default(),
             batch: None,
@@ -3304,7 +3374,14 @@ impl Drawer {
         let start = Instant::now();
         let was_watching = self.watching;
         match mem.take_written() {
-            Some(written) if self.texture_memo.len() < TEXTURE_MEMO_CAP => {
+            Some(written) => {
+                if self.texture_memo.len() >= TEXTURE_MEMO_CAP {
+                    self.timings.memo_cap_hits += 1;
+                    self.trim_texture_memo();
+                }
+                if self.texture_suspect.len() >= TEXTURE_MEMO_CAP {
+                    self.texture_suspect.clear();
+                }
                 self.watching = true;
                 if was_watching {
                     // Kept resolve blocks hashed against guest memory stay
@@ -3323,12 +3400,10 @@ impl Drawer {
                     self.uncheck(lo, hi);
                 }
             }
-            written => {
-                if written.is_some() {
-                    self.timings.memo_cap_hits += 1;
-                }
+            None => {
                 self.watching = false;
                 self.texture_memo.clear();
+                self.texture_suspect.clear();
                 self.texture_memo_epoch += 1;
                 self.index_memo.clear();
                 self.index_memo_bytes = 0;
@@ -3535,20 +3610,32 @@ impl Drawer {
             return;
         }
         let mut gone = Vec::new();
-        let mut gaps = 0;
-        self.texture_memo.retain(|c, m| {
-            let keep = !meets(ranges, m.span.0, m.span.1);
-            if !keep {
-                gaps += u32::from(!m.levels.iter().any(|&(a, b)| meets(ranges, a, b)));
-                gone.push(*c);
+        for (c, m) in &self.texture_memo {
+            if !meets(ranges, m.span.0, m.span.1) {
+                continue;
             }
-            keep
-        });
-        self.timings.gap_writes += gaps;
-        // The sets that used those textures; the others stay bound.
+            // Levels can lie far apart: a write between them changes none.
+            if !m.levels.iter().any(|&(a, b)| meets(ranges, a, b)) {
+                self.timings.gap_writes += 1;
+                continue;
+            }
+            gone.push(*c);
+        }
+        for (m, dirty) in self.texture_suspect.values_mut() {
+            if meets(ranges, m.span.0, m.span.1) {
+                dirty_pages(m, ranges, dirty);
+            }
+        }
         for c in gone {
+            // The sets that used those textures; the others stay bound.
             for flag in self.texture_set_flags.remove(&c).into_iter().flatten() {
                 flag.store(false, Ordering::Relaxed);
+            }
+            let m = self.texture_memo.remove(&c).expect("listed above");
+            if m.key.is_some() && !m.pages.is_empty() {
+                let mut dirty = Vec::new();
+                dirty_pages(&m, ranges, &mut dirty);
+                self.texture_suspect.insert(c, (m, dirty));
             }
         }
         self.window_memo
@@ -5347,7 +5434,9 @@ impl Drawer {
         }
         let sampler = self.sampler(&fetch, filters, report);
         let constant = self.regs.fetch_constant(n);
-        if let Some(m) = self.texture_memo.get(&constant) {
+        let suspect = self.texture_suspect.remove(&constant);
+        if let Some(m) = self.texture_memo.get_mut(&constant) {
+            m.used = self.replays;
             let view = m.view.clone();
             // Kept in use, so eviction does not take it for an old one.
             if let Some((_, _, used)) = m.key.and_then(|k| self.texture_cache.get_mut(&k)) {
@@ -5361,16 +5450,17 @@ impl Drawer {
             if let Some((view, lo, hi)) = self.kept_texture(&fetch, constant, addr, end, mem)? {
                 self.timings.textures_kept += 1;
                 self.timings.kept_bytes += hi - lo;
-                self.texture_memo.insert(
-                    constant,
-                    TextureMemo::new(view.clone(), vec![(lo, hi)], None),
-                );
+                let m = TextureMemo::new(view.clone(), vec![(lo, hi)], None, vec![], self.replays);
+                self.texture_memo.insert(constant, m);
                 return Ok((view, sampler));
             }
             // One sync over the whole chain: at most one writeback wait.
             if let Some((lo, hi)) = chain_range(&fetch) {
                 self.sync(mem, lo, hi)?;
             }
+        }
+        if let Some(view) = suspect.and_then(|s| self.restore_suspect(constant, s, mem, report)) {
+            return Ok((view, sampler));
         }
         let view = self
             .guest_texture(n, &fetch, &*mem, report)
@@ -5379,6 +5469,79 @@ impl Drawer {
                 self.zero_texture.clone()
             });
         Ok((view, sampler))
+    }
+
+    /// The view of suspect memo entry `s` of fetch constant `constant`, back
+    /// in the memo, if its texture is still cached and the pages written
+    /// since it was dropped hash as they did; `None` for the full lookup.
+    /// Not tried when the written pages are over half the texture: the
+    /// full lookup hashes it all anyway.
+    fn restore_suspect(
+        &mut self,
+        constant: [u32; 6],
+        (mut m, mut dirty): (TextureMemo, Vec<u32>),
+        mem: &Tracked,
+        report: &mut Report,
+    ) -> Option<wgpu::TextureView> {
+        let key = m.key?;
+        if !self.texture_cache.contains_key(&key) {
+            return None;
+        }
+        dirty.sort_unstable();
+        dirty.dedup();
+        let len = |i: &u32| m.pages[*i as usize].1 - m.pages[*i as usize].0;
+        let total: u64 = m.pages.iter().map(|p| p.1 - p.0).sum();
+        if dirty.iter().map(len).sum::<u64>() * 2 > total {
+            return None;
+        }
+        let mut buf = std::mem::take(&mut self.texture_scratch);
+        let same = dirty.iter().all(|&i| {
+            let (lo, hi, h) = m.pages[i as usize];
+            buf.resize((hi - lo) as usize, 0);
+            report.timings.hashed_bytes += hi - lo;
+            mem.read_into(lo as u32, &mut buf) && hash_bytes(&buf) == h
+        });
+        self.texture_scratch = buf;
+        if !same {
+            return None;
+        }
+        if let Some((_, _, used)) = self.texture_cache.get_mut(&key) {
+            *used = self.replays;
+        }
+        report.timings.textures_restored += 1;
+        m.used = self.replays;
+        let view = m.view.clone();
+        self.texture_memo.insert(constant, m);
+        Some(view)
+    }
+
+    /// Drops the least recently used half (or more, on ties) of the texture
+    /// memo, which reached [`TEXTURE_MEMO_CAP`]; only the sets binding the
+    /// dropped entries go with them.
+    fn trim_texture_memo(&mut self) {
+        let cache = &self.texture_cache;
+        // A set bound without a lookup marks only its textures' cache keys.
+        let used = |m: &TextureMemo| {
+            let cached = m.key.and_then(|k| cache.get(&k)).map_or(0, |e| e.2);
+            m.used.max(cached)
+        };
+        let ages = self.texture_memo.values().map(used).collect();
+        let Some(cut) = trim_cut(ages, TEXTURE_MEMO_CAP / 2) else {
+            return;
+        };
+        let mut gone = Vec::new();
+        self.texture_memo.retain(|c, m| {
+            let keep = used(m) > cut;
+            if !keep {
+                gone.push(*c);
+            }
+            keep
+        });
+        for c in gone {
+            for flag in self.texture_set_flags.remove(&c).into_iter().flatten() {
+                flag.store(false, Ordering::Relaxed);
+            }
+        }
     }
 
     /// The texture of `fetch` decoded on the GPU from a kept resolve holding
@@ -5705,9 +5868,6 @@ impl Drawer {
             true => xenon_texture::bytes_needed(fetch).map_err(|e| e.to_string())?,
             false => 0,
         };
-        // shortcut: one range spans the base, the mips and any gap between
-        // them, so a write into the gap decodes the chain again; keep a
-        // range per level if mips far from their base show up.
         let ranges = level_ranges(fetch);
         if ranges.is_empty() {
             return Err("texture without levels to read".into());
@@ -5729,14 +5889,23 @@ impl Drawer {
         }
         report.timings.hashed_bytes += bytes.len() as u64;
         let constant = self.regs.fetch_constant(n);
-        let key = (decode_key(constant), hash_bytes(bytes));
+        // Hashed a page at a time, so a later write is checked page by page.
+        let at_base = u64::from(fetch.base_address & PHYSICAL_MASK);
+        let segments = (base.then_some((at_base, 0, base_len)).into_iter()).chain(
+            mips.iter()
+                .filter_map(|(m, at, len)| Some((level_range(m)?.0, *at, *len))),
+        );
+        let (pages, hash) = page_hashes(bytes, segments);
+        let key = (decode_key(constant), hash);
         if let Some((view, _, used)) = self.texture_cache.get_mut(&key) {
             *used = self.replays;
             let view = view.clone();
             report.timings.rehash_hits += 1;
             report.timings.rehash_hit_bytes += bytes.len() as u64;
-            self.texture_memo
-                .insert(constant, TextureMemo::new(view.clone(), ranges, Some(key)));
+            self.texture_memo.insert(
+                constant,
+                TextureMemo::new(view.clone(), ranges, Some(key), pages, self.replays),
+            );
             return Ok(view);
         }
         let mut bc = self.bc_textures && !fetch.sign.contains(&1);
@@ -5863,8 +6032,10 @@ impl Drawer {
         self.texture_cache_bytes += len;
         self.texture_cache
             .insert(key, (view.clone(), len, self.replays));
-        self.texture_memo
-            .insert(constant, TextureMemo::new(view.clone(), ranges, Some(key)));
+        self.texture_memo.insert(
+            constant,
+            TextureMemo::new(view.clone(), ranges, Some(key), pages, self.replays),
+        );
         Ok(view)
     }
 
@@ -5920,6 +6091,7 @@ impl Drawer {
                 flag.store(false, Ordering::Relaxed);
             }
         }
+        (self.texture_suspect).retain(|_, (m, _)| !gone.contains(&m.view));
         // Sets of an older memo epoch can never bind again but would pin their views.
         let epoch = self.texture_memo_epoch;
         (self.texture_sets)
@@ -8030,6 +8202,48 @@ fn host_texture_format(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A full memo loses its least recently used entries only: those of
+    /// the replays still drawing stay.
+    #[test]
+    fn memo_cap_trims_the_oldest() {
+        let cap = TEXTURE_MEMO_CAP;
+        // Half used in replay 10 and earlier, half in replays 20 and 21.
+        let ages: Vec<u64> = (0..cap as u64)
+            .map(|i| if i % 2 == 0 { i % 11 } else { 20 + i % 2 })
+            .collect();
+        let cut = trim_cut(ages.clone(), cap / 2).unwrap();
+        let kept = ages.iter().filter(|&&a| a > cut).count();
+        assert_eq!((cut, kept), (10, cap / 2));
+        assert_eq!(trim_cut(vec![1, 2, 3], 3), None);
+        // All from one replay: none can be told apart, all go.
+        assert_eq!(trim_cut(vec![5; 8], 4), Some(5));
+    }
+
+    /// Pages split at guest page boundaries per level, in level order, and
+    /// the key hash follows any page's bytes.
+    #[test]
+    fn page_hashes_split_levels_at_guest_pages() {
+        let bytes: Vec<u8> = (0..0x3000u32).map(|i| (i * 7) as u8).collect();
+        // A level from 0x1800 for 0x2000 bytes, then one at 0x9000 for 0x1000.
+        let segs = [(0x1800, 0, 0x2000), (0x9000, 0x2000, 0x1000)];
+        let (pages, h) = page_hashes(&bytes, segs.into_iter());
+        let spans: Vec<_> = pages.iter().map(|p| (p.0, p.1)).collect();
+        assert_eq!(
+            spans,
+            [
+                (0x1800, 0x2000),
+                (0x2000, 0x3000),
+                (0x3000, 0x3800),
+                (0x9000, 0xA000)
+            ]
+        );
+        assert_eq!(pages[1].2, hash_bytes(&bytes[0x800..0x1800]));
+        let mut other = bytes.clone();
+        other[0x2FFF] ^= 1;
+        assert_ne!(page_hashes(&other, segs.into_iter()).1, h);
+        assert_eq!(page_hashes(&bytes, segs.into_iter()).1, h);
+    }
 
     /// Plain commands are charged by run, timed ones not at all, with two
     /// clock reads per timed command and none per plain one.

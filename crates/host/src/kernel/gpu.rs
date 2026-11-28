@@ -321,7 +321,7 @@ impl DrawStats {
              hashed {:.1} MB (kept resolves {:.1} MB), {} textures uploaded ({:.1} MB, {} evicted before), \
              {} evicted, {} from kept resolves, {} pipelines created; guest data {:.1} MB ({} windows reused, {:.1} MB); \
              uploads by format: rgba8 {}, bc {}, f16 {}, f32 {}, other {}; \
-             write watch {:.1} ms per {per} on the gpu thread;              texture memo: {} re-hashes found the cached texture ({:.1} MB), {} writes only between levels, {} cap hits",
+             write watch {:.1} ms per {per} on the gpu thread;              texture memo: {} re-hashes found the cached texture ({:.1} MB), {} writes only between levels, {} cap hits, {} restored by hashing written pages",
             window.as_secs_f64(),
             self.frames,
             self.replays,
@@ -390,6 +390,7 @@ impl DrawStats {
             mb(t.rehash_hit_bytes),
             t.gap_writes / n,
             t.memo_cap_hits,
+            t.textures_restored / n,
         ) + &if t.passes_timed > 0 {
             format!(
                 "; GPU ms per {per} (timestamps, {} passes): draw {:.1}, clear {:.1}, resolve {:.1}",

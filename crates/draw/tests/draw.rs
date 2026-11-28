@@ -2103,6 +2103,154 @@ fn listed_writes_keep_textures_across_replays() {
     assert_eq!(replay(&mut d, &mut w), (len, true, 90));
 }
 
+/// Records `s` from `mem` without replaying it.
+fn record(mem: &mut xenon_gpu::SliceMemory, s: &Stream) -> Vec<xenon_gpu::Command> {
+    mem.write_words(CMD, &s.0);
+    let mut rec = xenon_gpu::Recorder::new();
+    rec.record_buffer(mem, CMD, s.0.len() as u32).unwrap();
+    rec.commands
+}
+
+/// Replays `cmds` over `w`: the report and the colour target.
+fn replay_watched(
+    d: &mut xenon_draw::Drawer,
+    cmds: &[xenon_gpu::Command],
+    w: &mut Watched,
+) -> (xenon_draw::Report, Vec<u8>) {
+    let r = d
+        .replay(cmds, w as &mut dyn xenon_draw::GuestMemory)
+        .unwrap();
+    (r, d.read_render_target(COLOR_KEY, 0, 0, W, H).unwrap())
+}
+
+/// A listed write between a texture's base and its mip page, far apart,
+/// keeps the texture: nothing is read or hashed again. A write in the mip
+/// level still decodes it again.
+#[test]
+fn write_between_levels_keeps_texture() {
+    let Some(mut d) = drawer() else { return };
+    let mut mem = memory();
+    let (red, green, blue) = ([255, 0, 0, 255], [0, 255, 0, 255], [0, 0, 255, 255]);
+    let mip = TEXTURE + 0x8000;
+    solid_level(&mut mem, TEXTURE, 32, red);
+    solid_level(&mut mem, mip, 16, green);
+    let s = mip_stream(&mut mem, TEXTURE, 0, mip);
+    let cmds = record(&mut mem, &s);
+    let mut w = Watched {
+        mem,
+        written: Some(vec![]),
+    };
+    let (r, img) = replay_watched(&mut d, &cmds, &mut w);
+    assert_eq!(r.timings.textures_uploaded, 1, "{r:?}");
+    assert_eq!((px(&img, W, 5, 5), px(&img, W, 44, 4)), (red, green));
+
+    let gap = u64::from(TEXTURE) + 0x3000;
+    w.written = Some(vec![(gap, gap + 0x1000)]);
+    let (r, img) = replay_watched(&mut d, &cmds, &mut w);
+    let t = &r.timings;
+    assert_eq!(
+        (t.hashed_bytes, t.textures_uploaded, t.gap_writes),
+        (0, 0, 1),
+        "{r:?}"
+    );
+    assert_eq!((px(&img, W, 5, 5), px(&img, W, 44, 4)), (red, green));
+
+    solid_level(&mut w.mem, mip, 16, blue);
+    w.written = Some(vec![(u64::from(mip), u64::from(mip) + 0x1000)]);
+    let (r, img) = replay_watched(&mut d, &cmds, &mut w);
+    assert_eq!(r.timings.textures_uploaded, 1, "{r:?}");
+    assert_eq!((px(&img, W, 5, 5), px(&img, W, 44, 4)), (red, blue));
+}
+
+/// A listed write over one page of a four-page texture that leaves its
+/// bytes as they were hashes only that page and draws the texture it had,
+/// which is what a fresh decode draws; a write that changes the page
+/// decodes the texture again, as a fresh drawer does.
+#[test]
+fn unchanged_written_page_is_checked_alone() {
+    let Some(mut d) = drawer() else { return };
+    let n = 64u32;
+    let mut mem = memory();
+    let linear: Vec<u8> = (0..n * n)
+        .flat_map(|i| [(i % 251) as u8, (i / 64) as u8, 7, 255])
+        .collect();
+    let mut tiled = tile::tile_2d(&linear, n, n, n, 4).unwrap();
+    endian::swap_in_place(&mut tiled, xenon_texture::Endian::K8in32);
+    let len = tiled.len() as u64;
+    assert_eq!(len, 0x4000);
+    mem.data[TEXTURE as usize..][..tiled.len()].copy_from_slice(&tiled);
+    let q = n as f32;
+    let verts: Vec<u32> = [
+        (0.0, 0.0, 0.0, 0.0),
+        (q, 0.0, 1.0, 0.0),
+        (q, q, 1.0, 1.0),
+        (0.0, q, 0.0, 1.0),
+    ]
+    .iter()
+    .flat_map(|&(x, y, u, v)| [f(x), f(y), f(0.0), f(u), f(v)])
+    .collect();
+    mem.write_words(VERTS, &verts);
+    let fetch = [
+        2 | (2 << 10) | (2 << 13) | ((n >> 5) << 22) | (1 << 31),
+        6 | (2 << 6) | TEXTURE,
+        (n - 1) | ((n - 1) << 13),
+        ((1 << 3) | (2 << 6) | (3 << 9)) << 1,
+        0,
+        1 << 9,
+    ];
+    let mut s = Stream::default();
+    s.setup()
+        .resolve(&mut mem, W, H, false, Some((rgba(CLEAR), 0)))
+        .shader(false, &vs_uv())
+        .shader(true, &ps_texture(1))
+        .vertex_fetch(0, VERTS, 20)
+        .regs(SHADER_CONSTANT_FETCH + 6, &fetch)
+        .draw_auto(PRIM_QUAD_LIST, 4);
+    let cmds = record(&mut mem, &s);
+    let mut w = Watched {
+        mem,
+        written: Some(vec![]),
+    };
+    let (r, fresh) = replay_watched(&mut d, &cmds, &mut w);
+    assert_eq!(
+        (r.timings.hashed_bytes, r.timings.textures_uploaded),
+        (len, 1)
+    );
+
+    // Page 1 written with the bytes it held.
+    let page = u64::from(TEXTURE) + 0x1000;
+    w.written = Some(vec![(page + 8, page + 12)]);
+    let (r, img) = replay_watched(&mut d, &cmds, &mut w);
+    let t = &r.timings;
+    assert_eq!(
+        (t.hashed_bytes, t.textures_uploaded, t.textures_restored),
+        (0x1000, 0, 1),
+        "{r:?}"
+    );
+    assert!(img == fresh, "restored texture draws as the fresh decode");
+
+    // Page 1 changed: hashed alone, then the whole texture, and decoded.
+    w.mem.data[page as usize..][..0x1000].fill(0x80);
+    w.written = Some(vec![(page, page + 0x1000)]);
+    let (r, img) = replay_watched(&mut d, &cmds, &mut w);
+    let t = &r.timings;
+    assert_eq!(
+        (t.hashed_bytes, t.textures_uploaded, t.textures_restored),
+        (0x1000 + len, 1, 0),
+        "{r:?}"
+    );
+    assert!(img != fresh);
+    drop(d);
+    let Some(mut d) = drawer() else { return };
+    let mut mem = w.mem;
+    let _ = run(&mut d, &s, &mut mem);
+    let again = d.read_render_target(COLOR_KEY, 0, 0, W, H).unwrap();
+    assert!(
+        img == again,
+        "changed texture draws as a fresh drawer's decode"
+    );
+}
+
 /// With guest memory listing its writes, a draw's index buffer is read once
 /// and its host indices drawn again in later replays, until a listed write
 /// over it: vertices 0..3 are red and 3..6 green, and the indices move from
