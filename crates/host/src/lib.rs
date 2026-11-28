@@ -799,6 +799,7 @@ pub fn run(sha256: &str, regs: &[fn(&mut Runtime)]) -> ExitCode {
             kernel::k().usage_line(),
             growth_line()
         ));
+        log(&kernel::video::pace_line());
         if swaps == last {
             stalled += 1;
             // A stall with memory to spare is a wait, not exhaustion: say

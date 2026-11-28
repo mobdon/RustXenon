@@ -8854,8 +8854,9 @@ impl Drawer {
                     mapped_at_creation: false,
                 })
             });
-        // Three in turn: one shown, one queued to show, one written.
-        const TEXTURES: usize = 3;
+        // Four in turn: two queued in the window (its frame queue), one it
+        // took and is presenting, one written.
+        const TEXTURES: usize = 4;
         let fits = |t: &wgpu::Texture| (t.width(), t.height()) == (width, height);
         if !self.front_textures.iter().all(fits) {
             self.front_textures.clear();

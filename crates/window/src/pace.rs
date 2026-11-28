@@ -1,7 +1,26 @@
 //! How evenly frames reach the screen: the spread of the intervals between
-//! frames as they are presented, summed up once a second.
+//! frames as they are presented, summed up once a second. The host uses the
+//! same summary for the guest's swaps and vertical blanks; and the window's
+//! frame queue, which hands every frame over in order.
 
+use std::collections::VecDeque;
 use std::time::{Duration, Instant};
+
+/// Frames handed over and not yet presented, at most: more drops the oldest.
+/// The drawer writes frames into [`QUEUE`] + 2 textures in turn (the queued
+/// ones, one taken but not yet presented, one being written).
+pub const QUEUE: usize = 2;
+
+/// Puts `x` at the back of `q`, dropping the front one first when `q`
+/// already holds `cap`; whether one was dropped.
+pub fn push_bounded<T>(q: &mut VecDeque<T>, x: T, cap: usize) -> bool {
+    let full = q.len() >= cap.max(1);
+    if full {
+        q.pop_front();
+    }
+    q.push_back(x);
+    full
+}
 
 /// An interval longer than this counts as a hitch: a frame shown three
 /// 60 Hz refreshes after the one before it, or later.
@@ -15,14 +34,15 @@ pub struct Pacing {
     gaps: Vec<Duration>,
 }
 
-/// One second's intervals: how many, their median, 99th percentile and
-/// longest, and how many were hitches (longer than 25 ms).
+/// One second's intervals: how many, their median, 99th percentile,
+/// longest and shortest, and how many were hitches (longer than 25 ms).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Spread {
     pub frames: usize,
     pub p50: Duration,
     pub p99: Duration,
     pub max: Duration,
+    pub min: Duration,
     pub hitches: usize,
 }
 
@@ -42,17 +62,36 @@ impl std::fmt::Display for Spread {
 }
 
 impl Pacing {
+    /// None yet, for a static.
+    pub const fn new() -> Self {
+        Pacing {
+            last: None,
+            since: None,
+            gaps: Vec::new(),
+        }
+    }
+
     /// A frame was presented `at`; once a second has passed since the last
     /// summary, the summary of the intervals since.
     pub fn frame(&mut self, at: Instant) -> Option<Spread> {
-        if let Some(last) = self.last.replace(at) {
-            self.gaps.push(at.saturating_duration_since(last));
-        }
+        self.mark(at);
         let since = *self.since.get_or_insert(at);
         if at.saturating_duration_since(since) < Duration::from_secs(1) {
             return None;
         }
         self.since = Some(at);
+        self.take()
+    }
+
+    /// Notes one event `at`, for [`Pacing::take`] to sum up.
+    pub fn mark(&mut self, at: Instant) {
+        if let Some(last) = self.last.replace(at) {
+            self.gaps.push(at.saturating_duration_since(last));
+        }
+    }
+
+    /// The spread of the intervals since the last take, none for none.
+    pub fn take(&mut self) -> Option<Spread> {
         spread(std::mem::take(&mut self.gaps))
     }
 }
@@ -68,6 +107,7 @@ fn spread(mut gaps: Vec<Duration>) -> Option<Spread> {
         p50: rank(50),
         p99: rank(99),
         max,
+        min: gaps[0],
         hitches: gaps.iter().filter(|&&g| g > HITCH).count(),
     })
 }
@@ -107,6 +147,43 @@ mod tests {
             line.contains("p50 16.0 p99 50.0 max 50.0, over 25 ms: 2"),
             "{line}"
         );
+    }
+
+    #[test]
+    fn queue_keeps_order_and_drops_the_oldest() {
+        let mut q = VecDeque::new();
+        assert!(!push_bounded(&mut q, 1, QUEUE));
+        assert!(!push_bounded(&mut q, 2, QUEUE));
+        // Full: 1 goes, 2 and 3 stay in order.
+        assert!(push_bounded(&mut q, 3, QUEUE));
+        assert_eq!(q, [2, 3]);
+        assert_eq!(q.pop_front(), Some(2));
+        assert!(!push_bounded(&mut q, 4, QUEUE));
+        assert_eq!(q, [3, 4]);
+        // A cap of 0 still holds the newest.
+        let mut one = VecDeque::new();
+        push_bounded(&mut one, 1, 0);
+        assert!(push_bounded(&mut one, 2, 0));
+        assert_eq!(one, [2]);
+    }
+
+    #[test]
+    fn take_sums_up_marks() {
+        let ms = Duration::from_millis;
+        let t = Instant::now();
+        let mut p = Pacing::default();
+        assert_eq!(p.take(), None);
+        for (i, d) in [0, 16, 33, 35, 52].into_iter().enumerate() {
+            p.mark(t + ms(d));
+            if i == 0 {
+                assert_eq!(p.take(), None);
+            }
+        }
+        let s = p.take().unwrap();
+        assert_eq!((s.frames, s.min, s.max, s.p50), (4, ms(2), ms(17), ms(16)));
+        // Taken: the next take starts from the last mark.
+        p.mark(t + ms(69));
+        assert_eq!(p.take().unwrap().frames, 1);
     }
 
     #[test]

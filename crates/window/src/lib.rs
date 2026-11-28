@@ -8,7 +8,9 @@
 //! without one, frames are copied to the window with the CPU (bilinear
 //! scaling, letterboxed, rows split over a few threads).
 
+use std::collections::VecDeque;
 use std::num::NonZeroU32;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 use winit::application::ApplicationHandler;
@@ -21,7 +23,7 @@ use winit::window::{CursorGrabMode, Fullscreen, Window, WindowId};
 use xenon_input::{filtered, merge, Keyboard, Mouse, Pad};
 
 mod gpu;
-mod pace;
+pub mod pace;
 
 pub use gpu::Gpu;
 
@@ -68,7 +70,13 @@ enum Shown {
 /// Shared between the host and the window thread.
 #[derive(Default)]
 pub struct Link {
-    frame: Mutex<Option<Shown>>,
+    /// Frames handed over and not yet presented, oldest first (at most
+    /// [`pace::QUEUE`]): each is presented in turn at the monitor's refresh.
+    frames: Mutex<VecDeque<Shown>>,
+    /// Frames handed over, and dropped from a full queue, since the window
+    /// last logged them.
+    handed: AtomicU32,
+    dropped: AtomicU32,
     text: Mutex<Option<Vec<String>>>,
     pad: Mutex<Pad>,
     /// Whether the game last said the player is in a vehicle, and when.
@@ -84,21 +92,29 @@ pub struct Link {
 type Answer = mpsc::Sender<Result<(), String>>;
 
 impl Link {
-    /// Hands the window a new frame; an older one not yet shown is dropped.
+    /// Hands the window a new frame, shown after those before it; with
+    /// [`pace::QUEUE`] waiting already, the oldest of them is dropped.
     pub fn show(&self, width: u32, height: u32, rgba8: Pixels) {
-        *self.frame.lock().unwrap() = Some(Shown::Cpu(Image {
+        self.hand(Shown::Cpu(Image {
             width,
             height,
             rgba8,
         }));
-        self.wake();
     }
 
     /// Hands the window a frame texture on the device given to
-    /// [`Link::attach_gpu`], whose writes are submitted already; an older
-    /// one not yet shown is dropped.
+    /// [`Link::attach_gpu`], whose writes are submitted already; queued as
+    /// [`Link::show`] queues frames.
     pub fn show_texture(&self, tex: wgpu::Texture) {
-        *self.frame.lock().unwrap() = Some(Shown::Gpu(tex));
+        self.hand(Shown::Gpu(tex));
+    }
+
+    fn hand(&self, f: Shown) {
+        let dropped = pace::push_bounded(&mut self.frames.lock().unwrap(), f, pace::QUEUE);
+        self.handed.fetch_add(1, Ordering::Relaxed);
+        if dropped {
+            self.dropped.fetch_add(1, Ordering::Relaxed);
+        }
         self.wake();
     }
 
@@ -234,6 +250,11 @@ struct App {
     text: Option<(Vec<String>, bool)>,
     /// Intervals between new frames as they are presented.
     pace: pace::Pacing,
+    /// Frames presented, and the most queued at once, since `counted`,
+    /// when the window last logged frames handed over, dropped and shown.
+    presented: u32,
+    queued: usize,
+    counted: Instant,
 }
 
 impl App {
@@ -255,6 +276,9 @@ impl App {
             last: None,
             text: None,
             pace: pace::Pacing::default(),
+            presented: 0,
+            queued: 0,
+            counted: Instant::now(),
         }
     }
 
@@ -498,19 +522,41 @@ impl ApplicationHandler for App {
             }
             *armed |= !held;
         }
-        let fresh = self.link.frame.lock().unwrap().take();
+        // One frame a turn, oldest first: with the swapchain full, a
+        // present waits for the next refresh, so queued frames are shown
+        // one a refresh, in order.
+        let (fresh, more) = {
+            let mut q = self.link.frames.lock().unwrap();
+            self.queued = self.queued.max(q.len());
+            (q.pop_front(), !q.is_empty())
+        };
         if let Some(img) = fresh.filter(|_| self.text.is_none()) {
             self.last = Some(img);
             if self.draw() {
+                self.presented += 1;
                 if let Some(s) = self.pace.frame(Instant::now()) {
                     eprintln!("window: {s}");
                 }
             }
         }
-        // Read input at about 250 Hz; frames wake the loop when they come.
-        ev.set_control_flow(ControlFlow::WaitUntil(
-            Instant::now() + Duration::from_millis(4),
-        ));
+        if self.counted.elapsed() >= Duration::from_secs(1) {
+            self.counted = Instant::now();
+            let handed = self.link.handed.swap(0, Ordering::Relaxed);
+            let dropped = self.link.dropped.swap(0, Ordering::Relaxed);
+            if handed + self.presented > 0 {
+                eprintln!(
+                    "window: [frames] handed over {handed}, dropped {dropped}, presented {}, queued at most {}",
+                    self.presented, self.queued
+                );
+            }
+            (self.presented, self.queued) = (0, 0);
+        }
+        // Read input at about 250 Hz; frames wake the loop when they come,
+        // and the next queued one is presented at once.
+        ev.set_control_flow(match more {
+            true => ControlFlow::Poll,
+            false => ControlFlow::WaitUntil(Instant::now() + Duration::from_millis(4)),
+        });
     }
 }
 

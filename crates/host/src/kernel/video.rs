@@ -5,6 +5,41 @@
 //! presented frame; the host counts them to see that the main loop runs.
 
 use super::*;
+use std::time::{Duration, Instant};
+use xenon_window::pace::{Pacing, Spread};
+
+/// The guest's swaps and vertical blanks as they happened, summed up each
+/// second in the run log (see [`pace_line`]).
+static SWAP_PACE: Mutex<Pacing> = Mutex::new(Pacing::new());
+static VBLANK_PACE: Mutex<Pacing> = Mutex::new(Pacing::new());
+/// Vertical blanks skipped because their thread woke a whole period late.
+static VBLANKS_SKIPPED: AtomicU32 = AtomicU32::new(0);
+
+const VBLANK_PERIOD: Duration = Duration::from_micros(16_667);
+
+/// One line on how evenly the title swapped and the vertical blank came
+/// over the last second.
+pub fn pace_line() -> String {
+    let ms = |d: Duration| d.as_secs_f64() * 1000.0;
+    let f = |s: Option<Spread>| match s {
+        Some(s) => format!(
+            "{} intervals, ms p50 {:.1} p99 {:.1} max {:.1} min {:.1}, over 25 ms: {}",
+            s.frames,
+            ms(s.p50),
+            ms(s.p99),
+            ms(s.max),
+            ms(s.min),
+            s.hitches
+        ),
+        None => "none".into(),
+    };
+    format!(
+        "[pace] swaps: {}; vertical blanks: {}, skipped {}",
+        f(SWAP_PACE.lock().unwrap().take()),
+        f(VBLANK_PACE.lock().unwrap().take()),
+        VBLANKS_SKIPPED.swap(0, Ordering::Relaxed)
+    )
+}
 
 #[derive(Default)]
 pub struct Video {
@@ -100,6 +135,7 @@ pub fn vd_swap(rt: &Runtime, c: &mut Context) {
         );
     }
     k().swaps.fetch_add(1, Ordering::Relaxed);
+    SWAP_PACE.lock().unwrap().mark(Instant::now());
     ret(c, 0);
 }
 
@@ -147,43 +183,102 @@ pub fn vd_initialize_scaler_command_buffer(rt: &Runtime, c: &mut Context) {
     ret(c, 0);
 }
 
+/// Runs the title's graphics interrupt callback, if it set one, for
+/// `source` as processor `cpu`. The command processor's and the vertical
+/// blank's interrupts take turns on the one context `irq`.
+fn raise(rt: &Runtime, irq: &Mutex<Context>, source: u32, cpu: u32) {
+    let callback = k().video.lock().unwrap().interrupt;
+    if let Some((f, user)) = callback {
+        let held = irq.lock().unwrap();
+        let mut c = held.clone();
+        rt.mem.write_u8(c.r[13] as u32 + 0x10C, cpu as u8);
+        c.r[3] = source as u64;
+        c.r[4] = user as u64;
+        super::gpu::RAISED.fetch_add(1, Ordering::Relaxed);
+        crate::cpu_profile::interrupt(|| rt.call(&mut c, f));
+    }
+}
+
+/// One vertical blank: counted, and raised as source 0 on processor 2.
+fn vblank(rt: &Runtime, irq: &Mutex<Context>) {
+    super::gpu::VBLANKS.fetch_add(1, Ordering::Relaxed);
+    VBLANK_PACE.lock().unwrap().mark(Instant::now());
+    raise(rt, irq, 0, 2);
+}
+
+/// When the vertical blank after one due at `due` is, woken at `now`: a
+/// period on, or a period from `now` (the missed ones skipped, not raised
+/// in a burst) when `now` is a whole period late.
+fn next_vblank(due: Instant, now: Instant) -> Instant {
+    if now.saturating_duration_since(due) >= VBLANK_PERIOD {
+        VBLANKS_SKIPPED.fetch_add(1, Ordering::Relaxed);
+        now + VBLANK_PERIOD
+    } else {
+        due + VBLANK_PERIOD
+    }
+}
+
+/// Raises the vertical blank at 60 Hz on a thread of its own, so it comes
+/// on time while the command processor waits on the drawer or runs a long
+/// span: raised from the processor's loop, it could come late and then
+/// several at once, and the title (which retires a swap a vertical blank)
+/// made its frames in bursts that the window could not show evenly.
+fn start_vblank(rt: std::sync::Arc<Runtime>, irq: std::sync::Arc<Mutex<Context>>) {
+    let spawned = std::thread::Builder::new()
+        .name("vblank".into())
+        .spawn(move || {
+            let mut due = Instant::now() + VBLANK_PERIOD;
+            loop {
+                let now = Instant::now();
+                if now < due {
+                    std::thread::sleep(due - now);
+                    continue;
+                }
+                due = next_vblank(due, now);
+                vblank(&rt, &irq);
+            }
+        });
+    if let Err(e) = spawned {
+        crate::log(&format!("[video] no vertical blank thread: {e}"));
+    }
+}
+
 /// Host side of the GPU: runs the command ring and raises interrupts
 /// (command-processor interrupts as source 1, the vertical blank at 60 Hz
-/// as source 0) on a context of its own. Runs until the process ends.
+/// as source 0, on a thread of its own unless `XENON_VBLANK=cp` raises it
+/// from the processor's loop as before) on a context of its own. Runs
+/// until the process ends.
 pub fn start(rt: std::sync::Arc<Runtime>) {
-    use super::gpu::{gpu_to_cpu, Gpu, CP_RB_RPTR, CP_RB_WPTR};
+    use super::gpu::{gpu_to_cpu, Gpu, CP_RB_RPTR, CP_RB_WPTR, STATE};
     let _ = gpu_to_cpu;
     std::thread::Builder::new()
         .name("gpu".into())
         .spawn(move || {
             let (ctx, _) = super::threads::new_context(&rt, 64 << 10);
+            let irq = std::sync::Arc::new(Mutex::new(ctx));
+            let cp_vblank = std::env::var("XENON_VBLANK").as_deref() == Ok("cp");
+            if cp_vblank {
+                crate::log("[video] vertical blank raised from the command processor's loop");
+            } else {
+                start_vblank(rt.clone(), irq.clone());
+            }
             // The callback runs as processor 2 for a vertical blank and as
             // the packet's processor for command interrupts.
-            let raise = move |rt: &Runtime, source: u32, cpu: u32| {
-                let irq = k().video.lock().unwrap().interrupt;
-                if let Some((f, user)) = irq {
-                    let mut c = ctx.clone();
-                    rt.mem.write_u8(c.r[13] as u32 + 0x10C, cpu as u8);
-                    c.r[3] = source as u64;
-                    c.r[4] = user as u64;
-                    let prev = super::gpu::STATE.swap(3, Ordering::Relaxed);
-                    super::gpu::RAISED.fetch_add(1, Ordering::Relaxed);
-                    crate::cpu_profile::interrupt(|| rt.call(&mut c, f));
-                    super::gpu::STATE.store(prev, Ordering::Relaxed);
-                }
-            };
-            let mut next_vblank = std::time::Instant::now();
+            let mut due = Instant::now();
             let rt2 = rt.clone();
             let mut idle = move |g: &mut Gpu| {
                 for mask in std::mem::take(&mut g.interrupts) {
                     for cpu in (0..6).filter(|n| mask >> n & 1 != 0) {
-                        raise(&rt2, 1, cpu);
+                        let prev = STATE.swap(3, Ordering::Relaxed);
+                        raise(&rt2, &irq, 1, cpu);
+                        STATE.store(prev, Ordering::Relaxed);
                     }
                 }
-                if std::time::Instant::now() >= next_vblank {
-                    next_vblank += std::time::Duration::from_micros(16_667);
-                    g.vblanks += 1;
-                    raise(&rt2, 0, 2);
+                if cp_vblank && Instant::now() >= due {
+                    due += VBLANK_PERIOD;
+                    let prev = STATE.swap(3, Ordering::Relaxed);
+                    vblank(&rt2, &irq);
+                    STATE.store(prev, Ordering::Relaxed);
                 }
             };
             let mut gpu = Gpu::default();
@@ -313,4 +408,21 @@ pub fn start(rt: std::sync::Arc<Runtime>) {
             }
         })
         .expect("cannot start a host thread");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_late_vertical_blank_skips_rather_than_bursts() {
+        let t = Instant::now();
+        let ms = Duration::from_millis;
+        // On time or a little late: the next is a period after the due one.
+        assert_eq!(next_vblank(t, t), t + VBLANK_PERIOD);
+        assert_eq!(next_vblank(t, t + ms(5)), t + VBLANK_PERIOD);
+        // A whole period late: the next is a period from now, not due.
+        let now = t + ms(50);
+        assert_eq!(next_vblank(t, now), now + VBLANK_PERIOD);
+    }
 }
