@@ -51,7 +51,8 @@ pub enum Bind {
 
 /// The default keyboard layout, PC action-game style: WASD to move,
 /// mouse to look (see [`Mouse`]), Space to sprint, Shift to jump, F to get
-/// in or out of a vehicle. [`VEHICLE_KEYS`] override some keys while in one.
+/// in or out of a vehicle. [`VEHICLE_KEYS`] override some keys while in one;
+/// the horn (H) turns them on and jump (Shift) turns them off if F got it wrong.
 pub const DEFAULT_KEYS: [(&str, Bind); 27] = [
     ("KeyW", Bind::Left(0, 1)),
     ("KeyS", Bind::Left(0, -1)),
@@ -99,6 +100,12 @@ pub const VEHICLE_KEYS: [(&str, Bind); 8] = [
 /// The key that gets in or out of a vehicle, switching [`VEHICLE_KEYS`].
 pub const VEHICLE_TOGGLE: &str = "KeyF";
 
+/// The horn: pressing it turns the vehicle keys on, whatever F did.
+pub const VEHICLE_SET: &str = "KeyH";
+
+/// Jump: pressing it turns the vehicle keys off, whatever F did.
+pub const FOOT_SET: &str = "ShiftLeft";
+
 /// XInput's recommended dead zones.
 pub const LEFT_DEAD_ZONE: i16 = 7849;
 pub const RIGHT_DEAD_ZONE: i16 = 8689;
@@ -142,10 +149,17 @@ impl Keyboard {
         if !bound(&DEFAULT_KEYS) && !bound(&VEHICLE_KEYS) {
             return;
         }
-        // shortcut: the vehicle keys follow F presses, not the game's state, so
-        // an F that gets in nothing flips them wrongly; F again sets them back.
-        if down && code == VEHICLE_TOGGLE && !self.held.contains(code) {
-            self.vehicle = !self.vehicle;
+        // shortcut: the vehicle keys follow key presses, not the game's state
+        // (an F that gets in nothing flips them wrongly). Keys that only make
+        // sense in one place set it outright, so the next horn or jump fixes it;
+        // upgrade to the game's own in-a-vehicle state once a hook reads it.
+        if down && !self.held.contains(code) {
+            match code {
+                VEHICLE_TOGGLE => self.vehicle = !self.vehicle,
+                VEHICLE_SET => self.vehicle = true,
+                FOOT_SET => self.vehicle = false,
+                _ => {}
+            }
         }
         if down {
             self.held.insert(code.to_string());
@@ -383,6 +397,8 @@ mod tests {
         let p = k.pad();
         assert_eq!((p.rt, p.ly), (0, 32767)); // W walks again
         assert_eq!(p.buttons & 0x0040, 0); // H does nothing on foot
+        k.key("KeyH", false);
+        k.key("KeyW", false);
         let mut m = Mouse {
             left: true,
             ..Mouse::default()
@@ -391,6 +407,29 @@ mod tests {
             (m.pad_in(0.01, true).buttons, m.pad_in(0.01, true).rt),
             (0x0100, 0)
         );
+    }
+
+    #[test]
+    fn horn_and_jump_fix_a_wrong_toggle() {
+        let mut k = Keyboard::default();
+        k.key("KeyH", true); // in a car F never saw: the horn gives gas back
+        k.key("KeyH", false);
+        assert!(k.in_vehicle());
+        k.key("KeyW", true);
+        assert_eq!(k.pad().rt, 255);
+        k.key("KeyW", false);
+        k.key("KeyH", true); // more horn stays in the car
+        k.key("KeyH", false);
+        assert!(k.in_vehicle());
+        k.key("ShiftLeft", true); // jumping means on foot
+        assert!(!k.in_vehicle());
+        assert_eq!(k.pad().buttons, 0x4000);
+        k.key("ShiftLeft", true); // key repeat changes nothing
+        k.key("ShiftLeft", false);
+        k.key("ShiftLeft", true);
+        assert!(!k.in_vehicle());
+        k.key("KeyF", true); // F still toggles
+        assert!(k.in_vehicle());
     }
 
     #[test]
