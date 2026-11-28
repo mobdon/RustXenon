@@ -5451,7 +5451,12 @@ impl Drawer {
                     c.translating.insert(key);
                     let (words, made) = (p.words.clone(), c.made.clone());
                     c.queue(move || {
-                        let t = translate_words(&words, vertex, param_gen);
+                        // A panic becomes an error, so the key is not left
+                        // queued forever and its draws are reported.
+                        let t = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            translate_words(&words, vertex, param_gen)
+                        }))
+                        .unwrap_or_else(|_| Err("shader translation panicked".into()));
                         let _ = made.send(Made::Translation(key, t));
                     });
                 }
@@ -5533,23 +5538,26 @@ impl Drawer {
         c.queue(move || {
             let t0 = Instant::now();
             let mut new = Vec::new();
-            let r = [(&have[0], &vs_t), (&have[1], &ps_t)]
-                .into_iter()
-                .zip(keys)
-                .map(|((m, t), k)| match m {
-                    Some(m) => Ok(m.clone()),
-                    None => {
-                        let m = module_source(k.1, k.2, k.3, t)
-                            .and_then(|src| create_module(&dev, k.1, src))?;
-                        new.push((k, m.clone()));
-                        Ok(m)
-                    }
-                })
-                .collect::<Result<Vec<_>, String>>()
-                .and_then(|m| {
-                    draw_pipeline(&dev, &key, &layout, &m[0], &m[1], scale, cache.as_ref())
-                })
-                .map(|p| (p, new, g1, t0.elapsed()));
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                [(&have[0], &vs_t), (&have[1], &ps_t)]
+                    .into_iter()
+                    .zip(keys)
+                    .map(|((m, t), k)| match m {
+                        Some(m) => Ok(m.clone()),
+                        None => {
+                            let m = module_source(k.1, k.2, k.3, t)
+                                .and_then(|src| create_module(&dev, k.1, src))?;
+                            new.push((k, m.clone()));
+                            Ok(m)
+                        }
+                    })
+                    .collect::<Result<Vec<_>, String>>()
+                    .and_then(|m| {
+                        draw_pipeline(&dev, &key, &layout, &m[0], &m[1], scale, cache.as_ref())
+                    })
+                    .map(|p| (p, new, g1, t0.elapsed()))
+            }))
+            .unwrap_or_else(|_| Err("pipeline creation panicked".into()));
             let _ = made.send(Made::Pipeline(Box::new((key, r))));
         });
     }
