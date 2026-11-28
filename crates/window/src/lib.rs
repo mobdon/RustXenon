@@ -71,6 +71,8 @@ pub struct Link {
     frame: Mutex<Option<Shown>>,
     text: Mutex<Option<Vec<String>>>,
     pad: Mutex<Pad>,
+    /// Whether the game last said the player is in a vehicle, and when.
+    vehicle: Mutex<Option<(bool, Instant)>>,
     /// Wakes the event loop, once it runs, so a frame is shown when it
     /// arrives rather than at the next input poll.
     wake: Mutex<Option<EventLoopProxy<()>>>,
@@ -128,7 +130,26 @@ impl Link {
     pub fn pad(&self) -> Pad {
         *self.pad.lock().unwrap()
     }
+
+    /// The game says whether the player is in a vehicle: the keyboard's
+    /// vehicle keys follow it.
+    pub fn set_vehicle(&self, on: bool) {
+        *self.vehicle.lock().unwrap() = Some((on, Instant::now()));
+    }
+
+    /// Whether the player is in a vehicle: what the game said last, if it
+    /// said it within [`VEHICLE_STALE`] (a game that stops saying it,
+    /// say in a menu, leaves the keys on foot).
+    pub fn vehicle(&self) -> bool {
+        self.vehicle
+            .lock()
+            .unwrap()
+            .is_some_and(|(on, at)| on && at.elapsed() < VEHICLE_STALE)
+    }
 }
+
+/// How long the game's word on being in a vehicle holds.
+pub const VEHICLE_STALE: Duration = Duration::from_secs(2);
 
 /// Gives a window the program's icon. On Windows the title bar and taskbar
 /// load the exe's icon resource at their own sizes, so the small one is the
@@ -428,6 +449,7 @@ impl ApplicationHandler for App {
         let now = Instant::now();
         let dt = now.duration_since(self.last_poll).as_secs_f32();
         self.last_poll = now;
+        self.keys.set_vehicle(self.link.vehicle());
         self.keys.step(dt);
         let mouse = self.mouse.pad_in(dt, self.keys.in_vehicle());
         let mut pad = merge(merge(filtered(self.pad.read()), self.keys.pad()), mouse);
@@ -718,6 +740,18 @@ mod xinput {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn vehicle_word_goes_stale() {
+        let l = Link::default();
+        assert!(!l.vehicle());
+        l.set_vehicle(true);
+        assert!(l.vehicle());
+        *l.vehicle.lock().unwrap() = Some((true, Instant::now() - VEHICLE_STALE));
+        assert!(!l.vehicle());
+        l.set_vehicle(false);
+        assert!(!l.vehicle());
+    }
 
     #[test]
     fn tail_wraps_and_keeps_the_newest() {

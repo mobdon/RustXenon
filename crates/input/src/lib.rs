@@ -51,8 +51,8 @@ pub enum Bind {
 
 /// The default keyboard layout, PC action-game style: WASD to move,
 /// mouse to look (see [`Mouse`]), Space to sprint, Shift to jump, F to get
-/// in or out of a vehicle. [`VEHICLE_KEYS`] override some keys while in one;
-/// the horn (H) turns them on and jump (Shift) turns them off if F got it wrong.
+/// in or out of a vehicle. [`VEHICLE_KEYS`] override some keys while the
+/// game says the player is in one ([`Keyboard::set_vehicle`]).
 pub const DEFAULT_KEYS: [(&str, Bind); 27] = [
     ("KeyW", Bind::Left(0, 1)),
     ("KeyS", Bind::Left(0, -1)),
@@ -97,15 +97,6 @@ pub const VEHICLE_KEYS: [(&str, Bind); 8] = [
     ("Numpad6", Bind::Left(1, 0)),
 ];
 
-/// The key that gets in or out of a vehicle, switching [`VEHICLE_KEYS`].
-pub const VEHICLE_TOGGLE: &str = "KeyF";
-
-/// The horn: pressing it turns the vehicle keys on, whatever F did.
-pub const VEHICLE_SET: &str = "KeyH";
-
-/// Jump: pressing it turns the vehicle keys off, whatever F did.
-pub const FOOT_SET: &str = "ShiftLeft";
-
 /// XInput's recommended dead zones.
 pub const LEFT_DEAD_ZONE: i16 = 7849;
 pub const RIGHT_DEAD_ZONE: i16 = 8689;
@@ -126,7 +117,7 @@ pub struct Keyboard {
     held: HashSet<String>,
     /// The left stick as it ramps toward the held keys, -1..=1.
     left: (f32, f32),
-    /// In a vehicle: [`VEHICLE_KEYS`] apply.
+    /// The game says the player is in a vehicle: [`VEHICLE_KEYS`] apply.
     vehicle: bool,
 }
 
@@ -149,23 +140,17 @@ impl Keyboard {
         if !bound(&DEFAULT_KEYS) && !bound(&VEHICLE_KEYS) {
             return;
         }
-        // shortcut: the vehicle keys follow key presses, not the game's state
-        // (an F that gets in nothing flips them wrongly). Keys that only make
-        // sense in one place set it outright, so the next horn or jump fixes it;
-        // upgrade to the game's own in-a-vehicle state once a hook reads it.
-        if down && !self.held.contains(code) {
-            match code {
-                VEHICLE_TOGGLE => self.vehicle = !self.vehicle,
-                VEHICLE_SET => self.vehicle = true,
-                FOOT_SET => self.vehicle = false,
-                _ => {}
-            }
-        }
         if down {
             self.held.insert(code.to_string());
         } else {
             self.held.remove(code);
         }
+    }
+
+    /// Whether the player is in a vehicle, as the game reports it; held keys
+    /// change meaning at once.
+    pub fn set_vehicle(&mut self, on: bool) {
+        self.vehicle = on;
     }
 
     /// Whether the vehicle keys apply.
@@ -374,31 +359,38 @@ mod tests {
     }
 
     #[test]
-    fn vehicle_keys_follow_f() {
+    fn vehicle_keys_follow_the_game() {
         let mut k = Keyboard::default();
-        k.key("KeyF", true);
-        assert!(k.in_vehicle());
-        assert_eq!(k.pad().buttons, 0x8000); // F is still Y
-        k.key("KeyF", true); // key repeat does not flip it back
-        k.key("KeyF", false);
+        for _ in 0..3 {
+            k.key("KeyF", true); // F, H and Shift no longer switch anything
+            k.key("KeyF", false);
+            k.key("KeyH", true);
+            k.key("KeyH", false);
+        }
+        assert!(!k.in_vehicle());
         k.key("KeyW", true);
+        k.step(1.0);
+        assert_eq!((k.pad().rt, k.pad().ly), (0, 32767)); // W walks
+        k.set_vehicle(true); // the game says the player got in
         k.key("Space", true);
         k.key("KeyD", true);
         k.step(1.0);
         let p = k.pad();
-        assert_eq!((p.rt, p.lt, p.ly, p.lx), (255, 0, 0, 32767));
+        assert_eq!((p.rt, p.lt, p.ly, p.lx), (255, 0, 0, 32767)); // held W is gas now
         assert_eq!(p.buttons, 0x0200); // handbrake
+        k.key("KeyW", false);
+        k.key("KeyS", true);
+        assert_eq!((k.pad().rt, k.pad().lt), (0, 255)); // S brakes
         k.key("KeyH", true);
-        assert_eq!(k.pad().buttons & 0x0040, 0x0040);
+        assert_eq!(k.pad().buttons & 0x0040, 0x0040); // horn
         k.key("KeyF", true);
-        k.key("KeyF", false);
-        assert!(!k.in_vehicle());
+        assert_eq!(k.pad().buttons & 0x8000, 0x8000); // F is still Y: get out
+        assert!(k.in_vehicle());
+        k.set_vehicle(false); // the game says on foot
         k.step(1.0);
         let p = k.pad();
-        assert_eq!((p.rt, p.ly), (0, 32767)); // W walks again
+        assert_eq!((p.lt, p.ly), (0, -32767)); // S walks back again
         assert_eq!(p.buttons & 0x0040, 0); // H does nothing on foot
-        k.key("KeyH", false);
-        k.key("KeyW", false);
         let mut m = Mouse {
             left: true,
             ..Mouse::default()
@@ -407,29 +399,6 @@ mod tests {
             (m.pad_in(0.01, true).buttons, m.pad_in(0.01, true).rt),
             (0x0100, 0)
         );
-    }
-
-    #[test]
-    fn horn_and_jump_fix_a_wrong_toggle() {
-        let mut k = Keyboard::default();
-        k.key("KeyH", true); // in a car F never saw: the horn gives gas back
-        k.key("KeyH", false);
-        assert!(k.in_vehicle());
-        k.key("KeyW", true);
-        assert_eq!(k.pad().rt, 255);
-        k.key("KeyW", false);
-        k.key("KeyH", true); // more horn stays in the car
-        k.key("KeyH", false);
-        assert!(k.in_vehicle());
-        k.key("ShiftLeft", true); // jumping means on foot
-        assert!(!k.in_vehicle());
-        assert_eq!(k.pad().buttons, 0x4000);
-        k.key("ShiftLeft", true); // key repeat changes nothing
-        k.key("ShiftLeft", false);
-        k.key("ShiftLeft", true);
-        assert!(!k.in_vehicle());
-        k.key("KeyF", true); // F still toggles
-        assert!(k.in_vehicle());
     }
 
     #[test]
