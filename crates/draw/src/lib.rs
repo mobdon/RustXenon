@@ -320,6 +320,12 @@ struct Mirror {
     /// when the arena is replaced, and at the end of a replay for textures
     /// no longer kept.
     groups: HashMap<(wgpu::Texture, usize), wgpu::BindGroup>,
+    /// Decode bind groups reading the buffer, by `decode_pipelines` entry
+    /// and parameters, with the [`Drawer::decode_scratch`] generation they
+    /// write: the same kept resolves are decoded again every frame, and a
+    /// parameter buffer, texel buffer and group each time was a twentieth
+    /// of the draw thread.
+    decodes: HashMap<(usize, [u32; 12]), (u64, wgpu::BindGroup)>,
     /// Colour resolves into the buffer kept at the drawing scale too (see
     /// [`Drawer::sharp_front`]), apart from each other. In the mirror so
     /// that whatever drops the mirror (a CPU write, a failed check, the
@@ -1721,6 +1727,10 @@ pub struct Drawer {
     regs: RegisterFile,
     vs: Option<Program>,
     ps: Option<Program>,
+    /// The programs loaded last for each stage (vertex, pixel), newest
+    /// last: a frame loads the same few thousands of times, and copying
+    /// and hashing each load again was a twentieth of the draw thread.
+    recent_programs: [Vec<Program>; 2],
     /// Shared, so a draw takes a translation without copying its WGSL.
     translated: HashMap<TranslationKey, Translation>,
     /// Keyed by program hash, stage, extra vertex outputs, variant (the
@@ -1857,12 +1867,18 @@ pub struct Drawer {
     /// holds another, so `hi` grows with `lo` and the one window that can
     /// hold a range is the last starting at or before it.
     window_memo: BTreeMap<u64, (u64, (u64, u64))>,
+    /// At least the length of every window in `window_memo`, so a write
+    /// looks only at the windows starting at most this far before it.
+    window_memo_span: u64,
     /// Host indices of guest index buffers read this replay or, with
     /// guest writes listed, an earlier one: guest `lo`, `hi` and the
     /// indices. Dropped with the textures (see `forget_guest`).
     index_memo: HashMap<IndexKey, (u64, u64, Arc<HostIndices>)>,
     /// Bytes of the indices `index_memo` holds, counted as they go in.
     index_memo_bytes: usize,
+    /// A guest range holding every `index_memo` entry's, so most writes
+    /// skip visiting them all.
+    index_memo_span: (u64, u64),
     /// See [`Drawer::transfer_setup`].
     transfer_setups: HashMap<(RenderTargetKey, u32, RenderTargetKey, u32), Arc<TransferSetup>>,
     /// The last `Consts` block staged in the arena, as prefix and suffix,
@@ -1927,6 +1943,10 @@ pub struct Drawer {
     /// Entry points decode_8888 and decode_float of resolve.wgsl and
     /// detile_bc of texture.wgsl.
     decode_pipelines: [Option<wgpu::ComputePipeline>; 3],
+    /// The texel buffer kept resolves are decoded into before the copy to
+    /// their texture, shared by all of them (wgpu orders the uses), and its
+    /// generation, new each time it grows.
+    decode_scratch: Option<(wgpu::Buffer, u64)>,
     /// Leave resolve results on the GPU at the end of a replay instead of
     /// writing them to guest memory (default false). The drawer still writes
     /// them back before it reads those bytes itself (a texture it cannot
@@ -2182,6 +2202,26 @@ fn block_on<F: std::future::Future>(f: F) -> F::Output {
     pollster::block_on(f)
 }
 
+/// The program of `words`: one of `recent` when it holds them, else a new
+/// one, which joins `recent` (at most [`RECENT_PROGRAMS`], oldest out).
+fn recent_program(recent: &mut Vec<Program>, words: &[u32]) -> Program {
+    if let Some(p) = recent.iter().rev().find(|p| *p.words == *words) {
+        return p.clone();
+    }
+    let p = Program {
+        hash: hash_words(words),
+        words: words.into(),
+    };
+    if recent.len() >= RECENT_PROGRAMS {
+        recent.remove(0);
+    }
+    recent.push(p.clone());
+    p
+}
+
+/// Programs per stage [`recent_program`] keeps.
+const RECENT_PROGRAMS: usize = 32;
+
 fn hash_words(words: &[u32]) -> u64 {
     let mut h = DefaultHasher::new();
     words.hash(&mut h);
@@ -2423,9 +2463,9 @@ fn to_bytes(words: &[u32]) -> Vec<u8> {
     out
 }
 
-/// A built `Consts` block prefix ([`consts_prefix`]), shared by the draws
-/// that bind it.
-type ConstsBlock = Arc<Vec<u8>>;
+/// A built `Consts` block prefix ([`consts_prefix`]), held by value: a heap
+/// block per draw was a twentieth of the draw thread.
+type ConstsBlock = [u32; CONSTS_PREFIX];
 
 /// Registers of one stage's 256 float constants (4 each): the vertex
 /// stage's, then the pixel stage's.
@@ -2444,11 +2484,17 @@ fn float_consts(r: &regs::RegisterFile, stage: u32, mask: &[u64; 4], out: &mut [
         regs::SHADER_CONSTANT_FLOAT + FLOAT_STAGE_REGS * stage,
         FLOAT_STAGE_REGS,
     );
-    let read = (0..256).filter(|i| mask[i / 64] >> (i % 64) & 1 != 0);
+    // The set bits only, not a test of all 256 per draw.
+    let read = (0..4).flat_map(|w| {
+        let mut m = mask[w];
+        std::iter::from_fn(move || {
+            let b = m.trailing_zeros() as usize;
+            m &= m.wrapping_sub(1);
+            (b < 64).then_some(64 * w + b)
+        })
+    });
     for (o, i) in out.chunks_exact_mut(16).zip(read) {
-        for (o, w) in o.chunks_exact_mut(4).zip(&all[4 * i..4 * i + 4]) {
-            o.copy_from_slice(&w.to_le_bytes());
-        }
+        words_into(&all[4 * i..4 * i + 4], o);
     }
 }
 
@@ -2472,20 +2518,21 @@ const CONSTS_REGS: [std::ops::Range<u32>; 3] = [
 const CONSTS_SUFFIX: usize = 4 + 96;
 
 /// Bytes of a `Consts` block: its prefix (see [`consts_prefix`]) and suffix.
-const CONSTS_BYTES: usize = 4 * (192 + 8 + 32) + 4 * CONSTS_SUFFIX;
+const CONSTS_BYTES: usize = 4 * CONSTS_PREFIX + 4 * CONSTS_SUFFIX;
+
+/// Words of a `Consts` block's prefix: fetch, bool and loop constants.
+const CONSTS_PREFIX: usize = 192 + 8 + 32;
 
 /// The `Consts` uniform of the shader binding contract is this prefix, the
 /// fetch, bool and loop constants, which only register writes change, then
 /// [`consts_suffix`]. (The float constants are bound apart, a span for
 /// each stage: see [`FLOAT_STAGE_REGS`].)
-fn consts_prefix(r: &regs::RegisterFile) -> Vec<u8> {
+fn consts_prefix(r: &regs::RegisterFile) -> ConstsBlock {
     // Bool and loop constants are adjacent.
     const _: () = assert!(regs::SHADER_CONSTANT_BOOL + 8 == regs::SHADER_CONSTANT_LOOP);
-    let fetch = r.slice(regs::SHADER_CONSTANT_FETCH, 192);
-    let bool_loop = r.slice(regs::SHADER_CONSTANT_BOOL, 8 + 32);
-    let mut b = vec![0; 4 * (fetch.len() + bool_loop.len())];
-    words_into(fetch, &mut b);
-    words_into(bool_loop, &mut b[4 * fetch.len()..]);
+    let mut b = [0; CONSTS_PREFIX];
+    b[..192].copy_from_slice(r.slice(regs::SHADER_CONSTANT_FETCH, 192));
+    b[192..].copy_from_slice(r.slice(regs::SHADER_CONSTANT_BOOL, 8 + 32));
     b
 }
 
@@ -3079,6 +3126,7 @@ impl Drawer {
             regs: RegisterFile::default(),
             vs: None,
             ps: None,
+            recent_programs: Default::default(),
             translated: HashMap::default(),
             modules: HashMap::default(),
             pipelines: HashMap::default(),
@@ -3122,8 +3170,10 @@ impl Drawer {
             staged: Vec::new(),
             arena: None,
             window_memo: BTreeMap::new(),
+            window_memo_span: 0,
             index_memo: HashMap::default(),
             index_memo_bytes: 0,
+            index_memo_span: (u64::MAX, 0),
             transfer_setups: HashMap::default(),
             staged_consts: None,
             arena_epoch: 1,
@@ -3161,6 +3211,7 @@ impl Drawer {
             half_luts: HashMap::default(),
             mirrors: Vec::new(),
             decode_pipelines: [None, None, None],
+            decode_scratch: None,
             async_pipelines: false,
             compiler: None,
             pipeline_errors: HashMap::default(),
@@ -3758,6 +3809,7 @@ impl Drawer {
                 self.texture_memo_epoch += 1;
                 self.index_memo.clear();
                 self.index_memo_bytes = 0;
+                self.index_memo_span = (u64::MAX, 0);
                 // Windows staged by a watched replay: anything may have
                 // changed since.
                 self.wrap();
@@ -3870,10 +3922,10 @@ impl Drawer {
                         ));
                     }
                     self.timings.shader_loads += 1;
-                    let p = Some(Program {
-                        hash: hash_words(words),
-                        words: words.as_slice().into(),
-                    });
+                    let p = Some(recent_program(
+                        &mut self.recent_programs[usize::from(*stage == ShaderStage::Pixel)],
+                        words,
+                    ));
                     match stage {
                         ShaderStage::Vertex => self.vs = p,
                         ShaderStage::Pixel => self.ps = p,
@@ -3989,10 +4041,29 @@ impl Drawer {
                 self.texture_suspect.insert(c, (m, dirty));
             }
         }
-        self.window_memo
-            .retain(|&a, &mut (b, _)| !meets(ranges, a, b));
-        self.index_memo
-            .retain(|_, &mut (a, b, _)| !meets(ranges, a, b));
+        // A few writes (a resolve's, a MEM_WRITE's) look up the windows
+        // they can meet instead of visiting all of them each time.
+        if ranges.len() < 16 {
+            let span = self.window_memo_span;
+            let mut met = Vec::new();
+            for &(lo, hi) in ranges {
+                met.extend(
+                    (self.window_memo.range(lo.saturating_sub(span)..hi))
+                        .filter(|&(_, &(b, _))| lo < b)
+                        .map(|(&a, _)| a),
+                );
+            }
+            for a in met {
+                self.window_memo.remove(&a);
+            }
+        } else {
+            self.window_memo
+                .retain(|&a, &mut (b, _)| !meets(ranges, a, b));
+        }
+        if meets(ranges, self.index_memo_span.0, self.index_memo_span.1) {
+            self.index_memo
+                .retain(|_, &mut (a, b, _)| !meets(ranges, a, b));
+        }
     }
 
     /// Marks the kept resolve blocks over `[lo, hi)` unchecked: guest
@@ -4338,6 +4409,7 @@ impl Drawer {
             checked,
             views: HashMap::default(),
             groups: HashMap::default(),
+            decodes: HashMap::default(),
             scaled,
         });
         Ok(Some(self.mirrors.len() - 1))
@@ -4476,6 +4548,7 @@ impl Drawer {
         self.staged.clear();
         self.staged_base = 0;
         self.window_memo.clear();
+        self.window_memo_span = 0;
         self.staged_consts = None;
         self.staged_floats = [None; 2];
     }
@@ -4664,7 +4737,11 @@ impl Drawer {
 
     fn check_uncaptured(&self) -> Result<(), Error> {
         use std::sync::atomic::Ordering;
-        if !self.uncaptured_any.swap(false, Ordering::Acquire) {
+        // A plain load first: this runs after every command, and a swap's
+        // locked exchange each time was a fortieth of the draw thread.
+        if !self.uncaptured_any.load(Ordering::Relaxed)
+            || !self.uncaptured_any.swap(false, Ordering::Acquire)
+        {
             return Ok(());
         }
         let mut v = self
@@ -5697,12 +5774,16 @@ impl Drawer {
             ranges,
             part_of,
             at,
+            parts,
         } = scratch;
         ranges.clear();
         part_of.clear();
         at.clear();
         let mut clipped = false;
-        for k in (0..96).filter(|k| mask & (1u128 << k) != 0) {
+        let mut bits = mask & ((1u128 << 96) - 1);
+        while bits != 0 {
+            let k = bits.trailing_zeros();
+            bits &= bits - 1;
             let vf = self.regs.vertex_fetch(k);
             if vf.fetch_type != FetchConstantType::Vertex {
                 report.warn(format!("vertex fetch constant {k} is not a vertex fetch"));
@@ -5716,7 +5797,8 @@ impl Drawer {
             }
         }
         ranges.sort_unstable();
-        let mut parts: Vec<(u64, u64)> = Vec::new();
+        let mut parts = std::mem::take(parts);
+        parts.clear();
         // A read past its constant's buffer must find the guest's word or 0,
         // not another part's, so such a draw stages one span with no rebase.
         let gap = if clipped { u64::MAX } else { WINDOW_GAP };
@@ -5734,7 +5816,8 @@ impl Drawer {
         if parts.len() == 1 {
             let memo = self.window_memo.range(..=lo).next_back();
             if let Some((&a, &(b, s))) = memo.filter(|(_, (b, _))| hi <= *b) {
-                return Ok((Vec::new(), a as u32, rebase, Some(((a, b, s), hi - lo))));
+                parts.clear();
+                return Ok((parts, a as u32, rebase, Some(((a, b, s), hi - lo))));
             }
         }
         // Where each part lands in the window, as `stage` lays them out.
@@ -5801,6 +5884,23 @@ impl Drawer {
 
     /// The compute pipeline of entry point [`DECODE_ENTRIES`]`[entry]`
     /// (0 `decode_8888`, 1 `decode_float`, 2 `detile_bc`), made at first use.
+    /// [`Self::decode_scratch`]'s buffer, made larger first when it holds
+    /// fewer than `need` bytes, and its generation.
+    fn decode_scratch(&mut self, need: u64) -> (wgpu::Buffer, u64) {
+        let need = need.max(4);
+        if (self.decode_scratch.as_ref()).is_none_or(|(b, _)| b.size() < need) {
+            let gen = self.decode_scratch.as_ref().map_or(0, |(_, g)| g + 1);
+            let buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("decoded texels"),
+                size: need.next_power_of_two().min(self.max_storage).max(need),
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            });
+            self.decode_scratch = Some((buf, gen));
+        }
+        self.decode_scratch.clone().expect("made above")
+    }
+
     fn decode_pipeline(&mut self, entry: usize) -> wgpu::ComputePipeline {
         let device = &self.device;
         let cache = self.disk_cache.as_ref().map(|c| &c.cache);
@@ -6159,35 +6259,47 @@ impl Drawer {
                 0,
                 0,
             ];
-            let uniform = self.buffer(
-                "decode params",
-                &to_bytes(&params),
-                wgpu::BufferUsages::UNIFORM,
-            );
-            let texels = self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("decoded texels"),
-                size: u64::from(row_words) * 4 * u64::from(rows),
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-                mapped_at_creation: false,
-            });
-            let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some(entry),
-                layout: &pipeline.get_bind_group_layout(0),
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 5,
-                        resource: self.mirrors[i].buf.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 6,
-                        resource: texels.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 7,
-                        resource: uniform.as_entire_binding(),
-                    },
-                ],
-            });
+            let (texels, gen) = self.decode_scratch(u64::from(row_words) * 4 * u64::from(rows));
+            let key = (usize::from(mode.is_some()), params);
+            let cached = (self.mirrors[i].decodes.get(&key))
+                .filter(|(g, _)| *g == gen)
+                .map(|(_, bg)| bg.clone());
+            let bg = match cached {
+                Some(bg) => bg,
+                None => {
+                    // The group holds the parameters, which never change.
+                    let uniform = self.buffer(
+                        "decode params",
+                        &to_bytes(&params),
+                        wgpu::BufferUsages::UNIFORM,
+                    );
+                    let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: Some(entry),
+                        layout: &pipeline.get_bind_group_layout(0),
+                        entries: &[
+                            wgpu::BindGroupEntry {
+                                binding: 5,
+                                resource: self.mirrors[i].buf.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 6,
+                                resource: texels.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 7,
+                                resource: uniform.as_entire_binding(),
+                            },
+                        ],
+                    });
+                    let decodes = &mut self.mirrors[i].decodes;
+                    // Rows decoded again vary with the resolves: a bound.
+                    if decodes.len() >= 64 {
+                        decodes.clear();
+                    }
+                    decodes.insert(key, (gen, bg.clone()));
+                    bg
+                }
+            };
             {
                 let mut pass = enc.begin_compute_pass(&Default::default());
                 pass.set_pipeline(pipeline);
@@ -6956,8 +7068,14 @@ impl Drawer {
                     {
                         self.index_memo.clear();
                         self.index_memo_bytes = host.bytes.len();
+                        self.index_memo_span = (u64::MAX, 0);
                     }
                     self.index_memo.insert(k, (guest.0, guest.1, host.clone()));
+                    // Indices in the packet (no guest range) meet no write.
+                    if guest.0 < guest.1 {
+                        let span = &mut self.index_memo_span;
+                        *span = (span.0.min(guest.0), span.1.max(guest.1));
+                    }
                 }
                 host
             }
@@ -7045,17 +7163,26 @@ impl Drawer {
         self.pipeline_uses += 1;
         // The key names the modules and the texture layout: a cached
         // pipeline needs neither looked up.
-        if self.async_pipelines && !self.pipelines.contains_key(&key) {
+        // The cached pipeline found with one lookup of the key (most draws).
+        let hit = (self.pipelines.get_mut(&key)).map(|(p, used, g1)| {
+            *used = self.pipeline_uses;
+            (p.clone(), g1.clone())
+        });
+        if hit.is_none() && self.async_pipelines {
             self.take_made();
             if let Some(e) = self.pipeline_errors.get(&key) {
                 return unsupported(e.clone());
             }
         }
-        let (pipeline, g1_layout) = match self.pipelines.get_mut(&key) {
-            Some((p, used, g1)) => {
+        let found = match hit {
+            Some(h) => Some(h),
+            None => (self.pipelines.get_mut(&key)).map(|(p, used, g1)| {
                 *used = self.pipeline_uses;
                 (p.clone(), g1.clone())
-            }
+            }),
+        };
+        let (pipeline, g1_layout) = match found {
+            Some(h) => h,
             None if self.async_pipelines => {
                 // Drawn from a later replay on, once a worker made it.
                 self.queue_pipeline(key, vs_t, ps_t);
@@ -7097,15 +7224,10 @@ impl Drawer {
             self.guest_window(vf_mask, indices, mem, report)?;
         let gen = self.consts_gen;
         let consts = match &self.consts_built {
-            Some((g, c)) if *g == gen => c.clone(),
-            built => {
-                // Registers written with the words they held keep the block.
+            Some((g, c)) if *g == gen => *c,
+            _ => {
                 let c = consts_prefix(&self.regs);
-                let c = match built {
-                    Some((_, old)) if **old == c => old.clone(),
-                    _ => Arc::new(c),
-                };
-                self.consts_built = Some((gen, c.clone()));
+                self.consts_built = Some((gen, c));
                 c
             }
         };
@@ -7122,7 +7244,7 @@ impl Drawer {
         let mut kept_window =
             staged.filter(|((a, b, s), _)| self.window_memo.get(a) == Some(&(*b, *s)));
         let mut kept_consts = (self.staged_consts.as_ref())
-            .filter(|(b, s, _)| *s == suffix && (Arc::ptr_eq(b, &consts) || **b == *consts))
+            .filter(|(b, s, _)| *s == suffix && *b == consts)
             .map(|&(_, _, s)| s);
         // Each stage's float constants: those it reads, staged again only
         // when one of the stage's registers was written since.
@@ -7228,6 +7350,7 @@ impl Drawer {
                         self.window_memo.remove(&a);
                     }
                     self.window_memo.insert(lo, (hi, first));
+                    self.window_memo_span = self.window_memo_span.max(hi - lo);
                 }
                 (first.0, last.0 + last.1 - first.0)
             }
@@ -7239,8 +7362,8 @@ impl Drawer {
             }
             None => {
                 let s = (self.push(CONSTS_BYTES, |b| {
-                    let (prefix, rest) = b.split_at_mut(consts.len());
-                    prefix.copy_from_slice(&consts);
+                    let (prefix, rest) = b.split_at_mut(4 * consts.len());
+                    words_into(&consts, prefix);
                     words_into(&suffix, rest);
                     true
                 }))
@@ -7513,6 +7636,7 @@ impl Drawer {
         if let (false, Some(a), Some(b)) = (slow, t_groups, t_pass) {
             add_sampled(&mut self.timings.submit_parts, &[t0, a, b, t]);
         }
+        self.window_scratch.parts = read;
         Ok(true)
     }
 
@@ -8444,6 +8568,8 @@ struct WindowScratch {
     part_of: Vec<(u32, usize)>,
     /// Where each part lands in the window.
     at: Vec<u64>,
+    /// The parts list a draw gave back, for the next to fill.
+    parts: Vec<(u64, u64)>,
 }
 
 /// `ranges` sorted by start, with those that touch or overlap made one.
@@ -9112,6 +9238,55 @@ mod tests {
 
     /// The constants block holds each register of its four blocks in
     /// order, then the window base and the index offset.
+    /// The named float constants, in order, whatever the mask's words.
+    #[test]
+    fn float_consts_reads_the_masked_constants_in_order() {
+        let mut r = regs::RegisterFile::default();
+        for i in 0..2 * FLOAT_STAGE_REGS {
+            r.set(regs::SHADER_CONSTANT_FLOAT + i, 0x1000_0000 + i);
+        }
+        let picked = [0usize, 5, 63, 64, 130, 255];
+        let mut mask = [0u64; 4];
+        for &i in &picked {
+            mask[i / 64] |= 1 << (i % 64);
+        }
+        for stage in 0..2 {
+            let mut out = vec![0; 16 * picked.len()];
+            float_consts(&r, stage, &mask, &mut out);
+            let want: Vec<u32> = (picked.iter())
+                .flat_map(|&i| {
+                    (0..4).map(move |c| 0x1000_0000 + FLOAT_STAGE_REGS * stage + 4 * i as u32 + c)
+                })
+                .collect();
+            assert_eq!(out, to_bytes(&want), "stage {stage}");
+        }
+        let mut none = [7u8; 16];
+        float_consts(&r, 0, &[0; 4], &mut none);
+        assert_eq!(none, [7; 16]);
+    }
+
+    /// A program loaded again is the one made before (same words, so the
+    /// same hash), and the list keeps only the newest.
+    #[test]
+    fn recent_program_reuses_and_bounds() {
+        let mut recent = Vec::new();
+        let a = recent_program(&mut recent, &[1, 2, 3]);
+        let b = recent_program(&mut recent, &[4, 5]);
+        let a2 = recent_program(&mut recent, &[1, 2, 3]);
+        assert!(Arc::ptr_eq(&a.words, &a2.words));
+        assert_eq!(a.hash, hash_words(&[1, 2, 3]));
+        assert_eq!(b.hash, hash_words(&[4, 5]));
+        assert_eq!(recent.len(), 2);
+        for n in 0..2 * RECENT_PROGRAMS as u32 {
+            let p = recent_program(&mut recent, &[n, 99]);
+            assert_eq!(*p.words, [n, 99]);
+        }
+        assert_eq!(recent.len(), RECENT_PROGRAMS);
+        let a3 = recent_program(&mut recent, &[1, 2, 3]);
+        assert!(!Arc::ptr_eq(&a.words, &a3.words));
+        assert_eq!(a3.hash, a.hash);
+    }
+
     #[test]
     fn consts_block_is_the_registers_in_order() {
         let mut r = regs::RegisterFile::default();
@@ -9129,7 +9304,7 @@ mod tests {
         want.extend([0x1234_5678, 77, 0x3F00_0000, 0]);
         let rebase = std::array::from_fn(|k| k as i32 - 3);
         want.extend(rebase.map(|w: i32| w as u32));
-        let mut got = consts_prefix(r);
+        let mut got = to_bytes(&consts_prefix(r));
         got.extend(to_bytes(&consts_suffix(r, 0x1234_5678, &rebase)));
         assert_eq!(got, to_bytes(&want));
         assert_eq!(got.len(), CONSTS_BYTES);
