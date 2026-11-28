@@ -543,6 +543,9 @@ pub struct Timings {
     /// evicted, and the textures it evicted.
     pub textures_reuploaded: u32,
     pub textures_evicted: u32,
+    /// Of `textures_uploaded`, those decoded on the GPU from their guest
+    /// bytes (detiled, endian swapped and converted there).
+    pub textures_gpu_decoded: u32,
     /// `textures_uploaded` and `texture_bytes` by host format: `Rgba8Unorm`,
     /// BC blocks, `Rgba16Float`, `Rgba32Float`, other.
     pub uploads_by_format: [(u32, u64); 5],
@@ -620,6 +623,7 @@ impl std::ops::AddAssign<&Timings> for Timings {
         self.kept_hashed_bytes += t.kept_hashed_bytes;
         self.textures_reuploaded += t.textures_reuploaded;
         self.textures_evicted += t.textures_evicted;
+        self.textures_gpu_decoded += t.textures_gpu_decoded;
         for (a, b) in self.uploads_by_format.iter_mut().zip(t.uploads_by_format) {
             a.0 += b.0;
             a.1 += b.1;
@@ -1685,8 +1689,9 @@ pub struct Drawer {
     half_luts: HashMap<(TargetFormat, i32), Option<Vec<[u16; 2]>>>,
     /// Resolve destinations kept on the GPU, disjoint and not adjacent.
     mirrors: Vec<Mirror>,
-    /// Entry points decode_8888 and decode_float of resolve.wgsl.
-    decode_pipelines: [Option<wgpu::ComputePipeline>; 2],
+    /// Entry points decode_8888 and decode_float of resolve.wgsl and
+    /// detile_bc of texture.wgsl.
+    decode_pipelines: [Option<wgpu::ComputePipeline>; 3],
     /// Leave resolve results on the GPU at the end of a replay instead of
     /// writing them to guest memory (default false). The drawer still writes
     /// them back before it reads those bytes itself (a texture it cannot
@@ -1756,6 +1761,10 @@ pub struct Drawer {
     /// (default: whether the adapter has BC textures). Turning it on
     /// without them makes those uploads fail.
     pub bc_textures: bool,
+    /// Decode guest textures that [`gpu_plan`] takes on the GPU from their
+    /// raw guest bytes instead of on the CPU (default on;
+    /// `XENON_GPU_TEXTURE_DECODE=0` turns it off at [`Drawer::new`]).
+    pub gpu_texture_decode: bool,
     /// Diagnostic: report a warning line per distinct texture a draw
     /// samples (see [`texture_log_line`]): for every pixel shader when
     /// `Some(None)`, for the pixel shader of that program hash when
@@ -2907,7 +2916,7 @@ impl Drawer {
             snorm16_blend,
             half_luts: HashMap::default(),
             mirrors: Vec::new(),
-            decode_pipelines: [None, None],
+            decode_pipelines: [None, None, None],
             skip_resolve_writeback: std::env::var("XENON_RESOLVE_WRITEBACK").as_deref() == Ok("skip"),
             late_writeback: std::env::var("XENON_RESOLVE_WRITEBACK").as_deref() == Ok("late"),
             late_front_buffer: std::env::var("XENON_LATE_FRAME").as_deref() == Ok("1"),
@@ -2923,6 +2932,7 @@ impl Drawer {
             texture_cache_limit: TEXTURE_CACHE_LIMIT,
             texture_cache_count: TEXTURE_CACHE_COUNT,
             bc_textures: required_features.contains(wgpu::Features::TEXTURE_COMPRESSION_BC),
+            gpu_texture_decode: std::env::var("XENON_GPU_TEXTURE_DECODE").as_deref() != Ok("0"),
             texture_log: std::env::var("XENON_TEXTURE_LOG")
                 .ok()
                 .and_then(|v| match v.trim() {
@@ -3311,6 +3321,100 @@ impl Drawer {
     pub fn set_pipeline_cap(&mut self, pipelines: usize) {
         self.pipeline_cap = pipelines;
         self.drop_pipelines();
+    }
+
+    /// The host format and texels of each level (none for levels left as
+    /// zeros) that the guest path uploads for fetch constant `constant`
+    /// from its guest bytes `bytes` (the base's when it reads the base,
+    /// then each mip level's), read back from the GPU, with 32-bit float
+    /// textures filterable or not (`float32`); and whether the GPU decoded
+    /// them ([`Drawer::gpu_texture_decode`]). For tests.
+    #[doc(hidden)]
+    #[allow(clippy::type_complexity)]
+    pub fn decode_guest_texture(
+        &mut self,
+        constant: [u32; 6],
+        bytes: &[u8],
+        float32: bool,
+    ) -> Result<(wgpu::TextureFormat, Vec<Option<Vec<u8>>>, bool), String> {
+        let fetch = xenon_texture::TextureFetch::decode(constant);
+        let base = reads_base(&fetch);
+        let base_len = match base {
+            true => xenon_texture::bytes_needed(&fetch).map_err(|e| e.to_string())?,
+            false => 0,
+        };
+        // As Drawer::texture_from splits them.
+        let mut mips = Vec::new();
+        let mut at = base_len;
+        for m in xenon_texture::mip_fetches(&fetch) {
+            let Some((a, b)) = level_range(&m) else { break };
+            let len = (b - a) as usize;
+            if bytes.len() < at + len {
+                break;
+            }
+            mips.push((m, at, len));
+            at += len;
+        }
+        let keep = std::mem::replace(&mut self.float32_filterable, float32);
+        let decoded = self.decode_levels(&fetch, bytes, base, base_len, &mips);
+        self.float32_filterable = keep;
+        let (host, levels, gpu) = decoded?;
+        let tex = self.upload_levels(host, bytes, &levels, wgpu::TextureUsages::COPY_SRC)?;
+        let mut enc = (self.pre.take())
+            .unwrap_or_else(|| self.device.create_command_encoder(&Default::default()));
+        let (bw, bh) = host.block_dimensions();
+        let block = host.block_copy_size(None).unwrap_or(4);
+        let mut reads = Vec::new();
+        for (level, (w, h, texels)) in levels.iter().enumerate() {
+            if texels.is_none() {
+                reads.push(None);
+                continue;
+            }
+            let (row, rows) = (w.div_ceil(bw) * block, h.div_ceil(bh));
+            let padded = row.next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
+            let buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("texture readback"),
+                size: u64::from(padded) * u64::from(rows),
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            });
+            enc.copy_texture_to_buffer(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &tex,
+                    mip_level: level as u32,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::TexelCopyBufferInfo {
+                    buffer: &buf,
+                    layout: wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(padded),
+                        rows_per_image: Some(rows),
+                    },
+                },
+                wgpu::Extent3d {
+                    width: *w,
+                    height: *h,
+                    depth_or_array_layers: 1,
+                },
+            );
+            reads.push(Some((buf, row, padded)));
+        }
+        let index = self.submit_now([enc.finish()]);
+        self.check_uncaptured().map_err(|e| e.to_string())?;
+        let mut out = Vec::new();
+        for read in reads {
+            out.push(match read {
+                None => None,
+                Some((buf, row, padded)) => {
+                    let data = (self.map_read(&buf, index.clone())).map_err(|e| e.to_string())?;
+                    let rows = data.chunks(padded as usize);
+                    Some(rows.flat_map(|r| &r[..row as usize]).copied().collect())
+                }
+            });
+        }
+        Ok((host, out, gpu))
     }
 
     /// Drops the least recently used draw pipelines past the cap, and the
@@ -5370,19 +5474,21 @@ impl Drawer {
         }
     }
 
-    /// The compute pipeline of `resolve.wgsl`'s `decode_8888`, or with
-    /// `float` its `decode_float`, made at first use.
-    fn decode_pipeline(&mut self, float: bool) -> wgpu::ComputePipeline {
+    /// The compute pipeline of entry point [`DECODE_ENTRIES`]`[entry]`
+    /// (0 `decode_8888`, 1 `decode_float`, 2 `detile_bc`), made at first use.
+    fn decode_pipeline(&mut self, entry: usize) -> wgpu::ComputePipeline {
         let device = &self.device;
         let cache = self.disk_cache.as_ref().map(|c| &c.cache);
-        let entry = ["decode_8888", "decode_float"][usize::from(float)];
+        let (i, entry) = (entry, DECODE_ENTRIES[entry]);
         // Set once the shader module is made, so it times the pipeline alone.
         let mut t0 = None;
-        let pipeline = self.decode_pipelines[usize::from(float)]
+        let pipeline = self.decode_pipelines[i]
             .get_or_insert_with(|| {
+                // texture.wgsl uses resolve.wgsl's decode bindings and helpers.
+                let source = concat!(include_str!("resolve.wgsl"), include_str!("texture.wgsl"));
                 let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-                    label: Some("resolve"),
-                    source: wgpu::ShaderSource::Wgsl(include_str!("resolve.wgsl").into()),
+                    label: Some("texture decode"),
+                    source: wgpu::ShaderSource::Wgsl(source.into()),
                 });
                 t0 = Some(Instant::now());
                 device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
@@ -5679,8 +5785,8 @@ impl Drawer {
             }),
         };
         let scope = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
-        let entry = ["decode_8888", "decode_float"][usize::from(mode.is_some())];
-        let pipeline = self.decode_pipeline(mode.is_some());
+        let entry = DECODE_ENTRIES[usize::from(mode.is_some())];
+        let pipeline = self.decode_pipeline(usize::from(mode.is_some()));
         // After a resolve recorded in the batch, the decode runs after it:
         // with `decode_in_batch` (the default) it is recorded in the batch,
         // after the resolve, so the batch's earlier draws still sample the
@@ -5908,65 +6014,27 @@ impl Drawer {
             );
             return Ok(view);
         }
-        let mut bc = self.bc_textures && !fetch.sign.contains(&1);
-        let float32 = self.float32_filterable;
-        // Width, height and texels of each level; no texels for levels no
-        // LOD samples (the base not read, levels below the first sampled),
-        // which stay wgpu's zeros.
-        let mut levels = Vec::new();
-        let mut host = None;
-        if base {
-            let (h, width, height, data) =
-                decode_level(fetch, &bytes[..base_len], bc, float32).map_err(|e| e.to_string())?;
-            host = Some(h);
-            levels.push((width, height, Some(data)));
-        } else {
-            // A BC texture's base is whole blocks, written or not.
-            bc &= fetch.width().is_multiple_of(4) && fetch.height().is_multiple_of(4);
-            levels.push((fetch.width(), fetch.height(), None));
-        }
+        let (host, levels, on_gpu) = self.decode_levels(fetch, bytes, base, base_len, &mips)?;
         let (width, height) = (levels[0].0, levels[0].1);
         if width > self.max_dim || height > self.max_dim {
             return Err(format!("texture {width}x{height}"));
         }
-        let first = fetch.mip_range().0 as usize;
-        for (level, &(m, at, len)) in (1..).zip(&mips) {
-            if level < first {
-                levels.push((m.width(), m.height(), None));
-                continue;
-            }
-            // shortcut: the chain stops at a level that does not decode to
-            // the first level's host format (a DXT level not whole blocks)
-            // or at all; sampled LODs past it clamp to the last level kept.
-            let bc = bc && host.is_none_or(|h| h.is_compressed());
-            match decode_level(&m, &bytes[at..at + len], bc, float32) {
-                Ok((h, w, hh, d)) if host.is_none_or(|host| host == h) => {
-                    host = Some(h);
-                    levels.push((w, hh, Some(d)));
-                }
-                _ => break,
-            }
-        }
-        // A cut chain ends at a level with texels, which LODs past it reach.
-        while levels.last().is_some_and(|l| l.2.is_none()) {
-            levels.pop();
-        }
-        let Some(host) = host else {
-            return Err("texture whose first sampled mip level does not decode".into());
-        };
-        let uploaded: u64 = levels
-            .iter()
-            .flat_map(|l| &l.2)
-            .map(|d| d.len() as u64)
-            .sum();
         // GPU bytes, the levels left as zeros included.
         let (bw, bh) = host.block_dimensions();
         let block = u64::from(host.block_copy_size(None).unwrap_or(4));
-        let len: u64 = levels
+        let blocks = |w: u32, h: u32| u64::from(w.div_ceil(bw)) * u64::from(h.div_ceil(bh));
+        let len: u64 = levels.iter().map(|&(w, h, _)| blocks(w, h) * block).sum();
+        // Host texel bytes of the levels with texels, decoded here or there.
+        let uploaded: u64 = levels
             .iter()
-            .map(|&(w, h, _)| u64::from(w.div_ceil(bw)) * u64::from(h.div_ceil(bh)) * block)
+            .map(|(w, h, t)| match t {
+                Some(Texels::Cpu(d)) => d.len() as u64,
+                Some(Texels::Gpu(..)) => blocks(*w, *h) * block,
+                None => 0,
+            })
             .sum();
         report.timings.textures_uploaded += 1;
+        report.timings.textures_gpu_decoded += u32::from(on_gpu);
         report.timings.texture_bytes += uploaded;
         let bucket = match host {
             wgpu::TextureFormat::Rgba8Unorm => 0,
@@ -5978,44 +6046,7 @@ impl Drawer {
         let by = &mut report.timings.uploads_by_format[bucket];
         by.0 += 1;
         by.1 += uploaded;
-        let tex = self.device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("guest texture"),
-            size: wgpu::Extent3d {
-                width,
-                height,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: levels.len() as u32,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: host,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
-        for (level, (w, h, data)) in levels.iter().enumerate() {
-            let Some(data) = data else { continue };
-            // Rows of blocks: a BC row holds four rows of texels.
-            let rows = h / host.block_dimensions().1;
-            self.queue.write_texture(
-                wgpu::TexelCopyTextureInfo {
-                    texture: &tex,
-                    mip_level: level as u32,
-                    origin: wgpu::Origin3d::ZERO,
-                    aspect: wgpu::TextureAspect::All,
-                },
-                data,
-                wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(data.len() as u32 / rows),
-                    rows_per_image: Some(rows),
-                },
-                wgpu::Extent3d {
-                    width: *w,
-                    height: *h,
-                    depth_or_array_layers: 1,
-                },
-            );
-        }
+        let tex = self.upload_levels(host, bytes, &levels, wgpu::TextureUsages::empty())?;
         let view = tex.create_view(&Default::default());
         let key_hash = hash_bytes(&to_bytes(&key.0)) ^ key.1;
         if self.texture_evicted.remove(&key_hash) {
@@ -6037,6 +6068,211 @@ impl Drawer {
             TextureMemo::new(view.clone(), ranges, Some(key), pages, self.replays),
         );
         Ok(view)
+    }
+
+    /// The host format and levels (width, height, texels; the base
+    /// first) of the guest texture `fetch` from its guest bytes `bytes`:
+    /// the base's `base_len` when `base` ([`reads_base`]), then each
+    /// of `mips` (fetch, offset in `bytes`, length). Decoded on the GPU
+    /// where [`gpu_plan`] takes the whole chain, else on the CPU; and
+    /// whether on the GPU.
+    #[allow(clippy::type_complexity)]
+    fn decode_levels(
+        &self,
+        fetch: &xenon_texture::TextureFetch,
+        bytes: &[u8],
+        base: bool,
+        base_len: usize,
+        mips: &[(xenon_texture::TextureFetch, usize, usize)],
+    ) -> Result<(wgpu::TextureFormat, Vec<(u32, u32, Option<Texels>)>, bool), String> {
+        let mut bc = self.bc_textures && !fetch.sign.contains(&1);
+        let float32 = self.float32_filterable;
+        let gpu = match self.gpu_texture_decode && base && bytes.len() as u64 <= self.max_storage {
+            true => gpu_plan(fetch, base_len, mips, bc, float32, self.max_storage),
+            false => None,
+        };
+        let on_gpu = gpu.is_some();
+        // Width, height and texels of each level; no texels for levels no
+        // LOD samples (the base not read, levels below the first sampled),
+        // which stay wgpu's zeros.
+        let (host, levels) = match gpu {
+            Some((host, plan)) => {
+                let levels = plan
+                    .into_iter()
+                    .map(|(w, h, p)| (w, h, p.map(|(e, p)| Texels::Gpu(e, p))))
+                    .collect();
+                (host, levels)
+            }
+            None => {
+                let mut levels = Vec::new();
+                let mut host = None;
+                if base {
+                    let (h, width, height, data) =
+                        decode_level(fetch, &bytes[..base_len], bc, float32)
+                            .map_err(|e| e.to_string())?;
+                    host = Some(h);
+                    levels.push((width, height, Some(Texels::Cpu(data))));
+                } else {
+                    // A BC texture's base is whole blocks, written or not.
+                    bc &= fetch.width().is_multiple_of(4) && fetch.height().is_multiple_of(4);
+                    levels.push((fetch.width(), fetch.height(), None));
+                }
+                let first = fetch.mip_range().0 as usize;
+                for (level, &(m, at, len)) in (1..).zip(mips) {
+                    if level < first {
+                        levels.push((m.width(), m.height(), None));
+                        continue;
+                    }
+                    // shortcut: the chain stops at a level that does not decode to
+                    // the first level's host format (a DXT level not whole blocks)
+                    // or at all; sampled LODs past it clamp to the last level kept.
+                    let bc = bc && host.is_none_or(|h| h.is_compressed());
+                    match decode_level(&m, &bytes[at..at + len], bc, float32) {
+                        Ok((h, w, hh, d)) if host.is_none_or(|host| host == h) => {
+                            host = Some(h);
+                            levels.push((w, hh, Some(Texels::Cpu(d))));
+                        }
+                        _ => break,
+                    }
+                }
+                // A cut chain ends at a level with texels, which LODs past it reach.
+                while levels.last().is_some_and(|l| l.2.is_none()) {
+                    levels.pop();
+                }
+                let Some(host) = host else {
+                    return Err("texture whose first sampled mip level does not decode".into());
+                };
+                (host, levels)
+            }
+        };
+        Ok((host, levels, on_gpu))
+    }
+
+    /// A `host` texture of `levels` (width, height, texels), the first one
+    /// the base: CPU-decoded texels written with the queue, GPU ones
+    /// decoded from `bytes` (the guest bytes [`Drawer::texture_from`]
+    /// takes) by compute passes recorded in `pre`, which runs before the
+    /// open batch: the texture is new, so no draw recorded yet samples it.
+    /// `usage` adds to the texture's usages.
+    fn upload_levels(
+        &mut self,
+        host: wgpu::TextureFormat,
+        bytes: &[u8],
+        levels: &[(u32, u32, Option<Texels>)],
+        usage: wgpu::TextureUsages,
+    ) -> Result<wgpu::Texture, String> {
+        let tex = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("guest texture"),
+            size: wgpu::Extent3d {
+                width: levels[0].0,
+                height: levels[0].1,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: levels.len() as u32,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: host,
+            usage: usage | wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        // The guest bytes once, for every GPU level.
+        let mut guest = None;
+        for (level, (w, h, texels)) in levels.iter().enumerate() {
+            let size = wgpu::Extent3d {
+                width: *w,
+                height: *h,
+                depth_or_array_layers: 1,
+            };
+            let at = wgpu::TexelCopyTextureInfo {
+                texture: &tex,
+                mip_level: level as u32,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            };
+            match texels {
+                None => {}
+                Some(Texels::Cpu(data)) => {
+                    // Rows of blocks: a BC row holds four rows of texels.
+                    let rows = h / host.block_dimensions().1;
+                    let layout = wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(data.len() as u32 / rows),
+                        rows_per_image: Some(rows),
+                    };
+                    self.queue.write_texture(at, data, layout, size);
+                }
+                Some(Texels::Gpu(entry, params)) => {
+                    if guest.is_none() {
+                        let buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+                            label: Some("guest texture bytes"),
+                            size: (bytes.len() as u64).next_multiple_of(4).max(4),
+                            usage: wgpu::BufferUsages::STORAGE,
+                            mapped_at_creation: true,
+                        });
+                        let mut view = buf
+                            .slice(..)
+                            .get_mapped_range_mut()
+                            .map_err(|e| e.to_string())?;
+                        view.slice(..bytes.len()).copy_from_slice(bytes);
+                        drop(view);
+                        buf.unmap();
+                        guest = Some(buf);
+                    }
+                    let guest = guest.clone().expect("made above");
+                    let pipeline = self.decode_pipeline(*entry);
+                    let (cols, rows, row_words) = (params[0], params[1], params[6]);
+                    let uniform = self.buffer(
+                        "decode params",
+                        &to_bytes(params),
+                        wgpu::BufferUsages::UNIFORM,
+                    );
+                    let out = self.device.create_buffer(&wgpu::BufferDescriptor {
+                        label: Some("decoded texels"),
+                        size: u64::from(row_words) * 4 * u64::from(rows),
+                        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+                        mapped_at_creation: false,
+                    });
+                    let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: Some(DECODE_ENTRIES[*entry]),
+                        layout: &pipeline.get_bind_group_layout(0),
+                        entries: &[
+                            wgpu::BindGroupEntry {
+                                binding: 5,
+                                resource: guest.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 6,
+                                resource: out.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 7,
+                                resource: uniform.as_entire_binding(),
+                            },
+                        ],
+                    });
+                    let enc = self.pre.get_or_insert_with(|| {
+                        self.device.create_command_encoder(&Default::default())
+                    });
+                    {
+                        let mut pass = enc.begin_compute_pass(&Default::default());
+                        pass.set_pipeline(&pipeline);
+                        pass.set_bind_group(0, &bg, &[]);
+                        pass.dispatch_workgroups(cols.div_ceil(8), rows.div_ceil(8), 1);
+                    }
+                    let layout = wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(row_words * 4),
+                        rows_per_image: Some(rows),
+                    };
+                    let src = wgpu::TexelCopyBufferInfo {
+                        buffer: &out,
+                        layout,
+                    };
+                    enc.copy_buffer_to_texture(src, at, size);
+                }
+            }
+        }
+        Ok(tex)
     }
 
     /// Evicts least recently used textures until the cache holds at most
@@ -7798,7 +8034,7 @@ impl Drawer {
                 ))
             });
             let (endian, swizzle) = self.front_buffer_read(addr);
-            let pipeline = self.decode_pipeline(false);
+            let pipeline = self.decode_pipeline(0);
             let params = [
                 width,
                 height,
@@ -8073,9 +8309,8 @@ fn bc_blocks(
         F::Dxt4_5 => (wgpu::TextureFormat::Bc3RgbaUnorm, 16),
         _ => return Ok(None),
     };
-    const IDENTITY: u16 = (1 << 3) | (2 << 6) | (3 << 9);
     let (w, h) = (fetch.width(), fetch.height());
-    if fetch.swizzle & 0xFFF != IDENTITY || w % 4 != 0 || h % 4 != 0 {
+    if fetch.swizzle & 0xFFF != IDENTITY_SWIZZLE || w % 4 != 0 || h % 4 != 0 {
         return Ok(None);
     }
     let (wb, hb) = (w / 4, h / 4);
@@ -8105,6 +8340,141 @@ fn bc_blocks(
             .collect()
     };
     Ok(Some((format, blocks)))
+}
+
+/// The XYZW fetch swizzle that keeps each component.
+const IDENTITY_SWIZZLE: u16 = (1 << 3) | (2 << 6) | (3 << 9);
+
+/// Compute entry points that decode guest texture bytes, by the index
+/// [`Drawer::decode_pipeline`] and [`Texels::Gpu`] take.
+const DECODE_ENTRIES: [&str; 3] = ["decode_8888", "decode_float", "detile_bc"];
+
+/// The texels of one level of a guest texture upload.
+enum Texels {
+    /// Decoded on the CPU ([`decode_level`]).
+    Cpu(Vec<u8>),
+    /// Decoded on the GPU from the guest bytes: the [`DECODE_ENTRIES`]
+    /// index and its `DecodeParams` (resolve.wgsl), as [`gpu_level`] makes
+    /// them.
+    Gpu(usize, [u32; 12]),
+}
+
+/// How the GPU decodes guest level `f`, whose bytes start `at` bytes into
+/// the texture's guest bytes and run `len`, to the texels [`decode_level`]
+/// makes of them (`bc` and `float32` as it takes them): the host format,
+/// the [`DECODE_ENTRIES`] index and its `DecodeParams` (blocks wide and
+/// high, pitch in blocks, endian, swizzle, word offset, words per output
+/// row padded to `COPY_BYTES_PER_ROW_ALIGNMENT`, first row 0, decode_float
+/// mode or for detile_bc the log2 of the block bytes). `None` where the
+/// CPU decodes it: linear, 3D, stacked or signed fetches, formats the
+/// kernels lack, a DXT level `bc_blocks` refuses, bytes short of the level
+/// or unaligned, or an output buffer over `limit` bytes.
+fn gpu_level(
+    f: &xenon_texture::TextureFetch,
+    at: usize,
+    len: usize,
+    bc: bool,
+    float32: bool,
+    limit: u64,
+) -> Option<(wgpu::TextureFormat, usize, [u32; 12])> {
+    use wgpu::TextureFormat as H;
+    use xenon_texture::{tile, Dimension, TextureFormat as F};
+    if !f.tiled
+        || f.dimension != Dimension::D2OrStacked
+        || f.stacked
+        || f.sign.contains(&1)
+        || !at.is_multiple_of(4)
+    {
+        return None;
+    }
+    // (host format, entry, mode, guest and host bytes per block, block size)
+    let (host, entry, mode, bpb, host_bytes, block) = match (
+        f.format.data_format(),
+        host_texture_format(f.format, f.sign, float32),
+    ) {
+        (F::Dxt1, _) if bc => (H::Bc1RgbaUnorm, 2, 3, 8, 8, 4),
+        (F::Dxt2_3, _) if bc => (H::Bc2RgbaUnorm, 2, 4, 16, 16, 4),
+        (F::Dxt4_5, _) if bc => (H::Bc3RgbaUnorm, 2, 4, 16, 16, 4),
+        (F::K8_8_8_8, H::Rgba8Unorm) => (H::Rgba8Unorm, 0, 0, 4, 4, 1),
+        (F::K32Float, H::Rgba32Float) => (H::Rgba32Float, 1, 0, 4, 16, 1),
+        (F::K32Float, H::Rgba16Float) => (H::Rgba16Float, 1, 1, 4, 8, 1),
+        (F::K16_16_16_16Float, H::Rgba16Float) => (H::Rgba16Float, 1, 2, 8, 8, 1),
+        (F::K16_16Float, H::Rgba16Float) => (H::Rgba16Float, 1, 7, 4, 8, 1),
+        (F::K24_8, H::Rgba32Float) => (H::Rgba32Float, 1, 3, 4, 16, 1),
+        (F::K24_8, H::Rgba16Float) => (H::Rgba16Float, 1, 4, 4, 8, 1),
+        (F::K24_8Float, H::Rgba32Float) => (H::Rgba32Float, 1, 5, 4, 16, 1),
+        (F::K24_8Float, H::Rgba16Float) => (H::Rgba16Float, 1, 6, 4, 8, 1),
+        _ => return None,
+    };
+    let (w, h) = (f.width(), f.height());
+    if block == 4 && (f.swizzle & 0xFFF != IDENTITY_SWIZZLE || w % 4 != 0 || h % 4 != 0) {
+        return None;
+    }
+    let (wb, hb) = (w.div_ceil(block), h.div_ceil(block));
+    let pitch = tile::align_to_tile(f.pitch_texels().div_ceil(block));
+    if pitch < wb || len < tile::tiled_extent_2d(wb, hb, pitch, bpb).ok()? as usize {
+        return None;
+    }
+    let row_words = (wb * host_bytes).next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT) / 4;
+    if u64::from(row_words) * 4 * u64::from(hb) > limit {
+        return None;
+    }
+    let params = [
+        wb,
+        hb,
+        pitch,
+        f.endian as u32,
+        u32::from(f.swizzle),
+        u32::try_from(at / 4).ok()?,
+        row_words,
+        0,
+        mode,
+        0,
+        0,
+        0,
+    ];
+    Some((host, entry, params))
+}
+
+/// [`gpu_level`] of the base of `fetch` (its first `base_len` bytes) and
+/// of each of `mips` ([`Drawer::texture_from`]'s: fetch, offset, length),
+/// as the levels the CPU path of [`Drawer::texture_from`] uploads: the
+/// host format and per level its size and decode, none for levels below
+/// the first sampled one. A DXT chain stops before a level not whole
+/// blocks, as the CPU path's does; `None` (all on the CPU) when any other
+/// level is not one [`gpu_level`] takes.
+#[allow(clippy::type_complexity)]
+fn gpu_plan(
+    fetch: &xenon_texture::TextureFetch,
+    base_len: usize,
+    mips: &[(xenon_texture::TextureFetch, usize, usize)],
+    bc: bool,
+    float32: bool,
+    limit: u64,
+) -> Option<(
+    wgpu::TextureFormat,
+    Vec<(u32, u32, Option<(usize, [u32; 12])>)>,
+)> {
+    let (host, e, p) = gpu_level(fetch, 0, base_len, bc, float32, limit)?;
+    let mut levels = vec![(fetch.width(), fetch.height(), Some((e, p)))];
+    let first = fetch.mip_range().0 as usize;
+    for (level, (m, at, len)) in (1..).zip(mips) {
+        if level < first {
+            levels.push((m.width(), m.height(), None));
+            continue;
+        }
+        if host.is_compressed() && (m.width() % 4 != 0 || m.height() % 4 != 0) {
+            break;
+        }
+        match gpu_level(m, *at, *len, bc, float32, limit)? {
+            (h, e, p) if h == host => levels.push((m.width(), m.height(), Some((e, p)))),
+            _ => return None,
+        }
+    }
+    while levels.last().is_some_and(|l| l.2.is_none()) {
+        levels.pop();
+    }
+    Some((host, levels))
 }
 
 /// The [`Drawer::texture_log`] line of fetch constant `c` in slot `n` of a
@@ -9050,6 +9420,115 @@ mod tests {
         cache.remove(&(a, 12));
         assert_eq!(drop_stale(&mut latest, &mut cache, (a, 13)), 0);
         assert_eq!(drop_stale(&mut latest, &mut cache, (b, 10)), 0);
+    }
+
+    /// A 64x64 fetch of `format` (tiled or not, endian 8in32, mips 1 to
+    /// `max` after the base).
+    fn plan_fetch(format: u32, tiled: bool, max: u32) -> xenon_texture::TextureFetch {
+        xenon_texture::TextureFetch::decode([
+            2 | (2 << 22) | (u32::from(tiled) << 31),
+            format | (2 << 6) | 0x4_0000,
+            63 | (63 << 13),
+            u32::from(IDENTITY_SWIZZLE) << 1,
+            max << 6,
+            0x8_0000 | (1 << 9),
+        ])
+    }
+
+    /// The DecodeParams of each kernel: blocks, tiled pitch in blocks,
+    /// word offset and output rows padded to 256 bytes.
+    #[test]
+    fn gpu_level_params() {
+        use wgpu::TextureFormat as H;
+        let swizzle = u32::from(IDENTITY_SWIZZLE);
+        let rgba8 = plan_fetch(6, true, 0);
+        let p = gpu_level(&rgba8, 64, 16384, false, true, u64::MAX).unwrap();
+        assert_eq!(
+            p,
+            (
+                H::Rgba8Unorm,
+                0,
+                [64, 64, 64, 2, swizzle, 16, 64, 0, 0, 0, 0, 0]
+            )
+        );
+        // k_32_FLOAT to Rgba32Float: 16 host bytes per texel.
+        let p = gpu_level(&plan_fetch(36, true, 0), 0, 16384, false, true, u64::MAX).unwrap();
+        assert_eq!((p.0, p.1, p.2[6], p.2[8]), (H::Rgba32Float, 1, 256, 0));
+        let p = gpu_level(&plan_fetch(36, true, 0), 0, 16384, false, false, u64::MAX).unwrap();
+        assert_eq!((p.0, p.2[6], p.2[8]), (H::Rgba16Float, 128, 1));
+        // DXT1: 16x16 blocks of 8 bytes, a 32-block pitch, 128 bytes a row
+        // padded to 256.
+        let p = gpu_level(&plan_fetch(18, true, 0), 0, 8192, true, true, u64::MAX).unwrap();
+        assert_eq!(
+            p,
+            (
+                H::Bc1RgbaUnorm,
+                2,
+                [16, 16, 32, 2, swizzle, 0, 64, 0, 3, 0, 0, 0]
+            )
+        );
+        // DXT without BC textures, linear, unaligned, short, signed or over
+        // the limit: the CPU's.
+        assert_eq!(
+            gpu_level(&plan_fetch(18, true, 0), 0, 4096, false, true, u64::MAX),
+            None
+        );
+        assert_eq!(
+            gpu_level(&plan_fetch(6, false, 0), 0, 16384, false, true, u64::MAX),
+            None
+        );
+        assert_eq!(gpu_level(&rgba8, 2, 16384, false, true, u64::MAX), None);
+        assert_eq!(gpu_level(&rgba8, 0, 16383, false, true, u64::MAX), None);
+        assert_eq!(gpu_level(&rgba8, 0, 16384, false, true, 16383), None);
+        let signed = xenon_texture::TextureFetch {
+            sign: [0, 1, 0, 0],
+            ..plan_fetch(36, true, 0)
+        };
+        assert_eq!(gpu_level(&signed, 0, 16384, false, true, u64::MAX), None);
+    }
+
+    /// A plan covers the levels the CPU path uploads: a DXT chain stops
+    /// before its first level that is not whole blocks.
+    #[test]
+    fn gpu_plan_levels() {
+        let mips_of = |f: &xenon_texture::TextureFetch| {
+            let mut at = xenon_texture::bytes_needed(f).unwrap();
+            let base = at;
+            let mips: Vec<_> = xenon_texture::mip_fetches(f)
+                .map(|m| {
+                    let len = xenon_texture::bytes_needed(&m).unwrap();
+                    at += len;
+                    (m, at - len, len)
+                })
+                .collect();
+            (base, mips)
+        };
+        let bc = plan_fetch(20, true, 6);
+        let (base, mips) = mips_of(&bc);
+        let (host, levels) = gpu_plan(&bc, base, &mips, true, true, u64::MAX).unwrap();
+        assert_eq!(host, wgpu::TextureFormat::Bc3RgbaUnorm);
+        let sizes: Vec<_> = levels.iter().map(|l| (l.0, l.1)).collect();
+        assert_eq!(sizes, [(64, 64), (32, 32), (16, 16), (8, 8), (4, 4)]);
+        let offsets: Vec<_> = levels
+            .iter()
+            .map(|l| l.2.unwrap().1[5] as usize * 4)
+            .collect();
+        assert_eq!(
+            offsets[1..],
+            mips[..4].iter().map(|m| m.1).collect::<Vec<_>>()[..]
+        );
+        let rgba8 = xenon_texture::TextureFetch {
+            mip_min_level: 2,
+            ..plan_fetch(6, true, 6)
+        };
+        let (base, mips) = mips_of(&rgba8);
+        let (_, levels) = gpu_plan(&rgba8, base, &mips, true, true, u64::MAX).unwrap();
+        let decoded: Vec<_> = levels.iter().map(|l| l.2.is_some()).collect();
+        assert_eq!(decoded, [true, false, true, true, true, true, true]);
+        // A level the GPU cannot take puts the whole chain on the CPU.
+        let mut unaligned = mips.clone();
+        unaligned[1].1 += 2;
+        assert!(gpu_plan(&rgba8, base, &unaligned, true, true, u64::MAX).is_none());
     }
 
     #[test]

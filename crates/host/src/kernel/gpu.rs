@@ -318,7 +318,7 @@ impl DrawStats {
              resolve cpu {:.0}, clears {:.0}, swap {:.0} (transfers {:.0}), commands {:.1}, edges {:.1}, other {:.1}; of those, creating \
              pipelines {:.0}; per {per}: {} draws ({} consts reused, {} indices reused, {} texture sets reused = {:.0}%), {} shader loads, \
              {} resolves, {} submits ({} resolve, {} transfer, {} decode, {} flush/other), {} transfers ({} passes, {} set up), {} render passes, {} write-backs, readback {:.1} MB, \
-             hashed {:.1} MB (kept resolves {:.1} MB), {} textures uploaded ({:.1} MB, {} evicted before), \
+             hashed {:.1} MB (kept resolves {:.1} MB), {} textures uploaded ({:.1} MB, {} evicted before, {:.1} decoded on the gpu), \
              {} evicted, {} from kept resolves, {} pipelines created; guest data {:.1} MB ({} windows reused, {:.1} MB); \
              uploads by format: rgba8 {}, bc {}, f16 {}, f32 {}, other {}; \
              write watch {:.1} ms per {per} on the gpu thread;              texture memo: {} re-hashes found the cached texture ({:.1} MB), {} writes only between levels, {} cap hits, {} restored by hashing written pages",
@@ -374,6 +374,7 @@ impl DrawStats {
             t.textures_uploaded / n,
             mb(t.texture_bytes),
             t.textures_reuploaded / n,
+            f64::from(t.textures_gpu_decoded) / f64::from(n),
             t.textures_evicted / n,
             t.textures_kept / n,
             t.pipelines_created / n,
@@ -1046,6 +1047,7 @@ mod tests {
         s.t.windows_reused = 900;
         s.t.reused_bytes = 3_000_000;
         s.t.uploads_by_format = [(600, 200_000_000), (40, 8_000_000), (6, 0), (0, 0), (0, 0)];
+        s.t.textures_gpu_decoded = 5;
         let line = s.line(ms(5000));
         assert!(
             line.starts_with("[draw] 5.0 s: 2 frames, 7 replays; ms per frame: drawer 1000 ="),
@@ -1065,6 +1067,7 @@ mod tests {
             "140 submits (44 resolve, 19 transfer, 17 decode, 60 flush/other)",
             "guest data 4.5 MB (450 windows reused, 1.5 MB)",
             "write watch 1.5 ms per frame on the gpu thread",
+            "evicted before, 2.5 decoded on the gpu),",
             "rgba8 300 (100.0 MB), bc 20 (4.0 MB), f16 3 (0.0 MB), f32 0 (0.0 MB), other 0",
         ] {
             assert!(line.contains(part), "{part}: {line}");
