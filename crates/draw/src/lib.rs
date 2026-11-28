@@ -170,7 +170,9 @@ pub mod formats;
 pub mod frame;
 pub mod indices;
 pub mod resolve;
+mod spans;
 pub mod state;
+mod tick;
 
 use std::collections::hash_map::DefaultHasher;
 use std::collections::hash_map::Entry;
@@ -186,6 +188,7 @@ use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use tick::Tick;
 
 use xenon_gpu::regs;
 use xenon_gpu::{
@@ -1795,16 +1798,18 @@ pub struct Drawer {
     /// ([`GuestMemory::take_written`]): then only those entries go (a write
     /// between the levels of a texture keeps it), and past
     /// [`TEXTURE_MEMO_CAP`] the least recently used half.
-    texture_memo: HashMap<[u32; 6], TextureMemo>,
+    texture_memo: spans::SpanMap<TextureMemo>,
     /// Memo entries a guest write dropped, with the indices of their
     /// [`TextureMemo::pages`] the writes met since: the next lookup hashes
     /// only those pages, and if they still match, takes the entry back
     /// without reading and hashing the whole texture. (A write often leaves
     /// the bytes as they were: the CPU rewrites a page around a texture.)
-    texture_suspect: HashMap<[u32; 6], (TextureMemo, Vec<u32>)>,
+    texture_suspect: spans::SpanMap<(TextureMemo, Vec<u32>)>,
     /// Guest texture bytes are read into this buffer, kept across lookups:
     /// a fresh one per texture costs zeroing and page faults every frame.
     texture_scratch: Vec<u8>,
+    /// The memo keys a write may meet, kept across writes.
+    memo_near: Vec<spans::Key>,
     samplers: HashMap<SamplerKey, wgpu::Sampler>,
     /// Draws recorded but not yet submitted (see [`Batch`]).
     batch: Option<Batch>,
@@ -2148,8 +2153,8 @@ const ARENA_WATCHED: u64 = 256 << 20;
 const STAGED_RESERVE: u64 = 64 << 20;
 
 /// Time since `t`, restarting `t`.
-fn lap(t: &mut Instant) -> Duration {
-    let now = Instant::now();
+fn lap(t: &mut Tick) -> Duration {
+    let now = Tick::now();
     let d = now - *t;
     *t = now;
     d
@@ -2163,7 +2168,7 @@ const PART_SAMPLE: u32 = 32;
 
 /// Adds the spans between consecutive `marks` to `parts`, scaled by
 /// [`PART_SAMPLE`] as only one draw in that many is timed.
-fn add_sampled(parts: &mut [Duration], marks: &[Instant]) {
+fn add_sampled<T: Copy + std::ops::Sub<Output = Duration>>(parts: &mut [Duration], marks: &[T]) {
     for (p, w) in parts.iter_mut().zip(marks.windows(2)) {
         *p += (w[1] - w[0]) * PART_SAMPLE;
     }
@@ -2173,12 +2178,12 @@ fn add_sampled(parts: &mut [Duration], marks: &[Instant]) {
 /// which time their own phases) and the upkeep after every command, with
 /// clock reads only at the edges of the timed ones: a run of plain
 /// commands costs no read of its own.
-struct PlainTimer<F: FnMut() -> Instant> {
+struct PlainTimer<T, F: FnMut() -> T> {
     now: F,
-    mark: Instant,
+    mark: T,
 }
 
-impl<F: FnMut() -> Instant> PlainTimer<F> {
+impl<T: Copy + std::ops::Sub<Output = Duration>, F: FnMut() -> T> PlainTimer<T, F> {
     fn new(mut now: F) -> Self {
         let mark = now();
         Self { now, mark }
@@ -2403,6 +2408,18 @@ impl TextureMemo {
     }
 }
 
+impl spans::Spanned for TextureMemo {
+    fn span(&self) -> (u64, u64) {
+        self.span
+    }
+}
+
+impl spans::Spanned for (TextureMemo, Vec<u32>) {
+    fn span(&self) -> (u64, u64) {
+        self.0.span
+    }
+}
+
 /// Splits each `(guest address, offset in bytes, length)` segment of
 /// `bytes` at guest page boundaries and hashes each piece: the pieces for
 /// [`TextureMemo::pages`] and a hash of their hashes for the cache key.
@@ -2442,6 +2459,16 @@ const TEXTURE_PAGE: u64 = 4096;
 fn dirty_pages(m: &TextureMemo, ranges: &[(u64, u64)], dirty: &mut Vec<u32>) {
     let met = (m.pages.iter().enumerate()).filter(|(_, p)| meets(ranges, p.0, p.1));
     dirty.extend(met.map(|(i, _)| i as u32));
+}
+
+/// Whether the pages `dirty` lists (sorted and deduplicated here) hold over
+/// half the bytes of `m`'s pages: a suspect entry is then looked up whole.
+fn dirty_over_half(m: &TextureMemo, dirty: &mut Vec<u32>) -> bool {
+    dirty.sort_unstable();
+    dirty.dedup();
+    let len = |i: &u32| m.pages[*i as usize].1 - m.pages[*i as usize].0;
+    let total: u64 = m.pages.iter().map(|p| p.1 - p.0).sum();
+    dirty.iter().map(len).sum::<u64>() * 2 > total
 }
 
 /// Entries [`Drawer::texture_memo`] holds before it starts over.
@@ -3154,9 +3181,10 @@ impl Drawer {
             texture_latest: HashMap::default(),
             texture_evicted: HashSet::default(),
             replays: 0,
-            texture_memo: HashMap::default(),
-            texture_suspect: HashMap::default(),
+            texture_memo: Default::default(),
+            texture_suspect: Default::default(),
             texture_scratch: Vec::new(),
+            memo_near: Vec::new(),
             samplers: HashMap::default(),
             batch: None,
             texture_groups: HashMap::default(),
@@ -3883,7 +3911,7 @@ impl Drawer {
         // Two clock reads per draw, resolve and swap, none for the commands
         // between them: a run of those is charged once, before the next
         // timed command (and at the end).
-        let mut clock = PlainTimer::new(Instant::now);
+        let mut clock = PlainTimer::new(Tick::now);
         for c in commands {
             let mem = &mut *tracked;
             // Draws, resolves and swaps time their own phases; the rest,
@@ -4012,8 +4040,12 @@ impl Drawer {
         if ranges.is_empty() {
             return;
         }
+        let mut near = std::mem::take(&mut self.memo_near);
+        near.clear();
+        self.texture_memo.meeting(ranges, &mut near);
         let mut gone = Vec::new();
-        for (c, m) in &self.texture_memo {
+        for c in &near {
+            let m = &self.texture_memo[c];
             if !meets(ranges, m.span.0, m.span.1) {
                 continue;
             }
@@ -4024,11 +4056,22 @@ impl Drawer {
             }
             gone.push(*c);
         }
-        for (m, dirty) in self.texture_suspect.values_mut() {
-            if meets(ranges, m.span.0, m.span.1) {
-                dirty_pages(m, ranges, dirty);
+        near.clear();
+        self.texture_suspect.meeting(ranges, &mut near);
+        near.retain(|c| {
+            let (m, dirty) = self.texture_suspect.get_mut(c).expect("indexed");
+            if !meets(ranges, m.span.0, m.span.1) {
+                return false;
             }
+            dirty_pages(m, ranges, dirty);
+            // Past half written the entry can never be restored: dropped
+            // now, it no longer costs every later write.
+            dirty_over_half(m, dirty)
+        });
+        for c in &near {
+            self.texture_suspect.remove(c);
         }
+        self.memo_near = near;
         for c in gone {
             // The sets that used those textures; the others stay bound.
             for flag in self.texture_set_flags.remove(&c).into_iter().flatten() {
@@ -4251,7 +4294,7 @@ impl Drawer {
     ) -> Result<(), Error> {
         let now = before.as_ref().map(|_| self.guest_hashes(mem, &w));
         let (index, copies) = w;
-        let mut t = Instant::now();
+        let mut t = Tick::now();
         let mut first = true;
         for (k, (m_lo, dirty, spans, buf)) in copies.into_iter().enumerate() {
             if let (Some(before), Some(now)) = (&before, &now) {
@@ -4881,10 +4924,17 @@ impl Drawer {
                     store: wgpu::StoreOp::Store,
                 }
             }
-            let color_views = color
-                .each_ref()
-                .map(|t| t.as_ref().map(|t| t.create_view(&Default::default())));
-            let depth_view = depth.map(|t| (t.format(), t.create_view(&Default::default())));
+            // Kept per target texture: a view made per pass was a thirtieth
+            // of the draw thread on busy frames.
+            #[allow(clippy::mutable_key_type)]
+            let views = &mut self.target_views;
+            let mut view = |t: &wgpu::Texture| {
+                (views.entry(t.clone()))
+                    .or_insert_with(|| t.create_view(&Default::default()))
+                    .clone()
+            };
+            let color_views = color.each_ref().map(|t| t.as_ref().map(&mut view));
+            let depth_view = depth.map(|t| (t.format(), view(t)));
             self.timings.render_passes += 1;
             let timestamp_writes = GpuClock::render(&mut self.gpu_clock, 0);
             let pass = batch
@@ -6199,11 +6249,7 @@ impl Drawer {
         if !self.texture_cache.contains_key(&key) {
             return None;
         }
-        dirty.sort_unstable();
-        dirty.dedup();
-        let len = |i: &u32| m.pages[*i as usize].1 - m.pages[*i as usize].0;
-        let total: u64 = m.pages.iter().map(|p| p.1 - p.0).sum();
-        if dirty.iter().map(len).sum::<u64>() * 2 > total {
+        if dirty_over_half(&m, &mut dirty) {
             return None;
         }
         let mut buf = std::mem::take(&mut self.texture_scratch);
@@ -7025,7 +7071,7 @@ impl Drawer {
 
     /// Draws `d`; Ok(false) when the state makes it draw nothing.
     fn draw(&mut self, d: &Draw, mem: &mut Tracked, report: &mut Report) -> Result<bool, Skip> {
-        let mut t = Instant::now();
+        let mut t = Tick::now();
         let color_on = match self.regs.get(regs::RB_MODECONTROL) & 7 {
             4 => true,
             5 => false,
@@ -7179,7 +7225,7 @@ impl Drawer {
         }
 
         let sample = self.part_draws.is_multiple_of(PART_SAMPLE);
-        let stamp = || sample.then(Instant::now);
+        let stamp = || sample.then(Tick::now);
         let slow0 = sample.then(|| self.slow_work());
         let t_state = stamp();
         let strip = matches!(
@@ -8162,7 +8208,7 @@ impl Drawer {
             self.sync(mem, base, base + u64::from(extent))?;
         }
         self.flush()?;
-        let mut t = Instant::now();
+        let mut t = Tick::now();
         self.wait_idle()?;
         self.timings.gpu_wait += lap(&mut t);
         let px = self.read_target(format, &tex, rect.x0, rect.y0, rect.width(), rect.height())?;
@@ -8243,7 +8289,7 @@ impl Drawer {
             ))
             .into());
         }
-        let mut t = Instant::now();
+        let mut t = Tick::now();
         let base = r.dest_base & PHYSICAL_MASK;
         if !base.is_multiple_of(4) {
             return unsupported(format!("resolve destination 0x{base:08X} not word aligned"));
