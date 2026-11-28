@@ -252,6 +252,8 @@ struct DrawStats {
     resolves: u32,
     /// Wall time inside the drawer.
     busy: std::time::Duration,
+    /// The longest replay: where a frame stalled.
+    longest: std::time::Duration,
     /// Taking the written ranges, on the command processor thread.
     watch: std::time::Duration,
     t: xenon_draw::Timings,
@@ -272,6 +274,7 @@ impl DrawStats {
         self.draws += r.draws;
         self.resolves += r.resolves;
         self.busy += busy;
+        self.longest = self.longest.max(busy);
         self.watch += watch;
         self.t += &r.timings;
         let window = since.elapsed();
@@ -316,7 +319,7 @@ impl DrawStats {
             "[draw] {:.1} s: {} frames, {} replays; ms per {per}: drawer {:.0} = shaders {:.0} (state {:.0}, indices {:.0}, targets {:.0}, pipeline {:.0}), \
              guest data {:.0}, textures {:.0}, submit {:.0} (groups {:.1}, pass {:.1}, record {:.1}, queue {:.0}, upload {:.0}; finish {:.0} and submit {:.0} on the submit thread alongside), gpu wait {:.0}, readback {:.0}, \
              resolve cpu {:.0}, clears {:.0}, swap {:.0} (transfers {:.0}), commands {:.1}, edges {:.1}, other {:.1}; of those, creating \
-             pipelines {:.0} (and {:.0} on worker threads); per {per}: {} draws ({} more skipped waiting for pipelines,{} consts reused, {} indices reused, {} texture sets reused = {:.0}%), {} shader loads, \
+             pipelines {:.0} (and {:.0} on worker threads); per {per}: {} draws ({} more skipped waiting for pipelines, {} consts reused, {} indices reused, {} texture sets reused = {:.0}%), {} shader loads, \
              {} resolves, {} submits ({} resolve, {} transfer, {} decode, {} flush/other), {} transfers ({} passes, {} set up), {} render passes, {} write-backs, readback {:.1} MB, \
              hashed {:.1} MB (kept resolves {:.1} MB), {} textures uploaded ({:.1} MB, {} evicted before, {:.1} decoded on the gpu), \
              {} evicted, {} from kept resolves, {} pipelines created; guest data {:.1} MB ({} windows reused, {:.1} MB); \
@@ -394,6 +397,9 @@ impl DrawStats {
             t.gap_writes / n,
             t.memo_cap_hits,
             t.textures_restored / n,
+        ) + &format!(
+            "; longest replay {:.0} ms",
+            self.longest.as_secs_f64() * 1e3
         ) + &if t.passes_timed > 0 {
             format!(
                 "; GPU ms per {per} (timestamps, {} passes): draw {:.1}, clear {:.1}, resolve {:.1}",
@@ -1063,7 +1069,7 @@ mod tests {
             // 2000 ms busy less 300 readback, 160 submit, 40 commands and
             // 20 edges, per frame.
             "commands 20.0, edges 10.0, other 740.0;",
-            "1380 draws (300 consts reused, 0 indices reused, 345 texture sets reused = 25%), 5 shader loads,",
+            "1380 draws (0 more skipped waiting for pipelines, 300 consts reused, 0 indices reused, 345 texture sets reused = 25%), 5 shader loads,",
             "6 transfers (30 passes, 0 set up), 250 render passes, 7 write-backs,",
             "readback 40.0 MB",
             "140 submits (44 resolve, 19 transfer, 17 decode, 60 flush/other)",
@@ -1075,6 +1081,7 @@ mod tests {
             assert!(line.contains(part), "{part}: {line}");
         }
         assert!(!line.contains("GPU ms"), "{line}");
+        assert!(line.ends_with("; longest replay 0 ms"), "{line}");
         s.t.passes_timed = 400;
         s.t.gpu_passes = [ms(100), ms(3), ms(9)];
         let line = s.line(ms(5000));
