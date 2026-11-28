@@ -25,6 +25,8 @@ const OUT: RenderTargetKey = RenderTargetKey {
 const IDENTITY: u16 = (1 << 3) | (2 << 6) | (3 << 9);
 /// B, G, R, constant 1.
 const BGR1: u16 = 2 | (1 << 3) | (5 << 9);
+/// R, G, constant 1, constant 1.
+const XY11: u16 = (1 << 3) | (5 << 6) | (5 << 9);
 
 /// Fetch constant of a tiled 64x64 texture at DEST, point sampled.
 fn fetch(format: u32, endian: u32, swizzle: u16) -> [u32; 6] {
@@ -381,9 +383,9 @@ fn texture_over_two_resolves_matches_the_guest_path() {
 }
 
 /// A texture larger than what the resolve wrote (the rest is older guest
-/// memory) is read from guest memory.
+/// memory) is kept too, over the resolve and the guest bytes beside it.
 #[test]
-fn texture_past_the_resolve_takes_the_guest_path() {
+fn texture_past_the_resolve_is_kept() {
     let f = fetch(6, 2, IDENTITY);
     let Some(mut d) = drawer() else { return };
     let mut mem = memory();
@@ -396,7 +398,7 @@ fn texture_past_the_resolve_takes_the_guest_path() {
     let r = run(&mut d, &s, &mut mem);
     assert_eq!(
         (r.timings.textures_kept, r.timings.textures_uploaded),
-        (0, 1),
+        (1, 0),
         "{r:?}"
     );
     let img = d.read_render_target(OUT, 0, 0, W, H).unwrap();
@@ -632,6 +634,8 @@ fn wider_destination_pitch_keeps_the_columns() {
 const RT_2_10_10_10_FLOAT: u32 = 3;
 const RT_16_16_16_16_FLOAT: u32 = 7;
 const RT_32_FLOAT: u32 = 14;
+const RT_16_16_FLOAT: u32 = 6;
+const FETCH_16_16_FLOAT: u32 = 31;
 const FETCH_16_16_16_16_FLOAT: u32 = 32;
 const FETCH_32_FLOAT: u32 = 36;
 
@@ -658,6 +662,19 @@ const HALF4: FloatCase = FloatCase {
     out: TargetFormat::Rgba16Float,
     paint,
     float32: true,
+};
+
+/// A 7e3 target resolved to and fetched as k_16_16_FLOAT.
+const HALF2: FloatCase = FloatCase {
+    dest_format: FETCH_16_16_FLOAT,
+    fetch_format: FETCH_16_16_FLOAT,
+    ..HALF4
+};
+
+/// [`HALF2`] from a k_16_16_FLOAT target.
+const HALF2_RG: FloatCase = FloatCase {
+    rt: RT_16_16_FLOAT,
+    ..HALF2
 };
 
 /// [`HALF4`] from a half target holding NaNs, infinities and negatives.
@@ -703,17 +720,30 @@ impl FloatCase {
     /// Paints the gradient into a target of `rt` and resolves it whole to
     /// DEST with `endian` and exponent bias 2.
     fn paint_and_resolve(&self, s: &mut Stream, mem: &mut SliceMemory, endian: u32) {
-        let (wf, hf) = (W as f32, H as f32);
-        mem.write_words(RECT, &[f(0.0), f(0.0), f(wf), f(0.0), f(wf), f(hf)]);
+        self.paint_and_resolve_to(s, mem, endian, W, DEST);
+    }
+
+    /// [`Self::paint_and_resolve`] of the top-left `w` x `w` pixels to
+    /// `dest`, at pitch W, with the rectangle at RECT + `w`.
+    fn paint_and_resolve_to(
+        &self,
+        s: &mut Stream,
+        mem: &mut SliceMemory,
+        endian: u32,
+        w: u32,
+        dest: u32,
+    ) {
+        let (at, wf) = (RECT + w, w as f32);
+        mem.write_words(at, &[f(0.0), f(0.0), f(wf), f(0.0), f(wf), f(wf)]);
         s.regs(RB_COLOR_INFO, &[COLOR_BASE | (self.rt << 16)]);
         (self.paint)(s)
-            .vertex_fetch(0, RECT, 6)
+            .vertex_fetch(0, at, 6)
             .regs(RB_MODECONTROL, &[6])
             .regs(
                 RB_COPY_CONTROL,
                 &[
                     COPY_CONVERT,
-                    DEST,
+                    dest,
                     W | (H << 16),
                     (dest_info(self.dest_format, 2, false) & !7) | endian,
                 ],
@@ -765,6 +795,32 @@ fn float_resolves_are_kept_and_match_the_guest_path() {
         (&FLOAT32_AS_HALF, 2, IDENTITY, 4),
         (&FLOAT32_AS_HALF, 3, BGR1, 4),
     ] {
+        kept_matches_guest_path(case, endian, swizzle, bytes);
+    }
+}
+
+/// 7e3 and k_16_16_FLOAT targets resolved to k_16_16_FLOAT and fetched as
+/// k_16_16_FLOAT (XYYY, uploaded as `Rgba16Float`) at several endians and
+/// swizzles: kept on the GPU and bit for bit what the guest path samples.
+#[test]
+fn half2_resolves_are_kept_and_match_the_guest_path() {
+    for (case, endian, swizzle) in [
+        (&HALF2, 2, IDENTITY),
+        (&HALF2, 0, XY11),
+        (&HALF2, 1, BGR1),
+        (&HALF2, 3, IDENTITY),
+        (&HALF2_RG, 2, XY11),
+        (&HALF2_RG, 0, IDENTITY),
+    ] {
+        kept_matches_guest_path(case, endian, swizzle, 4);
+    }
+}
+
+/// Resolves `case` with `endian`, samples it with `swizzle` in the same
+/// replay and checks it is kept (`bytes` per texel) and matches the guest
+/// path.
+fn kept_matches_guest_path(case: &FloatCase, endian: u32, swizzle: u16, bytes: u32) {
+    {
         // The fetch endian undoes the resolve's within each word; 8in64
         // also swaps the words, which a fetch cannot undo.
         let fetch_endian = if endian == 4 { 2 } else { endian };
@@ -814,6 +870,93 @@ fn float_resolves_are_kept_and_match_the_guest_path() {
             case.fetch_format
         );
     }
+}
+
+/// A k_16_16_FLOAT surface that resolves fill only in parts, a 32x32 tile
+/// at a time with the destination moved to each tile, sampled whole (as a
+/// shadow map is): kept on the GPU over the tiles and the older guest bytes
+/// beside them, the same as the guest path, and the next replay's resolve
+/// into one tile neither hashes nor uploads the surface again.
+#[test]
+fn half2_tiles_of_a_larger_surface_are_kept() {
+    let f = fetch(FETCH_16_16_FLOAT, 2, XY11);
+    let Some(mut d) = HALF2.drawer() else { return };
+    let mut mem = memory();
+    vertices(&mut mem);
+    // Older guest bytes: halves of about 1.06.
+    mem.data[DEST as usize..][..(W * H * 4) as usize].fill(0x3C);
+    let tile = 32 * 32 * 4;
+    let mut s = Stream::default();
+    HALF2.paint_and_resolve_to(s.setup(), &mut mem, 2, 32, DEST + tile);
+    HALF2.paint_and_resolve_to(&mut s, &mut mem, 2, 32, DEST + 2 * tile);
+    HALF2.sample(&mut s, f);
+    let r = run(&mut d, &s, &mut mem);
+    assert!(r.unsupported.is_empty(), "{r:?}");
+    let t = &r.timings;
+    assert_eq!(
+        (t.textures_kept, t.textures_uploaded, t.hashed_bytes),
+        (1, 0, 0),
+        "{r:?}"
+    );
+    let first = d
+        .read_render_target_raw(HALF2.out_key(), 0, 0, W, H)
+        .unwrap();
+    let first_mem = mem.clone();
+    let n = first.len() / (W * H) as usize;
+    let distinct: std::collections::HashSet<_> = first.chunks(n).collect();
+    assert!(distinct.len() >= 64, "{}", distinct.len());
+    // The next frame: one tile again, then the whole surface.
+    let mut s = Stream::default();
+    HALF2.paint_and_resolve_to(s.setup(), &mut mem, 2, 32, DEST + 2 * tile);
+    HALF2.sample(&mut s, f);
+    let r = run(&mut d, &s, &mut mem);
+    assert!(r.unsupported.is_empty(), "{r:?}");
+    let t = &r.timings;
+    assert_eq!(
+        (t.textures_kept, t.textures_uploaded, t.hashed_bytes),
+        (1, 0, 0),
+        "{r:?}"
+    );
+    assert!(t.readback_bytes <= u64::from(2 * tile), "{r:?}");
+    let kept = d
+        .read_render_target_raw(HALF2.out_key(), 0, 0, W, H)
+        .unwrap();
+    // One drawer at a time: the guest path makes its own.
+    drop(d);
+    assert!(first == HALF2.guest_path(&first_mem, f));
+    assert!(kept == HALF2.guest_path(&mem, f));
+}
+
+/// A CPU write between replays to a block of a kept surface no resolve
+/// wrote, then a resolve into another tile and a sample of the whole
+/// surface: the failed check of the surface writes the tile back before it
+/// drops the buffer, so guest memory and the sample both have the resolve.
+#[test]
+fn cpu_write_beside_a_kept_tile_keeps_the_resolve() {
+    let f = fetch(FETCH_16_16_FLOAT, 2, XY11);
+    let Some(mut d) = HALF2.drawer() else { return };
+    let mut mem = memory();
+    vertices(&mut mem);
+    mem.data[DEST as usize..][..(W * H * 4) as usize].fill(0x3C);
+    let tile = 32 * 32 * 4;
+    let mut s = Stream::default();
+    HALF2.paint_and_resolve_to(s.setup(), &mut mem, 2, 32, DEST + tile);
+    HALF2.sample(&mut s, f);
+    let r = run(&mut d, &s, &mut mem);
+    assert_eq!(r.timings.textures_kept, 1, "{r:?}");
+    mem.data[(DEST + 3 * tile) as usize..][..256].fill(0x55);
+    let mut s = Stream::default();
+    HALF2.paint_and_resolve_to(s.setup(), &mut mem, 2, 32, DEST);
+    HALF2.sample(&mut s, f);
+    let r = run(&mut d, &s, &mut mem);
+    assert!(r.unsupported.is_empty(), "{r:?}");
+    let out = d
+        .read_render_target_raw(HALF2.out_key(), 0, 0, W, H)
+        .unwrap();
+    drop(d);
+    assert!(mem.data[DEST as usize..][..tile as usize] != [0x3C; 32 * 32 * 4]);
+    assert_eq!(mem.data[(DEST + 3 * tile) as usize], 0x55);
+    assert!(out == HALF2.guest_path(&mem, f));
 }
 
 /// A float resolve sampled by the next replay is still on the GPU.
@@ -1074,6 +1217,33 @@ fn kept_mip_level_is_sampled() {
     assert!(outputs[0] == case.guest_path(&mem, mip_fetch(0)));
 }
 
+/// A resolve into one tile of a chain's base, with its mip in older guest
+/// memory: the kept buffer made for the texture covers the mip too, so a
+/// fetch of level 1 samples the guest's mip as the guest path does.
+#[test]
+fn texture_past_the_resolve_keeps_its_mips() {
+    let case = &HALF4;
+    let Some(mut d) = case.drawer() else { return };
+    let mut mem = memory();
+    vertices(&mut mem);
+    mem.data[MIP as usize..][..32 * 32 * 8].fill(0x3C);
+    let mut s = Stream::default();
+    case.paint_and_resolve_to(s.setup(), &mut mem, 2, 32, DEST);
+    case.sample(&mut s, mip_fetch(1));
+    let r = run(&mut d, &s, &mut mem);
+    assert!(r.unsupported.is_empty(), "{r:?}");
+    assert_eq!(
+        (r.timings.textures_kept, r.timings.textures_uploaded),
+        (1, 0),
+        "{r:?}"
+    );
+    let out = d
+        .read_render_target_raw(case.out_key(), 0, 0, W, H)
+        .unwrap();
+    drop(d);
+    assert!(out == case.guest_path(&mem, mip_fetch(1)));
+}
+
 /// A resolve into the mip of a kept chain after it was sampled decodes the
 /// chain again: the second fetch of level 1 sees the new gradient.
 #[test]
@@ -1233,4 +1403,109 @@ fn listed_writes_skip_hashing_unwritten_kept_resolves() {
     assert_eq!(replay(&mut d, &mut w, &sample_cmds).0, 0);
     let img = d.read_render_target(OUT, 0, 0, W, H).unwrap();
     assert!(img.chunks(4).any(|p| p == [0x55; 4]));
+}
+
+/// The gradient with the blue rectangle over it.
+fn paint_both(s: &mut Stream) -> &mut Stream {
+    paint_small(paint(s))
+}
+
+/// Paints a target from scratch.
+type Paint = fn(&mut Stream) -> &mut Stream;
+
+/// Guest memory after each of `steps` (what to paint, where to resolve a
+/// 64x32 tile of it) is resolved by a fresh drawer in a replay of its own,
+/// so no kept buffer is merged.
+fn resolved_apart(mem: &SliceMemory, steps: &[(Paint, u32)]) -> SliceMemory {
+    let mut mem = mem.clone();
+    for &(p, dest) in steps {
+        let mut d = drawer().expect("a drawer");
+        let mut s = Stream::default();
+        p(s.setup());
+        resolve_to(&mut s, &mut mem, W, 32, dest);
+        let r = run(&mut d, &s, &mut mem);
+        assert!(r.unsupported.is_empty(), "{r:?}");
+    }
+    mem
+}
+
+/// Two 64x32 resolves at `first` and `second` that overlap or touch, then
+/// a texture over both and the guest bytes past them, in one replay: the
+/// kept buffers are merged on the GPU (no write-back or readback before the
+/// end of the replay), the texture draws what the guest path draws, and
+/// guest memory ends with the bytes it gets when each resolve is written
+/// back on its own. Without write-back, a swap of the destination writes
+/// the same bytes back.
+fn merged_resolves_match(first: u32, second: u32, skip: bool) {
+    let f = fetch(6, 2, IDENTITY);
+    if drawer().is_none() {
+        return;
+    }
+    let mut mem = memory();
+    vertices(&mut mem);
+    mem.data[DEST as usize..][..(W * H * 4 + 0x200) as usize].fill(0x77);
+    // Before the drawer under test: one drawer at a time.
+    let want = resolved_apart(&mem, &[(paint, first), (paint_both, second)]);
+    let mut d = drawer().expect("a drawer");
+    d.skip_resolve_writeback = skip;
+    let mut s = Stream::default();
+    paint(s.setup());
+    resolve_to(&mut s, &mut mem, W, 32, first);
+    paint_small(&mut s);
+    resolve_to(&mut s, &mut mem, W, 32, second);
+    sample(&mut s, f);
+    let r = run(&mut d, &s, &mut mem);
+    assert!(r.unsupported.is_empty(), "{r:?}");
+    assert_eq!(
+        (r.timings.textures_kept, r.timings.textures_uploaded),
+        (1, 0),
+        "{r:?}"
+    );
+    assert_eq!(r.timings.writebacks, u32::from(!skip), "{r:?}");
+    let img = d.read_render_target(OUT, 0, 0, W, H).unwrap();
+    if skip {
+        assert_eq!(r.timings.readback_bytes, 0, "{r:?}");
+        let mut s = Stream::default();
+        s.swap_at(DEST, W, H);
+        let r = run(&mut d, &s, &mut mem);
+        assert_eq!(r.frames.len(), 1, "{r:?}");
+        assert_eq!(r.frames[0].rgba8, detiled(&mem, DEST, W, H, W, 4));
+    }
+    drop(d);
+    // The command streams differ; the resolve destinations must not.
+    let dest = |m: &SliceMemory| m.data[DEST as usize..][..(W * H * 4 + 0x200) as usize].to_vec();
+    assert!(
+        dest(&mem) == dest(&want),
+        "guest memory differs from resolves written back apart"
+    );
+    assert_eq!(img, guest_path(&mem, f));
+    if first.max(second) + W * 32 * 4 < DEST + W * H * 4 {
+        assert!(img.chunks(4).any(|p| p == [0x77; 4]));
+    }
+}
+
+/// Tiles one under the other: the second starts where the first ends.
+#[test]
+fn adjacent_kept_resolves_merge_on_the_gpu() {
+    for skip in [false, true] {
+        merged_resolves_match(DEST, DEST + W * 32 * 4, skip);
+    }
+}
+
+/// The second resolve over the second half of the first.
+#[test]
+fn overlapping_kept_resolves_merge_on_the_gpu() {
+    for skip in [false, true] {
+        merged_resolves_match(DEST, DEST + W * 16 * 4, skip);
+    }
+}
+
+/// The first resolve not block aligned to the merged buffer, so no block
+/// of it is copied whole: its blocks are made from guest memory with its
+/// unwritten bytes copied over.
+#[test]
+fn unaligned_kept_resolves_merge_on_the_gpu() {
+    for skip in [false, true] {
+        merged_resolves_match(DEST + 0x100, DEST, skip);
+    }
 }

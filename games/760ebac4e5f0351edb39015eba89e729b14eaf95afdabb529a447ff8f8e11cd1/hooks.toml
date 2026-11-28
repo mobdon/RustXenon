@@ -8,3 +8,7 @@ frame_present = 0x82a467d8
 gpu_interrupt = 0x82a487b8
 # Waits until the GPU has caught up with the frames already queued.
 frames_in_flight_wait = 0x828bf420
+# Script native: gives a player's character handle (player index, out handle).
+script_player_char = 0x825b6c38
+# Script native: whether a character is in any vehicle (handle -> flag).
+script_in_vehicle = 0x825c2528

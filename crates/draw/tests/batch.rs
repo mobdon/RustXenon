@@ -687,17 +687,19 @@ fn resolve_clears_join_the_next_batch() {
     let img = d.read_render_target(COLOR_KEY, 0, 0, W, H).unwrap();
     assert_eq!(px(&img, W, 10, 10), BLUE);
     assert_eq!(px(&img, W, 40, 40), GREEN);
-    // The copies and clears are recorded in the batch: 4 flushes and
-    // write-backs, where a submit per copy and a flush before each made 7.
+    // The copies and clears are recorded in the batch, and the second
+    // destination, touching the first, joins its kept buffer on the GPU:
+    // a flush and a write-back, where a submit per copy and a flush before
+    // each made 7, and a write-back before the merge 4.
     let t = &report.timings;
-    assert_eq!(t.submits_by_site, [0, 0, 0, 4], "{t:?}");
-    assert_eq!(t.submits, 4, "{t:?}");
+    assert_eq!(t.submits_by_site, [0, 0, 0, 2], "{t:?}");
+    assert_eq!(t.submits, 2, "{t:?}");
 }
 
-/// A resolve copy taken on the CPU (16_16_FLOAT destination) counts its
-/// readback submit as a resolve submit.
+/// A 64bpp resolve copy (16_16_16_16 destination) runs on the GPU: no
+/// readback of its own, so no resolve submit.
 #[test]
-fn cpu_resolve_readback_counts_as_resolve_submit() {
+fn resolve_to_64bpp_takes_no_readback() {
     let Some(mut d) = drawer() else { return };
     let mut mem = memory();
     let wf = W as f32;
@@ -712,14 +714,14 @@ fn cpu_resolve_readback_counts_as_resolve_submit() {
             &mut mem,
             (W, H),
             COPY_RAW,
-            (DEST, W | (H << 16), dest_info(31, 0, false)),
+            (DEST, W | (H << 16), dest_info(26, 0, false)),
             [0; 3],
         );
     let report = run(&mut d, &s, &mut mem);
     assert_eq!((report.draws, report.resolves), (1, 1), "{report:?}");
     let t = &report.timings;
     assert_eq!(t.submits_by_site.iter().sum::<u32>(), t.submits, "{t:?}");
-    assert_eq!(t.submits_by_site[0], 1, "{t:?}");
+    assert_eq!(t.submits_by_site[0], 0, "{t:?}");
 }
 
 /// A texture bind group outlives the replay: the next replay drawing the

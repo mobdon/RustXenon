@@ -91,6 +91,59 @@ fn triangle_interpolates_vertex_colours() {
     assert_eq!(px(&img, W, 33, 63), CLEAR);
 }
 
+/// With pipelines made on worker threads, a draw whose shaders or pipeline
+/// are not made yet is skipped and counted, and the same draw in a replay
+/// after they are made is drawn.
+#[test]
+fn draw_waits_for_its_pipeline_without_stalling() {
+    let Some(mut d) = drawer() else { return };
+    d.async_pipelines = true;
+    let mut mem = memory();
+    let white = [255, 255, 255, 255];
+    mem.write_words(
+        VERTS,
+        &color_verts(&[
+            (-1.0, 1.0, 0.0, white),
+            (1.0, 1.0, 0.0, white),
+            (-1.0, -1.0, 0.0, white),
+        ]),
+    );
+    let half = (W / 2) as f32;
+    let mut s = Stream::default();
+    s.setup()
+        .resolve(&mut mem, W, H, false, Some((rgba(CLEAR), 0)))
+        .regs(PA_CL_VTE_CNTL, &[0x3F | (1 << 10)])
+        .regs(PA_SU_VTX_CNTL, &[0])
+        .regs(
+            PA_CL_VPORT_XSCALE,
+            &[f(half), f(half), f(-half), f(half), f(1.0), f(0.0)],
+        )
+        .shader(false, &vs_color())
+        .shader(true, &ps_interp())
+        .vertex_fetch(0, VERTS, 12)
+        .draw_auto(PRIM_TRI_LIST, 3);
+    let mut waited = 0;
+    for _ in 0..3 {
+        let report = run(&mut d, &s, &mut mem);
+        assert!(report.unsupported.is_empty(), "{report:?}");
+        let img = d.read_render_target(COLOR_KEY, 0, 0, W, H).unwrap();
+        if report.draws == 0 {
+            // Skipped first for the translations, then for the pipeline.
+            assert_eq!(report.timings.draws_waiting, 1, "{report:?}");
+            assert_eq!(px(&img, W, 8, 8), CLEAR);
+            waited += 1;
+            d.wait_pipelines();
+            continue;
+        }
+        assert_eq!(report.timings.draws_waiting, 0, "{report:?}");
+        assert_eq!(px(&img, W, 8, 8), white);
+        assert_eq!(px(&img, W, 60, 40), CLEAR);
+        assert_eq!(waited, 2, "translations, then the pipeline");
+        return;
+    }
+    panic!("never drawn");
+}
+
 /// A triangle strip from a byte-swapped 16-bit index buffer covers the
 /// 32x32 square at the origin.
 #[test]
@@ -606,6 +659,63 @@ fn texture_cache_evicts_past_its_count() {
     assert_eq!(draw(&mut d, &mut mem, 2), (0, 0));
 }
 
+/// With guest memory listing its writes, an eviction drops only the memo
+/// entries of evicted textures: the textures that stay are still found
+/// without hashing their bytes, and an evicted one is read and uploaded again.
+#[test]
+fn eviction_keeps_memo_entries_of_kept_textures() {
+    let Some(mut d) = drawer() else { return };
+    let n = 32u32;
+    d.texture_cache_count = 4;
+    let mut w = Watched {
+        mem: memory(),
+        written: Some(vec![]),
+    };
+    let verts: Vec<u32> = [(0.0, 0.0), (8.0, 0.0), (8.0, 8.0), (0.0, 8.0)]
+        .iter()
+        .flat_map(|&(x, y)| [f(x), f(y), f(0.0), f(0.5), f(0.5)])
+        .collect();
+    w.mem.write_words(VERTS, &verts);
+    let draw = |d: &mut xenon_draw::Drawer, w: &mut Watched, k: u32| {
+        let fetch = [
+            2 | ((n >> 5) << 22) | (1 << 31),
+            6 | (2 << 6) | (TEXTURE + k * 0x1000),
+            (n - 1) | ((n - 1) << 13),
+            ((1 << 3) | (2 << 6) | (3 << 9)) << 1,
+            0,
+            1 << 9,
+        ];
+        let mut s = Stream::default();
+        s.setup()
+            .shader(false, &vs_uv())
+            .shader(true, &ps_texture(1))
+            .vertex_fetch(0, VERTS, 20)
+            .regs(SHADER_CONSTANT_FETCH + 6, &fetch)
+            .draw_auto(PRIM_QUAD_LIST, 4);
+        w.mem.write_words(CMD, &s.0);
+        let mut rec = xenon_gpu::Recorder::new();
+        rec.record_buffer(&w.mem, CMD, s.0.len() as u32).unwrap();
+        let r = d
+            .replay(&rec.commands, w as &mut dyn xenon_draw::GuestMemory)
+            .unwrap();
+        let t = r.timings;
+        (t.textures_uploaded, t.textures_evicted, t.hashed_bytes)
+    };
+    let bytes = u64::from(n * n * 4);
+    for k in 0..4 {
+        assert_eq!(draw(&mut d, &mut w, k), (1, 0, bytes), "texture {k}");
+    }
+    assert_eq!(draw(&mut d, &mut w, 0), (0, 0, 0));
+    // Full: evicts 1, the least recently drawn.
+    assert_eq!(draw(&mut d, &mut w, 4), (1, 1, bytes));
+    // Kept textures: still in the memo, nothing hashed.
+    for k in [0, 2, 3, 4] {
+        assert_eq!(draw(&mut d, &mut w, k), (0, 0, 0), "texture {k}");
+    }
+    // The evicted one is gone from the memo: read and uploaded again.
+    assert_eq!(draw(&mut d, &mut w, 1), (1, 1, bytes));
+}
+
 /// A texture slot without a texture fetch constant, or with a format that
 /// cannot be decoded, samples zeros (Xenia's null image) and the draw still
 /// happens, with one warning per kind.
@@ -931,6 +1041,64 @@ fn late_front_buffer_applies_fetch_constant_0_swizzle() {
     assert_eq!(r.frames[0].rgba8, sync.rgba8);
 }
 
+/// With a window presenting on the GPU, a swap hands over a texture holding
+/// the frame the read-back path gives (swizzle and all) once its batch is
+/// submitted, and reports the frame with no pixels.
+#[test]
+fn present_hands_over_the_frame_on_the_gpu() {
+    let Some(mut d) = drawer() else { return };
+    let mut mem = memory();
+    let mut s = Stream::default();
+    draw_pattern(&mut mem, &mut s);
+    let zyxw = 2 | (1 << 3) | (3 << 9);
+    s.regs(SHADER_CONSTANT_FETCH, &[2, DEST, 0, zyxw << 1, 0, 0])
+        .swap(W, H);
+    let sync = run(&mut d, &s, &mut mem).frames.remove(0);
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let tx = std::sync::Mutex::new(tx);
+    d.present = Some(std::sync::Arc::new(move |t| {
+        let _ = tx.lock().unwrap().send(t);
+    }));
+    for _ in 0..2 {
+        let r = run(&mut d, &s, &mut mem);
+        assert_eq!(r.frames.len(), 1, "{r:?}");
+        let f = &r.frames[0];
+        assert_eq!((f.width, f.height, f.rgba8.len()), (W, H, 0));
+        let tex: wgpu::Texture = rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        assert_eq!((tex.width(), tex.height()), (W, H));
+        let (_, _, device, queue) = d.gpu();
+        let row = (4 * W).next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
+        let buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: u64::from(row * H),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut enc = device.create_command_encoder(&Default::default());
+        enc.copy_texture_to_buffer(
+            tex.as_image_copy(),
+            wgpu::TexelCopyBufferInfo {
+                buffer: &buf,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(row),
+                    rows_per_image: Some(H),
+                },
+            },
+            tex.size(),
+        );
+        queue.submit([enc.finish()]);
+        buf.slice(..).map_async(wgpu::MapMode::Read, |r| r.unwrap());
+        device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+        let got: Vec<u8> = (buf.slice(..).get_mapped_range().unwrap())
+            .chunks(row as usize)
+            .flat_map(|r| r[..4 * W as usize].to_vec())
+            .collect();
+        assert_eq!(got, sync.rgba8);
+    }
+}
+
 /// A frame bundle of two frames, saved and read back, replays to the same
 /// last frame; with that frame's draw skipped, only the clear is left.
 #[test]
@@ -1175,6 +1343,76 @@ fn colour_write_mask() {
     assert_eq!(report.draws, 1, "{report:?}");
     let img = d.read_render_target(COLOR_KEY, 0, 0, W, H).unwrap();
     assert_eq!(px(&img, W, 10, 10), [255, 20, 255, 40]);
+}
+
+/// RB_COLORCONTROL's alpha test discards the pixels whose oC0 alpha fails
+/// against RB_ALPHA_REF, with blending off (alpha-tested cut-out cards draw
+/// opaque black around their shapes without it), and alpha to mask covers
+/// from alpha 0.5.
+#[test]
+fn alpha_test_discards_failing_pixels() {
+    let Some(mut d) = drawer() else { return };
+    let mut mem = memory();
+    let faint = [255, 0, 0, 64];
+    let solid = [0, 255, 0, 200];
+    mem.write_words(
+        VERTS,
+        &[
+            color_verts(&[
+                (0.0, 0.0, 0.0, faint),
+                (32.0, 0.0, 0.0, faint),
+                (0.0, 32.0, 0.0, faint),
+            ]),
+            color_verts(&[
+                (32.0, 32.0, 0.0, solid),
+                (64.0, 32.0, 0.0, solid),
+                (32.0, 64.0, 0.0, solid),
+            ]),
+        ]
+        .concat(),
+    );
+    let draw_both = |s: &mut Stream, colorcontrol: u32| {
+        s.regs(RB_COLORCONTROL, &[colorcontrol])
+            .vertex_fetch(0, VERTS, 12)
+            .draw_auto(PRIM_TRI_LIST, 3)
+            .vertex_fetch(0, VERTS + 48, 12)
+            .draw_auto(PRIM_TRI_LIST, 3);
+    };
+    for (colorcontrol, faint_drawn) in [
+        // Off, then always: both drawn.
+        (0x04, true),
+        (0x0F, true),
+        // Greater than 0.5: only the alpha 200 one.
+        (0x0C, false),
+        // Less than 0.5: only the alpha 64 one.
+        (0x09, true),
+        // Alpha to mask.
+        (0x10, false),
+    ] {
+        let mut s = Stream::default();
+        s.setup()
+            .resolve(&mut mem, W, H, false, Some((rgba(CLEAR), 0)))
+            .shader(false, &vs_color())
+            .shader(true, &ps_interp())
+            .regs(RB_ALPHA_REF, &[f(0.5)]);
+        draw_both(&mut s, colorcontrol);
+        let report = run(&mut d, &s, &mut mem);
+        assert_eq!(report.draws, 2, "{report:?}");
+        let img = d.read_render_target(COLOR_KEY, 0, 0, W, H).unwrap();
+        let want_faint = if faint_drawn { faint } else { CLEAR };
+        let solid_drawn = colorcontrol & 0x0F != 0x09;
+        let want_solid = if solid_drawn { solid } else { CLEAR };
+        assert_eq!(
+            px(&img, W, 4, 4),
+            want_faint,
+            "colorcontrol {colorcontrol:#x}"
+        );
+        assert_eq!(
+            px(&img, W, 36, 36),
+            want_solid,
+            "colorcontrol {colorcontrol:#x}"
+        );
+    }
 }
 
 /// z_write_enable without z_enable writes no depth (Xenia ignores it), so
@@ -1974,6 +2212,154 @@ fn listed_writes_keep_textures_across_replays() {
     // Writes not listed: everything is read again.
     w.written = None;
     assert_eq!(replay(&mut d, &mut w), (len, true, 90));
+}
+
+/// Records `s` from `mem` without replaying it.
+fn record(mem: &mut xenon_gpu::SliceMemory, s: &Stream) -> Vec<xenon_gpu::Command> {
+    mem.write_words(CMD, &s.0);
+    let mut rec = xenon_gpu::Recorder::new();
+    rec.record_buffer(mem, CMD, s.0.len() as u32).unwrap();
+    rec.commands
+}
+
+/// Replays `cmds` over `w`: the report and the colour target.
+fn replay_watched(
+    d: &mut xenon_draw::Drawer,
+    cmds: &[xenon_gpu::Command],
+    w: &mut Watched,
+) -> (xenon_draw::Report, Vec<u8>) {
+    let r = d
+        .replay(cmds, w as &mut dyn xenon_draw::GuestMemory)
+        .unwrap();
+    (r, d.read_render_target(COLOR_KEY, 0, 0, W, H).unwrap())
+}
+
+/// A listed write between a texture's base and its mip page, far apart,
+/// keeps the texture: nothing is read or hashed again. A write in the mip
+/// level still decodes it again.
+#[test]
+fn write_between_levels_keeps_texture() {
+    let Some(mut d) = drawer() else { return };
+    let mut mem = memory();
+    let (red, green, blue) = ([255, 0, 0, 255], [0, 255, 0, 255], [0, 0, 255, 255]);
+    let mip = TEXTURE + 0x8000;
+    solid_level(&mut mem, TEXTURE, 32, red);
+    solid_level(&mut mem, mip, 16, green);
+    let s = mip_stream(&mut mem, TEXTURE, 0, mip);
+    let cmds = record(&mut mem, &s);
+    let mut w = Watched {
+        mem,
+        written: Some(vec![]),
+    };
+    let (r, img) = replay_watched(&mut d, &cmds, &mut w);
+    assert_eq!(r.timings.textures_uploaded, 1, "{r:?}");
+    assert_eq!((px(&img, W, 5, 5), px(&img, W, 44, 4)), (red, green));
+
+    let gap = u64::from(TEXTURE) + 0x3000;
+    w.written = Some(vec![(gap, gap + 0x1000)]);
+    let (r, img) = replay_watched(&mut d, &cmds, &mut w);
+    let t = &r.timings;
+    assert_eq!(
+        (t.hashed_bytes, t.textures_uploaded, t.gap_writes),
+        (0, 0, 1),
+        "{r:?}"
+    );
+    assert_eq!((px(&img, W, 5, 5), px(&img, W, 44, 4)), (red, green));
+
+    solid_level(&mut w.mem, mip, 16, blue);
+    w.written = Some(vec![(u64::from(mip), u64::from(mip) + 0x1000)]);
+    let (r, img) = replay_watched(&mut d, &cmds, &mut w);
+    assert_eq!(r.timings.textures_uploaded, 1, "{r:?}");
+    assert_eq!((px(&img, W, 5, 5), px(&img, W, 44, 4)), (red, blue));
+}
+
+/// A listed write over one page of a four-page texture that leaves its
+/// bytes as they were hashes only that page and draws the texture it had,
+/// which is what a fresh decode draws; a write that changes the page
+/// decodes the texture again, as a fresh drawer does.
+#[test]
+fn unchanged_written_page_is_checked_alone() {
+    let Some(mut d) = drawer() else { return };
+    let n = 64u32;
+    let mut mem = memory();
+    let linear: Vec<u8> = (0..n * n)
+        .flat_map(|i| [(i % 251) as u8, (i / 64) as u8, 7, 255])
+        .collect();
+    let mut tiled = tile::tile_2d(&linear, n, n, n, 4).unwrap();
+    endian::swap_in_place(&mut tiled, xenon_texture::Endian::K8in32);
+    let len = tiled.len() as u64;
+    assert_eq!(len, 0x4000);
+    mem.data[TEXTURE as usize..][..tiled.len()].copy_from_slice(&tiled);
+    let q = n as f32;
+    let verts: Vec<u32> = [
+        (0.0, 0.0, 0.0, 0.0),
+        (q, 0.0, 1.0, 0.0),
+        (q, q, 1.0, 1.0),
+        (0.0, q, 0.0, 1.0),
+    ]
+    .iter()
+    .flat_map(|&(x, y, u, v)| [f(x), f(y), f(0.0), f(u), f(v)])
+    .collect();
+    mem.write_words(VERTS, &verts);
+    let fetch = [
+        2 | (2 << 10) | (2 << 13) | ((n >> 5) << 22) | (1 << 31),
+        6 | (2 << 6) | TEXTURE,
+        (n - 1) | ((n - 1) << 13),
+        ((1 << 3) | (2 << 6) | (3 << 9)) << 1,
+        0,
+        1 << 9,
+    ];
+    let mut s = Stream::default();
+    s.setup()
+        .resolve(&mut mem, W, H, false, Some((rgba(CLEAR), 0)))
+        .shader(false, &vs_uv())
+        .shader(true, &ps_texture(1))
+        .vertex_fetch(0, VERTS, 20)
+        .regs(SHADER_CONSTANT_FETCH + 6, &fetch)
+        .draw_auto(PRIM_QUAD_LIST, 4);
+    let cmds = record(&mut mem, &s);
+    let mut w = Watched {
+        mem,
+        written: Some(vec![]),
+    };
+    let (r, fresh) = replay_watched(&mut d, &cmds, &mut w);
+    assert_eq!(
+        (r.timings.hashed_bytes, r.timings.textures_uploaded),
+        (len, 1)
+    );
+
+    // Page 1 written with the bytes it held.
+    let page = u64::from(TEXTURE) + 0x1000;
+    w.written = Some(vec![(page + 8, page + 12)]);
+    let (r, img) = replay_watched(&mut d, &cmds, &mut w);
+    let t = &r.timings;
+    assert_eq!(
+        (t.hashed_bytes, t.textures_uploaded, t.textures_restored),
+        (0x1000, 0, 1),
+        "{r:?}"
+    );
+    assert!(img == fresh, "restored texture draws as the fresh decode");
+
+    // Page 1 changed: hashed alone, then the whole texture, and decoded.
+    w.mem.data[page as usize..][..0x1000].fill(0x80);
+    w.written = Some(vec![(page, page + 0x1000)]);
+    let (r, img) = replay_watched(&mut d, &cmds, &mut w);
+    let t = &r.timings;
+    assert_eq!(
+        (t.hashed_bytes, t.textures_uploaded, t.textures_restored),
+        (0x1000 + len, 1, 0),
+        "{r:?}"
+    );
+    assert!(img != fresh);
+    drop(d);
+    let Some(mut d) = drawer() else { return };
+    let mut mem = w.mem;
+    let _ = run(&mut d, &s, &mut mem);
+    let again = d.read_render_target(COLOR_KEY, 0, 0, W, H).unwrap();
+    assert!(
+        img == again,
+        "changed texture draws as a fresh drawer's decode"
+    );
 }
 
 /// With guest memory listing its writes, a draw's index buffer is read once

@@ -85,6 +85,12 @@ impl Runtime {
         self.functions.insert(addr, f);
     }
 
+    /// The game function registered at `addr`, ignoring overrides: what a
+    /// hook that wraps it calls.
+    pub fn function(&self, addr: u32) -> Option<GuestFn> {
+        self.functions.get(&addr).copied()
+    }
+
     /// Replaces the function at `addr` with a hook.
     pub fn set_override(&mut self, addr: u32, f: GuestFn) {
         self.overrides.insert(addr, f);
@@ -363,6 +369,10 @@ mod tests {
         rt.set_override(0x8200_0000, add_ten);
         rt.call(&mut c, 0x8200_0000);
         assert_eq!(c.r[3], 11);
+        // The wrapped function stays reachable for the hook.
+        (rt.function(0x8200_0000).unwrap())(&rt, &mut c);
+        assert_eq!(c.r[3], 12);
+        assert!(rt.function(0x8200_0004).is_none());
     }
 
     #[test]

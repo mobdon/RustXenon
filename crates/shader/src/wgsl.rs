@@ -198,7 +198,7 @@ const PRELUDE: &str = "struct Consts {
     loop_consts: array<vec4<u32>, 8>,
     window_base: u32,
     vertex_base: u32,
-    _pad0: u32,
+    alpha_ref: f32,
     _pad1: u32,
     vf_rebase: array<vec4<i32>, 24>,
 }

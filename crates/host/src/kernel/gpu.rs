@@ -25,6 +25,8 @@ pub static WAIT_ON: AtomicU32 = AtomicU32::new(0);
 /// Rounds of the processor loop and interrupts raised.
 pub static ROUNDS: AtomicU32 = AtomicU32::new(0);
 pub static RAISED: AtomicU32 = AtomicU32::new(0);
+/// Vertical blanks so far: the value counter fences write.
+pub static VBLANKS: AtomicU32 = AtomicU32::new(0);
 
 /// GPU (physical) address to guest address, in the 0xA0000000 view.
 pub fn gpu_to_cpu(a: u32) -> u32 {
@@ -161,8 +163,6 @@ pub struct Gpu {
     rec: Recorder,
     /// Processor masks of interrupt packets applied, for the caller to raise.
     pub interrupts: Vec<u32>,
-    /// Vertical blanks so far: the value counter fences write.
-    pub vblanks: u32,
     /// When set, applied commands are also kept here (see [`capture`]).
     pub keep: Option<Vec<Command>>,
     /// The last vertex and pixel shader loads, kept for a frame bundle
@@ -252,6 +252,8 @@ struct DrawStats {
     resolves: u32,
     /// Wall time inside the drawer.
     busy: std::time::Duration,
+    /// The longest replay: where a frame stalled.
+    longest: std::time::Duration,
     /// Taking the written ranges, on the command processor thread.
     watch: std::time::Duration,
     t: xenon_draw::Timings,
@@ -272,6 +274,7 @@ impl DrawStats {
         self.draws += r.draws;
         self.resolves += r.resolves;
         self.busy += busy;
+        self.longest = self.longest.max(busy);
         self.watch += watch;
         self.t += &r.timings;
         let window = since.elapsed();
@@ -316,12 +319,12 @@ impl DrawStats {
             "[draw] {:.1} s: {} frames, {} replays; ms per {per}: drawer {:.0} = shaders {:.0} (state {:.0}, indices {:.0}, targets {:.0}, pipeline {:.0}), \
              guest data {:.0}, textures {:.0}, submit {:.0} (groups {:.1}, pass {:.1}, record {:.1}, queue {:.0}, upload {:.0}; finish {:.0} and submit {:.0} on the submit thread alongside), gpu wait {:.0}, readback {:.0}, \
              resolve cpu {:.0}, clears {:.0}, swap {:.0} (transfers {:.0}), commands {:.1}, edges {:.1}, other {:.1}; of those, creating \
-             pipelines {:.0}; per {per}: {} draws ({} consts reused, {} indices reused, {} texture sets reused = {:.0}%), {} shader loads, \
+             pipelines {:.0} (and {:.0} on worker threads); per {per}: {} draws ({} more skipped waiting for pipelines, {} consts reused, {} indices reused, {} texture sets reused = {:.0}%), {} shader loads, \
              {} resolves, {} submits ({} resolve, {} transfer, {} decode, {} flush/other), {} transfers ({} passes, {} set up), {} render passes, {} write-backs, readback {:.1} MB, \
-             hashed {:.1} MB (kept resolves {:.1} MB), {} textures uploaded ({:.1} MB, {} evicted before), \
+             hashed {:.1} MB (kept resolves {:.1} MB), {} textures uploaded ({:.1} MB, {} evicted before, {:.1} decoded on the gpu), \
              {} evicted, {} from kept resolves, {} pipelines created; guest data {:.1} MB ({} windows reused, {:.1} MB); \
              uploads by format: rgba8 {}, bc {}, f16 {}, f32 {}, other {}; \
-             write watch {:.1} ms per {per} on the gpu thread",
+             write watch {:.1} ms per {per} on the gpu thread;              texture memo: {} re-hashes found the cached texture ({:.1} MB), {} writes only between levels, {} cap hits, {} restored by hashing written pages",
             window.as_secs_f64(),
             self.frames,
             self.replays,
@@ -351,7 +354,9 @@ impl DrawStats {
             ms(t.edges),
             ms(other),
             ms(t.pipeline),
+            ms(t.pipeline_workers),
             self.draws / n,
+            t.draws_waiting / n,
             t.consts_reused / n,
             t.indices_reused / n,
             t.texture_sets_reused / n,
@@ -374,6 +379,7 @@ impl DrawStats {
             t.textures_uploaded / n,
             mb(t.texture_bytes),
             t.textures_reuploaded / n,
+            f64::from(t.textures_gpu_decoded) / f64::from(n),
             t.textures_evicted / n,
             t.textures_kept / n,
             t.pipelines_created / n,
@@ -386,6 +392,14 @@ impl DrawStats {
             by(3),
             by(4),
             ms(self.watch),
+            t.rehash_hits / n,
+            mb(t.rehash_hit_bytes),
+            t.gap_writes / n,
+            t.memo_cap_hits,
+            t.textures_restored / n,
+        ) + &format!(
+            "; longest replay {:.0} ms",
+            self.longest.as_secs_f64() * 1e3
         ) + &if t.passes_timed > 0 {
             format!(
                 "; GPU ms per {per} (timestamps, {} passes): draw {:.1}, clear {:.1}, resolve {:.1}",
@@ -567,7 +581,7 @@ impl Gpu {
             Command::EventWrite(e) => match (e.kind, e.address) {
                 (EventKind::Shader, Some(a)) => {
                     let v = if e.use_counter {
-                        self.vblanks
+                        VBLANKS.load(Ordering::Relaxed)
                     } else {
                         e.value.unwrap_or(0)
                     };
@@ -667,7 +681,11 @@ pub mod capture {
 
     /// Writes the drawer's frame number `n` when it was asked for.
     pub fn frame_done(n: u32, f: &Arc<xenon_draw::Frame>) {
-        if let Some(w) = super::super::input::WINDOW.get() {
+        // A frame with no pixels went to the window on the GPU already.
+        if let Some(w) = super::super::input::WINDOW
+            .get()
+            .filter(|_| !f.rgba8.is_empty())
+        {
             // Shared, not copied: a copy of every frame was 3.7 MB at 720p.
             w.show(f.width, f.height, f.clone());
         }
@@ -909,12 +927,13 @@ pub mod capture {
     /// Render state that places a draw or resolve in EDRAM and on screen,
     /// raw register values in hex: surface, colour targets 0..3, depth,
     /// mode, window offset, window and screen scissors, mode control,
-    /// viewport transform control, depth control and colour mask.
+    /// viewport transform control, depth control, colour mask, colour
+    /// control (alpha test), alpha reference and target 0 blend.
     fn state(regs: &RegisterFile) -> String {
         use xenon_gpu::regs::*;
         let r = |a: u32| regs.get(a);
         format!(
-            "surf {:x} rt {:x} {:x} {:x} {:x} depth {:x} mode {:x} woff {:x} wsc {:x}-{:x} ssc {:x}-{:x} sc_mode {:x} vte {:x} zc {:x} mask {:x}",
+            "surf {:x} rt {:x} {:x} {:x} {:x} depth {:x} mode {:x} woff {:x} wsc {:x}-{:x} ssc {:x}-{:x} sc_mode {:x} vte {:x} zc {:x} mask {:x} cc {:x} aref {:x} blend {:x}",
             r(RB_SURFACE_INFO),
             r(RB_COLOR_INFO_RT[0]),
             r(RB_COLOR_INFO_RT[1]),
@@ -931,6 +950,9 @@ pub mod capture {
             r(PA_CL_VTE_CNTL),
             r(RB_DEPTHCONTROL),
             r(RB_COLOR_MASK),
+            r(RB_COLORCONTROL),
+            r(RB_ALPHA_REF),
+            r(RB_BLENDCONTROL0),
         )
     }
 
@@ -1037,6 +1059,7 @@ mod tests {
         s.t.windows_reused = 900;
         s.t.reused_bytes = 3_000_000;
         s.t.uploads_by_format = [(600, 200_000_000), (40, 8_000_000), (6, 0), (0, 0), (0, 0)];
+        s.t.textures_gpu_decoded = 5;
         let line = s.line(ms(5000));
         assert!(
             line.starts_with("[draw] 5.0 s: 2 frames, 7 replays; ms per frame: drawer 1000 ="),
@@ -1050,17 +1073,19 @@ mod tests {
             // 2000 ms busy less 300 readback, 160 submit, 40 commands and
             // 20 edges, per frame.
             "commands 20.0, edges 10.0, other 740.0;",
-            "1380 draws (300 consts reused, 0 indices reused, 345 texture sets reused = 25%), 5 shader loads,",
+            "1380 draws (0 more skipped waiting for pipelines, 300 consts reused, 0 indices reused, 345 texture sets reused = 25%), 5 shader loads,",
             "6 transfers (30 passes, 0 set up), 250 render passes, 7 write-backs,",
             "readback 40.0 MB",
             "140 submits (44 resolve, 19 transfer, 17 decode, 60 flush/other)",
             "guest data 4.5 MB (450 windows reused, 1.5 MB)",
             "write watch 1.5 ms per frame on the gpu thread",
+            "evicted before, 2.5 decoded on the gpu),",
             "rgba8 300 (100.0 MB), bc 20 (4.0 MB), f16 3 (0.0 MB), f32 0 (0.0 MB), other 0",
         ] {
             assert!(line.contains(part), "{part}: {line}");
         }
         assert!(!line.contains("GPU ms"), "{line}");
+        assert!(line.ends_with("; longest replay 0 ms"), "{line}");
         s.t.passes_timed = 400;
         s.t.gpu_passes = [ms(100), ms(3), ms(9)];
         let line = s.line(ms(5000));

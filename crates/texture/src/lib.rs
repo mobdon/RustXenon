@@ -24,7 +24,10 @@ pub mod tile;
 
 use std::fmt;
 
-pub use convert::{apply_swizzle, apply_swizzle_f32, to_rgba8, to_rgba_f32, to_rgba_f32_signed};
+pub use convert::{
+    apply_swizzle, apply_swizzle_f16, apply_swizzle_f32, to_rgba8, to_rgba_f16, to_rgba_f32,
+    to_rgba_f32_signed,
+};
 pub use endian::Endian;
 pub use fetch::{Dimension, TextureFetch};
 pub use format::{FormatInfo, TextureFormat};
@@ -172,6 +175,15 @@ pub fn decode_base_level_f32(fetch: &TextureFetch, guest_bytes: &[u8]) -> Result
         height,
         rgba,
     })
+}
+
+/// [`decode_base_level_f32`] of a 16-bit float format as halves
+/// ([`to_rgba_f16`]), `width * height * 4` of them.
+pub fn decode_base_level_f16(fetch: &TextureFetch, guest_bytes: &[u8]) -> Result<Vec<u16>, Error> {
+    let linear = linear_base_level(fetch, guest_bytes)?;
+    let mut rgba = to_rgba_f16(fetch.format, &linear, fetch.width(), fetch.height())?;
+    apply_swizzle_f16(&mut rgba, fetch.swizzle);
+    Ok(rgba)
 }
 
 /// Mip level `level` (1 and up) of a 2D mip chain, below its packed tail.

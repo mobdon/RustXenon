@@ -170,7 +170,9 @@ pub mod formats;
 pub mod frame;
 pub mod indices;
 pub mod resolve;
+mod spans;
 pub mod state;
+mod tick;
 
 use std::collections::hash_map::DefaultHasher;
 use std::collections::hash_map::Entry;
@@ -186,6 +188,7 @@ use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use tick::Tick;
 
 use xenon_gpu::regs;
 use xenon_gpu::{
@@ -320,6 +323,12 @@ struct Mirror {
     /// when the arena is replaced, and at the end of a replay for textures
     /// no longer kept.
     groups: HashMap<(wgpu::Texture, usize), wgpu::BindGroup>,
+    /// Decode bind groups reading the buffer, by `decode_pipelines` entry
+    /// and parameters, with the [`Drawer::decode_scratch`] generation they
+    /// write: the same kept resolves are decoded again every frame, and a
+    /// parameter buffer, texel buffer and group each time was a twentieth
+    /// of the draw thread.
+    decodes: HashMap<(usize, [u32; 12]), (u64, wgpu::BindGroup)>,
     /// Colour resolves into the buffer kept at the drawing scale too (see
     /// [`Drawer::sharp_front`]), apart from each other. In the mirror so
     /// that whatever drops the mirror (a CPU write, a failed check, the
@@ -506,6 +515,12 @@ pub struct Timings {
     pub pipeline: Duration,
     /// Counts: pipelines and shader modules created, textures uploaded.
     pub pipelines_created: u32,
+    /// Draws skipped because their shader translation or pipeline was
+    /// still being made on the workers ([`Drawer::async_pipelines`]).
+    pub draws_waiting: u32,
+    /// Worker time spent making the pipelines taken in (not part of any
+    /// drawer phase).
+    pub pipeline_workers: Duration,
     pub textures_uploaded: u32,
     /// Submissions made during the replay. Batch flushes count one each,
     /// though the submit thread may merge queued ones into one
@@ -543,6 +558,9 @@ pub struct Timings {
     /// evicted, and the textures it evicted.
     pub textures_reuploaded: u32,
     pub textures_evicted: u32,
+    /// Of `textures_uploaded`, those decoded on the GPU from their guest
+    /// bytes (detiled, endian swapped and converted there).
+    pub textures_gpu_decoded: u32,
     /// `textures_uploaded` and `texture_bytes` by host format: `Rgba8Unorm`,
     /// BC blocks, `Rgba16Float`, `Rgba32Float`, other.
     pub uploads_by_format: [(u32, u64); 5],
@@ -562,6 +580,19 @@ pub struct Timings {
     /// Draws that bound a texture bind group found by their fetch
     /// constants, without looking each texture up.
     pub texture_sets_reused: u32,
+    /// Texture lookups whose guest bytes, read and hashed again after a
+    /// write dropped their memo entry, found the texture already cached;
+    /// and the bytes they hashed.
+    pub rehash_hits: u32,
+    pub rehash_hit_bytes: u64,
+    /// Texture memo entries a guest write met only between their levels
+    /// (in no level the texture reads).
+    pub gap_writes: u32,
+    /// Replays that found the texture memo at [`TEXTURE_MEMO_CAP`].
+    pub memo_cap_hits: u32,
+    /// Texture lookups whose memo entry a guest write dropped, found
+    /// unchanged by hashing only the written pages of their guest bytes.
+    pub textures_restored: u32,
     /// Render passes begun for draws: each target change or flush ends one.
     pub render_passes: u32,
     /// GPU time measured by timestamps around the batch's draw passes,
@@ -590,6 +621,8 @@ impl std::ops::AddAssign<&Timings> for Timings {
         self.transfer += t.transfer;
         self.pipeline += t.pipeline;
         self.pipelines_created += t.pipelines_created;
+        self.draws_waiting += t.draws_waiting;
+        self.pipeline_workers += t.pipeline_workers;
         self.textures_uploaded += t.textures_uploaded;
         self.submits += t.submits;
         for (a, b) in self.submits_by_site.iter_mut().zip(t.submits_by_site) {
@@ -607,6 +640,7 @@ impl std::ops::AddAssign<&Timings> for Timings {
         self.kept_hashed_bytes += t.kept_hashed_bytes;
         self.textures_reuploaded += t.textures_reuploaded;
         self.textures_evicted += t.textures_evicted;
+        self.textures_gpu_decoded += t.textures_gpu_decoded;
         for (a, b) in self.uploads_by_format.iter_mut().zip(t.uploads_by_format) {
             a.0 += b.0;
             a.1 += b.1;
@@ -617,6 +651,11 @@ impl std::ops::AddAssign<&Timings> for Timings {
         self.indices_reused += t.indices_reused;
         self.texture_groups_reused += t.texture_groups_reused;
         self.texture_sets_reused += t.texture_sets_reused;
+        self.rehash_hits += t.rehash_hits;
+        self.rehash_hit_bytes += t.rehash_hit_bytes;
+        self.gap_writes += t.gap_writes;
+        self.memo_cap_hits += t.memo_cap_hits;
+        self.textures_restored += t.textures_restored;
         self.queue += t.queue;
         self.upload += t.upload;
         for (a, b) in self.submit_parts.iter_mut().zip(t.submit_parts) {
@@ -675,12 +714,21 @@ type SubmitDone = (
 const SPARE_STAGED: usize = 8;
 
 /// Staged bytes to write to `arena` at an offset before the encoders run,
-/// and the encoders.
+/// the encoders, a buffer to map after the submit and what to run after it.
 type SubmitJob = (
     Option<(wgpu::Buffer, u64, Vec<u8>)>,
     Vec<wgpu::CommandEncoder>,
     Option<(wgpu::Buffer, Mapped)>,
+    Option<AfterSubmit>,
 );
+
+/// Run on the submit thread once its batch is submitted.
+type AfterSubmit = Box<dyn FnOnce() + Send>;
+
+/// Takes each frame the drawer made on the GPU (see [`Drawer::present`]),
+/// on the submit thread once the work that writes it is submitted: any
+/// later submission on the drawer's queue sees the whole frame.
+pub type Present = Arc<dyn Fn(wgpu::Texture) + Send + Sync>;
 
 #[derive(Default)]
 struct SubmitState {
@@ -732,8 +780,10 @@ impl Submitter {
                     let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
                     let mut finished = Vec::with_capacity(batch.len());
                     let mut maps = Vec::new();
-                    for (upload, encs, map) in batch {
+                    let mut afters = Vec::new();
+                    for (upload, encs, map, after) in batch {
                         maps.extend(map);
+                        afters.extend(after);
                         let t = Instant::now();
                         let bufs: Vec<wgpu::CommandBuffer> =
                             encs.into_iter().map(|e| e.finish()).collect();
@@ -773,6 +823,9 @@ impl Submitter {
                     belt.finish();
                     let index = queue.submit(cmds);
                     belt.recall();
+                    for after in afters {
+                        after();
+                    }
                     if !maps.is_empty() {
                         for (buf, slot) in maps {
                             map_to(&buf, slot);
@@ -810,6 +863,7 @@ impl Submitter {
         upload: Option<(wgpu::Buffer, u64, Vec<u8>)>,
         encs: Vec<wgpu::CommandEncoder>,
         map: Option<(wgpu::Buffer, Mapped)>,
+        after: Option<AfterSubmit>,
     ) {
         let mut st = self.state.lock().expect("submit state");
         st.pending += 1;
@@ -818,7 +872,7 @@ impl Submitter {
         self.tx
             .as_ref()
             .expect("submit thread")
-            .send((upload, encs, map))
+            .send((upload, encs, map, after))
             .expect("submit thread alive");
     }
 
@@ -1102,6 +1156,22 @@ fn unsupported<T>(why: impl Into<String>) -> Result<T, Skip> {
     Err(Skip::Unsupported(why.into()))
 }
 
+/// resolve.wgsl's `dest_format` code for a colour resolve destination, or
+/// None for one it does not write.
+fn gpu_dest(dest_format: u32) -> Option<u32> {
+    Some(match dest_format {
+        formats::DEST_8_8_8_8 => 0,
+        formats::DEST_2_10_10_10 => 1,
+        formats::DEST_32_FLOAT => 2,
+        formats::DEST_16_16 => 3,
+        formats::DEST_16_16_16_16_FLOAT => 4,
+        formats::DEST_16_16_FLOAT => 5,
+        formats::DEST_16_16_16_16 => 6,
+        formats::DEST_32_32_FLOAT => 7,
+        _ => return None,
+    })
+}
+
 #[derive(Clone)]
 struct Program {
     /// Shared, so a draw takes the loaded programs without copying them.
@@ -1127,7 +1197,8 @@ struct PipelineKey {
     vs_extra: u16,
     vs_variant: Variant,
     ps: u64,
-    /// 1 when the pixel shader's depth export is dropped (no depth target).
+    /// Bit 0 when the pixel shader's depth export is dropped (no depth
+    /// target), then the alpha test bits of [`alpha_extra`].
     ps_extra: u16,
     ps_variant: Variant,
     ps_param_gen: Option<ParamGen>,
@@ -1248,6 +1319,15 @@ type TextureGroupKey = (u32, Vec<(wgpu::TextureView, wgpu::Sampler)>);
 /// each slot's packed fetch filter overrides ([`pack_filters`]).
 type TextureSetKey = (u32, Vec<([u32; 6], u32)>);
 
+/// A [`Drawer::texture_sets`] entry.
+type TextureSet = (
+    wgpu::BindGroup,
+    u64,
+    Arc<AtomicBool>,
+    Vec<([u32; 6], u64)>,
+    u64,
+);
+
 /// A fetch instruction's filter overrides as one word: 0 for none, else
 /// bit 31 with mag, min, mip and aniso in bytes 0 to 3.
 fn pack_filters(f: Option<[u8; 4]>) -> u32 {
@@ -1258,7 +1338,8 @@ fn pack_filters(f: Option<[u8; 4]>) -> u32 {
 type Translation = Result<Arc<Translated>, String>;
 
 /// Key of a shader module: program hash, vertex stage, extra vertex
-/// outputs (pixel stage: 1 when the depth export is dropped), variant and
+/// outputs (pixel stage: bit 0 when the depth export is dropped, then the
+/// alpha test bits of `alpha_extra`), variant and
 /// pixel parameter generation.
 type ModuleKey = (u64, bool, u16, Variant, Option<ParamGen>);
 
@@ -1268,6 +1349,233 @@ fn module_keys(k: &PipelineKey) -> [ModuleKey; 2] {
         (k.vs, true, k.vs_extra, k.vs_variant, None),
         (k.ps, false, k.ps_extra, k.ps_variant, k.ps_param_gen),
     ]
+}
+
+/// Translates shader microcode `words`.
+fn translate_words(words: &[u32], vertex: bool, param_gen: Option<ParamGen>) -> Translation {
+    let s = if vertex {
+        xenon_shader::ShaderStage::Vertex
+    } else {
+        xenon_shader::ShaderStage::Pixel
+    };
+    xenon_shader::translate_with(words, s, param_gen)
+        .map(Arc::new)
+        .map_err(|e| e.to_string())
+}
+
+/// Key of a shader translation: program hash, vertex stage and pixel
+/// parameter generation.
+type TranslationKey = (u64, bool, Option<ParamGen>);
+
+/// A pipeline a worker made, with the shader modules it made for it, its
+/// texture bind group layout and the time it took.
+type Built = (
+    wgpu::RenderPipeline,
+    Vec<(ModuleKey, wgpu::ShaderModule)>,
+    wgpu::BindGroupLayout,
+    Duration,
+);
+
+/// What a pipeline worker sends back.
+enum Made {
+    Translation(TranslationKey, Translation),
+    Pipeline(Box<(PipelineKey, Result<Built, String>)>),
+}
+
+/// Most translations and pipelines queued on the workers at once; a draw
+/// that finds the queue full is skipped and queues its work at a later
+/// replay.
+const COMPILE_QUEUE: usize = 64;
+
+/// A job for the pipeline workers.
+type Job = Box<dyn FnOnce() + Send>;
+
+/// Worker threads that translate shaders and make draw pipelines (wgpu's
+/// device works from any thread), so no replay waits for a driver
+/// compile: see [`Drawer::async_pipelines`].
+struct Compiler {
+    jobs: std::sync::mpsc::Sender<Job>,
+    made: std::sync::mpsc::Sender<Made>,
+    done: std::sync::mpsc::Receiver<Made>,
+    translating: HashSet<TranslationKey>,
+    building: HashSet<PipelineKey>,
+}
+
+impl Compiler {
+    fn start() -> Compiler {
+        let (jobs, rx) = std::sync::mpsc::channel::<Job>();
+        let rx = Arc::new(Mutex::new(rx));
+        // A few threads: a driver compiles one pipeline per thread, and the
+        // guest and drawer threads need the other cores.
+        let n = std::thread::available_parallelism().map_or(2, |n| (n.get() / 4).clamp(1, 4));
+        for _ in 0..n {
+            let rx = rx.clone();
+            let _ = std::thread::Builder::new()
+                .name("pipelines".into())
+                .spawn(move || loop {
+                    // The guard drops at the end of this statement, before
+                    // the job runs.
+                    let job = rx.lock().map(|r| r.recv());
+                    match job {
+                        Ok(Ok(job)) => job(),
+                        _ => return,
+                    }
+                });
+        }
+        let (made, done) = std::sync::mpsc::channel();
+        Compiler {
+            jobs,
+            made,
+            done,
+            translating: HashSet::default(),
+            building: HashSet::default(),
+        }
+    }
+
+    fn full(&self) -> bool {
+        self.translating.len() + self.building.len() >= COMPILE_QUEUE
+    }
+
+    fn queue(&self, job: impl FnOnce() + Send + 'static) {
+        let _ = self.jobs.send(Box::new(job));
+    }
+}
+
+/// Runs `f` inside a validation error scope of this thread (wgpu keeps a
+/// scope stack per thread); a validation error becomes `what: error`.
+fn validated_on<T>(
+    dev: &wgpu::Device,
+    what: &str,
+    f: impl FnOnce(&wgpu::Device) -> T,
+) -> Result<T, String> {
+    let scope = dev.push_error_scope(wgpu::ErrorFilter::Validation);
+    let v = f(dev);
+    match block_on(scope.pop()) {
+        None => Ok(v),
+        Some(e) => Err(format!("{what}: {e}")),
+    }
+}
+
+/// The WGSL of a shader module: translation `t` patched for the module
+/// key's extra outputs and variant.
+fn module_source(
+    vertex: bool,
+    extra: u16,
+    variant: Variant,
+    t: &Translated,
+) -> Result<String, String> {
+    match (vertex, variant) {
+        (true, Variant::RectList) => patch_vertex_wgsl(&t.wgsl, extra)
+            .and_then(|vs| rect_list_wgsl(&vs, t.info.interpolators_written | extra)),
+        (true, _) => patch_vertex_wgsl(&t.wgsl, extra),
+        (false, _) if extra & 1 != 0 => drop_depth_wgsl(&t.wgsl),
+        (false, _) => Ok(t.wgsl.clone()),
+    }
+    .and_then(|src| match vertex {
+        false if extra >> 1 != 0 => alpha_test_wgsl(&src, extra),
+        _ => Ok(src),
+    })
+    .and_then(|src| match variant {
+        Variant::Output(c) if !vertex => {
+            c.iter().enumerate().try_fold(src, |ps, (rt, c)| match c {
+                Some((rgb, a, bias, k)) => output_pixel_wgsl(
+                    &ps,
+                    rt,
+                    *bias,
+                    f32::from_bits(*rgb),
+                    f32::from_bits(*a),
+                    f32::from_bits(*k),
+                ),
+                None => Ok(ps),
+            })
+        }
+        _ => Ok(src),
+    })
+}
+
+fn create_module(
+    dev: &wgpu::Device,
+    vertex: bool,
+    src: String,
+) -> Result<wgpu::ShaderModule, String> {
+    validated_on(dev, "shader module", |d| {
+        d.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some(if vertex { "vertex" } else { "pixel" }),
+            source: wgpu::ShaderSource::Wgsl(src.into()),
+        })
+    })
+}
+
+/// Makes the draw pipeline of `k` from its shader modules, at drawing
+/// scale `scale`.
+fn draw_pipeline(
+    dev: &wgpu::Device,
+    k: &PipelineKey,
+    layout: &wgpu::PipelineLayout,
+    vs_mod: &wgpu::ShaderModule,
+    ps_mod: &wgpu::ShaderModule,
+    scale: u32,
+    cache: Option<&wgpu::PipelineCache>,
+) -> Result<wgpu::RenderPipeline, String> {
+    let topology = k.topology;
+    let strip = matches!(
+        topology,
+        wgpu::PrimitiveTopology::TriangleStrip | wgpu::PrimitiveTopology::LineStrip
+    );
+    // Only a pixel shader with parameter generation declares xe_scale; at
+    // scale 1 its default holds.
+    let scale = [("xe_scale", f64::from(scale))];
+    let ps_constants: &[(&str, f64)] = if k.ps_param_gen.is_some() && scale[0].1 != 1.0 {
+        &scale
+    } else {
+        &[]
+    };
+    validated_on(dev, "render pipeline", |dev| {
+        dev.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("draw"),
+            layout: Some(layout),
+            vertex: wgpu::VertexState {
+                module: vs_mod,
+                entry_point: Some("vs_main"),
+                compilation_options: Default::default(),
+                buffers: &[],
+            },
+            primitive: wgpu::PrimitiveState {
+                topology,
+                strip_index_format: strip.then_some(wgpu::IndexFormat::Uint32),
+                front_face: k.cull.0,
+                cull_mode: k.cull.1,
+                ..Default::default()
+            },
+            depth_stencil: k.depth.clone().map(|(format, write, compare, st)| {
+                wgpu::DepthStencilState {
+                    format,
+                    depth_write_enabled: Some(write),
+                    depth_compare: Some(compare),
+                    stencil: st.unwrap_or_default(),
+                    bias: Default::default(),
+                }
+            }),
+            multisample: Default::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: ps_mod,
+                entry_point: Some("ps_main"),
+                compilation_options: wgpu::PipelineCompilationOptions {
+                    constants: ps_constants,
+                    ..Default::default()
+                },
+                targets: &k.color.map(|c| {
+                    c.map(|(format, blend, write_mask)| wgpu::ColorTargetState {
+                        format,
+                        blend,
+                        write_mask,
+                    })
+                }),
+            }),
+            multiview_mask: None,
+            cache,
+        })
+    })
 }
 
 /// `blend` as the pipeline needs it with colour write mask `mask`: a
@@ -1437,8 +1745,12 @@ pub struct Drawer {
     regs: RegisterFile,
     vs: Option<Program>,
     ps: Option<Program>,
+    /// The programs loaded last for each stage (vertex, pixel), newest
+    /// last: a frame loads the same few thousands of times, and copying
+    /// and hashing each load again was a twentieth of the draw thread.
+    recent_programs: [Vec<Program>; 2],
     /// Shared, so a draw takes a translation without copying its WGSL.
-    translated: HashMap<(u64, bool, Option<ParamGen>), Translation>,
+    translated: HashMap<TranslationKey, Translation>,
     /// Keyed by program hash, stage, extra vertex outputs, variant (the
     /// rectangle list wrapper or the pixel output bias and clamp) and pixel parameter
     /// generation.
@@ -1483,6 +1795,9 @@ pub struct Drawer {
     /// replay that last used them, for least recently used eviction.
     texture_cache: HashMap<([u32; 6], u64), (wgpu::TextureView, u64, u64)>,
     texture_cache_bytes: u64,
+    /// The hash last uploaded for each decode key in `texture_cache`, so a
+    /// new upload of the key drops the entry it replaces.
+    texture_latest: HashMap<[u32; 6], u64>,
     /// Hashes of keys evicted from `texture_cache`, to count uploads of a
     /// texture the cache held before (cache too small) apart from new ones.
     texture_evicted: HashSet<u64>,
@@ -1495,11 +1810,21 @@ pub struct Drawer {
     /// the entries whose range they write, so later draws skip reading and
     /// hashing the guest bytes of the others. Cleared at each replay, unless
     /// guest memory lists the pages the CPU wrote between replays
-    /// ([`GuestMemory::take_written`]): then only those entries go.
-    texture_memo: HashMap<[u32; 6], TextureMemo>,
+    /// ([`GuestMemory::take_written`]): then only those entries go (a write
+    /// between the levels of a texture keeps it), and past
+    /// [`TEXTURE_MEMO_CAP`] the least recently used half.
+    texture_memo: spans::SpanMap<TextureMemo>,
+    /// Memo entries a guest write dropped, with the indices of their
+    /// [`TextureMemo::pages`] the writes met since: the next lookup hashes
+    /// only those pages, and if they still match, takes the entry back
+    /// without reading and hashing the whole texture. (A write often leaves
+    /// the bytes as they were: the CPU rewrites a page around a texture.)
+    texture_suspect: spans::SpanMap<(TextureMemo, Vec<u32>)>,
     /// Guest texture bytes are read into this buffer, kept across lookups:
     /// a fresh one per texture costs zeroing and page faults every frame.
     texture_scratch: Vec<u8>,
+    /// The memo keys a write may meet, kept across writes.
+    memo_near: Vec<spans::Key>,
     samplers: HashMap<SamplerKey, wgpu::Sampler>,
     /// Draws recorded but not yet submitted (see [`Batch`]).
     batch: Option<Batch>,
@@ -1507,17 +1832,18 @@ pub struct Drawer {
     /// samplers, with the replay that last bound each. Kept across flushes
     /// and replays (a new texture has a new view, so a stale entry never
     /// matches); at the end of a replay those not bound in it or the one
-    /// before go, and all go when textures are evicted and past
-    /// [`TEXTURE_GROUP_CAP`], so they keep dropped textures alive no longer
-    /// than that. (Cleared at every replay's end, a frame made its
+    /// before go, those binding a texture go when it is evicted, and all go
+    /// past [`TEXTURE_GROUP_CAP`], so they keep dropped textures alive no
+    /// longer than that. (Cleared at every replay's end, a frame made its
     /// thousands again: a tenth of the draw thread.)
     texture_groups: HashMap<TextureGroupKey, (wgpu::BindGroup, u64)>,
     /// A draw's texture bind group by its slot mask and the fetch constants
     /// of those slots, with the [`Drawer::texture_memo_epoch`] it was found
-    /// in and a flag that stays set while the memo keeps its textures: a
+    /// in, a flag that stays set while the memo keeps its textures, and its
+    /// textures' cache keys with the replay that last marked them used: a
     /// later draw with the same constants binds it without looking each
     /// texture up again.
-    texture_sets: HashMap<TextureSetKey, (wgpu::BindGroup, u64, Arc<AtomicBool>)>,
+    texture_sets: HashMap<TextureSetKey, TextureSet>,
     /// The flags of the sets each fetch constant is in: a guest write that
     /// drops the constant's memo entry clears them, so only the sets using
     /// that texture go (dropping them all made a third of draws miss).
@@ -1561,12 +1887,18 @@ pub struct Drawer {
     /// holds another, so `hi` grows with `lo` and the one window that can
     /// hold a range is the last starting at or before it.
     window_memo: BTreeMap<u64, (u64, (u64, u64))>,
+    /// At least the length of every window in `window_memo`, so a write
+    /// looks only at the windows starting at most this far before it.
+    window_memo_span: u64,
     /// Host indices of guest index buffers read this replay or, with
     /// guest writes listed, an earlier one: guest `lo`, `hi` and the
     /// indices. Dropped with the textures (see `forget_guest`).
     index_memo: HashMap<IndexKey, (u64, u64, Arc<HostIndices>)>,
     /// Bytes of the indices `index_memo` holds, counted as they go in.
     index_memo_bytes: usize,
+    /// A guest range holding every `index_memo` entry's, so most writes
+    /// skip visiting them all.
+    index_memo_span: (u64, u64),
     /// See [`Drawer::transfer_setup`].
     transfer_setups: HashMap<(RenderTargetKey, u32, RenderTargetKey, u32), Arc<TransferSetup>>,
     /// The last `Consts` block staged in the arena, as prefix and suffix,
@@ -1628,8 +1960,13 @@ pub struct Drawer {
     half_luts: HashMap<(TargetFormat, i32), Option<Vec<[u16; 2]>>>,
     /// Resolve destinations kept on the GPU, disjoint and not adjacent.
     mirrors: Vec<Mirror>,
-    /// Entry points decode_8888 and decode_float of resolve.wgsl.
-    decode_pipelines: [Option<wgpu::ComputePipeline>; 2],
+    /// Entry points decode_8888 and decode_float of resolve.wgsl and
+    /// detile_bc of texture.wgsl.
+    decode_pipelines: [Option<wgpu::ComputePipeline>; 3],
+    /// The texel buffer kept resolves are decoded into before the copy to
+    /// their texture, shared by all of them (wgpu orders the uses), and its
+    /// generation, new each time it grows.
+    decode_scratch: Option<(wgpu::Buffer, u64)>,
     /// Leave resolve results on the GPU at the end of a replay instead of
     /// writing them to guest memory (default false). The drawer still writes
     /// them back before it reads those bytes itself (a texture it cannot
@@ -1643,6 +1980,15 @@ pub struct Drawer {
     /// `XENON_RESOLVE_WRITEBACK=skip` turns it on at [`Drawer::new`]; the
     /// host turns it on unless that variable is `on` or `late`.
     pub skip_resolve_writeback: bool,
+    /// Translate shaders and make draw pipelines on worker threads: a
+    /// draw whose pipeline is not made yet is skipped (counted in
+    /// [`Timings::draws_waiting`]) and drawn from a later replay on, so no
+    /// frame waits for a driver compile. Off, each is made on the spot.
+    /// The host turns it on unless `XENON_ASYNC_PIPELINES` is `0`.
+    pub async_pipelines: bool,
+    compiler: Option<Compiler>,
+    /// Pipelines the workers failed to make, and why.
+    pipeline_errors: HashMap<PipelineKey, String>,
     /// Queue the end-of-replay write-back of kept resolves without waiting
     /// for it, and write it to guest memory when the next replay starts:
     /// the CPU sees resolve output one frame late, in exchange for no GPU
@@ -1665,7 +2011,19 @@ pub struct Drawer {
     /// The late front buffer copy the next flush's batch writes, for the
     /// submit thread to ask to map after it submits that batch.
     map_after: Option<(wgpu::Buffer, Mapped)>,
+    /// What the submit thread runs after the next flush's batch: handing
+    /// [`Drawer::present`] the frame it writes.
+    after_submit: Option<AfterSubmit>,
     front_rows: Option<wgpu::Buffer>,
+    /// Where a window shows frames from the GPU: when set, a swap whose
+    /// front buffer a kept resolve holds decodes it into one of
+    /// [`Drawer::front_textures`] and hands that over instead of reading
+    /// it back, and its [`Frame`] in the report has no pixels. The window
+    /// presents from the drawer's own device (see [`Drawer::gpu`]).
+    pub present: Option<Present>,
+    /// The textures frames for [`Drawer::present`] are decoded into, in
+    /// turn, so the one a window still shows is not the one being written.
+    front_textures: Vec<wgpu::Texture>,
     /// At a [`Drawer::scale`] above 1, keep each 32bpp colour resolve at
     /// the drawing scale too and make a swap's frame from the
     /// copy that holds its whole front buffer, unchanged since: the frame
@@ -1690,7 +2048,7 @@ pub struct Drawer {
     decode_in_batch: bool,
     late: Option<(Vec<Vec<Option<u64>>>, WriteBack)>,
     /// Bytes of decoded guest textures the texture cache keeps before
-    /// evicting the least recently used ones (default 256 MiB).
+    /// evicting the least recently used ones (default 512 MiB).
     pub texture_cache_limit: u64,
     /// Decoded guest textures the texture cache keeps however small
     /// (default [`TEXTURE_CACHE_COUNT`]).
@@ -1699,6 +2057,10 @@ pub struct Drawer {
     /// (default: whether the adapter has BC textures). Turning it on
     /// without them makes those uploads fail.
     pub bc_textures: bool,
+    /// Decode guest textures that [`gpu_plan`] takes on the GPU from their
+    /// raw guest bytes instead of on the CPU (default on;
+    /// `XENON_GPU_TEXTURE_DECODE=0` turns it off at [`Drawer::new`]).
+    pub gpu_texture_decode: bool,
     /// Diagnostic: report a warning line per distinct texture a draw
     /// samples (see [`texture_log_line`]): for every pixel shader when
     /// `Some(None)`, for the pixel shader of that program hash when
@@ -1728,6 +2090,8 @@ pub struct Drawer {
     /// Host pixels per guest pixel on each axis of every render target
     /// (see [`Drawer::set_scale`]).
     scale: u32,
+    /// The adapter the device was made on, for a window's surface.
+    gpu_adapter: wgpu::Adapter,
     /// Last, so it drops after the device and every resource made from it.
     instance: wgpu::Instance,
 }
@@ -1818,8 +2182,8 @@ const ARENA_WATCHED: u64 = 256 << 20;
 const STAGED_RESERVE: u64 = 64 << 20;
 
 /// Time since `t`, restarting `t`.
-fn lap(t: &mut Instant) -> Duration {
-    let now = Instant::now();
+fn lap(t: &mut Tick) -> Duration {
+    let now = Tick::now();
     let d = now - *t;
     *t = now;
     d
@@ -1833,7 +2197,7 @@ const PART_SAMPLE: u32 = 32;
 
 /// Adds the spans between consecutive `marks` to `parts`, scaled by
 /// [`PART_SAMPLE`] as only one draw in that many is timed.
-fn add_sampled(parts: &mut [Duration], marks: &[Instant]) {
+fn add_sampled<T: Copy + std::ops::Sub<Output = Duration>>(parts: &mut [Duration], marks: &[T]) {
     for (p, w) in parts.iter_mut().zip(marks.windows(2)) {
         *p += (w[1] - w[0]) * PART_SAMPLE;
     }
@@ -1843,12 +2207,12 @@ fn add_sampled(parts: &mut [Duration], marks: &[Instant]) {
 /// which time their own phases) and the upkeep after every command, with
 /// clock reads only at the edges of the timed ones: a run of plain
 /// commands costs no read of its own.
-struct PlainTimer<F: FnMut() -> Instant> {
+struct PlainTimer<T, F: FnMut() -> T> {
     now: F,
-    mark: Instant,
+    mark: T,
 }
 
-impl<F: FnMut() -> Instant> PlainTimer<F> {
+impl<T: Copy + std::ops::Sub<Output = Duration>, F: FnMut() -> T> PlainTimer<T, F> {
     fn new(mut now: F) -> Self {
         let mark = now();
         Self { now, mark }
@@ -1871,6 +2235,26 @@ impl<F: FnMut() -> Instant> PlainTimer<F> {
 fn block_on<F: std::future::Future>(f: F) -> F::Output {
     pollster::block_on(f)
 }
+
+/// The program of `words`: one of `recent` when it holds them, else a new
+/// one, which joins `recent` (at most [`RECENT_PROGRAMS`], oldest out).
+fn recent_program(recent: &mut Vec<Program>, words: &[u32]) -> Program {
+    if let Some(p) = recent.iter().rev().find(|p| *p.words == *words) {
+        return p.clone();
+    }
+    let p = Program {
+        hash: hash_words(words),
+        words: words.into(),
+    };
+    if recent.len() >= RECENT_PROGRAMS {
+        recent.remove(0);
+    }
+    recent.push(p.clone());
+    p
+}
+
+/// Programs per stage [`recent_program`] keeps.
+const RECENT_PROGRAMS: usize = 32;
 
 fn hash_words(words: &[u32]) -> u64 {
     let mut h = DefaultHasher::new();
@@ -2012,18 +2396,120 @@ const INDEX_MEMO_BYTES: usize = 32 << 20;
 /// ranges are staged apart, so the gap between them is not uploaded.
 const WINDOW_GAP: u64 = 4096;
 
-/// A [`Drawer::texture_memo`] entry: view, guest range, cache key.
-type TextureMemo = (wgpu::TextureView, u64, u64, Option<([u32; 6], u64)>);
+/// A [`Drawer::texture_memo`] entry.
+struct TextureMemo {
+    view: wgpu::TextureView,
+    /// The physical guest range `[lo, hi)` spanning `levels`.
+    span: (u64, u64),
+    /// The physical guest ranges the texture was read from, one per level.
+    levels: Vec<(u64, u64)>,
+    /// The `texture_cache` key (none for kept-resolve decodes).
+    key: Option<([u32; 6], u64)>,
+    /// `[lo, hi)` and [`hash_bytes`] of each piece of the levels within
+    /// one guest page, which together make the key's hash ([`page_hashes`]);
+    /// empty unless they cover every level.
+    pages: Vec<(u64, u64, u64)>,
+    /// The replay that last looked it up.
+    used: u64,
+}
+
+impl TextureMemo {
+    fn new(
+        view: wgpu::TextureView,
+        levels: Vec<(u64, u64)>,
+        key: Option<([u32; 6], u64)>,
+        pages: Vec<(u64, u64, u64)>,
+        used: u64,
+    ) -> Self {
+        let span = (levels.iter().copied())
+            .reduce(|a, b| (a.0.min(b.0), a.1.max(b.1)))
+            .unwrap_or_default();
+        let paged: u64 = pages.iter().map(|p| p.1 - p.0).sum();
+        let covered = paged == levels.iter().map(|&(a, b)| b - a).sum::<u64>();
+        Self {
+            view,
+            span,
+            levels,
+            key,
+            pages: if covered { pages } else { Vec::new() },
+            used,
+        }
+    }
+}
+
+impl spans::Spanned for TextureMemo {
+    fn span(&self) -> (u64, u64) {
+        self.span
+    }
+}
+
+impl spans::Spanned for (TextureMemo, Vec<u32>) {
+    fn span(&self) -> (u64, u64) {
+        self.0.span
+    }
+}
+
+/// Splits each `(guest address, offset in bytes, length)` segment of
+/// `bytes` at guest page boundaries and hashes each piece: the pieces for
+/// [`TextureMemo::pages`] and a hash of their hashes for the cache key.
+fn page_hashes(
+    bytes: &[u8],
+    segments: impl Iterator<Item = (u64, usize, usize)>,
+) -> (Vec<(u64, u64, u64)>, u64) {
+    let mut pages = Vec::new();
+    let mut all = Vec::new();
+    for (addr, at, len) in segments {
+        let end = addr + len as u64;
+        let mut lo = addr;
+        while lo < end {
+            let hi = ((lo | (TEXTURE_PAGE - 1)) + 1).min(end);
+            let off = at + (lo - addr) as usize;
+            let h = hash_bytes(&bytes[off..off + (hi - lo) as usize]);
+            pages.push((lo, hi, h));
+            all.extend_from_slice(&h.to_le_bytes());
+            lo = hi;
+        }
+    }
+    (pages, hash_bytes(&all))
+}
+
+/// The last-used replay at or below which entries go so that at most
+/// `keep` of those with `ages` stay (fewer on ties); `None` when no more
+/// than `keep` are there.
+fn trim_cut(mut ages: Vec<u64>, keep: usize) -> Option<u64> {
+    let i = ages.len().checked_sub(keep + 1)?;
+    Some(*ages.select_nth_unstable(i).1)
+}
+
+/// The guest page size [`TextureMemo::pages`] split at: the write watch's.
+const TEXTURE_PAGE: u64 = 4096;
+
+/// Pushes the indices of the pages of `m` that meet `ranges` to `dirty`.
+fn dirty_pages(m: &TextureMemo, ranges: &[(u64, u64)], dirty: &mut Vec<u32>) {
+    let met = (m.pages.iter().enumerate()).filter(|(_, p)| meets(ranges, p.0, p.1));
+    dirty.extend(met.map(|(i, _)| i as u32));
+}
+
+/// Whether the pages `dirty` lists (sorted and deduplicated here) hold over
+/// half the bytes of `m`'s pages: a suspect entry is then looked up whole.
+fn dirty_over_half(m: &TextureMemo, dirty: &mut Vec<u32>) -> bool {
+    dirty.sort_unstable();
+    dirty.dedup();
+    let len = |i: &u32| m.pages[*i as usize].1 - m.pages[*i as usize].0;
+    let total: u64 = m.pages.iter().map(|p| p.1 - p.0).sum();
+    dirty.iter().map(len).sum::<u64>() * 2 > total
+}
 
 /// Entries [`Drawer::texture_memo`] holds before it starts over.
 const TEXTURE_MEMO_CAP: usize = 1 << 14;
 
-/// Cached textures are dropped wholesale past this many bytes.
-const TEXTURE_CACHE_LIMIT: u64 = 256 << 20;
+/// Cached textures past this many bytes are evicted, least recently used
+/// first. Host memory, not guest: modest for small GPUs and lavapipe.
+const TEXTURE_CACHE_LIMIT: u64 = 512 << 20;
 
 /// Cached textures past this many are dropped too: small ones each cost a
 /// texture and view in the driver however few bytes they hold.
-const TEXTURE_CACHE_COUNT: usize = 2048;
+const TEXTURE_CACHE_COUNT: usize = 8192;
 
 fn to_bytes(words: &[u32]) -> Vec<u8> {
     let mut out = Vec::with_capacity(4 * words.len());
@@ -2033,9 +2519,9 @@ fn to_bytes(words: &[u32]) -> Vec<u8> {
     out
 }
 
-/// A built `Consts` block prefix ([`consts_prefix`]), shared by the draws
-/// that bind it.
-type ConstsBlock = Arc<Vec<u8>>;
+/// A built `Consts` block prefix ([`consts_prefix`]), held by value: a heap
+/// block per draw was a twentieth of the draw thread.
+type ConstsBlock = [u32; CONSTS_PREFIX];
 
 /// Registers of one stage's 256 float constants (4 each): the vertex
 /// stage's, then the pixel stage's.
@@ -2054,11 +2540,17 @@ fn float_consts(r: &regs::RegisterFile, stage: u32, mask: &[u64; 4], out: &mut [
         regs::SHADER_CONSTANT_FLOAT + FLOAT_STAGE_REGS * stage,
         FLOAT_STAGE_REGS,
     );
-    let read = (0..256).filter(|i| mask[i / 64] >> (i % 64) & 1 != 0);
+    // The set bits only, not a test of all 256 per draw.
+    let read = (0..4).flat_map(|w| {
+        let mut m = mask[w];
+        std::iter::from_fn(move || {
+            let b = m.trailing_zeros() as usize;
+            m &= m.wrapping_sub(1);
+            (b < 64).then_some(64 * w + b)
+        })
+    });
     for (o, i) in out.chunks_exact_mut(16).zip(read) {
-        for (o, w) in o.chunks_exact_mut(4).zip(&all[4 * i..4 * i + 4]) {
-            o.copy_from_slice(&w.to_le_bytes());
-        }
+        words_into(&all[4 * i..4 * i + 4], o);
     }
 }
 
@@ -2077,36 +2569,42 @@ const CONSTS_REGS: [std::ops::Range<u32>; 3] = [
 ];
 
 /// Words of a `Consts` block's suffix: the window base, the index offset,
-/// two of padding and the 96 rebase words.
+/// RB_ALPHA_REF (the alpha test reference, f32 bits), one word of padding
+/// and the 96 rebase words.
 const CONSTS_SUFFIX: usize = 4 + 96;
 
 /// Bytes of a `Consts` block: its prefix (see [`consts_prefix`]) and suffix.
-const CONSTS_BYTES: usize = 4 * (192 + 8 + 32) + 4 * CONSTS_SUFFIX;
+const CONSTS_BYTES: usize = 4 * CONSTS_PREFIX + 4 * CONSTS_SUFFIX;
+
+/// Words of a `Consts` block's prefix: fetch, bool and loop constants.
+const CONSTS_PREFIX: usize = 192 + 8 + 32;
 
 /// The `Consts` uniform of the shader binding contract is this prefix, the
 /// fetch, bool and loop constants, which only register writes change, then
 /// [`consts_suffix`]. (The float constants are bound apart, a span for
 /// each stage: see [`FLOAT_STAGE_REGS`].)
-fn consts_prefix(r: &regs::RegisterFile) -> Vec<u8> {
+fn consts_prefix(r: &regs::RegisterFile) -> ConstsBlock {
     // Bool and loop constants are adjacent.
     const _: () = assert!(regs::SHADER_CONSTANT_BOOL + 8 == regs::SHADER_CONSTANT_LOOP);
-    let fetch = r.slice(regs::SHADER_CONSTANT_FETCH, 192);
-    let bool_loop = r.slice(regs::SHADER_CONSTANT_BOOL, 8 + 32);
-    let mut b = vec![0; 4 * (fetch.len() + bool_loop.len())];
-    words_into(fetch, &mut b);
-    words_into(bool_loop, &mut b[4 * fetch.len()..]);
+    let mut b = [0; CONSTS_PREFIX];
+    b[..192].copy_from_slice(r.slice(regs::SHADER_CONSTANT_FETCH, 192));
+    b[192..].copy_from_slice(r.slice(regs::SHADER_CONSTANT_BOOL, 8 + 32));
     b
 }
 
 /// The rest of a `Consts` block, which each draw's window sets: the window
-/// base, the index offset and the 96 vertex fetch constants' rebase words.
+/// base, the index offset, the alpha test reference and the 96 vertex fetch constants' rebase words.
 fn consts_suffix(
     r: &regs::RegisterFile,
     window_base: u32,
     rebase: &[i32; 96],
 ) -> [u32; CONSTS_SUFFIX] {
     let mut s = [0; CONSTS_SUFFIX];
-    s[..2].copy_from_slice(&[window_base, r.get(regs::VGT_INDX_OFFSET)]);
+    s[..3].copy_from_slice(&[
+        window_base,
+        r.get(regs::VGT_INDX_OFFSET),
+        r.get(regs::RB_ALPHA_REF),
+    ]);
     for (o, &w) in s[4..].iter_mut().zip(rebase) {
         *o = w as u32;
     }
@@ -2266,6 +2764,56 @@ fn output_pixel_wgsl(
         &format!("    out.c{rt} = vec4<f32>({rgb}, {a}){scaled};\n"),
         1,
     ))
+}
+
+/// The pixel module extra bits of RB_COLORCONTROL's alpha test and alpha to
+/// mask, as Xenia applies them: only to a shader that writes oC0, on its
+/// alpha before the exponent bias. Bit 1: alpha test on, bits 2..5: its
+/// `xenos::CompareFunction`; bit 5: alpha to mask. (Bit 0 is the dropped
+/// depth export.)
+fn alpha_extra(colorcontrol: u32, writes_c0: bool) -> u16 {
+    if !writes_c0 {
+        return 0;
+    }
+    let func = colorcontrol & 7;
+    let test = colorcontrol & 8 != 0 && func != 7;
+    let mask = colorcontrol & 0x10 != 0;
+    (if test { 2 | (func as u16) << 2 } else { 0 }) | if mask { 1 << 5 } else { 0 }
+}
+
+/// A translated pixel shader that discards the pixels failing the alpha
+/// test and alpha to mask of `extra` (see [`alpha_extra`]), compared with
+/// `consts.alpha_ref`.
+fn alpha_test_wgsl(ps: &str, extra: u16) -> Result<String, String> {
+    const STORE: &str = "    out.c0 = o_col[0];
+";
+    if !ps.contains(STORE) {
+        return Err("pixel shader colour output 0 not recognised".into());
+    }
+    let mut test = String::new();
+    if extra & 2 != 0 {
+        let pass = match (extra >> 2) & 7 {
+            0 => "false",
+            1 => "o_col[0].w < consts.alpha_ref",
+            2 => "o_col[0].w == consts.alpha_ref",
+            3 => "o_col[0].w <= consts.alpha_ref",
+            4 => "o_col[0].w > consts.alpha_ref",
+            5 => "o_col[0].w != consts.alpha_ref",
+            _ => "o_col[0].w >= consts.alpha_ref",
+        };
+        test += &format!(
+            "    if !({pass}) {{ discard; }}
+"
+        );
+    }
+    if extra & (1 << 5) != 0 {
+        // shortcut: alpha to mask on a single-sampled target covers the
+        // pixel from alpha 0.5, without the guest's 2x2 dither offsets
+        // (RB_COLORCONTROL bits 24..32); add them if cut-outs look jagged.
+        test += "    if !(o_col[0].w >= 0.5) { discard; }
+";
+    }
+    Ok(ps.replacen(STORE, &(test + STORE), 1))
 }
 
 /// A translated pixel shader without its oDepth output, for a pass with no
@@ -2611,6 +3159,7 @@ impl Drawer {
             .create_view(&Default::default());
         let submitter = Submitter::new(device.clone(), queue.clone());
         let mut d = Drawer {
+            gpu_adapter: adapter.clone(),
             instance,
             device,
             queue,
@@ -2634,6 +3183,7 @@ impl Drawer {
             regs: RegisterFile::default(),
             vs: None,
             ps: None,
+            recent_programs: Default::default(),
             translated: HashMap::default(),
             modules: HashMap::default(),
             pipelines: HashMap::default(),
@@ -2658,10 +3208,13 @@ impl Drawer {
             resolved_endian: HashMap::default(),
             texture_cache: HashMap::default(),
             texture_cache_bytes: 0,
+            texture_latest: HashMap::default(),
             texture_evicted: HashSet::default(),
             replays: 0,
-            texture_memo: HashMap::default(),
+            texture_memo: Default::default(),
+            texture_suspect: Default::default(),
             texture_scratch: Vec::new(),
+            memo_near: Vec::new(),
             samplers: HashMap::default(),
             batch: None,
             texture_groups: HashMap::default(),
@@ -2675,8 +3228,10 @@ impl Drawer {
             staged: Vec::new(),
             arena: None,
             window_memo: BTreeMap::new(),
+            window_memo_span: 0,
             index_memo: HashMap::default(),
             index_memo_bytes: 0,
+            index_memo_span: (u64::MAX, 0),
             transfer_setups: HashMap::default(),
             staged_consts: None,
             arena_epoch: 1,
@@ -2713,14 +3268,21 @@ impl Drawer {
             snorm16_blend,
             half_luts: HashMap::default(),
             mirrors: Vec::new(),
-            decode_pipelines: [None, None],
+            decode_pipelines: [None, None, None],
+            decode_scratch: None,
+            async_pipelines: false,
+            compiler: None,
+            pipeline_errors: HashMap::default(),
             skip_resolve_writeback: std::env::var("XENON_RESOLVE_WRITEBACK").as_deref() == Ok("skip"),
             late_writeback: std::env::var("XENON_RESOLVE_WRITEBACK").as_deref() == Ok("late"),
             late_front_buffer: std::env::var("XENON_LATE_FRAME").as_deref() == Ok("1"),
             late_front: None,
             front_spare: None,
             map_after: None,
+            after_submit: None,
             front_rows: None,
+            present: None,
+            front_textures: Vec::new(),
             sharp_front: false,
             scaled_clock: 0,
             sharp_frames: [0; 4],
@@ -2729,6 +3291,7 @@ impl Drawer {
             texture_cache_limit: TEXTURE_CACHE_LIMIT,
             texture_cache_count: TEXTURE_CACHE_COUNT,
             bc_textures: required_features.contains(wgpu::Features::TEXTURE_COMPRESSION_BC),
+            gpu_texture_decode: std::env::var("XENON_GPU_TEXTURE_DECODE").as_deref() != Ok("0"),
             texture_log: std::env::var("XENON_TEXTURE_LOG")
                 .ok()
                 .and_then(|v| match v.trim() {
@@ -3119,6 +3682,100 @@ impl Drawer {
         self.drop_pipelines();
     }
 
+    /// The host format and texels of each level (none for levels left as
+    /// zeros) that the guest path uploads for fetch constant `constant`
+    /// from its guest bytes `bytes` (the base's when it reads the base,
+    /// then each mip level's), read back from the GPU, with 32-bit float
+    /// textures filterable or not (`float32`); and whether the GPU decoded
+    /// them ([`Drawer::gpu_texture_decode`]). For tests.
+    #[doc(hidden)]
+    #[allow(clippy::type_complexity)]
+    pub fn decode_guest_texture(
+        &mut self,
+        constant: [u32; 6],
+        bytes: &[u8],
+        float32: bool,
+    ) -> Result<(wgpu::TextureFormat, Vec<Option<Vec<u8>>>, bool), String> {
+        let fetch = xenon_texture::TextureFetch::decode(constant);
+        let base = reads_base(&fetch);
+        let base_len = match base {
+            true => xenon_texture::bytes_needed(&fetch).map_err(|e| e.to_string())?,
+            false => 0,
+        };
+        // As Drawer::texture_from splits them.
+        let mut mips = Vec::new();
+        let mut at = base_len;
+        for m in xenon_texture::mip_fetches(&fetch) {
+            let Some((a, b)) = level_range(&m) else { break };
+            let len = (b - a) as usize;
+            if bytes.len() < at + len {
+                break;
+            }
+            mips.push((m, at, len));
+            at += len;
+        }
+        let keep = std::mem::replace(&mut self.float32_filterable, float32);
+        let decoded = self.decode_levels(&fetch, bytes, base, base_len, &mips);
+        self.float32_filterable = keep;
+        let (host, levels, gpu) = decoded?;
+        let tex = self.upload_levels(host, bytes, &levels, wgpu::TextureUsages::COPY_SRC)?;
+        let mut enc = (self.pre.take())
+            .unwrap_or_else(|| self.device.create_command_encoder(&Default::default()));
+        let (bw, bh) = host.block_dimensions();
+        let block = host.block_copy_size(None).unwrap_or(4);
+        let mut reads = Vec::new();
+        for (level, (w, h, texels)) in levels.iter().enumerate() {
+            if texels.is_none() {
+                reads.push(None);
+                continue;
+            }
+            let (row, rows) = (w.div_ceil(bw) * block, h.div_ceil(bh));
+            let padded = row.next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
+            let buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("texture readback"),
+                size: u64::from(padded) * u64::from(rows),
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            });
+            enc.copy_texture_to_buffer(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &tex,
+                    mip_level: level as u32,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::TexelCopyBufferInfo {
+                    buffer: &buf,
+                    layout: wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(padded),
+                        rows_per_image: Some(rows),
+                    },
+                },
+                wgpu::Extent3d {
+                    width: *w,
+                    height: *h,
+                    depth_or_array_layers: 1,
+                },
+            );
+            reads.push(Some((buf, row, padded)));
+        }
+        let index = self.submit_now([enc.finish()]);
+        self.check_uncaptured().map_err(|e| e.to_string())?;
+        let mut out = Vec::new();
+        for read in reads {
+            out.push(match read {
+                None => None,
+                Some((buf, row, padded)) => {
+                    let data = (self.map_read(&buf, index.clone())).map_err(|e| e.to_string())?;
+                    let rows = data.chunks(padded as usize);
+                    Some(rows.flat_map(|r| &r[..row as usize]).copied().collect())
+                }
+            });
+        }
+        Ok((host, out, gpu))
+    }
+
     /// Drops the least recently used draw pipelines past the cap, and the
     /// shader modules and translations no kept pipeline uses.
     fn drop_pipelines(&mut self) {
@@ -3180,7 +3837,14 @@ impl Drawer {
         let start = Instant::now();
         let was_watching = self.watching;
         match mem.take_written() {
-            Some(written) if self.texture_memo.len() < TEXTURE_MEMO_CAP => {
+            Some(written) => {
+                if self.texture_memo.len() >= TEXTURE_MEMO_CAP {
+                    self.timings.memo_cap_hits += 1;
+                    self.trim_texture_memo();
+                }
+                if self.texture_suspect.len() >= TEXTURE_MEMO_CAP {
+                    self.texture_suspect.clear();
+                }
                 self.watching = true;
                 if was_watching {
                     // Kept resolve blocks hashed against guest memory stay
@@ -3199,12 +3863,14 @@ impl Drawer {
                     self.uncheck(lo, hi);
                 }
             }
-            _ => {
+            None => {
                 self.watching = false;
                 self.texture_memo.clear();
+                self.texture_suspect.clear();
                 self.texture_memo_epoch += 1;
                 self.index_memo.clear();
                 self.index_memo_bytes = 0;
+                self.index_memo_span = (u64::MAX, 0);
                 // Windows staged by a watched replay: anything may have
                 // changed since.
                 self.wrap();
@@ -3237,6 +3903,11 @@ impl Drawer {
         let t = Instant::now();
         let replay = self.replays;
         (self.texture_groups).retain(|_, &mut (_, used)| used + 1 >= replay);
+        // A set a guest write invalidated still holds its old views (a resolve
+        // rewritten each frame is a new texture each frame): free them now.
+        let epoch = self.texture_memo_epoch;
+        (self.texture_sets)
+            .retain(|_, (_, e, kept, ..)| *e == epoch && kept.load(Ordering::Relaxed));
         self.timings.edges += t.elapsed();
         if !self.watching || done.is_err() {
             self.wrap();
@@ -3273,7 +3944,7 @@ impl Drawer {
         // Two clock reads per draw, resolve and swap, none for the commands
         // between them: a run of those is charged once, before the next
         // timed command (and at the end).
-        let mut clock = PlainTimer::new(Instant::now);
+        let mut clock = PlainTimer::new(Tick::now);
         for c in commands {
             let mem = &mut *tracked;
             // Draws, resolves and swaps time their own phases; the rest,
@@ -3312,10 +3983,10 @@ impl Drawer {
                         ));
                     }
                     self.timings.shader_loads += 1;
-                    let p = Some(Program {
-                        hash: hash_words(words),
-                        words: words.as_slice().into(),
-                    });
+                    let p = Some(recent_program(
+                        &mut self.recent_programs[usize::from(*stage == ShaderStage::Pixel)],
+                        words,
+                    ));
                     match stage {
                         ShaderStage::Vertex => self.vs = p,
                         ShaderStage::Pixel => self.ps = p,
@@ -3402,24 +4073,73 @@ impl Drawer {
         if ranges.is_empty() {
             return;
         }
+        let mut near = std::mem::take(&mut self.memo_near);
+        near.clear();
+        self.texture_memo.meeting(ranges, &mut near);
         let mut gone = Vec::new();
-        self.texture_memo.retain(|c, &mut (_, a, b, _)| {
-            let keep = !meets(ranges, a, b);
-            if !keep {
-                gone.push(*c);
+        for c in &near {
+            let m = &self.texture_memo[c];
+            if !meets(ranges, m.span.0, m.span.1) {
+                continue;
             }
-            keep
+            // Levels can lie far apart: a write between them changes none.
+            if !m.levels.iter().any(|&(a, b)| meets(ranges, a, b)) {
+                self.timings.gap_writes += 1;
+                continue;
+            }
+            gone.push(*c);
+        }
+        near.clear();
+        self.texture_suspect.meeting(ranges, &mut near);
+        near.retain(|c| {
+            let (m, dirty) = self.texture_suspect.get_mut(c).expect("indexed");
+            if !meets(ranges, m.span.0, m.span.1) {
+                return false;
+            }
+            dirty_pages(m, ranges, dirty);
+            // Past half written the entry can never be restored: dropped
+            // now, it no longer costs every later write.
+            dirty_over_half(m, dirty)
         });
-        // The sets that used those textures; the others stay bound.
+        for c in &near {
+            self.texture_suspect.remove(c);
+        }
+        self.memo_near = near;
         for c in gone {
+            // The sets that used those textures; the others stay bound.
             for flag in self.texture_set_flags.remove(&c).into_iter().flatten() {
                 flag.store(false, Ordering::Relaxed);
             }
+            let m = self.texture_memo.remove(&c).expect("listed above");
+            if m.key.is_some() && !m.pages.is_empty() {
+                let mut dirty = Vec::new();
+                dirty_pages(&m, ranges, &mut dirty);
+                self.texture_suspect.insert(c, (m, dirty));
+            }
         }
-        self.window_memo
-            .retain(|&a, &mut (b, _)| !meets(ranges, a, b));
-        self.index_memo
-            .retain(|_, &mut (a, b, _)| !meets(ranges, a, b));
+        // A few writes (a resolve's, a MEM_WRITE's) look up the windows
+        // they can meet instead of visiting all of them each time.
+        if ranges.len() < 16 {
+            let span = self.window_memo_span;
+            let mut met = Vec::new();
+            for &(lo, hi) in ranges {
+                met.extend(
+                    (self.window_memo.range(lo.saturating_sub(span)..hi))
+                        .filter(|&(_, &(b, _))| lo < b)
+                        .map(|(&a, _)| a),
+                );
+            }
+            for a in met {
+                self.window_memo.remove(&a);
+            }
+        } else {
+            self.window_memo
+                .retain(|&a, &mut (b, _)| !meets(ranges, a, b));
+        }
+        if meets(ranges, self.index_memo_span.0, self.index_memo_span.1) {
+            self.index_memo
+                .retain(|_, &mut (a, b, _)| !meets(ranges, a, b));
+        }
     }
 
     /// Marks the kept resolve blocks over `[lo, hi)` unchecked: guest
@@ -3445,6 +4165,39 @@ impl Drawer {
     /// it (in `skip_resolve_writeback` mode with its unwritten pixels, as
     /// the CPU wrote after them).
     fn verify(&mut self, i: usize, mem: &Tracked, lo: u64, hi: u64) -> bool {
+        let ok = self.matches(i, mem, lo, hi);
+        if !ok {
+            self.mirrors.remove(i);
+        }
+        ok
+    }
+
+    /// [`Self::verify`] that loses no unwritten resolve pixels: on a
+    /// mismatch it writes back the buffer's dirty ranges (which a texture
+    /// read or a later resolve may not cover) and returns false without the
+    /// drop, which the next check makes.
+    fn verify_read(
+        &mut self,
+        i: usize,
+        mem: &mut Tracked,
+        lo: u64,
+        hi: u64,
+    ) -> Result<bool, Error> {
+        let (m_lo, m_hi, dirty) = {
+            let m = &self.mirrors[i];
+            (m.lo, m.hi, !m.dirty.is_empty())
+        };
+        if !self.skip_resolve_writeback && dirty && !self.matches(i, mem, lo, hi) {
+            self.sync(mem, m_lo, m_hi)?;
+            return Ok(false);
+        }
+        Ok(self.verify(i, mem, lo, hi))
+    }
+
+    /// Whether the blocks of kept resolve `i` over `[lo, hi)` match guest
+    /// memory, marking those that do checked; [`Self::verify`] without the
+    /// drop.
+    fn matches(&mut self, i: usize, mem: &Tracked, lo: u64, hi: u64) -> bool {
         let (m_lo, m_hi) = (self.mirrors[i].lo, self.mirrors[i].hi);
         let k0 = (lo.max(m_lo) - m_lo) / KEPT_BLOCK;
         let k1 = (hi.min(m_hi) - m_lo).div_ceil(KEPT_BLOCK);
@@ -3458,7 +4211,6 @@ impl Drawer {
                 .read_bytes(a as u32, (b - a) as usize)
                 .map(|b| self.block_hash(&b));
             if now.is_none() || now != self.mirrors[i].hashes[k] {
-                self.mirrors.remove(i);
                 return false;
             }
             self.mirrors[i].checked[k] = true;
@@ -3575,7 +4327,7 @@ impl Drawer {
     ) -> Result<(), Error> {
         let now = before.as_ref().map(|_| self.guest_hashes(mem, &w));
         let (index, copies) = w;
-        let mut t = Instant::now();
+        let mut t = Tick::now();
         let mut first = true;
         for (k, (m_lo, dirty, spans, buf)) in copies.into_iter().enumerate() {
             if let (Some(before), Some(now)) = (&before, &now) {
@@ -3642,12 +4394,21 @@ impl Drawer {
     }
 
     /// Index of the kept resolve buffer holding `[lo, hi)`, which a resolve
-    /// is about to write, made from guest memory if there is none. Kept buffers it overlaps or touches are
-    /// written back and merged into it, so a texture over several resolves
-    /// (tiles, one under the other) is in one buffer.
-    fn mirror(&mut self, mem: &mut Tracked, lo: u64, hi: u64) -> Result<Option<usize>, Error> {
+    /// is about to write (`resolve`) or a texture to read, made from guest
+    /// memory if there is none. Kept buffers it overlaps or touches are
+    /// merged into it, so a texture over several resolves (tiles, one under
+    /// the other) is in one buffer: on the GPU when they can be
+    /// ([`Self::merge_on_gpu`]), else written back and made again from
+    /// guest memory.
+    fn mirror(
+        &mut self,
+        mem: &mut Tracked,
+        lo: u64,
+        hi: u64,
+        resolve: bool,
+    ) -> Result<Option<usize>, Error> {
         if let Some(i) = self.mirrors.iter().position(|m| m.lo <= lo && hi <= m.hi) {
-            if self.verify(i, mem, lo, hi) {
+            if self.verify_read(i, mem, lo, hi)? {
                 return Ok(Some(i));
             }
         }
@@ -3664,6 +4425,15 @@ impl Drawer {
         // dropped, not the least recently used; track use if a capture
         // keeps more than 256 MB of resolve destinations.
         let all = total + (b - a) > MIRROR_LIMIT;
+        // With write-back, the blocks the resolve covers are hashed when
+        // it writes them back.
+        let skip = self.skip_resolve_writeback;
+        let covers = move |s: u64, e: u64| resolve && !skip && lo <= s && e <= hi;
+        if !all {
+            if let Some(i) = self.merge_on_gpu(mem, a, b, covers)? {
+                return Ok(Some(i));
+            }
+        }
         let (sa, sb) = if all { (0, u64::MAX) } else { (a, b) };
         // Those touching [sa, sb) too.
         self.sync(mem, sa.saturating_sub(1), sb.saturating_add(1))?;
@@ -3699,13 +4469,12 @@ impl Drawer {
         let Some(bytes) = mem.read_bytes(a as u32, (b - a) as usize) else {
             return Ok(None);
         };
-        // With write-back, the blocks the resolve covers are hashed when
-        // it writes them back.
-        let covers = |k: u64| {
-            let s = a + k * KEPT_BLOCK;
-            !self.skip_resolve_writeback && lo <= s && (s + KEPT_BLOCK).min(b) <= hi
-        };
-        let covered: Vec<bool> = (0..(b - a).div_ceil(KEPT_BLOCK)).map(covers).collect();
+        let covered: Vec<bool> = (0..(b - a).div_ceil(KEPT_BLOCK))
+            .map(|k| {
+                let s = a + k * KEPT_BLOCK;
+                covers(s, (s + KEPT_BLOCK).min(b))
+            })
+            .collect();
         let hashes = bytes
             .chunks(KEPT_BLOCK as usize)
             .zip(&covered)
@@ -3726,6 +4495,178 @@ impl Drawer {
             checked,
             views: HashMap::default(),
             groups: HashMap::default(),
+            decodes: HashMap::default(),
+            scaled,
+        });
+        Ok(Some(self.mirrors.len() - 1))
+    }
+
+    /// [`Self::mirror`]'s merge into one kept buffer over `[a, b)` done on
+    /// the GPU: the kept buffers inside it are copied into the new one,
+    /// with their unwritten bytes, hashes and scaled copies, and only the
+    /// bytes between them are read from guest memory, so there is no GPU
+    /// wait, readback or hash of the whole range. `None` (nothing changed)
+    /// when it cannot: a kept buffer reaches past `[a, b)`, no longer
+    /// matches guest memory, or is not word aligned, or guest memory is
+    /// not readable; then the caller writes back and merges from guest
+    /// memory. `covers(s, e)`: the block `[s, e)` is hashed at write-back.
+    fn merge_on_gpu(
+        &mut self,
+        mem: &mut Tracked,
+        a: u64,
+        b: u64,
+        covers: impl Fn(u64, u64) -> bool,
+    ) -> Result<Option<usize>, Error> {
+        let parts: Vec<usize> = (0..self.mirrors.len())
+            .filter(|&i| self.mirrors[i].lo < b && a < self.mirrors[i].hi)
+            .collect();
+        let word = |x: u64| x.is_multiple_of(4);
+        if parts.is_empty() || !word(a) {
+            return Ok(None);
+        }
+        for &i in &parts {
+            let m = &self.mirrors[i];
+            let (l, h) = (m.lo, m.hi);
+            let aligned = word(l) && word(h) && m.dirty.iter().all(|&(x, y)| word(x) && word(y));
+            // Copied as they are, so they must hold what guest memory
+            // holds (or will, once written back); hashes only the blocks
+            // not checked this replay.
+            if l < a || b < h || !aligned || !self.matches(i, mem, l, h) {
+                return Ok(None);
+            }
+        }
+        // Each new block that is exactly a block of a kept buffer keeps its
+        // bytes and hash; the others are made from guest memory now (their
+        // unwritten bytes copied over after), as a hash of guest memory
+        // must be of the bytes the buffer holds.
+        let blocks = (b - a).div_ceil(KEPT_BLOCK) as usize;
+        let mut from: Vec<Option<(usize, usize)>> = vec![None; blocks];
+        for (p, &i) in parts.iter().enumerate() {
+            let m = &self.mirrors[i];
+            if !(m.lo - a).is_multiple_of(KEPT_BLOCK) {
+                continue;
+            }
+            for j in 0..m.hashes.len() {
+                let s = m.lo + j as u64 * KEPT_BLOCK;
+                if (s + KEPT_BLOCK).min(m.hi) == (s + KEPT_BLOCK).min(b) {
+                    from[((s - a) / KEPT_BLOCK) as usize] = Some((p, j));
+                }
+            }
+        }
+        let span = |k: usize| {
+            let s = a + k as u64 * KEPT_BLOCK;
+            (s, (s + KEPT_BLOCK).min(b))
+        };
+        // Runs of blocks made from guest memory, with their bytes.
+        let mut guest: Vec<(u64, u64, Vec<u8>)> = Vec::new();
+        let mut k = 0;
+        while k < blocks {
+            if from[k].is_some() {
+                k += 1;
+                continue;
+            }
+            let start = k;
+            while k < blocks && from[k].is_none() {
+                k += 1;
+            }
+            let (s, e) = (span(start).0, span(k - 1).1);
+            let Some(bytes) = mem.read_bytes(s as u32, (e - s) as usize) else {
+                return Ok(None);
+            };
+            guest.push((s, e, bytes));
+        }
+        // (part, source offset, destination offset, bytes) of each copy:
+        // the runs of kept blocks, and the unwritten bytes in the blocks
+        // made from guest memory.
+        let mut copies: Vec<(usize, u64, u64, u64)> = Vec::new();
+        for (k, f) in from.iter().enumerate() {
+            let &Some((p, _)) = f else { continue };
+            let (s, e) = span(k);
+            let m_lo = self.mirrors[parts[p]].lo;
+            match copies.last_mut() {
+                Some(c) if c.0 == p && c.2 + c.3 == s - a => c.3 += e - s,
+                _ => copies.push((p, s - m_lo, s - a, e - s)),
+            }
+        }
+        for (p, &i) in parts.iter().enumerate() {
+            let m = &self.mirrors[i];
+            for &(x, y) in &m.dirty {
+                for &(s, e, _) in &guest {
+                    let (x, y) = (x.max(s), y.min(e));
+                    if x < y {
+                        copies.push((p, x - m.lo, x - a, y - x));
+                    }
+                }
+            }
+        }
+        let mut hashes = vec![None; blocks];
+        let mut checked = vec![true; blocks];
+        for (k, f) in from.iter().enumerate() {
+            if let &Some((p, j)) = f {
+                let m = &self.mirrors[parts[p]];
+                (hashes[k], checked[k]) = (m.hashes[j], m.checked[j]);
+            }
+        }
+        let size = (b - a).max(4).next_multiple_of(4);
+        let buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("kept resolve"),
+            size,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_SRC
+                | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        for (s, e, mut bytes) in guest {
+            let k0 = ((s - a) / KEPT_BLOCK) as usize;
+            for (k, block) in (k0..).zip(bytes.chunks(KEPT_BLOCK as usize)) {
+                let (bs, be) = span(k);
+                if !covers(bs, be) {
+                    hashes[k] = Some(self.block_hash(block));
+                }
+            }
+            bytes.resize((e - s).next_multiple_of(4) as usize, 0);
+            // Staged writes land at the next submit, before the batch the
+            // copies over them are in.
+            self.queue.write_buffer(&buf, s - a, &bytes);
+        }
+        let device = &self.device;
+        let batch = self.batch.get_or_insert_with(|| Batch {
+            pass: None,
+            enc: device.create_command_encoder(&Default::default()),
+        });
+        batch.pass = None;
+        for &(p, src, dst, len) in &copies {
+            let old = &self.mirrors[parts[p]].buf;
+            batch.enc.copy_buffer_to_buffer(old, src, &buf, dst, len);
+        }
+        // The batch now writes a kept buffer: decodes from it go after.
+        self.resolve_pending = true;
+        let mut dirty: Vec<(u64, u64)> = Vec::new();
+        let mut scaled = Vec::new();
+        for &i in parts.iter().rev() {
+            let m = self.mirrors.remove(i);
+            dirty.extend(m.dirty);
+            scaled.extend(m.scaled);
+        }
+        dirty.sort_unstable();
+        // Apart and not touching, as a resolve keeps them.
+        let mut merged: Vec<(u64, u64)> = Vec::new();
+        for (x, y) in dirty {
+            match merged.last_mut() {
+                Some(l) if x <= l.1 => l.1 = l.1.max(y),
+                _ => merged.push((x, y)),
+            }
+        }
+        self.mirrors.push(Mirror {
+            lo: a,
+            hi: b,
+            buf,
+            dirty: merged,
+            hashes,
+            checked,
+            views: HashMap::default(),
+            groups: HashMap::default(),
+            decodes: HashMap::default(),
             scaled,
         });
         Ok(Some(self.mirrors.len() - 1))
@@ -3788,7 +4729,12 @@ impl Drawer {
                 b.enc
             }))
             .collect();
-        self.submitter.send(upload, encs, self.map_after.take());
+        self.submitter.send(
+            upload,
+            encs,
+            self.map_after.take(),
+            self.after_submit.take(),
+        );
         self.submitted(site);
         // One reading for both, so `queue` never exceeds `submit`.
         let e = t.elapsed();
@@ -3864,6 +4810,7 @@ impl Drawer {
         self.staged.clear();
         self.staged_base = 0;
         self.window_memo.clear();
+        self.window_memo_span = 0;
         self.staged_consts = None;
         self.staged_floats = [None; 2];
     }
@@ -4015,10 +4962,17 @@ impl Drawer {
                     store: wgpu::StoreOp::Store,
                 }
             }
-            let color_views = color
-                .each_ref()
-                .map(|t| t.as_ref().map(|t| t.create_view(&Default::default())));
-            let depth_view = depth.map(|t| (t.format(), t.create_view(&Default::default())));
+            // Kept per target texture: a view made per pass was a thirtieth
+            // of the draw thread on busy frames.
+            #[allow(clippy::mutable_key_type)]
+            let views = &mut self.target_views;
+            let mut view = |t: &wgpu::Texture| {
+                (views.entry(t.clone()))
+                    .or_insert_with(|| t.create_view(&Default::default()))
+                    .clone()
+            };
+            let color_views = color.each_ref().map(|t| t.as_ref().map(&mut view));
+            let depth_view = depth.map(|t| (t.format(), view(t)));
             self.timings.render_passes += 1;
             let timestamp_writes = GpuClock::render(&mut self.gpu_clock, 0);
             let pass = batch
@@ -4052,7 +5006,11 @@ impl Drawer {
 
     fn check_uncaptured(&self) -> Result<(), Error> {
         use std::sync::atomic::Ordering;
-        if !self.uncaptured_any.swap(false, Ordering::Acquire) {
+        // A plain load first: this runs after every command, and a swap's
+        // locked exchange each time was a fortieth of the draw thread.
+        if !self.uncaptured_any.load(Ordering::Relaxed)
+            || !self.uncaptured_any.swap(false, Ordering::Acquire)
+        {
             return Ok(());
         }
         let mut v = self
@@ -4821,28 +5779,41 @@ impl Drawer {
         }
     }
 
+    /// The translation of `p`, or None while a worker makes it (with
+    /// [`Drawer::async_pipelines`]).
     fn translate(
         &mut self,
         p: &Program,
         stage: ShaderStage,
         param_gen: Option<ParamGen>,
-    ) -> Result<Arc<Translated>, Skip> {
+    ) -> Result<Option<Arc<Translated>>, Skip> {
         let vertex = stage == ShaderStage::Vertex;
-        let t = self
-            .translated
-            .entry((p.hash, vertex, param_gen))
-            .or_insert_with(|| {
-                let s = if vertex {
-                    xenon_shader::ShaderStage::Vertex
-                } else {
-                    xenon_shader::ShaderStage::Pixel
-                };
-                xenon_shader::translate_with(&p.words, s, param_gen)
-                    .map(Arc::new)
-                    .map_err(|e| e.to_string())
-            });
+        let key = (p.hash, vertex, param_gen);
+        if !self.translated.contains_key(&key) && self.async_pipelines {
+            self.take_made();
+            if !self.translated.contains_key(&key) {
+                let c = self.compiler();
+                if !c.translating.contains(&key) && !c.full() {
+                    c.translating.insert(key);
+                    let (words, made) = (p.words.clone(), c.made.clone());
+                    c.queue(move || {
+                        // A panic becomes an error, so the key is not left
+                        // queued forever and its draws are reported.
+                        let t = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            translate_words(&words, vertex, param_gen)
+                        }))
+                        .unwrap_or_else(|_| Err("shader translation panicked".into()));
+                        let _ = made.send(Made::Translation(key, t));
+                    });
+                }
+                return Ok(None);
+            }
+        }
+        let t = (self.translated)
+            .entry(key)
+            .or_insert_with(|| translate_words(&p.words, vertex, param_gen));
         match t {
-            Ok(t) => Ok(t.clone()),
+            Ok(t) => Ok(Some(t.clone())),
             Err(e) => unsupported(format!(
                 "{} shader: {e}",
                 if vertex { "vertex" } else { "pixel" }
@@ -4850,15 +5821,111 @@ impl Drawer {
         }
     }
 
+    /// The pipeline workers, started at first use.
+    fn compiler(&mut self) -> &mut Compiler {
+        self.compiler.get_or_insert_with(Compiler::start)
+    }
+
+    /// Takes in what the pipeline workers finished, without waiting.
+    fn take_made(&mut self) {
+        while let Some(m) = self.compiler.as_ref().and_then(|c| c.done.try_recv().ok()) {
+            self.take(m);
+        }
+    }
+
+    fn take(&mut self, m: Made) {
+        let Some(c) = &mut self.compiler else { return };
+        match m {
+            Made::Translation(key, t) => {
+                c.translating.remove(&key);
+                self.translated.insert(key, t);
+            }
+            Made::Pipeline(b) => {
+                let (key, r) = *b;
+                c.building.remove(&key);
+                match r {
+                    Ok((p, modules, g1, took)) => {
+                        for (k, m) in modules {
+                            self.modules.entry(k).or_insert(m);
+                        }
+                        self.timings.pipeline_workers += took;
+                        self.timings.pipelines_created += 1;
+                        if let Some(c) = &mut self.disk_cache {
+                            c.unsaved += 1;
+                        }
+                        self.pipelines.insert(key, (p, self.pipeline_uses, g1));
+                        self.drop_pipelines();
+                    }
+                    Err(e) => {
+                        if self.pipeline_errors.len() >= PIPELINE_CAP {
+                            self.pipeline_errors.clear();
+                        }
+                        self.pipeline_errors.insert(key, e);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Queues pipeline `key` (and the shader modules it lacks) on the
+    /// workers, unless it is queued already or the queue is full.
+    fn queue_pipeline(&mut self, key: PipelineKey, vs_t: Arc<Translated>, ps_t: Arc<Translated>) {
+        if self.compiler().building.contains(&key) || self.compiler().full() {
+            return;
+        }
+        let keys = module_keys(&key);
+        let have = keys.map(|k| self.modules.get(&k).cloned());
+        let (g1, layout) = self.texture_layout(key.textures);
+        let (dev, scale) = (self.device.clone(), self.scale);
+        let cache = self.pipeline_cache().cloned();
+        let c = self.compiler();
+        c.building.insert(key.clone());
+        let made = c.made.clone();
+        c.queue(move || {
+            let t0 = Instant::now();
+            let mut new = Vec::new();
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                [(&have[0], &vs_t), (&have[1], &ps_t)]
+                    .into_iter()
+                    .zip(keys)
+                    .map(|((m, t), k)| match m {
+                        Some(m) => Ok(m.clone()),
+                        None => {
+                            let m = module_source(k.1, k.2, k.3, t)
+                                .and_then(|src| create_module(&dev, k.1, src))?;
+                            new.push((k, m.clone()));
+                            Ok(m)
+                        }
+                    })
+                    .collect::<Result<Vec<_>, String>>()
+                    .and_then(|m| {
+                        draw_pipeline(&dev, &key, &layout, &m[0], &m[1], scale, cache.as_ref())
+                    })
+                    .map(|p| (p, new, g1, t0.elapsed()))
+            }))
+            .unwrap_or_else(|_| Err("pipeline creation panicked".into()));
+            let _ = made.send(Made::Pipeline(Box::new((key, r))));
+        });
+    }
+
+    /// Waits until the pipeline workers have finished everything queued
+    /// and takes it in; tests use it to make the next replay draw what the
+    /// last one skipped.
+    #[doc(hidden)]
+    pub fn wait_pipelines(&mut self) {
+        while let Some(c) = &self.compiler {
+            if c.translating.is_empty() && c.building.is_empty() {
+                break;
+            }
+            let Ok(m) = c.done.recv() else { break };
+            self.take(m);
+        }
+    }
+
     /// Runs `f` inside a validation error scope; a validation error becomes
     /// `Skip::Unsupported(what: error)`.
     fn validated<T>(&self, what: &str, f: impl FnOnce(&wgpu::Device) -> T) -> Result<T, Skip> {
-        let scope = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
-        let v = f(&self.device);
-        match block_on(scope.pop()) {
-            None => Ok(v),
-            Some(e) => unsupported(format!("{what}: {e}")),
-        }
+        validated_on(&self.device, what, f).map_err(Skip::Unsupported)
     }
 
     fn module(
@@ -4874,36 +5941,9 @@ impl Drawer {
         if let Some(m) = self.modules.get(&key) {
             return Ok(m.clone());
         }
-        let src = match (vertex, variant) {
-            (true, Variant::RectList) => patch_vertex_wgsl(&t.wgsl, extra)
-                .and_then(|vs| rect_list_wgsl(&vs, t.info.interpolators_written | extra)),
-            (true, _) => patch_vertex_wgsl(&t.wgsl, extra),
-            (false, _) if extra != 0 => drop_depth_wgsl(&t.wgsl),
-            (false, _) => Ok(t.wgsl.clone()),
-        }
-        .and_then(|src| match variant {
-            Variant::Output(c) if !vertex => {
-                c.iter().enumerate().try_fold(src, |ps, (rt, c)| match c {
-                    Some((rgb, a, bias, k)) => output_pixel_wgsl(
-                        &ps,
-                        rt,
-                        *bias,
-                        f32::from_bits(*rgb),
-                        f32::from_bits(*a),
-                        f32::from_bits(*k),
-                    ),
-                    None => Ok(ps),
-                })
-            }
-            _ => Ok(src),
-        })
-        .map_err(Skip::Unsupported)?;
-        let m = self.validated("shader module", |d| {
-            d.create_shader_module(wgpu::ShaderModuleDescriptor {
-                label: Some(if vertex { "vertex" } else { "pixel" }),
-                source: wgpu::ShaderSource::Wgsl(src.into()),
-            })
-        })?;
+        let m = module_source(vertex, extra, variant, t)
+            .and_then(|src| create_module(&self.device, vertex, src))
+            .map_err(Skip::Unsupported)?;
         self.modules.insert(key, m.clone());
         Ok(m)
     }
@@ -5003,12 +6043,16 @@ impl Drawer {
             ranges,
             part_of,
             at,
+            parts,
         } = scratch;
         ranges.clear();
         part_of.clear();
         at.clear();
         let mut clipped = false;
-        for k in (0..96).filter(|k| mask & (1u128 << k) != 0) {
+        let mut bits = mask & ((1u128 << 96) - 1);
+        while bits != 0 {
+            let k = bits.trailing_zeros();
+            bits &= bits - 1;
             let vf = self.regs.vertex_fetch(k);
             if vf.fetch_type != FetchConstantType::Vertex {
                 report.warn(format!("vertex fetch constant {k} is not a vertex fetch"));
@@ -5022,7 +6066,8 @@ impl Drawer {
             }
         }
         ranges.sort_unstable();
-        let mut parts: Vec<(u64, u64)> = Vec::new();
+        let mut parts = std::mem::take(parts);
+        parts.clear();
         // A read past its constant's buffer must find the guest's word or 0,
         // not another part's, so such a draw stages one span with no rebase.
         let gap = if clipped { u64::MAX } else { WINDOW_GAP };
@@ -5040,7 +6085,8 @@ impl Drawer {
         if parts.len() == 1 {
             let memo = self.window_memo.range(..=lo).next_back();
             if let Some((&a, &(b, s))) = memo.filter(|(_, (b, _))| hi <= *b) {
-                return Ok((Vec::new(), a as u32, rebase, Some(((a, b, s), hi - lo))));
+                parts.clear();
+                return Ok((parts, a as u32, rebase, Some(((a, b, s), hi - lo))));
             }
         }
         // Where each part lands in the window, as `stage` lays them out.
@@ -5105,19 +6151,38 @@ impl Drawer {
         }
     }
 
-    /// The compute pipeline of `resolve.wgsl`'s `decode_8888`, or with
-    /// `float` its `decode_float`, made at first use.
-    fn decode_pipeline(&mut self, float: bool) -> wgpu::ComputePipeline {
+    /// The compute pipeline of entry point [`DECODE_ENTRIES`]`[entry]`
+    /// (0 `decode_8888`, 1 `decode_float`, 2 `detile_bc`), made at first use.
+    /// [`Self::decode_scratch`]'s buffer, made larger first when it holds
+    /// fewer than `need` bytes, and its generation.
+    fn decode_scratch(&mut self, need: u64) -> (wgpu::Buffer, u64) {
+        let need = need.max(4);
+        if (self.decode_scratch.as_ref()).is_none_or(|(b, _)| b.size() < need) {
+            let gen = self.decode_scratch.as_ref().map_or(0, |(_, g)| g + 1);
+            let buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("decoded texels"),
+                size: need.next_power_of_two().min(self.max_storage).max(need),
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            });
+            self.decode_scratch = Some((buf, gen));
+        }
+        self.decode_scratch.clone().expect("made above")
+    }
+
+    fn decode_pipeline(&mut self, entry: usize) -> wgpu::ComputePipeline {
         let device = &self.device;
         let cache = self.disk_cache.as_ref().map(|c| &c.cache);
-        let entry = ["decode_8888", "decode_float"][usize::from(float)];
+        let (i, entry) = (entry, DECODE_ENTRIES[entry]);
         // Set once the shader module is made, so it times the pipeline alone.
         let mut t0 = None;
-        let pipeline = self.decode_pipelines[usize::from(float)]
+        let pipeline = self.decode_pipelines[i]
             .get_or_insert_with(|| {
+                // texture.wgsl uses resolve.wgsl's decode bindings and helpers.
+                let source = concat!(include_str!("resolve.wgsl"), include_str!("texture.wgsl"));
                 let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-                    label: Some("resolve"),
-                    source: wgpu::ShaderSource::Wgsl(include_str!("resolve.wgsl").into()),
+                    label: Some("texture decode"),
+                    source: wgpu::ShaderSource::Wgsl(source.into()),
                 });
                 t0 = Some(Instant::now());
                 device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
@@ -5169,10 +6234,12 @@ impl Drawer {
         }
         let sampler = self.sampler(&fetch, filters, report);
         let constant = self.regs.fetch_constant(n);
-        if let Some((view, _, _, key)) = self.texture_memo.get(&constant) {
-            let view = view.clone();
+        let suspect = self.texture_suspect.remove(&constant);
+        if let Some(m) = self.texture_memo.get_mut(&constant) {
+            m.used = self.replays;
+            let view = m.view.clone();
             // Kept in use, so eviction does not take it for an old one.
-            if let Some((_, _, used)) = key.and_then(|k| self.texture_cache.get_mut(&k)) {
+            if let Some((_, _, used)) = m.key.and_then(|k| self.texture_cache.get_mut(&k)) {
                 *used = self.replays;
             }
             return Ok((view, sampler));
@@ -5183,14 +6250,17 @@ impl Drawer {
             if let Some((view, lo, hi)) = self.kept_texture(&fetch, constant, addr, end, mem)? {
                 self.timings.textures_kept += 1;
                 self.timings.kept_bytes += hi - lo;
-                self.texture_memo
-                    .insert(constant, (view.clone(), lo, hi, None));
+                let m = TextureMemo::new(view.clone(), vec![(lo, hi)], None, vec![], self.replays);
+                self.texture_memo.insert(constant, m);
                 return Ok((view, sampler));
             }
             // One sync over the whole chain: at most one writeback wait.
             if let Some((lo, hi)) = chain_range(&fetch) {
                 self.sync(mem, lo, hi)?;
             }
+        }
+        if let Some(view) = suspect.and_then(|s| self.restore_suspect(constant, s, mem, report)) {
+            return Ok((view, sampler));
         }
         let view = self
             .guest_texture(n, &fetch, &*mem, report)
@@ -5201,11 +6271,80 @@ impl Drawer {
         Ok((view, sampler))
     }
 
+    /// The view of suspect memo entry `s` of fetch constant `constant`, back
+    /// in the memo, if its texture is still cached and the pages written
+    /// since it was dropped hash as they did; `None` for the full lookup.
+    /// Not tried when the written pages are over half the texture: the
+    /// full lookup hashes it all anyway.
+    fn restore_suspect(
+        &mut self,
+        constant: [u32; 6],
+        (mut m, mut dirty): (TextureMemo, Vec<u32>),
+        mem: &Tracked,
+        report: &mut Report,
+    ) -> Option<wgpu::TextureView> {
+        let key = m.key?;
+        if !self.texture_cache.contains_key(&key) {
+            return None;
+        }
+        if dirty_over_half(&m, &mut dirty) {
+            return None;
+        }
+        let mut buf = std::mem::take(&mut self.texture_scratch);
+        let same = dirty.iter().all(|&i| {
+            let (lo, hi, h) = m.pages[i as usize];
+            buf.resize((hi - lo) as usize, 0);
+            report.timings.hashed_bytes += hi - lo;
+            mem.read_into(lo as u32, &mut buf) && hash_bytes(&buf) == h
+        });
+        self.texture_scratch = buf;
+        if !same {
+            return None;
+        }
+        if let Some((_, _, used)) = self.texture_cache.get_mut(&key) {
+            *used = self.replays;
+        }
+        report.timings.textures_restored += 1;
+        m.used = self.replays;
+        let view = m.view.clone();
+        self.texture_memo.insert(constant, m);
+        Some(view)
+    }
+
+    /// Drops the least recently used half (or more, on ties) of the texture
+    /// memo, which reached [`TEXTURE_MEMO_CAP`]; only the sets binding the
+    /// dropped entries go with them.
+    fn trim_texture_memo(&mut self) {
+        let cache = &self.texture_cache;
+        // A set bound without a lookup marks only its textures' cache keys.
+        let used = |m: &TextureMemo| {
+            let cached = m.key.and_then(|k| cache.get(&k)).map_or(0, |e| e.2);
+            m.used.max(cached)
+        };
+        let ages = self.texture_memo.values().map(used).collect();
+        let Some(cut) = trim_cut(ages, TEXTURE_MEMO_CAP / 2) else {
+            return;
+        };
+        let mut gone = Vec::new();
+        self.texture_memo.retain(|c, m| {
+            let keep = used(m) > cut;
+            if !keep {
+                gone.push(*c);
+            }
+            keep
+        });
+        for c in gone {
+            for flag in self.texture_set_flags.remove(&c).into_iter().flatten() {
+                flag.store(false, Ordering::Relaxed);
+            }
+        }
+    }
+
     /// The texture of `fetch` decoded on the GPU from a kept resolve holding
     /// all of its guest bytes `[addr, end)`, as [`Self::guest_texture`]
     /// would decode them; `None` for the guest path. Only tiled 2D
     /// k_8_8_8_8 layouts that host as `Rgba8Unorm`, k_32_FLOAT,
-    /// k_16_16_16_16_FLOAT and the depth formats k_24_8 and k_24_8_FLOAT
+    /// k_16_16_FLOAT, k_16_16_16_16_FLOAT and the depth formats k_24_8 and k_24_8_FLOAT
     /// (any endian, swizzle and resolve format, as the bytes are the
     /// guest's) are decoded here. Mip levels before the packed tail, up to
     /// the fetch's last one, that the same kept resolve holds are decoded
@@ -5217,16 +6356,12 @@ impl Drawer {
         constant: [u32; 6],
         addr: u64,
         end: u64,
-        mem: &Tracked,
+        mem: &mut Tracked,
     ) -> Result<Option<(wgpu::TextureView, u64, u64)>, Skip> {
         use xenon_texture::{Dimension, TextureFormat as F};
-        let Some(i) = self
-            .mirrors
-            .iter()
-            .position(|m| m.lo <= addr && end <= m.hi)
-        else {
+        if !self.mirrors.iter().any(|m| m.lo < end && addr < m.hi) {
             return Ok(None);
-        };
+        }
         use wgpu::TextureFormat as H;
         let (w, h) = (fetch.width(), fetch.height());
         let pitch = xenon_texture::tile::align_to_tile(fetch.pitch_texels());
@@ -5238,6 +6373,7 @@ impl Drawer {
             (F::K32Float, H::Rgba32Float) => (Some(0), 4, 16),
             (F::K32Float, H::Rgba16Float) => (Some(1), 4, 8),
             (F::K16_16_16_16Float, H::Rgba16Float) => (Some(2), 8, 8),
+            (F::K16_16Float, H::Rgba16Float) => (Some(7), 4, 8),
             (F::K24_8, H::Rgba32Float) => (Some(3), 4, 16),
             (F::K24_8, H::Rgba16Float) => (Some(4), 4, 8),
             (F::K24_8Float, H::Rgba32Float) => (Some(5), 4, 16),
@@ -5247,12 +6383,36 @@ impl Drawer {
         if !fetch.tiled
             || fetch.dimension != Dimension::D2OrStacked
             || fetch.stacked
-            || !(addr - self.mirrors[i].lo).is_multiple_of(4)
             || pitch < w
             || w > self.max_dim
             || h > self.max_dim
-            || !self.verify(i, mem, addr, end)
         {
+            return Ok(None);
+        }
+        // A texture over kept resolves and bytes no resolve wrote (resolves
+        // into tiles of a larger surface) gets one kept buffer over all of
+        // it and its mips, made from guest memory with the resolves merged
+        // in, so it is decoded on the GPU too and later resolves into it
+        // stay there.
+        let i = match self
+            .mirrors
+            .iter()
+            .position(|m| m.lo <= addr && end <= m.hi)
+        {
+            Some(i) => i,
+            None => {
+                let (lo, hi) =
+                    chain_range(fetch).map_or((addr, end), |(a, b)| (a.min(addr), b.max(end)));
+                if hi - lo > self.max_storage {
+                    return Ok(None);
+                }
+                match self.mirror(mem, lo, hi, false)? {
+                    Some(i) => i,
+                    None => return Ok(None),
+                }
+            }
+        };
+        if !(addr - self.mirrors[i].lo).is_multiple_of(4) || !self.verify_read(i, mem, addr, end)? {
             return Ok(None);
         }
         // (width, height, pitch, guest address) of each level decoded.
@@ -5271,7 +6431,7 @@ impl Drawer {
             if a < mirror.lo || mirror.hi < b || !(a - mirror.lo).is_multiple_of(4) {
                 break;
             }
-            if !self.verify(i, mem, a, b) {
+            if !self.verify_read(i, mem, a, b)? {
                 return Ok(None);
             }
             levels.push((m.width, m.height, m.pitch_blocks, a));
@@ -5315,8 +6475,8 @@ impl Drawer {
             }),
         };
         let scope = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
-        let entry = ["decode_8888", "decode_float"][usize::from(mode.is_some())];
-        let pipeline = self.decode_pipeline(mode.is_some());
+        let entry = DECODE_ENTRIES[usize::from(mode.is_some())];
+        let pipeline = self.decode_pipeline(usize::from(mode.is_some()));
         // After a resolve recorded in the batch, the decode runs after it:
         // with `decode_in_batch` (the default) it is recorded in the batch,
         // after the resolve, so the batch's earlier draws still sample the
@@ -5364,35 +6524,47 @@ impl Drawer {
                 0,
                 0,
             ];
-            let uniform = self.buffer(
-                "decode params",
-                &to_bytes(&params),
-                wgpu::BufferUsages::UNIFORM,
-            );
-            let texels = self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("decoded texels"),
-                size: u64::from(row_words) * 4 * u64::from(rows),
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-                mapped_at_creation: false,
-            });
-            let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some(entry),
-                layout: &pipeline.get_bind_group_layout(0),
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 5,
-                        resource: self.mirrors[i].buf.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 6,
-                        resource: texels.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 7,
-                        resource: uniform.as_entire_binding(),
-                    },
-                ],
-            });
+            let (texels, gen) = self.decode_scratch(u64::from(row_words) * 4 * u64::from(rows));
+            let key = (usize::from(mode.is_some()), params);
+            let cached = (self.mirrors[i].decodes.get(&key))
+                .filter(|(g, _)| *g == gen)
+                .map(|(_, bg)| bg.clone());
+            let bg = match cached {
+                Some(bg) => bg,
+                None => {
+                    // The group holds the parameters, which never change.
+                    let uniform = self.buffer(
+                        "decode params",
+                        &to_bytes(&params),
+                        wgpu::BufferUsages::UNIFORM,
+                    );
+                    let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: Some(entry),
+                        layout: &pipeline.get_bind_group_layout(0),
+                        entries: &[
+                            wgpu::BindGroupEntry {
+                                binding: 5,
+                                resource: self.mirrors[i].buf.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 6,
+                                resource: texels.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 7,
+                                resource: uniform.as_entire_binding(),
+                            },
+                        ],
+                    });
+                    let decodes = &mut self.mirrors[i].decodes;
+                    // Rows decoded again vary with the resolves: a bound.
+                    if decodes.len() >= 64 {
+                        decodes.clear();
+                    }
+                    decodes.insert(key, (gen, bg.clone()));
+                    bg
+                }
+            };
             {
                 let mut pass = enc.begin_compute_pass(&Default::default());
                 pass.set_pipeline(pipeline);
@@ -5504,10 +6676,10 @@ impl Drawer {
             true => xenon_texture::bytes_needed(fetch).map_err(|e| e.to_string())?,
             false => 0,
         };
-        // shortcut: one range spans the base, the mips and any gap between
-        // them, so a write into the gap decodes the chain again; keep a
-        // range per level if mips far from their base show up.
-        let range = chain_range(fetch).ok_or("texture without levels to read")?;
+        let ranges = level_ranges(fetch);
+        if ranges.is_empty() {
+            return Err("texture without levels to read".into());
+        }
         // (fetch, offset in `bytes`, length) of each mip level read.
         let mut mips = Vec::new();
         let mut at = base_len;
@@ -5525,73 +6697,46 @@ impl Drawer {
         }
         report.timings.hashed_bytes += bytes.len() as u64;
         let constant = self.regs.fetch_constant(n);
-        let key = (decode_key(constant), hash_bytes(bytes));
+        // Hashed a page at a time, so a later write is checked page by page.
+        let at_base = u64::from(fetch.base_address & PHYSICAL_MASK);
+        let segments = (base.then_some((at_base, 0, base_len)).into_iter()).chain(
+            mips.iter()
+                .filter_map(|(m, at, len)| Some((level_range(m)?.0, *at, *len))),
+        );
+        let (pages, hash) = page_hashes(bytes, segments);
+        let key = (decode_key(constant), hash);
         if let Some((view, _, used)) = self.texture_cache.get_mut(&key) {
             *used = self.replays;
             let view = view.clone();
-            self.texture_memo
-                .insert(constant, (view.clone(), range.0, range.1, Some(key)));
+            report.timings.rehash_hits += 1;
+            report.timings.rehash_hit_bytes += bytes.len() as u64;
+            self.texture_memo.insert(
+                constant,
+                TextureMemo::new(view.clone(), ranges, Some(key), pages, self.replays),
+            );
             return Ok(view);
         }
-        let mut bc = self.bc_textures && !fetch.sign.contains(&1);
-        let float32 = self.float32_filterable;
-        // Width, height and texels of each level; no texels for levels no
-        // LOD samples (the base not read, levels below the first sampled),
-        // which stay wgpu's zeros.
-        let mut levels = Vec::new();
-        let mut host = None;
-        if base {
-            let (h, width, height, data) =
-                decode_level(fetch, &bytes[..base_len], bc, float32).map_err(|e| e.to_string())?;
-            host = Some(h);
-            levels.push((width, height, Some(data)));
-        } else {
-            // A BC texture's base is whole blocks, written or not.
-            bc &= fetch.width().is_multiple_of(4) && fetch.height().is_multiple_of(4);
-            levels.push((fetch.width(), fetch.height(), None));
-        }
+        let (host, levels, on_gpu) = self.decode_levels(fetch, bytes, base, base_len, &mips)?;
         let (width, height) = (levels[0].0, levels[0].1);
         if width > self.max_dim || height > self.max_dim {
             return Err(format!("texture {width}x{height}"));
         }
-        let first = fetch.mip_range().0 as usize;
-        for (level, &(m, at, len)) in (1..).zip(&mips) {
-            if level < first {
-                levels.push((m.width(), m.height(), None));
-                continue;
-            }
-            // shortcut: the chain stops at a level that does not decode to
-            // the first level's host format (a DXT level not whole blocks)
-            // or at all; sampled LODs past it clamp to the last level kept.
-            let bc = bc && host.is_none_or(|h| h.is_compressed());
-            match decode_level(&m, &bytes[at..at + len], bc, float32) {
-                Ok((h, w, hh, d)) if host.is_none_or(|host| host == h) => {
-                    host = Some(h);
-                    levels.push((w, hh, Some(d)));
-                }
-                _ => break,
-            }
-        }
-        // A cut chain ends at a level with texels, which LODs past it reach.
-        while levels.last().is_some_and(|l| l.2.is_none()) {
-            levels.pop();
-        }
-        let Some(host) = host else {
-            return Err("texture whose first sampled mip level does not decode".into());
-        };
-        let uploaded: u64 = levels
-            .iter()
-            .flat_map(|l| &l.2)
-            .map(|d| d.len() as u64)
-            .sum();
         // GPU bytes, the levels left as zeros included.
         let (bw, bh) = host.block_dimensions();
         let block = u64::from(host.block_copy_size(None).unwrap_or(4));
-        let len: u64 = levels
+        let blocks = |w: u32, h: u32| u64::from(w.div_ceil(bw)) * u64::from(h.div_ceil(bh));
+        let len: u64 = levels.iter().map(|&(w, h, _)| blocks(w, h) * block).sum();
+        // Host texel bytes of the levels with texels, decoded here or there.
+        let uploaded: u64 = levels
             .iter()
-            .map(|&(w, h, _)| u64::from(w.div_ceil(bw)) * u64::from(h.div_ceil(bh)) * block)
+            .map(|(w, h, t)| match t {
+                Some(Texels::Cpu(d)) => d.len() as u64,
+                Some(Texels::Gpu(..)) => blocks(*w, *h) * block,
+                None => 0,
+            })
             .sum();
         report.timings.textures_uploaded += 1;
+        report.timings.textures_gpu_decoded += u32::from(on_gpu);
         report.timings.texture_bytes += uploaded;
         let bucket = match host {
             wgpu::TextureFormat::Rgba8Unorm => 0,
@@ -5603,49 +6748,14 @@ impl Drawer {
         let by = &mut report.timings.uploads_by_format[bucket];
         by.0 += 1;
         by.1 += uploaded;
-        let tex = self.device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("guest texture"),
-            size: wgpu::Extent3d {
-                width,
-                height,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: levels.len() as u32,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: host,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
-        for (level, (w, h, data)) in levels.iter().enumerate() {
-            let Some(data) = data else { continue };
-            // Rows of blocks: a BC row holds four rows of texels.
-            let rows = h / host.block_dimensions().1;
-            self.queue.write_texture(
-                wgpu::TexelCopyTextureInfo {
-                    texture: &tex,
-                    mip_level: level as u32,
-                    origin: wgpu::Origin3d::ZERO,
-                    aspect: wgpu::TextureAspect::All,
-                },
-                data,
-                wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(data.len() as u32 / rows),
-                    rows_per_image: Some(rows),
-                },
-                wgpu::Extent3d {
-                    width: *w,
-                    height: *h,
-                    depth_or_array_layers: 1,
-                },
-            );
-        }
+        let tex = self.upload_levels(host, bytes, &levels, wgpu::TextureUsages::empty())?;
         let view = tex.create_view(&Default::default());
         let key_hash = hash_bytes(&to_bytes(&key.0)) ^ key.1;
         if self.texture_evicted.remove(&key_hash) {
             report.timings.textures_reuploaded += 1;
         }
+        self.texture_cache_bytes -=
+            drop_stale(&mut self.texture_latest, &mut self.texture_cache, key);
         let limit = self.texture_cache_limit;
         if self.texture_cache_bytes + len > limit
             || self.texture_cache.len() >= self.texture_cache_count
@@ -5655,9 +6765,216 @@ impl Drawer {
         self.texture_cache_bytes += len;
         self.texture_cache
             .insert(key, (view.clone(), len, self.replays));
-        self.texture_memo
-            .insert(constant, (view.clone(), range.0, range.1, Some(key)));
+        self.texture_memo.insert(
+            constant,
+            TextureMemo::new(view.clone(), ranges, Some(key), pages, self.replays),
+        );
         Ok(view)
+    }
+
+    /// The host format and levels (width, height, texels; the base
+    /// first) of the guest texture `fetch` from its guest bytes `bytes`:
+    /// the base's `base_len` when `base` ([`reads_base`]), then each
+    /// of `mips` (fetch, offset in `bytes`, length). Decoded on the GPU
+    /// where [`gpu_plan`] takes the whole chain, else on the CPU; and
+    /// whether on the GPU.
+    #[allow(clippy::type_complexity)]
+    fn decode_levels(
+        &self,
+        fetch: &xenon_texture::TextureFetch,
+        bytes: &[u8],
+        base: bool,
+        base_len: usize,
+        mips: &[(xenon_texture::TextureFetch, usize, usize)],
+    ) -> Result<(wgpu::TextureFormat, Vec<(u32, u32, Option<Texels>)>, bool), String> {
+        let mut bc = self.bc_textures && !fetch.sign.contains(&1);
+        let float32 = self.float32_filterable;
+        let gpu = match self.gpu_texture_decode && base && bytes.len() as u64 <= self.max_storage {
+            true => gpu_plan(fetch, base_len, mips, bc, float32, self.max_storage),
+            false => None,
+        };
+        let on_gpu = gpu.is_some();
+        // Width, height and texels of each level; no texels for levels no
+        // LOD samples (the base not read, levels below the first sampled),
+        // which stay wgpu's zeros.
+        let (host, levels) = match gpu {
+            Some((host, plan)) => {
+                let levels = plan
+                    .into_iter()
+                    .map(|(w, h, p)| (w, h, p.map(|(e, p)| Texels::Gpu(e, p))))
+                    .collect();
+                (host, levels)
+            }
+            None => {
+                let mut levels = Vec::new();
+                let mut host = None;
+                if base {
+                    let (h, width, height, data) =
+                        decode_level(fetch, &bytes[..base_len], bc, float32)
+                            .map_err(|e| e.to_string())?;
+                    host = Some(h);
+                    levels.push((width, height, Some(Texels::Cpu(data))));
+                } else {
+                    // A BC texture's base is whole blocks, written or not.
+                    bc &= fetch.width().is_multiple_of(4) && fetch.height().is_multiple_of(4);
+                    levels.push((fetch.width(), fetch.height(), None));
+                }
+                let first = fetch.mip_range().0 as usize;
+                for (level, &(m, at, len)) in (1..).zip(mips) {
+                    if level < first {
+                        levels.push((m.width(), m.height(), None));
+                        continue;
+                    }
+                    // shortcut: the chain stops at a level that does not decode to
+                    // the first level's host format (a DXT level not whole blocks)
+                    // or at all; sampled LODs past it clamp to the last level kept.
+                    let bc = bc && host.is_none_or(|h| h.is_compressed());
+                    match decode_level(&m, &bytes[at..at + len], bc, float32) {
+                        Ok((h, w, hh, d)) if host.is_none_or(|host| host == h) => {
+                            host = Some(h);
+                            levels.push((w, hh, Some(Texels::Cpu(d))));
+                        }
+                        _ => break,
+                    }
+                }
+                // A cut chain ends at a level with texels, which LODs past it reach.
+                while levels.last().is_some_and(|l| l.2.is_none()) {
+                    levels.pop();
+                }
+                let Some(host) = host else {
+                    return Err("texture whose first sampled mip level does not decode".into());
+                };
+                (host, levels)
+            }
+        };
+        Ok((host, levels, on_gpu))
+    }
+
+    /// A `host` texture of `levels` (width, height, texels), the first one
+    /// the base: CPU-decoded texels written with the queue, GPU ones
+    /// decoded from `bytes` (the guest bytes [`Drawer::texture_from`]
+    /// takes) by compute passes recorded in `pre`, which runs before the
+    /// open batch: the texture is new, so no draw recorded yet samples it.
+    /// `usage` adds to the texture's usages.
+    fn upload_levels(
+        &mut self,
+        host: wgpu::TextureFormat,
+        bytes: &[u8],
+        levels: &[(u32, u32, Option<Texels>)],
+        usage: wgpu::TextureUsages,
+    ) -> Result<wgpu::Texture, String> {
+        let tex = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("guest texture"),
+            size: wgpu::Extent3d {
+                width: levels[0].0,
+                height: levels[0].1,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: levels.len() as u32,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: host,
+            usage: usage | wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        // The guest bytes once, for every GPU level.
+        let mut guest = None;
+        for (level, (w, h, texels)) in levels.iter().enumerate() {
+            let size = wgpu::Extent3d {
+                width: *w,
+                height: *h,
+                depth_or_array_layers: 1,
+            };
+            let at = wgpu::TexelCopyTextureInfo {
+                texture: &tex,
+                mip_level: level as u32,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            };
+            match texels {
+                None => {}
+                Some(Texels::Cpu(data)) => {
+                    // Rows of blocks: a BC row holds four rows of texels.
+                    let rows = h / host.block_dimensions().1;
+                    let layout = wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(data.len() as u32 / rows),
+                        rows_per_image: Some(rows),
+                    };
+                    self.queue.write_texture(at, data, layout, size);
+                }
+                Some(Texels::Gpu(entry, params)) => {
+                    if guest.is_none() {
+                        let buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+                            label: Some("guest texture bytes"),
+                            size: (bytes.len() as u64).next_multiple_of(4).max(4),
+                            usage: wgpu::BufferUsages::STORAGE,
+                            mapped_at_creation: true,
+                        });
+                        let mut view = buf
+                            .slice(..)
+                            .get_mapped_range_mut()
+                            .map_err(|e| e.to_string())?;
+                        view.slice(..bytes.len()).copy_from_slice(bytes);
+                        drop(view);
+                        buf.unmap();
+                        guest = Some(buf);
+                    }
+                    let guest = guest.clone().expect("made above");
+                    let pipeline = self.decode_pipeline(*entry);
+                    let (cols, rows, row_words) = (params[0], params[1], params[6]);
+                    let uniform = self.buffer(
+                        "decode params",
+                        &to_bytes(params),
+                        wgpu::BufferUsages::UNIFORM,
+                    );
+                    let out = self.device.create_buffer(&wgpu::BufferDescriptor {
+                        label: Some("decoded texels"),
+                        size: u64::from(row_words) * 4 * u64::from(rows),
+                        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+                        mapped_at_creation: false,
+                    });
+                    let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: Some(DECODE_ENTRIES[*entry]),
+                        layout: &pipeline.get_bind_group_layout(0),
+                        entries: &[
+                            wgpu::BindGroupEntry {
+                                binding: 5,
+                                resource: guest.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 6,
+                                resource: out.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 7,
+                                resource: uniform.as_entire_binding(),
+                            },
+                        ],
+                    });
+                    let enc = self.pre.get_or_insert_with(|| {
+                        self.device.create_command_encoder(&Default::default())
+                    });
+                    {
+                        let mut pass = enc.begin_compute_pass(&Default::default());
+                        pass.set_pipeline(&pipeline);
+                        pass.set_bind_group(0, &bg, &[]);
+                        pass.dispatch_workgroups(cols.div_ceil(8), rows.div_ceil(8), 1);
+                    }
+                    let layout = wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(row_words * 4),
+                        rows_per_image: Some(rows),
+                    };
+                    let src = wgpu::TexelCopyBufferInfo {
+                        buffer: &out,
+                        layout,
+                    };
+                    enc.copy_buffer_to_texture(src, at, size);
+                }
+            }
+        }
+        Ok(tex)
     }
 
     /// Evicts least recently used textures until the cache holds at most
@@ -5672,29 +6989,52 @@ impl Drawer {
             .map(|(k, &(_, len, used))| (used, len, *k))
             .collect();
         by_age.sort_unstable_by_key(|e| e.0);
-        // Groups and the memo hold views; drop them so evicted textures go too.
-        self.texture_groups.clear();
-        self.texture_sets.clear();
-        self.texture_set_flags.clear();
-        self.texture_memo.clear();
-        self.texture_memo_epoch += 1;
         // shortcut: the evicted-key set only feeds a counter; cleared
         // when large, which undercounts re-uploads after that.
         if self.texture_evicted.len() > 1 << 16 {
             self.texture_evicted.clear();
         }
+        // A view hashes by its id, which never changes.
+        #[allow(clippy::mutable_key_type)]
+        let mut gone = HashSet::default();
         for (_, len, k) in by_age {
             if self.texture_cache_bytes <= goal
                 && self.texture_cache.len() <= self.texture_cache_count * 3 / 4
             {
                 break;
             }
-            self.texture_cache.remove(&k);
+            if let Some((view, _, _)) = self.texture_cache.remove(&k) {
+                gone.insert(view);
+            }
             self.texture_cache_bytes -= len;
+            if self.texture_latest.get(&k.0) == Some(&k.1) {
+                self.texture_latest.remove(&k.0);
+            }
             self.texture_evicted
                 .insert(hash_bytes(&to_bytes(&k.0)) ^ k.1);
             report.timings.textures_evicted += 1;
         }
+        // Only the memo entries, sets and groups holding evicted views go:
+        // dropping them all made every later draw hash and bind again.
+        let mut dropped = Vec::new();
+        self.texture_memo.retain(|c, m| {
+            let keep = !gone.contains(&m.view);
+            if !keep {
+                dropped.push(*c);
+            }
+            keep
+        });
+        for c in dropped {
+            for flag in self.texture_set_flags.remove(&c).into_iter().flatten() {
+                flag.store(false, Ordering::Relaxed);
+            }
+        }
+        (self.texture_suspect).retain(|_, (m, _)| !gone.contains(&m.view));
+        // Sets of an older memo epoch can never bind again but would pin their views.
+        let epoch = self.texture_memo_epoch;
+        (self.texture_sets)
+            .retain(|_, (_, e, kept, ..)| *e == epoch && kept.load(Ordering::Relaxed));
+        (self.texture_groups).retain(|(_, slots), _| !slots.iter().any(|(v, _)| gone.contains(v)));
     }
 
     fn sampler(
@@ -5769,7 +7109,7 @@ impl Drawer {
 
     /// Draws `d`; Ok(false) when the state makes it draw nothing.
     fn draw(&mut self, d: &Draw, mem: &mut Tracked, report: &mut Report) -> Result<bool, Skip> {
-        let mut t = Instant::now();
+        let mut t = Tick::now();
         let color_on = match self.regs.get(regs::RB_MODECONTROL) & 7 {
             4 => true,
             5 => false,
@@ -5799,8 +7139,14 @@ impl Drawer {
                 wgpu::PrimitiveTopology::TriangleList | wgpu::PrimitiveTopology::TriangleStrip
             );
         let param_gen = self.param_gen(topology, polygonal);
-        let vs_t = self.translate(&vs, ShaderStage::Vertex, None)?;
-        let ps_t = self.translate(&ps, ShaderStage::Pixel, param_gen)?;
+        let (vs_t, ps_t) = (
+            self.translate(&vs, ShaderStage::Vertex, None)?,
+            self.translate(&ps, ShaderStage::Pixel, param_gen)?,
+        );
+        let (Some(vs_t), Some(ps_t)) = (vs_t, ps_t) else {
+            self.timings.draws_waiting += 1;
+            return Ok(false);
+        };
         let surface = self.regs.get(regs::RB_SURFACE_INFO);
         // shortcut: MSAA targets are drawn with one sample per pixel (the
         // resolve then copies that sample); add samples if edges matter.
@@ -5917,7 +7263,7 @@ impl Drawer {
         }
 
         let sample = self.part_draws.is_multiple_of(PART_SAMPLE);
-        let stamp = || sample.then(Instant::now);
+        let stamp = || sample.then(Tick::now);
         let slow0 = sample.then(|| self.slow_work());
         let t_state = stamp();
         let strip = matches!(
@@ -5987,8 +7333,14 @@ impl Drawer {
                     {
                         self.index_memo.clear();
                         self.index_memo_bytes = host.bytes.len();
+                        self.index_memo_span = (u64::MAX, 0);
                     }
                     self.index_memo.insert(k, (guest.0, guest.1, host.clone()));
+                    // Indices in the packet (no guest range) meet no write.
+                    if guest.0 < guest.1 {
+                        let span = &mut self.index_memo_span;
+                        *span = (span.0.min(guest.0), span.1.max(guest.1));
+                    }
                 }
                 host
             }
@@ -6040,7 +7392,11 @@ impl Drawer {
             report.warn("texture fetches of one slot with different filters drawn with one");
         }
         let extra = ps_t.info.interpolators_read & !vs_t.info.interpolators_written;
-        let ps_extra = u16::from(ps_t.info.writes_depth && depth_format.is_none());
+        let ps_extra = u16::from(ps_t.info.writes_depth && depth_format.is_none())
+            | alpha_extra(
+                self.regs.get(regs::RB_COLORCONTROL),
+                ps_t.info.colour_targets_written & 1 != 0,
+            );
 
         let key_stencil = stencil
             .as_ref()
@@ -6072,72 +7428,40 @@ impl Drawer {
         self.pipeline_uses += 1;
         // The key names the modules and the texture layout: a cached
         // pipeline needs neither looked up.
-        let (pipeline, g1_layout) = match self.pipelines.get_mut(&key) {
-            Some((p, used, g1)) => {
+        // The cached pipeline found with one lookup of the key (most draws).
+        let hit = (self.pipelines.get_mut(&key)).map(|(p, used, g1)| {
+            *used = self.pipeline_uses;
+            (p.clone(), g1.clone())
+        });
+        if hit.is_none() && self.async_pipelines {
+            self.take_made();
+            if let Some(e) = self.pipeline_errors.get(&key) {
+                return unsupported(e.clone());
+            }
+        }
+        let found = match hit {
+            Some(h) => Some(h),
+            None => (self.pipelines.get_mut(&key)).map(|(p, used, g1)| {
                 *used = self.pipeline_uses;
                 (p.clone(), g1.clone())
+            }),
+        };
+        let (pipeline, g1_layout) = match found {
+            Some(h) => h,
+            None if self.async_pipelines => {
+                // Drawn from a later replay on, once a worker made it.
+                self.queue_pipeline(key, vs_t, ps_t);
+                self.timings.draws_waiting += 1;
+                return Ok(false);
             }
             None => {
                 let vs_mod = self.module(vs.hash, true, extra, vs_variant, None, &vs_t)?;
                 let ps_mod = self.module(ps.hash, false, ps_extra, ps_variant, param_gen, &ps_t)?;
                 let (g1_layout, layout) = self.texture_layout(tex_mask);
-                let k = key.clone();
-                // Only a pixel shader with parameter generation declares
-                // xe_scale; at scale 1 its default holds.
-                let scale = [("xe_scale", f64::from(self.scale))];
-                let ps_constants: &[(&str, f64)] = if param_gen.is_some() && self.scale != 1 {
-                    &scale
-                } else {
-                    &[]
-                };
-                let cache = self.pipeline_cache();
+                let (scale, cache) = (self.scale, self.pipeline_cache());
                 let t0 = Instant::now();
-                let p = self.validated("render pipeline", |dev| {
-                    dev.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                        label: Some("draw"),
-                        layout: Some(&layout),
-                        vertex: wgpu::VertexState {
-                            module: &vs_mod,
-                            entry_point: Some("vs_main"),
-                            compilation_options: Default::default(),
-                            buffers: &[],
-                        },
-                        primitive: wgpu::PrimitiveState {
-                            topology,
-                            strip_index_format: strip.then_some(wgpu::IndexFormat::Uint32),
-                            front_face: k.cull.0,
-                            cull_mode: k.cull.1,
-                            ..Default::default()
-                        },
-                        depth_stencil: k.depth.map(|(format, write, compare, st)| {
-                            wgpu::DepthStencilState {
-                                format,
-                                depth_write_enabled: Some(write),
-                                depth_compare: Some(compare),
-                                stencil: st.unwrap_or_default(),
-                                bias: Default::default(),
-                            }
-                        }),
-                        multisample: Default::default(),
-                        fragment: Some(wgpu::FragmentState {
-                            module: &ps_mod,
-                            entry_point: Some("ps_main"),
-                            compilation_options: wgpu::PipelineCompilationOptions {
-                                constants: ps_constants,
-                                ..Default::default()
-                            },
-                            targets: &k.color.map(|c| {
-                                c.map(|(format, blend, write_mask)| wgpu::ColorTargetState {
-                                    format,
-                                    blend,
-                                    write_mask,
-                                })
-                            }),
-                        }),
-                        multiview_mask: None,
-                        cache,
-                    })
-                })?;
+                let p = draw_pipeline(&self.device, &key, &layout, &vs_mod, &ps_mod, scale, cache)
+                    .map_err(Skip::Unsupported)?;
                 self.pipeline_made(t0);
                 let entry = (p.clone(), self.pipeline_uses, g1_layout.clone());
                 self.pipelines.insert(key, entry);
@@ -6165,15 +7489,10 @@ impl Drawer {
             self.guest_window(vf_mask, indices, mem, report)?;
         let gen = self.consts_gen;
         let consts = match &self.consts_built {
-            Some((g, c)) if *g == gen => c.clone(),
-            built => {
-                // Registers written with the words they held keep the block.
+            Some((g, c)) if *g == gen => *c,
+            _ => {
                 let c = consts_prefix(&self.regs);
-                let c = match built {
-                    Some((_, old)) if **old == c => old.clone(),
-                    _ => Arc::new(c),
-                };
-                self.consts_built = Some((gen, c.clone()));
+                self.consts_built = Some((gen, c));
                 c
             }
         };
@@ -6190,7 +7509,7 @@ impl Drawer {
         let mut kept_window =
             staged.filter(|((a, b, s), _)| self.window_memo.get(a) == Some(&(*b, *s)));
         let mut kept_consts = (self.staged_consts.as_ref())
-            .filter(|(b, s, _)| *s == suffix && (Arc::ptr_eq(b, &consts) || **b == *consts))
+            .filter(|(b, s, _)| *s == suffix && *b == consts)
             .map(|&(_, _, s)| s);
         // Each stage's float constants: those it reads, staged again only
         // when one of the stage's registers was written since.
@@ -6296,6 +7615,7 @@ impl Drawer {
                         self.window_memo.remove(&a);
                     }
                     self.window_memo.insert(lo, (hi, first));
+                    self.window_memo_span = self.window_memo_span.max(hi - lo);
                 }
                 (first.0, last.0 + last.1 - first.0)
             }
@@ -6307,8 +7627,8 @@ impl Drawer {
             }
             None => {
                 let s = (self.push(CONSTS_BYTES, |b| {
-                    let (prefix, rest) = b.split_at_mut(consts.len());
-                    prefix.copy_from_slice(&consts);
+                    let (prefix, rest) = b.split_at_mut(4 * consts.len());
+                    words_into(&consts, prefix);
                     words_into(&suffix, rest);
                     true
                 }))
@@ -6379,9 +7699,8 @@ impl Drawer {
                 report.warn(texture_log_line(ps.hash, n, c, lod, bias));
             }
         }
-        // shortcut: a set found here neither reports its textures'
-        // warnings again nor marks them used for eviction; the first draw
-        // of the set in each memo epoch does both.
+        // shortcut: a set found here does not report its textures'
+        // warnings again; the first draw of the set in each memo epoch does.
         // The key is built in a kept list: a new one only when a set is
         // recorded below.
         let mut key = (tex_mask, std::mem::take(&mut self.texture_set_key));
@@ -6392,11 +7711,22 @@ impl Drawer {
                 .filter(|n| tex_mask & (1 << n) != 0)
                 .map(|n| (regs.fetch_constant(n), pack_filters(filters(n)))),
         );
-        let set = (self.texture_sets.get(&key))
-            .filter(|(_, epoch, kept)| {
+        let set = (self.texture_sets.get_mut(&key))
+            .filter(|(_, epoch, kept, _, _)| {
                 *epoch == self.texture_memo_epoch && kept.load(Ordering::Relaxed)
             })
-            .map(|(g, _, _)| g.clone());
+            .map(|(g, _, _, keys, used)| {
+                // Once a replay: eviction would take its textures for old ones.
+                if *used != self.replays {
+                    *used = self.replays;
+                    for k in keys.iter() {
+                        if let Some((_, _, u)) = self.texture_cache.get_mut(k) {
+                            *u = self.replays;
+                        }
+                    }
+                }
+                g.clone()
+            });
         self.texture_set_key = key.1;
         let mut textures = Vec::new();
         if set.is_none() {
@@ -6485,9 +7815,13 @@ impl Drawer {
                     }
                     flags.push(kept.clone());
                 }
+                let keys = (constants.iter())
+                    .filter_map(|(c, _)| self.texture_memo.get(c).and_then(|m| m.key))
+                    .collect();
                 let epoch = self.texture_memo_epoch;
                 let key = (tex_mask, constants);
-                (self.texture_sets).insert(key, (g.clone(), epoch, kept));
+                let set = (g.clone(), epoch, kept, keys, self.replays);
+                (self.texture_sets).insert(key, set);
             }
             g
         };
@@ -6567,6 +7901,7 @@ impl Drawer {
         if let (false, Some(a), Some(b)) = (slow, t_groups, t_pass) {
             add_sampled(&mut self.timings.submit_parts, &[t0, a, b, t]);
         }
+        self.window_scratch.parts = read;
         Ok(true)
     }
 
@@ -6893,16 +8228,9 @@ impl Drawer {
         if rect.is_empty() {
             return Ok(());
         }
-        // shortcut: 16_16_FLOAT copies, and 64bpp copies but
-        // 16_16_16_16_FLOAT from 7e3 / 16_16_16_16_FLOAT sources, take the
-        // CPU path; add them to resolve.wgsl if they show up in profiles.
-        let gpu = if dest_bytes == 4 {
-            r.is_depth || r.dest_format != formats::DEST_16_16_FLOAT
-        } else {
-            r.dest_format == formats::DEST_16_16_16_16_FLOAT
-                && matches!(format, TargetFormat::Float7e3 | TargetFormat::Rgba16Float)
-        };
-        if gpu {
+        // The CPU path below stays for a destination resolve.wgsl does not
+        // write (none of those formats::dest_bytes takes today).
+        if r.is_depth || gpu_dest(r.dest_format).is_some() {
             self.resolve_gpu(r, rect, format, dest_bytes as u32, &tex, mem)?;
             if dest_bytes == 4 {
                 self.resolved_endian
@@ -6918,7 +8246,7 @@ impl Drawer {
             self.sync(mem, base, base + u64::from(extent))?;
         }
         self.flush()?;
-        let mut t = Instant::now();
+        let mut t = Tick::now();
         self.wait_idle()?;
         self.timings.gpu_wait += lap(&mut t);
         let px = self.read_target(format, &tex, rect.x0, rect.y0, rect.width(), rect.height())?;
@@ -6970,8 +8298,7 @@ impl Drawer {
         done
     }
 
-    /// 32bpp (or 16_16_16_16_FLOAT, `dest_bytes` 8) colour copy on the
-    /// GPU: resolve.wgsl converts, tiles and
+    /// Colour or depth copy on the GPU: resolve.wgsl converts, tiles and
     /// swaps each pixel into the destination's guest bytes kept on the GPU
     /// (see [`Mirror`]). Same result as the CPU path in
     /// [`Self::resolve_copy`]. Nothing waits here: the bytes reach guest
@@ -7000,7 +8327,7 @@ impl Drawer {
             ))
             .into());
         }
-        let mut t = Instant::now();
+        let mut t = Tick::now();
         let base = r.dest_base & PHYSICAL_MASK;
         if !base.is_multiple_of(4) {
             return unsupported(format!("resolve destination 0x{base:08X} not word aligned"));
@@ -7012,7 +8339,7 @@ impl Drawer {
             return unsupported(format!("resolve destination of {extent} bytes"));
         }
         let (lo, hi) = (u64::from(base), u64::from(base) + u64::from(extent));
-        let Some(i) = self.mirror(mem, lo, hi)? else {
+        let Some(i) = self.mirror(mem, lo, hi, true)? else {
             return unsupported(format!("resolve destination 0x{base:08X} is not readable"));
         };
         let src_format = match format {
@@ -7040,13 +8367,8 @@ impl Drawer {
             rect.height(),
             pitch,
             src_format,
-            match r.dest_format {
-                formats::DEST_8_8_8_8 => 0,
-                formats::DEST_2_10_10_10 => 1,
-                formats::DEST_16_16 => 3,
-                formats::DEST_16_16_16_16_FLOAT => 4,
-                _ => 2,
-            },
+            // A depth copy writes raw words whatever this says.
+            gpu_dest(r.dest_format).unwrap_or(2),
             u32::from(r.dest_swap),
             r.dest_endian,
             2f32.powi(r.dest_exp_bias).to_bits(),
@@ -7180,7 +8502,8 @@ impl Drawer {
             }
             apart
         });
-        if s > 1 && self.sharp_front && entry == 0 && dest_bytes == 4 {
+        // Only 8_8_8_8 and 2_10_10_10 copies can be the presented front buffer.
+        if s > 1 && self.sharp_front && entry == 0 && params[6] <= 1 {
             self.resolve_scaled(params, rect, pitch, tex, pipeline, i, (lo, hi), spare)?;
         }
         self.forget_guest(lo, hi);
@@ -7319,7 +8642,7 @@ impl Drawer {
         let (lo, hi) = (u64::from(addr), u64::from(addr) + u64::from(extent));
         let s = self.scale;
         let sharp = s > 1 && self.sharp_front;
-        let late = self.late_front_buffer || sharp;
+        let late = self.late_front_buffer || sharp || self.present.is_some();
         let mut kept = self.mirrors.iter().position(|m| m.lo <= lo && hi <= m.hi);
         let found = kept.is_some();
         // A CPU write to the front buffer since the resolve drops the kept
@@ -7369,6 +8692,16 @@ impl Drawer {
                     )
                 }
             };
+            if let Some(present) = self.present.clone() {
+                self.present_front(present, (width, height, pitch), src, offset, addr)?;
+                // No older late copy is waiting: none is made meanwhile.
+                self.late_front = None;
+                return Ok(Ok(Frame {
+                    width,
+                    height,
+                    rgba8: Vec::new(),
+                }));
+            }
             let size = u64::from(width) * u64::from(height) * 4;
             let usage = |u| wgpu::BufferDescriptor {
                 label: Some("front buffer"),
@@ -7390,7 +8723,7 @@ impl Drawer {
                 ))
             });
             let (endian, swizzle) = self.front_buffer_read(addr);
-            let pipeline = self.decode_pipeline(false);
+            let pipeline = self.decode_pipeline(0);
             let params = [
                 width,
                 height,
@@ -7483,6 +8816,153 @@ impl Drawer {
         Ok(raw.and_then(|raw| detile_front(raw, width, height, pitch, endian, swizzle)))
     }
 
+    /// The device, its adapter and queue and the instance they came from,
+    /// for a window that presents [`Drawer::present`]'s frames on the same
+    /// device.
+    pub fn gpu(&self) -> (wgpu::Instance, wgpu::Adapter, wgpu::Device, wgpu::Queue) {
+        (
+            self.instance.clone(),
+            self.gpu_adapter.clone(),
+            self.device.clone(),
+            self.queue.clone(),
+        )
+    }
+
+    /// Decodes the front buffer at word `offset` of `src` (`width` x
+    /// `height`, rows `pitch` apart, tiled) into the next of
+    /// [`Drawer::front_textures`] at the end of the batch, flushes, and has
+    /// the submit thread hand the texture to `present` once submitted. The
+    /// swap waits for neither the GPU nor a read-back.
+    fn present_front(
+        &mut self,
+        present: Present,
+        (width, height, pitch): (u32, u32, u32),
+        src: wgpu::Buffer,
+        offset: u32,
+        addr: u32,
+    ) -> Result<(), Error> {
+        // Rows of a buffer to texture copy are 256 bytes apart.
+        let row_words = width.next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT / 4);
+        let size = u64::from(row_words) * u64::from(height) * 4;
+        let rows = (self.front_rows.take())
+            .filter(|b| b.size() == size)
+            .unwrap_or_else(|| {
+                self.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("front buffer"),
+                    size,
+                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+                    mapped_at_creation: false,
+                })
+            });
+        // In turn: two queued in the window (its frame queue), one it took
+        // and is presenting, one written, and two more so that a frame the
+        // queue drops while the window is still presenting cannot hand the
+        // presented texture back to be written over.
+        const TEXTURES: usize = 6;
+        let fits = |t: &wgpu::Texture| (t.width(), t.height()) == (width, height);
+        if !self.front_textures.iter().all(fits) {
+            self.front_textures.clear();
+        }
+        let tex = if self.front_textures.len() < TEXTURES {
+            let t = self.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("presented frame"),
+                size: wgpu::Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8Unorm,
+                // Copied out only by tests.
+                usage: wgpu::TextureUsages::COPY_DST
+                    | wgpu::TextureUsages::TEXTURE_BINDING
+                    | wgpu::TextureUsages::COPY_SRC,
+                view_formats: &[],
+            });
+            self.front_textures.push(t.clone());
+            t
+        } else {
+            self.front_textures.rotate_left(1);
+            self.front_textures[TEXTURES - 1].clone()
+        };
+        let (endian, swizzle) = self.front_buffer_read(addr);
+        let pipeline = self.decode_pipeline(0);
+        let params = [
+            width,
+            height,
+            pitch,
+            endian as u32,
+            // x, y, z, w from themselves: none.
+            u32::from(swizzle.unwrap_or((1 << 3) | (2 << 6) | (3 << 9))),
+            offset,
+            row_words,
+            0,
+            0,
+            0,
+            0,
+            0,
+        ];
+        let uniform = self.buffer(
+            "front params",
+            &to_bytes(&params),
+            wgpu::BufferUsages::UNIFORM,
+        );
+        let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("front buffer decode"),
+            layout: &pipeline.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: src.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: rows.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 7,
+                    resource: uniform.as_entire_binding(),
+                },
+            ],
+        });
+        let device = &self.device;
+        let b = self.batch.get_or_insert_with(|| Batch {
+            pass: None,
+            enc: device.create_command_encoder(&Default::default()),
+        });
+        b.pass = None;
+        {
+            let mut pass = b.enc.begin_compute_pass(&Default::default());
+            pass.set_pipeline(&pipeline);
+            pass.set_bind_group(0, &bg, &[]);
+            pass.dispatch_workgroups(width.div_ceil(8), height.div_ceil(8), 1);
+        }
+        b.enc.copy_buffer_to_texture(
+            wgpu::TexelCopyBufferInfo {
+                buffer: &rows,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(row_words * 4),
+                    rows_per_image: Some(height),
+                },
+            },
+            tex.as_image_copy(),
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+        );
+        self.front_rows = Some(rows);
+        self.after_submit = Some(Box::new(move || present(tex)));
+        self.flush().map_err(|e| match e {
+            Skip::Fatal(e) => e,
+            Skip::Unsupported(why) => Error::Gpu(why),
+        })
+    }
+
     /// The endian the front buffer at `addr` was resolved with, and the
     /// swizzle scan-out reads it through: fetch constant 0's, as Xenia's
     /// swap texture, when it is a texture fetch of this address (it undoes
@@ -7510,6 +8990,8 @@ struct WindowScratch {
     part_of: Vec<(u32, usize)>,
     /// Where each part lands in the window.
     at: Vec<u64>,
+    /// The parts list a draw gave back, for the next to fill.
+    parts: Vec<(u64, u64)>,
 }
 
 /// `ranges` sorted by start, with those that touch or overlap made one.
@@ -7557,6 +9039,21 @@ fn detile_front(
 
 impl Drawer {}
 
+/// Records `key` as the latest upload of its decode key and removes the
+/// cache entry of the hash it replaces (a texture the guest rewrote, such as
+/// a render target resolved every frame), returning that entry's bytes.
+/// Views still bound in the open batch stay alive through their clones.
+fn drop_stale<V>(
+    latest: &mut HashMap<[u32; 6], u64>,
+    cache: &mut HashMap<([u32; 6], u64), (V, u64, u64)>,
+    key: ([u32; 6], u64),
+) -> u64 {
+    match latest.insert(key.0, key.1) {
+        Some(old) if old != key.1 => cache.remove(&(key.0, old)).map_or(0, |e| e.1),
+        _ => 0,
+    }
+}
+
 /// The base level of `fetch` from its guest bytes as host texels: host
 /// format, width, height and texel bytes. BC blocks when `bc` and
 /// [`bc_blocks`] takes them; Rgba8Unorm, or floats where
@@ -7576,6 +9073,17 @@ fn decode_level(
     if host == wgpu::TextureFormat::Rgba8Unorm {
         let img = xenon_texture::decode_base_level(fetch, bytes)?;
         return Ok((host, img.width, img.height, img.rgba8));
+    }
+    use xenon_texture::TextureFormat as F;
+    let half = matches!(
+        fetch.format.data_format(),
+        F::K16Float | F::K16_16Float | F::K16_16_16_16Float
+    );
+    if half && host == wgpu::TextureFormat::Rgba16Float {
+        // Halves straight through: the f32 round trip is the identity for them.
+        let rgba = xenon_texture::decode_base_level_f16(fetch, bytes)?;
+        let data = rgba.iter().flat_map(|h| h.to_le_bytes()).collect();
+        return Ok((host, fetch.width(), fetch.height(), data));
     }
     let img = xenon_texture::decode_base_level_f32(fetch, bytes)?;
     let data = if host == wgpu::TextureFormat::Rgba32Float {
@@ -7602,11 +9110,15 @@ fn reads_base(fetch: &xenon_texture::TextureFetch) -> bool {
 /// [`xenon_texture::mip_fetches`] that [`level_range`] places; `None` when
 /// there are none.
 fn chain_range(fetch: &xenon_texture::TextureFetch) -> Option<(u64, u64)> {
+    (level_ranges(fetch).into_iter()).reduce(|a, b| (a.0.min(b.0), a.1.max(b.1)))
+}
+
+/// The physical guest ranges `[lo, hi)` of the levels [`chain_range`] spans,
+/// one per level.
+fn level_ranges(fetch: &xenon_texture::TextureFetch) -> Vec<(u64, u64)> {
     let base = level_range(fetch).filter(|_| reads_base(fetch));
     let mips = xenon_texture::mip_fetches(fetch).map_while(|m| level_range(&m));
-    base.into_iter()
-        .chain(mips)
-        .reduce(|a, b| (a.0.min(b.0), a.1.max(b.1)))
+    base.into_iter().chain(mips).collect()
 }
 
 /// The physical guest range `[lo, hi)` the base level of `fetch` reads.
@@ -7635,9 +9147,8 @@ fn bc_blocks(
         F::Dxt4_5 => (wgpu::TextureFormat::Bc3RgbaUnorm, 16),
         _ => return Ok(None),
     };
-    const IDENTITY: u16 = (1 << 3) | (2 << 6) | (3 << 9);
     let (w, h) = (fetch.width(), fetch.height());
-    if fetch.swizzle & 0xFFF != IDENTITY || w % 4 != 0 || h % 4 != 0 {
+    if fetch.swizzle & 0xFFF != IDENTITY_SWIZZLE || w % 4 != 0 || h % 4 != 0 {
         return Ok(None);
     }
     let (wb, hb) = (w / 4, h / 4);
@@ -7667,6 +9178,141 @@ fn bc_blocks(
             .collect()
     };
     Ok(Some((format, blocks)))
+}
+
+/// The XYZW fetch swizzle that keeps each component.
+const IDENTITY_SWIZZLE: u16 = (1 << 3) | (2 << 6) | (3 << 9);
+
+/// Compute entry points that decode guest texture bytes, by the index
+/// [`Drawer::decode_pipeline`] and [`Texels::Gpu`] take.
+const DECODE_ENTRIES: [&str; 3] = ["decode_8888", "decode_float", "detile_bc"];
+
+/// The texels of one level of a guest texture upload.
+enum Texels {
+    /// Decoded on the CPU ([`decode_level`]).
+    Cpu(Vec<u8>),
+    /// Decoded on the GPU from the guest bytes: the [`DECODE_ENTRIES`]
+    /// index and its `DecodeParams` (resolve.wgsl), as [`gpu_level`] makes
+    /// them.
+    Gpu(usize, [u32; 12]),
+}
+
+/// How the GPU decodes guest level `f`, whose bytes start `at` bytes into
+/// the texture's guest bytes and run `len`, to the texels [`decode_level`]
+/// makes of them (`bc` and `float32` as it takes them): the host format,
+/// the [`DECODE_ENTRIES`] index and its `DecodeParams` (blocks wide and
+/// high, pitch in blocks, endian, swizzle, word offset, words per output
+/// row padded to `COPY_BYTES_PER_ROW_ALIGNMENT`, first row 0, decode_float
+/// mode or for detile_bc the log2 of the block bytes). `None` where the
+/// CPU decodes it: linear, 3D, stacked or signed fetches, formats the
+/// kernels lack, a DXT level `bc_blocks` refuses, bytes short of the level
+/// or unaligned, or an output buffer over `limit` bytes.
+fn gpu_level(
+    f: &xenon_texture::TextureFetch,
+    at: usize,
+    len: usize,
+    bc: bool,
+    float32: bool,
+    limit: u64,
+) -> Option<(wgpu::TextureFormat, usize, [u32; 12])> {
+    use wgpu::TextureFormat as H;
+    use xenon_texture::{tile, Dimension, TextureFormat as F};
+    if !f.tiled
+        || f.dimension != Dimension::D2OrStacked
+        || f.stacked
+        || f.sign.contains(&1)
+        || !at.is_multiple_of(4)
+    {
+        return None;
+    }
+    // (host format, entry, mode, guest and host bytes per block, block size)
+    let (host, entry, mode, bpb, host_bytes, block) = match (
+        f.format.data_format(),
+        host_texture_format(f.format, f.sign, float32),
+    ) {
+        (F::Dxt1, _) if bc => (H::Bc1RgbaUnorm, 2, 3, 8, 8, 4),
+        (F::Dxt2_3, _) if bc => (H::Bc2RgbaUnorm, 2, 4, 16, 16, 4),
+        (F::Dxt4_5, _) if bc => (H::Bc3RgbaUnorm, 2, 4, 16, 16, 4),
+        (F::K8_8_8_8, H::Rgba8Unorm) => (H::Rgba8Unorm, 0, 0, 4, 4, 1),
+        (F::K32Float, H::Rgba32Float) => (H::Rgba32Float, 1, 0, 4, 16, 1),
+        (F::K32Float, H::Rgba16Float) => (H::Rgba16Float, 1, 1, 4, 8, 1),
+        (F::K16_16_16_16Float, H::Rgba16Float) => (H::Rgba16Float, 1, 2, 8, 8, 1),
+        (F::K16_16Float, H::Rgba16Float) => (H::Rgba16Float, 1, 7, 4, 8, 1),
+        (F::K24_8, H::Rgba32Float) => (H::Rgba32Float, 1, 3, 4, 16, 1),
+        (F::K24_8, H::Rgba16Float) => (H::Rgba16Float, 1, 4, 4, 8, 1),
+        (F::K24_8Float, H::Rgba32Float) => (H::Rgba32Float, 1, 5, 4, 16, 1),
+        (F::K24_8Float, H::Rgba16Float) => (H::Rgba16Float, 1, 6, 4, 8, 1),
+        _ => return None,
+    };
+    let (w, h) = (f.width(), f.height());
+    if block == 4 && (f.swizzle & 0xFFF != IDENTITY_SWIZZLE || w % 4 != 0 || h % 4 != 0) {
+        return None;
+    }
+    let (wb, hb) = (w.div_ceil(block), h.div_ceil(block));
+    let pitch = tile::align_to_tile(f.pitch_texels().div_ceil(block));
+    if pitch < wb || len < tile::tiled_extent_2d(wb, hb, pitch, bpb).ok()? as usize {
+        return None;
+    }
+    let row_words = (wb * host_bytes).next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT) / 4;
+    if u64::from(row_words) * 4 * u64::from(hb) > limit {
+        return None;
+    }
+    let params = [
+        wb,
+        hb,
+        pitch,
+        f.endian as u32,
+        u32::from(f.swizzle),
+        u32::try_from(at / 4).ok()?,
+        row_words,
+        0,
+        mode,
+        0,
+        0,
+        0,
+    ];
+    Some((host, entry, params))
+}
+
+/// [`gpu_level`] of the base of `fetch` (its first `base_len` bytes) and
+/// of each of `mips` ([`Drawer::texture_from`]'s: fetch, offset, length),
+/// as the levels the CPU path of [`Drawer::texture_from`] uploads: the
+/// host format and per level its size and decode, none for levels below
+/// the first sampled one. A DXT chain stops before a level not whole
+/// blocks, as the CPU path's does; `None` (all on the CPU) when any other
+/// level is not one [`gpu_level`] takes.
+#[allow(clippy::type_complexity)]
+fn gpu_plan(
+    fetch: &xenon_texture::TextureFetch,
+    base_len: usize,
+    mips: &[(xenon_texture::TextureFetch, usize, usize)],
+    bc: bool,
+    float32: bool,
+    limit: u64,
+) -> Option<(
+    wgpu::TextureFormat,
+    Vec<(u32, u32, Option<(usize, [u32; 12])>)>,
+)> {
+    let (host, e, p) = gpu_level(fetch, 0, base_len, bc, float32, limit)?;
+    let mut levels = vec![(fetch.width(), fetch.height(), Some((e, p)))];
+    let first = fetch.mip_range().0 as usize;
+    for (level, (m, at, len)) in (1..).zip(mips) {
+        if level < first {
+            levels.push((m.width(), m.height(), None));
+            continue;
+        }
+        if host.is_compressed() && (m.width() % 4 != 0 || m.height() % 4 != 0) {
+            break;
+        }
+        match gpu_level(m, *at, *len, bc, float32, limit)? {
+            (h, e, p) if h == host => levels.push((m.width(), m.height(), Some((e, p)))),
+            _ => return None,
+        }
+    }
+    while levels.last().is_some_and(|l| l.2.is_none()) {
+        levels.pop();
+    }
+    Some((host, levels))
 }
 
 /// The [`Drawer::texture_log`] line of fetch constant `c` in slot `n` of a
@@ -7764,6 +9410,48 @@ fn host_texture_format(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A full memo loses its least recently used entries only: those of
+    /// the replays still drawing stay.
+    #[test]
+    fn memo_cap_trims_the_oldest() {
+        let cap = TEXTURE_MEMO_CAP;
+        // Half used in replay 10 and earlier, half in replays 20 and 21.
+        let ages: Vec<u64> = (0..cap as u64)
+            .map(|i| if i % 2 == 0 { i % 11 } else { 20 + i % 2 })
+            .collect();
+        let cut = trim_cut(ages.clone(), cap / 2).unwrap();
+        let kept = ages.iter().filter(|&&a| a > cut).count();
+        assert_eq!((cut, kept), (10, cap / 2));
+        assert_eq!(trim_cut(vec![1, 2, 3], 3), None);
+        // All from one replay: none can be told apart, all go.
+        assert_eq!(trim_cut(vec![5; 8], 4), Some(5));
+    }
+
+    /// Pages split at guest page boundaries per level, in level order, and
+    /// the key hash follows any page's bytes.
+    #[test]
+    fn page_hashes_split_levels_at_guest_pages() {
+        let bytes: Vec<u8> = (0..0x3000u32).map(|i| (i * 7) as u8).collect();
+        // A level from 0x1800 for 0x2000 bytes, then one at 0x9000 for 0x1000.
+        let segs = [(0x1800, 0, 0x2000), (0x9000, 0x2000, 0x1000)];
+        let (pages, h) = page_hashes(&bytes, segs.into_iter());
+        let spans: Vec<_> = pages.iter().map(|p| (p.0, p.1)).collect();
+        assert_eq!(
+            spans,
+            [
+                (0x1800, 0x2000),
+                (0x2000, 0x3000),
+                (0x3000, 0x3800),
+                (0x9000, 0xA000)
+            ]
+        );
+        assert_eq!(pages[1].2, hash_bytes(&bytes[0x800..0x1800]));
+        let mut other = bytes.clone();
+        other[0x2FFF] ^= 1;
+        assert_ne!(page_hashes(&other, segs.into_iter()).1, h);
+        assert_eq!(page_hashes(&bytes, segs.into_iter()).1, h);
+    }
 
     /// Plain commands are charged by run, timed ones not at all, with two
     /// clock reads per timed command and none per plain one.
@@ -7972,6 +9660,55 @@ mod tests {
 
     /// The constants block holds each register of its four blocks in
     /// order, then the window base and the index offset.
+    /// The named float constants, in order, whatever the mask's words.
+    #[test]
+    fn float_consts_reads_the_masked_constants_in_order() {
+        let mut r = regs::RegisterFile::default();
+        for i in 0..2 * FLOAT_STAGE_REGS {
+            r.set(regs::SHADER_CONSTANT_FLOAT + i, 0x1000_0000 + i);
+        }
+        let picked = [0usize, 5, 63, 64, 130, 255];
+        let mut mask = [0u64; 4];
+        for &i in &picked {
+            mask[i / 64] |= 1 << (i % 64);
+        }
+        for stage in 0..2 {
+            let mut out = vec![0; 16 * picked.len()];
+            float_consts(&r, stage, &mask, &mut out);
+            let want: Vec<u32> = (picked.iter())
+                .flat_map(|&i| {
+                    (0..4).map(move |c| 0x1000_0000 + FLOAT_STAGE_REGS * stage + 4 * i as u32 + c)
+                })
+                .collect();
+            assert_eq!(out, to_bytes(&want), "stage {stage}");
+        }
+        let mut none = [7u8; 16];
+        float_consts(&r, 0, &[0; 4], &mut none);
+        assert_eq!(none, [7; 16]);
+    }
+
+    /// A program loaded again is the one made before (same words, so the
+    /// same hash), and the list keeps only the newest.
+    #[test]
+    fn recent_program_reuses_and_bounds() {
+        let mut recent = Vec::new();
+        let a = recent_program(&mut recent, &[1, 2, 3]);
+        let b = recent_program(&mut recent, &[4, 5]);
+        let a2 = recent_program(&mut recent, &[1, 2, 3]);
+        assert!(Arc::ptr_eq(&a.words, &a2.words));
+        assert_eq!(a.hash, hash_words(&[1, 2, 3]));
+        assert_eq!(b.hash, hash_words(&[4, 5]));
+        assert_eq!(recent.len(), 2);
+        for n in 0..2 * RECENT_PROGRAMS as u32 {
+            let p = recent_program(&mut recent, &[n, 99]);
+            assert_eq!(*p.words, [n, 99]);
+        }
+        assert_eq!(recent.len(), RECENT_PROGRAMS);
+        let a3 = recent_program(&mut recent, &[1, 2, 3]);
+        assert!(!Arc::ptr_eq(&a.words, &a3.words));
+        assert_eq!(a3.hash, a.hash);
+    }
+
     #[test]
     fn consts_block_is_the_registers_in_order() {
         let mut r = regs::RegisterFile::default();
@@ -7979,16 +9716,17 @@ mod tests {
             r.set(i, i.wrapping_mul(0x9E37_79B9));
         }
         r.set(regs::VGT_INDX_OFFSET, 77);
+        r.set(regs::RB_ALPHA_REF, 0x3F00_0000);
         let r = &r;
         let block = |base: u32, n: u32| (0..n).map(move |i| r.get(base + i));
         let mut want: Vec<u32> = block(regs::SHADER_CONSTANT_FETCH, 192)
             .chain(block(regs::SHADER_CONSTANT_BOOL, 8))
             .chain(block(regs::SHADER_CONSTANT_LOOP, 32))
             .collect();
-        want.extend([0x1234_5678, 77, 0, 0]);
+        want.extend([0x1234_5678, 77, 0x3F00_0000, 0]);
         let rebase = std::array::from_fn(|k| k as i32 - 3);
         want.extend(rebase.map(|w: i32| w as u32));
-        let mut got = consts_prefix(r);
+        let mut got = to_bytes(&consts_prefix(r));
         got.extend(to_bytes(&consts_suffix(r, 0x1234_5678, &rebase)));
         assert_eq!(got, to_bytes(&want));
         assert_eq!(got.len(), CONSTS_BYTES);
@@ -8480,6 +10218,206 @@ mod tests {
         assert_eq!(m.data, vec![0, 0, 1, 2]);
     }
 
+    /// The half fast path of `decode_level` gives the bytes of the f32
+    /// round trip it replaces: random halves, denormals, infinities, NaNs,
+    /// constant swizzles, on the base and each mip level.
+    #[test]
+    fn half_textures_decode_as_through_f32() {
+        use xenon_texture::{Endian, TextureFetch, TextureFormat as F};
+        let specials = [
+            0x0000, 0x8000, 0x0001, 0x8001, 0x03FF, 0x0400, 0x3C00, 0x7BFF, 0x7C00, 0xFC00, 0x7C01,
+            0x7E00, 0x7FFF, 0xFC01, 0xFFFF,
+        ];
+        let mut seed = 0x9E37_79B9u32;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed
+        };
+        let swz = |s: [u32; 4]| s[0] | s[1] << 3 | s[2] << 6 | s[3] << 9;
+        for format in [
+            F::K16Float,
+            F::K16_16Float,
+            F::K16_16_16_16Float,
+            F::K16_16Expand,
+        ] {
+            for swizzle in [swz([0, 1, 2, 3]), swz([0, 1, 5, 5]), swz([2, 4, 0, 5])] {
+                let words = [
+                    2 | (64 >> 5) << 22 | 1 << 31,
+                    format as u32 | (Endian::K8in32 as u32) << 6 | 0x1234 << 12,
+                    63 | 31 << 13,
+                    swizzle << 1,
+                    3 << 6,
+                    1 << 9 | 0x0008_0000,
+                ];
+                let base = TextureFetch::decode(words);
+                let levels: Vec<_> = std::iter::once(base)
+                    .chain(xenon_texture::mip_fetches(&base))
+                    .collect();
+                assert_eq!(levels.len(), 4);
+                for fetch in levels {
+                    let len = xenon_texture::bytes_needed(&fetch).unwrap();
+                    let bytes: Vec<u8> = (0..len / 2)
+                        .flat_map(|_| {
+                            let r = next();
+                            let h = match r % 4 {
+                                0 => specials[(r >> 8) as usize % specials.len()],
+                                _ => (r >> 16) as u16,
+                            };
+                            h.to_le_bytes()
+                        })
+                        .collect();
+                    let img = xenon_texture::decode_base_level_f32(&fetch, &bytes).unwrap();
+                    let want: Vec<u8> = img
+                        .rgba
+                        .iter()
+                        .flat_map(|&v| formats::f32_to_half(v).to_le_bytes())
+                        .collect();
+                    for float32 in [false, true] {
+                        let (host, w, h, data) =
+                            decode_level(&fetch, &bytes, false, float32).unwrap();
+                        assert_eq!(host, wgpu::TextureFormat::Rgba16Float);
+                        assert_eq!((w, h), (img.width, img.height));
+                        assert!(data == want, "{format:?} swizzle {swizzle:#x} {w}x{h}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// A decode key uploaded with new bytes drops the entry of its last
+    /// hash, and only that one.
+    #[test]
+    fn new_upload_of_a_key_drops_its_stale_entry() {
+        let mut latest = HashMap::default();
+        let mut cache: HashMap<([u32; 6], u64), ((), u64, u64)> = HashMap::default();
+        let (a, b) = ([1; 6], [2; 6]);
+        let mut bytes = 0;
+        for (key, len) in [((a, 10), 100), ((b, 10), 7), ((a, 11), 100), ((a, 12), 100)] {
+            bytes -= drop_stale(&mut latest, &mut cache, key);
+            bytes += len;
+            cache.insert(key, ((), len, 0));
+        }
+        assert_eq!(bytes, 107);
+        let mut keys: Vec<_> = cache.keys().copied().collect();
+        keys.sort();
+        assert_eq!(keys, [(a, 12), (b, 10)]);
+        // An entry evicted already frees nothing more.
+        cache.remove(&(a, 12));
+        assert_eq!(drop_stale(&mut latest, &mut cache, (a, 13)), 0);
+        assert_eq!(drop_stale(&mut latest, &mut cache, (b, 10)), 0);
+    }
+
+    /// A 64x64 fetch of `format` (tiled or not, endian 8in32, mips 1 to
+    /// `max` after the base).
+    fn plan_fetch(format: u32, tiled: bool, max: u32) -> xenon_texture::TextureFetch {
+        xenon_texture::TextureFetch::decode([
+            2 | (2 << 22) | (u32::from(tiled) << 31),
+            format | (2 << 6) | 0x4_0000,
+            63 | (63 << 13),
+            u32::from(IDENTITY_SWIZZLE) << 1,
+            max << 6,
+            0x8_0000 | (1 << 9),
+        ])
+    }
+
+    /// The DecodeParams of each kernel: blocks, tiled pitch in blocks,
+    /// word offset and output rows padded to 256 bytes.
+    #[test]
+    fn gpu_level_params() {
+        use wgpu::TextureFormat as H;
+        let swizzle = u32::from(IDENTITY_SWIZZLE);
+        let rgba8 = plan_fetch(6, true, 0);
+        let p = gpu_level(&rgba8, 64, 16384, false, true, u64::MAX).unwrap();
+        assert_eq!(
+            p,
+            (
+                H::Rgba8Unorm,
+                0,
+                [64, 64, 64, 2, swizzle, 16, 64, 0, 0, 0, 0, 0]
+            )
+        );
+        // k_32_FLOAT to Rgba32Float: 16 host bytes per texel.
+        let p = gpu_level(&plan_fetch(36, true, 0), 0, 16384, false, true, u64::MAX).unwrap();
+        assert_eq!((p.0, p.1, p.2[6], p.2[8]), (H::Rgba32Float, 1, 256, 0));
+        let p = gpu_level(&plan_fetch(36, true, 0), 0, 16384, false, false, u64::MAX).unwrap();
+        assert_eq!((p.0, p.2[6], p.2[8]), (H::Rgba16Float, 128, 1));
+        // DXT1: 16x16 blocks of 8 bytes, a 32-block pitch, 128 bytes a row
+        // padded to 256.
+        let p = gpu_level(&plan_fetch(18, true, 0), 0, 8192, true, true, u64::MAX).unwrap();
+        assert_eq!(
+            p,
+            (
+                H::Bc1RgbaUnorm,
+                2,
+                [16, 16, 32, 2, swizzle, 0, 64, 0, 3, 0, 0, 0]
+            )
+        );
+        // DXT without BC textures, linear, unaligned, short, signed or over
+        // the limit: the CPU's.
+        assert_eq!(
+            gpu_level(&plan_fetch(18, true, 0), 0, 4096, false, true, u64::MAX),
+            None
+        );
+        assert_eq!(
+            gpu_level(&plan_fetch(6, false, 0), 0, 16384, false, true, u64::MAX),
+            None
+        );
+        assert_eq!(gpu_level(&rgba8, 2, 16384, false, true, u64::MAX), None);
+        assert_eq!(gpu_level(&rgba8, 0, 16383, false, true, u64::MAX), None);
+        assert_eq!(gpu_level(&rgba8, 0, 16384, false, true, 16383), None);
+        let signed = xenon_texture::TextureFetch {
+            sign: [0, 1, 0, 0],
+            ..plan_fetch(36, true, 0)
+        };
+        assert_eq!(gpu_level(&signed, 0, 16384, false, true, u64::MAX), None);
+    }
+
+    /// A plan covers the levels the CPU path uploads: a DXT chain stops
+    /// before its first level that is not whole blocks.
+    #[test]
+    fn gpu_plan_levels() {
+        let mips_of = |f: &xenon_texture::TextureFetch| {
+            let mut at = xenon_texture::bytes_needed(f).unwrap();
+            let base = at;
+            let mips: Vec<_> = xenon_texture::mip_fetches(f)
+                .map(|m| {
+                    let len = xenon_texture::bytes_needed(&m).unwrap();
+                    at += len;
+                    (m, at - len, len)
+                })
+                .collect();
+            (base, mips)
+        };
+        let bc = plan_fetch(20, true, 6);
+        let (base, mips) = mips_of(&bc);
+        let (host, levels) = gpu_plan(&bc, base, &mips, true, true, u64::MAX).unwrap();
+        assert_eq!(host, wgpu::TextureFormat::Bc3RgbaUnorm);
+        let sizes: Vec<_> = levels.iter().map(|l| (l.0, l.1)).collect();
+        assert_eq!(sizes, [(64, 64), (32, 32), (16, 16), (8, 8), (4, 4)]);
+        let offsets: Vec<_> = levels
+            .iter()
+            .map(|l| l.2.unwrap().1[5] as usize * 4)
+            .collect();
+        assert_eq!(
+            offsets[1..],
+            mips[..4].iter().map(|m| m.1).collect::<Vec<_>>()[..]
+        );
+        let rgba8 = xenon_texture::TextureFetch {
+            mip_min_level: 2,
+            ..plan_fetch(6, true, 6)
+        };
+        let (base, mips) = mips_of(&rgba8);
+        let (_, levels) = gpu_plan(&rgba8, base, &mips, true, true, u64::MAX).unwrap();
+        let decoded: Vec<_> = levels.iter().map(|l| l.2.is_some()).collect();
+        assert_eq!(decoded, [true, false, true, true, true, true, true]);
+        // A level the GPU cannot take puts the whole chain on the CPU.
+        let mut unaligned = mips.clone();
+        unaligned[1].1 += 2;
+        assert!(gpu_plan(&rgba8, base, &unaligned, true, true, u64::MAX).is_none());
+    }
+
     #[test]
     fn host_texture_formats() {
         use wgpu::TextureFormat as H;
@@ -8563,6 +10501,39 @@ mod tests {
         assert!(drop_depth_wgsl(DEPTH_MEMBER).is_err());
     }
 
+    /// RB_COLORCONTROL's alpha test needs bit 3 and a function other than
+    /// always, and both it and alpha to mask need a shader writing oC0.
+    #[test]
+    fn alpha_test_bits_and_wgsl() {
+        // Greater (4), test on: bit 1 and the function in bits 2..5.
+        assert_eq!(alpha_extra(0x0C, true), 2 | 4 << 2);
+        assert_eq!(alpha_extra(0x0C, false), 0);
+        assert_eq!(alpha_extra(0x04, true), 0, "test off");
+        assert_eq!(alpha_extra(0x0F, true), 0, "always");
+        assert_eq!(alpha_extra(0x08, true), 2, "never");
+        assert_eq!(alpha_extra(0x10, true), 1 << 5, "alpha to mask");
+        let store = "    out.c0 = o_col[0];
+";
+        let ps = alpha_test_wgsl(store, alpha_extra(0x0E, true)).unwrap();
+        assert_eq!(
+            ps,
+            "    if !(o_col[0].w >= consts.alpha_ref) { discard; }
+    out.c0 = o_col[0];
+"
+        );
+        let ps = alpha_test_wgsl(store, alpha_extra(0x08 | 0x10, true)).unwrap();
+        assert!(ps.starts_with(
+            "    if !(false) { discard; }
+    if !(o_col[0].w >= 0.5)"
+        ));
+        assert!(alpha_test_wgsl(
+            "    out.c1 = o_col[1];
+",
+            2
+        )
+        .is_err());
+    }
+
     #[test]
     fn index_range_skips_resets_and_applies_the_offset() {
         let range = |i: &[u32], o| offset_range(min_max(i), o);
@@ -8614,5 +10585,19 @@ mod tests {
         // Entirely past the buffer: nothing, and clipped.
         let (lo, hi, clipped) = fetch_range(a, 16, 2, &[r(4, true, 0, 1)], Some((20, 30)));
         assert_eq!((lo == hi, clipped), (true, true));
+    }
+
+    /// Every destination the drawer writes resolves on the GPU, with the
+    /// texel size resolve.wgsl writes for its code.
+    #[test]
+    fn every_resolve_destination_is_on_the_gpu() {
+        for f in 0..64 {
+            let Some(bytes) = formats::dest_bytes(f) else {
+                assert_eq!(gpu_dest(f), None, "{f}");
+                continue;
+            };
+            let code = gpu_dest(f).unwrap_or_else(|| panic!("{f}"));
+            assert_eq!(bytes == 8, matches!(code, 4 | 6 | 7), "{f}");
+        }
     }
 }
