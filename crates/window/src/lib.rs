@@ -198,6 +198,8 @@ struct App {
     /// A d-pad press from the mouse wheel (weapon switch) and until when.
     wheel: Option<(u16, Instant)>,
     last_poll: Instant,
+    /// The last pad state written to the log.
+    logged: (u16, u8, u8, bool),
     pad: xinput::Reader,
     window: Option<Arc<Window>>,
     /// The CPU path's surface, made when first drawn to.
@@ -224,6 +226,7 @@ impl App {
             captured: false,
             wheel: None,
             last_poll: Instant::now(),
+            logged: (0, 0, 0, false),
             pad: xinput::Reader::default(),
             window: None,
             soft: None,
@@ -431,6 +434,16 @@ impl ApplicationHandler for App {
         match self.wheel {
             Some((b, until)) if now < until => pad.buttons |= b,
             _ => self.wheel = None,
+        }
+        // One line per change of buttons, triggers or car mode, so a log
+        // shows what the game was given when controls misbehave.
+        let key = (pad.buttons, pad.lt, pad.rt, self.keys.in_vehicle());
+        if key != self.logged {
+            self.logged = key;
+            eprintln!(
+                "window: pad buttons {:#06x} lt {} rt {} vehicle {}",
+                key.0, key.1, key.2, key.3
+            );
         }
 
         *self.link.pad.lock().unwrap() = pad;
