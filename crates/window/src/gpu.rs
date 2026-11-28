@@ -131,7 +131,11 @@ impl Presenter {
             stale: false,
             modes,
         };
-        p.follow_refresh(0);
+        p.follow_refresh(0, false);
+        eprintln!(
+            "window: frames presented on the GPU ({:?}, {:?})",
+            p.config.format, p.config.present_mode
+        );
         Ok(p)
     }
 
@@ -144,19 +148,21 @@ impl Presenter {
     /// there blocked the window to about 42 of 60 frames a second).
     /// XENON_PRESENT=fifo, mailbox or immediate picks one; an unsupported
     /// choice falls back.
-    pub fn follow_refresh(&mut self, mhz: u32) {
+    pub fn follow_refresh(&mut self, mhz: u32, locked: bool) {
         let want = match std::env::var("XENON_PRESENT").as_deref() {
             Ok("fifo") => wgpu::PresentMode::Fifo,
             Ok("immediate") => wgpu::PresentMode::Immediate,
             Ok("mailbox") => wgpu::PresentMode::Mailbox,
-            _ if crate::pace::near_sixty_hz(mhz) => wgpu::PresentMode::Fifo,
+            // Fifo against a title on a clock of its own blocked the
+            // window to about 42 of 60 frames a second.
+            _ if locked && crate::pace::near_sixty_hz(mhz) => wgpu::PresentMode::Fifo,
             _ => wgpu::PresentMode::Mailbox,
         };
         let mode = [want, wgpu::PresentMode::Mailbox, wgpu::PresentMode::Fifo]
             .into_iter()
             .find(|m| self.modes.contains(m))
             .unwrap_or(wgpu::PresentMode::Fifo);
-        if mode != self.config.present_mode || mhz == 0 {
+        if mode != self.config.present_mode {
             self.config.present_mode = mode;
             self.stale = true;
             eprintln!(

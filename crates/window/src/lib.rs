@@ -92,6 +92,9 @@ pub struct Link {
     monitor: Mutex<Option<(String, u32)>>,
     /// Frames presented since the window opened.
     presents: AtomicU32,
+    /// When the host last raised the title's vertical blank on the
+    /// display's own: the window presents with Fifo only while it does.
+    locked: Mutex<Option<Instant>>,
 }
 
 /// Whether the window presents with the device it was given.
@@ -158,6 +161,20 @@ impl Link {
     /// Frames presented since the window opened.
     pub fn presents(&self) -> u32 {
         self.presents.load(Ordering::Relaxed)
+    }
+
+    /// The host raised a vertical blank on the display's own just now.
+    pub fn set_locked(&self) {
+        *self.locked.lock().unwrap() = Some(Instant::now());
+    }
+
+    /// Whether the title's frames follow the display's refresh (a raise
+    /// on the display's within the last quarter second).
+    pub fn locked(&self) -> bool {
+        self.locked
+            .lock()
+            .unwrap()
+            .is_some_and(|t| t.elapsed() < Duration::from_millis(250))
     }
 
     /// The controller and keyboard together, as last read.
@@ -327,7 +344,7 @@ impl App {
         };
         let mhz = m.refresh_rate_millihertz().unwrap_or(0);
         if let Some(g) = self.gpu.as_mut() {
-            g.follow_refresh(mhz);
+            g.follow_refresh(mhz, self.link.locked());
         }
         #[cfg(windows)]
         {

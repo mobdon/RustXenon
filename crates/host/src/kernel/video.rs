@@ -317,10 +317,20 @@ fn start_vblank(rt: std::sync::Arc<Runtime>, irq: std::sync::Arc<Mutex<Context>>
                         if let Some(w) = &window {
                             REFRESHES.lock().unwrap().refresh(w.presents());
                         }
+                        let steady =
+                            prev.is_some_and(|p| near_sixty(t.saturating_duration_since(p)));
                         if display_raises(prev, raised, t) {
                             (raised, due) = (t, t + VBLANK_PERIOD + DISPLAY_SLACK);
                             VBLANKS_ON_DISPLAY.fetch_add(1, Ordering::Relaxed);
+                            if let Some(w) = &window {
+                                w.set_locked();
+                            }
                             vblank(&rt, &irq);
+                        } else if steady {
+                            // The timer just stood in: move it behind the
+                            // display, so the next refresh raises and the
+                            // two lock instead of drifting side by side.
+                            due = t + VBLANK_PERIOD + DISPLAY_SLACK;
                         }
                         prev = Some(t);
                     }
