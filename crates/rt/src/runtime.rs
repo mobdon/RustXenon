@@ -138,6 +138,13 @@ impl Runtime {
         if addr & 3 == 0 && i < self.table.len() {
             return self.table[i];
         }
+        self.lookup_maps(addr)
+    }
+
+    /// [`Runtime::lookup`] outside the flat table (import thunks, or before
+    /// `share`): out of line so the table path stays inline in the call.
+    #[inline(never)]
+    fn lookup_maps(&self, addr: u32) -> Option<GuestFn> {
         self.overrides
             .get(&addr)
             .or_else(|| self.functions.get(&addr))
