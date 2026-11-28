@@ -714,12 +714,21 @@ type SubmitDone = (
 const SPARE_STAGED: usize = 8;
 
 /// Staged bytes to write to `arena` at an offset before the encoders run,
-/// and the encoders.
+/// the encoders, a buffer to map after the submit and what to run after it.
 type SubmitJob = (
     Option<(wgpu::Buffer, u64, Vec<u8>)>,
     Vec<wgpu::CommandEncoder>,
     Option<(wgpu::Buffer, Mapped)>,
+    Option<AfterSubmit>,
 );
+
+/// Run on the submit thread once its batch is submitted.
+type AfterSubmit = Box<dyn FnOnce() + Send>;
+
+/// Takes each frame the drawer made on the GPU (see [`Drawer::present`]),
+/// on the submit thread once the work that writes it is submitted: any
+/// later submission on the drawer's queue sees the whole frame.
+pub type Present = Arc<dyn Fn(wgpu::Texture) + Send + Sync>;
 
 #[derive(Default)]
 struct SubmitState {
@@ -771,8 +780,10 @@ impl Submitter {
                     let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
                     let mut finished = Vec::with_capacity(batch.len());
                     let mut maps = Vec::new();
-                    for (upload, encs, map) in batch {
+                    let mut afters = Vec::new();
+                    for (upload, encs, map, after) in batch {
                         maps.extend(map);
+                        afters.extend(after);
                         let t = Instant::now();
                         let bufs: Vec<wgpu::CommandBuffer> =
                             encs.into_iter().map(|e| e.finish()).collect();
@@ -812,6 +823,9 @@ impl Submitter {
                     belt.finish();
                     let index = queue.submit(cmds);
                     belt.recall();
+                    for after in afters {
+                        after();
+                    }
                     if !maps.is_empty() {
                         for (buf, slot) in maps {
                             map_to(&buf, slot);
@@ -849,6 +863,7 @@ impl Submitter {
         upload: Option<(wgpu::Buffer, u64, Vec<u8>)>,
         encs: Vec<wgpu::CommandEncoder>,
         map: Option<(wgpu::Buffer, Mapped)>,
+        after: Option<AfterSubmit>,
     ) {
         let mut st = self.state.lock().expect("submit state");
         st.pending += 1;
@@ -857,7 +872,7 @@ impl Submitter {
         self.tx
             .as_ref()
             .expect("submit thread")
-            .send((upload, encs, map))
+            .send((upload, encs, map, after))
             .expect("submit thread alive");
     }
 
@@ -1996,7 +2011,19 @@ pub struct Drawer {
     /// The late front buffer copy the next flush's batch writes, for the
     /// submit thread to ask to map after it submits that batch.
     map_after: Option<(wgpu::Buffer, Mapped)>,
+    /// What the submit thread runs after the next flush's batch: handing
+    /// [`Drawer::present`] the frame it writes.
+    after_submit: Option<AfterSubmit>,
     front_rows: Option<wgpu::Buffer>,
+    /// Where a window shows frames from the GPU: when set, a swap whose
+    /// front buffer a kept resolve holds decodes it into one of
+    /// [`Drawer::front_textures`] and hands that over instead of reading
+    /// it back, and its [`Frame`] in the report has no pixels. The window
+    /// presents from the drawer's own device (see [`Drawer::gpu`]).
+    pub present: Option<Present>,
+    /// The textures frames for [`Drawer::present`] are decoded into, in
+    /// turn, so the one a window still shows is not the one being written.
+    front_textures: Vec<wgpu::Texture>,
     /// At a [`Drawer::scale`] above 1, keep each 32bpp colour resolve at
     /// the drawing scale too and make a swap's frame from the
     /// copy that holds its whole front buffer, unchanged since: the frame
@@ -2063,6 +2090,8 @@ pub struct Drawer {
     /// Host pixels per guest pixel on each axis of every render target
     /// (see [`Drawer::set_scale`]).
     scale: u32,
+    /// The adapter the device was made on, for a window's surface.
+    gpu_adapter: wgpu::Adapter,
     /// Last, so it drops after the device and every resource made from it.
     instance: wgpu::Instance,
 }
@@ -3130,6 +3159,7 @@ impl Drawer {
             .create_view(&Default::default());
         let submitter = Submitter::new(device.clone(), queue.clone());
         let mut d = Drawer {
+            gpu_adapter: adapter.clone(),
             instance,
             device,
             queue,
@@ -3249,7 +3279,10 @@ impl Drawer {
             late_front: None,
             front_spare: None,
             map_after: None,
+            after_submit: None,
             front_rows: None,
+            present: None,
+            front_textures: Vec::new(),
             sharp_front: false,
             scaled_clock: 0,
             sharp_frames: [0; 4],
@@ -4696,7 +4729,12 @@ impl Drawer {
                 b.enc
             }))
             .collect();
-        self.submitter.send(upload, encs, self.map_after.take());
+        self.submitter.send(
+            upload,
+            encs,
+            self.map_after.take(),
+            self.after_submit.take(),
+        );
         self.submitted(site);
         // One reading for both, so `queue` never exceeds `submit`.
         let e = t.elapsed();
@@ -8604,7 +8642,7 @@ impl Drawer {
         let (lo, hi) = (u64::from(addr), u64::from(addr) + u64::from(extent));
         let s = self.scale;
         let sharp = s > 1 && self.sharp_front;
-        let late = self.late_front_buffer || sharp;
+        let late = self.late_front_buffer || sharp || self.present.is_some();
         let mut kept = self.mirrors.iter().position(|m| m.lo <= lo && hi <= m.hi);
         let found = kept.is_some();
         // A CPU write to the front buffer since the resolve drops the kept
@@ -8654,6 +8692,16 @@ impl Drawer {
                     )
                 }
             };
+            if let Some(present) = self.present.clone() {
+                self.present_front(present, (width, height, pitch), src, offset, addr)?;
+                // No older late copy is waiting: none is made meanwhile.
+                self.late_front = None;
+                return Ok(Ok(Frame {
+                    width,
+                    height,
+                    rgba8: Vec::new(),
+                }));
+            }
             let size = u64::from(width) * u64::from(height) * 4;
             let usage = |u| wgpu::BufferDescriptor {
                 label: Some("front buffer"),
@@ -8766,6 +8814,153 @@ impl Drawer {
             .ok_or_else(|| format!("front buffer at 0x{addr:08X} not readable"));
         let (endian, swizzle) = self.front_buffer_read(addr);
         Ok(raw.and_then(|raw| detile_front(raw, width, height, pitch, endian, swizzle)))
+    }
+
+    /// The device, its adapter and queue and the instance they came from,
+    /// for a window that presents [`Drawer::present`]'s frames on the same
+    /// device.
+    pub fn gpu(&self) -> (wgpu::Instance, wgpu::Adapter, wgpu::Device, wgpu::Queue) {
+        (
+            self.instance.clone(),
+            self.gpu_adapter.clone(),
+            self.device.clone(),
+            self.queue.clone(),
+        )
+    }
+
+    /// Decodes the front buffer at word `offset` of `src` (`width` x
+    /// `height`, rows `pitch` apart, tiled) into the next of
+    /// [`Drawer::front_textures`] at the end of the batch, flushes, and has
+    /// the submit thread hand the texture to `present` once submitted. The
+    /// swap waits for neither the GPU nor a read-back.
+    fn present_front(
+        &mut self,
+        present: Present,
+        (width, height, pitch): (u32, u32, u32),
+        src: wgpu::Buffer,
+        offset: u32,
+        addr: u32,
+    ) -> Result<(), Error> {
+        // Rows of a buffer to texture copy are 256 bytes apart.
+        let row_words = width.next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT / 4);
+        let size = u64::from(row_words) * u64::from(height) * 4;
+        let rows = (self.front_rows.take())
+            .filter(|b| b.size() == size)
+            .unwrap_or_else(|| {
+                self.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("front buffer"),
+                    size,
+                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+                    mapped_at_creation: false,
+                })
+            });
+        // In turn: two queued in the window (its frame queue), one it took
+        // and is presenting, one written, and two more so that a frame the
+        // queue drops while the window is still presenting cannot hand the
+        // presented texture back to be written over.
+        const TEXTURES: usize = 6;
+        let fits = |t: &wgpu::Texture| (t.width(), t.height()) == (width, height);
+        if !self.front_textures.iter().all(fits) {
+            self.front_textures.clear();
+        }
+        let tex = if self.front_textures.len() < TEXTURES {
+            let t = self.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("presented frame"),
+                size: wgpu::Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8Unorm,
+                // Copied out only by tests.
+                usage: wgpu::TextureUsages::COPY_DST
+                    | wgpu::TextureUsages::TEXTURE_BINDING
+                    | wgpu::TextureUsages::COPY_SRC,
+                view_formats: &[],
+            });
+            self.front_textures.push(t.clone());
+            t
+        } else {
+            self.front_textures.rotate_left(1);
+            self.front_textures[TEXTURES - 1].clone()
+        };
+        let (endian, swizzle) = self.front_buffer_read(addr);
+        let pipeline = self.decode_pipeline(0);
+        let params = [
+            width,
+            height,
+            pitch,
+            endian as u32,
+            // x, y, z, w from themselves: none.
+            u32::from(swizzle.unwrap_or((1 << 3) | (2 << 6) | (3 << 9))),
+            offset,
+            row_words,
+            0,
+            0,
+            0,
+            0,
+            0,
+        ];
+        let uniform = self.buffer(
+            "front params",
+            &to_bytes(&params),
+            wgpu::BufferUsages::UNIFORM,
+        );
+        let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("front buffer decode"),
+            layout: &pipeline.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: src.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: rows.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 7,
+                    resource: uniform.as_entire_binding(),
+                },
+            ],
+        });
+        let device = &self.device;
+        let b = self.batch.get_or_insert_with(|| Batch {
+            pass: None,
+            enc: device.create_command_encoder(&Default::default()),
+        });
+        b.pass = None;
+        {
+            let mut pass = b.enc.begin_compute_pass(&Default::default());
+            pass.set_pipeline(&pipeline);
+            pass.set_bind_group(0, &bg, &[]);
+            pass.dispatch_workgroups(width.div_ceil(8), height.div_ceil(8), 1);
+        }
+        b.enc.copy_buffer_to_texture(
+            wgpu::TexelCopyBufferInfo {
+                buffer: &rows,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(row_words * 4),
+                    rows_per_image: Some(height),
+                },
+            },
+            tex.as_image_copy(),
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+        );
+        self.front_rows = Some(rows);
+        self.after_submit = Some(Box::new(move || present(tex)));
+        self.flush().map_err(|e| match e {
+            Skip::Fatal(e) => e,
+            Skip::Unsupported(why) => Error::Gpu(why),
+        })
     }
 
     /// The endian the front buffer at `addr` was resolved with, and the

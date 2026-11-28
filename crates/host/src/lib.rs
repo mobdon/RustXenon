@@ -12,6 +12,7 @@ pub mod cpu_profile;
 pub mod heap;
 pub mod kernel;
 pub mod settings;
+pub mod vehicle;
 
 use sha2::{Digest, Sha256};
 use std::cell::Cell;
@@ -759,6 +760,7 @@ pub fn run(sha256: &str, regs: &[fn(&mut Runtime)]) -> ExitCode {
             update_dir: arg_or("--update", &conf.update).map(PathBuf::from),
         },
     );
+    vehicle::install(&mut rt, sha256);
     let rt = rt.share();
     set_runtime(rt.clone());
     log(&format!("call table: {} MB", rt.table_bytes() >> 20));
@@ -797,6 +799,7 @@ pub fn run(sha256: &str, regs: &[fn(&mut Runtime)]) -> ExitCode {
             kernel::k().usage_line(),
             growth_line()
         ));
+        log(&kernel::video::pace_line());
         if swaps == last {
             stalled += 1;
             // A stall with memory to spare is a wait, not exhaustion: say

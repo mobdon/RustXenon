@@ -6,6 +6,8 @@ use crate::Error;
 
 /// One presented frame: `rgba8` is `width * height * 4` bytes, rows top to
 /// bottom, R G B A per pixel.
+/// It is empty when the frame went to a window on the GPU instead (see
+/// `Drawer::present`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Frame {
     pub width: u32,

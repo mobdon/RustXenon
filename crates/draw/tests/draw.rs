@@ -1041,6 +1041,64 @@ fn late_front_buffer_applies_fetch_constant_0_swizzle() {
     assert_eq!(r.frames[0].rgba8, sync.rgba8);
 }
 
+/// With a window presenting on the GPU, a swap hands over a texture holding
+/// the frame the read-back path gives (swizzle and all) once its batch is
+/// submitted, and reports the frame with no pixels.
+#[test]
+fn present_hands_over_the_frame_on_the_gpu() {
+    let Some(mut d) = drawer() else { return };
+    let mut mem = memory();
+    let mut s = Stream::default();
+    draw_pattern(&mut mem, &mut s);
+    let zyxw = 2 | (1 << 3) | (3 << 9);
+    s.regs(SHADER_CONSTANT_FETCH, &[2, DEST, 0, zyxw << 1, 0, 0])
+        .swap(W, H);
+    let sync = run(&mut d, &s, &mut mem).frames.remove(0);
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let tx = std::sync::Mutex::new(tx);
+    d.present = Some(std::sync::Arc::new(move |t| {
+        let _ = tx.lock().unwrap().send(t);
+    }));
+    for _ in 0..2 {
+        let r = run(&mut d, &s, &mut mem);
+        assert_eq!(r.frames.len(), 1, "{r:?}");
+        let f = &r.frames[0];
+        assert_eq!((f.width, f.height, f.rgba8.len()), (W, H, 0));
+        let tex: wgpu::Texture = rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        assert_eq!((tex.width(), tex.height()), (W, H));
+        let (_, _, device, queue) = d.gpu();
+        let row = (4 * W).next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
+        let buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: u64::from(row * H),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut enc = device.create_command_encoder(&Default::default());
+        enc.copy_texture_to_buffer(
+            tex.as_image_copy(),
+            wgpu::TexelCopyBufferInfo {
+                buffer: &buf,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(row),
+                    rows_per_image: Some(H),
+                },
+            },
+            tex.size(),
+        );
+        queue.submit([enc.finish()]);
+        buf.slice(..).map_async(wgpu::MapMode::Read, |r| r.unwrap());
+        device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+        let got: Vec<u8> = (buf.slice(..).get_mapped_range().unwrap())
+            .chunks(row as usize)
+            .flat_map(|r| r[..4 * W as usize].to_vec())
+            .collect();
+        assert_eq!(got, sync.rgba8);
+    }
+}
+
 /// A frame bundle of two frames, saved and read back, replays to the same
 /// last frame; with that frame's draw skipped, only the clear is left.
 #[test]

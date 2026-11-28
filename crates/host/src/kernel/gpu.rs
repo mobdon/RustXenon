@@ -25,6 +25,8 @@ pub static WAIT_ON: AtomicU32 = AtomicU32::new(0);
 /// Rounds of the processor loop and interrupts raised.
 pub static ROUNDS: AtomicU32 = AtomicU32::new(0);
 pub static RAISED: AtomicU32 = AtomicU32::new(0);
+/// Vertical blanks so far: the value counter fences write.
+pub static VBLANKS: AtomicU32 = AtomicU32::new(0);
 
 /// GPU (physical) address to guest address, in the 0xA0000000 view.
 pub fn gpu_to_cpu(a: u32) -> u32 {
@@ -161,8 +163,6 @@ pub struct Gpu {
     rec: Recorder,
     /// Processor masks of interrupt packets applied, for the caller to raise.
     pub interrupts: Vec<u32>,
-    /// Vertical blanks so far: the value counter fences write.
-    pub vblanks: u32,
     /// When set, applied commands are also kept here (see [`capture`]).
     pub keep: Option<Vec<Command>>,
     /// The last vertex and pixel shader loads, kept for a frame bundle
@@ -581,7 +581,7 @@ impl Gpu {
             Command::EventWrite(e) => match (e.kind, e.address) {
                 (EventKind::Shader, Some(a)) => {
                     let v = if e.use_counter {
-                        self.vblanks
+                        VBLANKS.load(Ordering::Relaxed)
                     } else {
                         e.value.unwrap_or(0)
                     };
@@ -681,7 +681,11 @@ pub mod capture {
 
     /// Writes the drawer's frame number `n` when it was asked for.
     pub fn frame_done(n: u32, f: &Arc<xenon_draw::Frame>) {
-        if let Some(w) = super::super::input::WINDOW.get() {
+        // A frame with no pixels went to the window on the GPU already.
+        if let Some(w) = super::super::input::WINDOW
+            .get()
+            .filter(|_| !f.rgba8.is_empty())
+        {
             // Shared, not copied: a copy of every frame was 3.7 MB at 720p.
             w.show(f.width, f.height, f.clone());
         }

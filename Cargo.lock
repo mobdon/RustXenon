@@ -3299,7 +3299,9 @@ name = "xenon-window"
 version = "0.0.0"
 dependencies = [
  "font8x8",
+ "pollster",
  "softbuffer",
+ "wgpu",
  "winit",
  "xenon-icon",
  "xenon-input",
