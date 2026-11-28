@@ -8888,7 +8888,7 @@ impl Drawer {
             self.front_textures[TEXTURES - 1].clone()
         };
         let (endian, swizzle) = self.front_buffer_read(addr);
-        let pipeline = self.decode_pipeline(false);
+        let pipeline = self.decode_pipeline(0);
         let params = [
             width,
             height,
