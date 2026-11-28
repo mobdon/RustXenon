@@ -687,11 +687,13 @@ fn resolve_clears_join_the_next_batch() {
     let img = d.read_render_target(COLOR_KEY, 0, 0, W, H).unwrap();
     assert_eq!(px(&img, W, 10, 10), BLUE);
     assert_eq!(px(&img, W, 40, 40), GREEN);
-    // The copies and clears are recorded in the batch: 4 flushes and
-    // write-backs, where a submit per copy and a flush before each made 7.
+    // The copies and clears are recorded in the batch, and the second
+    // destination, touching the first, joins its kept buffer on the GPU:
+    // a flush and a write-back, where a submit per copy and a flush before
+    // each made 7, and a write-back before the merge 4.
     let t = &report.timings;
-    assert_eq!(t.submits_by_site, [0, 0, 0, 4], "{t:?}");
-    assert_eq!(t.submits, 4, "{t:?}");
+    assert_eq!(t.submits_by_site, [0, 0, 0, 2], "{t:?}");
+    assert_eq!(t.submits, 2, "{t:?}");
 }
 
 /// A 64bpp resolve copy (16_16_16_16 destination) runs on the GPU: no

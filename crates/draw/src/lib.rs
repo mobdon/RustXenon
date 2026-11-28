@@ -4320,8 +4320,10 @@ impl Drawer {
     /// Index of the kept resolve buffer holding `[lo, hi)`, which a resolve
     /// is about to write (`resolve`) or a texture to read, made from guest
     /// memory if there is none. Kept buffers it overlaps or touches are
-    /// written back and merged into it, so a texture over several resolves
-    /// (tiles, one under the other) is in one buffer.
+    /// merged into it, so a texture over several resolves (tiles, one under
+    /// the other) is in one buffer: on the GPU when they can be
+    /// ([`Self::merge_on_gpu`]), else written back and made again from
+    /// guest memory.
     fn mirror(
         &mut self,
         mem: &mut Tracked,
@@ -4347,6 +4349,15 @@ impl Drawer {
         // dropped, not the least recently used; track use if a capture
         // keeps more than 256 MB of resolve destinations.
         let all = total + (b - a) > MIRROR_LIMIT;
+        // With write-back, the blocks the resolve covers are hashed when
+        // it writes them back.
+        let skip = self.skip_resolve_writeback;
+        let covers = move |s: u64, e: u64| resolve && !skip && lo <= s && e <= hi;
+        if !all {
+            if let Some(i) = self.merge_on_gpu(mem, a, b, covers)? {
+                return Ok(Some(i));
+            }
+        }
         let (sa, sb) = if all { (0, u64::MAX) } else { (a, b) };
         // Those touching [sa, sb) too.
         self.sync(mem, sa.saturating_sub(1), sb.saturating_add(1))?;
@@ -4382,13 +4393,12 @@ impl Drawer {
         let Some(bytes) = mem.read_bytes(a as u32, (b - a) as usize) else {
             return Ok(None);
         };
-        // With write-back, the blocks the resolve covers are hashed when
-        // it writes them back.
-        let covers = |k: u64| {
-            let s = a + k * KEPT_BLOCK;
-            resolve && !self.skip_resolve_writeback && lo <= s && (s + KEPT_BLOCK).min(b) <= hi
-        };
-        let covered: Vec<bool> = (0..(b - a).div_ceil(KEPT_BLOCK)).map(covers).collect();
+        let covered: Vec<bool> = (0..(b - a).div_ceil(KEPT_BLOCK))
+            .map(|k| {
+                let s = a + k * KEPT_BLOCK;
+                covers(s, (s + KEPT_BLOCK).min(b))
+            })
+            .collect();
         let hashes = bytes
             .chunks(KEPT_BLOCK as usize)
             .zip(&covered)
@@ -4405,6 +4415,177 @@ impl Drawer {
             hi: b,
             buf,
             dirty: Vec::new(),
+            hashes,
+            checked,
+            views: HashMap::default(),
+            groups: HashMap::default(),
+            decodes: HashMap::default(),
+            scaled,
+        });
+        Ok(Some(self.mirrors.len() - 1))
+    }
+
+    /// [`Self::mirror`]'s merge into one kept buffer over `[a, b)` done on
+    /// the GPU: the kept buffers inside it are copied into the new one,
+    /// with their unwritten bytes, hashes and scaled copies, and only the
+    /// bytes between them are read from guest memory, so there is no GPU
+    /// wait, readback or hash of the whole range. `None` (nothing changed)
+    /// when it cannot: a kept buffer reaches past `[a, b)`, no longer
+    /// matches guest memory, or is not word aligned, or guest memory is
+    /// not readable; then the caller writes back and merges from guest
+    /// memory. `covers(s, e)`: the block `[s, e)` is hashed at write-back.
+    fn merge_on_gpu(
+        &mut self,
+        mem: &mut Tracked,
+        a: u64,
+        b: u64,
+        covers: impl Fn(u64, u64) -> bool,
+    ) -> Result<Option<usize>, Error> {
+        let parts: Vec<usize> = (0..self.mirrors.len())
+            .filter(|&i| self.mirrors[i].lo < b && a < self.mirrors[i].hi)
+            .collect();
+        let word = |x: u64| x.is_multiple_of(4);
+        if parts.is_empty() || !word(a) {
+            return Ok(None);
+        }
+        for &i in &parts {
+            let m = &self.mirrors[i];
+            let (l, h) = (m.lo, m.hi);
+            let aligned = word(l) && word(h) && m.dirty.iter().all(|&(x, y)| word(x) && word(y));
+            // Copied as they are, so they must hold what guest memory
+            // holds (or will, once written back); hashes only the blocks
+            // not checked this replay.
+            if l < a || b < h || !aligned || !self.matches(i, mem, l, h) {
+                return Ok(None);
+            }
+        }
+        // Each new block that is exactly a block of a kept buffer keeps its
+        // bytes and hash; the others are made from guest memory now (their
+        // unwritten bytes copied over after), as a hash of guest memory
+        // must be of the bytes the buffer holds.
+        let blocks = (b - a).div_ceil(KEPT_BLOCK) as usize;
+        let mut from: Vec<Option<(usize, usize)>> = vec![None; blocks];
+        for (p, &i) in parts.iter().enumerate() {
+            let m = &self.mirrors[i];
+            if !(m.lo - a).is_multiple_of(KEPT_BLOCK) {
+                continue;
+            }
+            for j in 0..m.hashes.len() {
+                let s = m.lo + j as u64 * KEPT_BLOCK;
+                if (s + KEPT_BLOCK).min(m.hi) == (s + KEPT_BLOCK).min(b) {
+                    from[((s - a) / KEPT_BLOCK) as usize] = Some((p, j));
+                }
+            }
+        }
+        let span = |k: usize| {
+            let s = a + k as u64 * KEPT_BLOCK;
+            (s, (s + KEPT_BLOCK).min(b))
+        };
+        // Runs of blocks made from guest memory, with their bytes.
+        let mut guest: Vec<(u64, u64, Vec<u8>)> = Vec::new();
+        let mut k = 0;
+        while k < blocks {
+            if from[k].is_some() {
+                k += 1;
+                continue;
+            }
+            let start = k;
+            while k < blocks && from[k].is_none() {
+                k += 1;
+            }
+            let (s, e) = (span(start).0, span(k - 1).1);
+            let Some(bytes) = mem.read_bytes(s as u32, (e - s) as usize) else {
+                return Ok(None);
+            };
+            guest.push((s, e, bytes));
+        }
+        // (part, source offset, destination offset, bytes) of each copy:
+        // the runs of kept blocks, and the unwritten bytes in the blocks
+        // made from guest memory.
+        let mut copies: Vec<(usize, u64, u64, u64)> = Vec::new();
+        for (k, f) in from.iter().enumerate() {
+            let &Some((p, _)) = f else { continue };
+            let (s, e) = span(k);
+            let m_lo = self.mirrors[parts[p]].lo;
+            match copies.last_mut() {
+                Some(c) if c.0 == p && c.2 + c.3 == s - a => c.3 += e - s,
+                _ => copies.push((p, s - m_lo, s - a, e - s)),
+            }
+        }
+        for (p, &i) in parts.iter().enumerate() {
+            let m = &self.mirrors[i];
+            for &(x, y) in &m.dirty {
+                for &(s, e, _) in &guest {
+                    let (x, y) = (x.max(s), y.min(e));
+                    if x < y {
+                        copies.push((p, x - m.lo, x - a, y - x));
+                    }
+                }
+            }
+        }
+        let mut hashes = vec![None; blocks];
+        let mut checked = vec![true; blocks];
+        for (k, f) in from.iter().enumerate() {
+            if let &Some((p, j)) = f {
+                let m = &self.mirrors[parts[p]];
+                (hashes[k], checked[k]) = (m.hashes[j], m.checked[j]);
+            }
+        }
+        let size = (b - a).max(4).next_multiple_of(4);
+        let buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("kept resolve"),
+            size,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_SRC
+                | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        for (s, e, mut bytes) in guest {
+            let k0 = ((s - a) / KEPT_BLOCK) as usize;
+            for (k, block) in (k0..).zip(bytes.chunks(KEPT_BLOCK as usize)) {
+                let (bs, be) = span(k);
+                if !covers(bs, be) {
+                    hashes[k] = Some(self.block_hash(block));
+                }
+            }
+            bytes.resize((e - s).next_multiple_of(4) as usize, 0);
+            // Staged writes land at the next submit, before the batch the
+            // copies over them are in.
+            self.queue.write_buffer(&buf, s - a, &bytes);
+        }
+        let device = &self.device;
+        let batch = self.batch.get_or_insert_with(|| Batch {
+            pass: None,
+            enc: device.create_command_encoder(&Default::default()),
+        });
+        batch.pass = None;
+        for &(p, src, dst, len) in &copies {
+            let old = &self.mirrors[parts[p]].buf;
+            batch.enc.copy_buffer_to_buffer(old, src, &buf, dst, len);
+        }
+        // The batch now writes a kept buffer: decodes from it go after.
+        self.resolve_pending = true;
+        let mut dirty: Vec<(u64, u64)> = Vec::new();
+        let mut scaled = Vec::new();
+        for &i in parts.iter().rev() {
+            let m = self.mirrors.remove(i);
+            dirty.extend(m.dirty);
+            scaled.extend(m.scaled);
+        }
+        dirty.sort_unstable();
+        // Apart and not touching, as a resolve keeps them.
+        let mut merged: Vec<(u64, u64)> = Vec::new();
+        for (x, y) in dirty {
+            match merged.last_mut() {
+                Some(l) if x <= l.1 => l.1 = l.1.max(y),
+                _ => merged.push((x, y)),
+            }
+        }
+        self.mirrors.push(Mirror {
+            lo: a,
+            hi: b,
+            buf,
+            dirty: merged,
             hashes,
             checked,
             views: HashMap::default(),

@@ -1404,3 +1404,108 @@ fn listed_writes_skip_hashing_unwritten_kept_resolves() {
     let img = d.read_render_target(OUT, 0, 0, W, H).unwrap();
     assert!(img.chunks(4).any(|p| p == [0x55; 4]));
 }
+
+/// The gradient with the blue rectangle over it.
+fn paint_both(s: &mut Stream) -> &mut Stream {
+    paint_small(paint(s))
+}
+
+/// Paints a target from scratch.
+type Paint = fn(&mut Stream) -> &mut Stream;
+
+/// Guest memory after each of `steps` (what to paint, where to resolve a
+/// 64x32 tile of it) is resolved by a fresh drawer in a replay of its own,
+/// so no kept buffer is merged.
+fn resolved_apart(mem: &SliceMemory, steps: &[(Paint, u32)]) -> SliceMemory {
+    let mut mem = mem.clone();
+    for &(p, dest) in steps {
+        let mut d = drawer().expect("a drawer");
+        let mut s = Stream::default();
+        p(s.setup());
+        resolve_to(&mut s, &mut mem, W, 32, dest);
+        let r = run(&mut d, &s, &mut mem);
+        assert!(r.unsupported.is_empty(), "{r:?}");
+    }
+    mem
+}
+
+/// Two 64x32 resolves at `first` and `second` that overlap or touch, then
+/// a texture over both and the guest bytes past them, in one replay: the
+/// kept buffers are merged on the GPU (no write-back or readback before the
+/// end of the replay), the texture draws what the guest path draws, and
+/// guest memory ends with the bytes it gets when each resolve is written
+/// back on its own. Without write-back, a swap of the destination writes
+/// the same bytes back.
+fn merged_resolves_match(first: u32, second: u32, skip: bool) {
+    let f = fetch(6, 2, IDENTITY);
+    if drawer().is_none() {
+        return;
+    }
+    let mut mem = memory();
+    vertices(&mut mem);
+    mem.data[DEST as usize..][..(W * H * 4 + 0x200) as usize].fill(0x77);
+    // Before the drawer under test: one drawer at a time.
+    let want = resolved_apart(&mem, &[(paint, first), (paint_both, second)]);
+    let mut d = drawer().expect("a drawer");
+    d.skip_resolve_writeback = skip;
+    let mut s = Stream::default();
+    paint(s.setup());
+    resolve_to(&mut s, &mut mem, W, 32, first);
+    paint_small(&mut s);
+    resolve_to(&mut s, &mut mem, W, 32, second);
+    sample(&mut s, f);
+    let r = run(&mut d, &s, &mut mem);
+    assert!(r.unsupported.is_empty(), "{r:?}");
+    assert_eq!(
+        (r.timings.textures_kept, r.timings.textures_uploaded),
+        (1, 0),
+        "{r:?}"
+    );
+    assert_eq!(r.timings.writebacks, u32::from(!skip), "{r:?}");
+    let img = d.read_render_target(OUT, 0, 0, W, H).unwrap();
+    if skip {
+        assert_eq!(r.timings.readback_bytes, 0, "{r:?}");
+        let mut s = Stream::default();
+        s.swap_at(DEST, W, H);
+        let r = run(&mut d, &s, &mut mem);
+        assert_eq!(r.frames.len(), 1, "{r:?}");
+        assert_eq!(r.frames[0].rgba8, detiled(&mem, DEST, W, H, W, 4));
+    }
+    drop(d);
+    // The command streams differ; the resolve destinations must not.
+    let dest = |m: &SliceMemory| m.data[DEST as usize..][..(W * H * 4 + 0x200) as usize].to_vec();
+    assert!(
+        dest(&mem) == dest(&want),
+        "guest memory differs from resolves written back apart"
+    );
+    assert_eq!(img, guest_path(&mem, f));
+    if first.max(second) + W * 32 * 4 < DEST + W * H * 4 {
+        assert!(img.chunks(4).any(|p| p == [0x77; 4]));
+    }
+}
+
+/// Tiles one under the other: the second starts where the first ends.
+#[test]
+fn adjacent_kept_resolves_merge_on_the_gpu() {
+    for skip in [false, true] {
+        merged_resolves_match(DEST, DEST + W * 32 * 4, skip);
+    }
+}
+
+/// The second resolve over the second half of the first.
+#[test]
+fn overlapping_kept_resolves_merge_on_the_gpu() {
+    for skip in [false, true] {
+        merged_resolves_match(DEST, DEST + W * 16 * 4, skip);
+    }
+}
+
+/// The first resolve not block aligned to the merged buffer, so no block
+/// of it is copied whole: its blocks are made from guest memory with its
+/// unwritten bytes copied over.
+#[test]
+fn unaligned_kept_resolves_merge_on_the_gpu() {
+    for skip in [false, true] {
+        merged_resolves_match(DEST + 0x100, DEST, skip);
+    }
+}
