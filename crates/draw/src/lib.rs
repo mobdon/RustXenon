@@ -8854,9 +8854,11 @@ impl Drawer {
                     mapped_at_creation: false,
                 })
             });
-        // Four in turn: two queued in the window (its frame queue), one it
-        // took and is presenting, one written.
-        const TEXTURES: usize = 4;
+        // In turn: two queued in the window (its frame queue), one it took
+        // and is presenting, one written, and two more so that a frame the
+        // queue drops while the window is still presenting cannot hand the
+        // presented texture back to be written over.
+        const TEXTURES: usize = 6;
         let fits = |t: &wgpu::Texture| (t.width(), t.height()) == (width, height);
         if !self.front_textures.iter().all(fits) {
             self.front_textures.clear();
