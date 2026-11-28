@@ -229,14 +229,50 @@ impl GuestMemory {
     access!(read_u64, write_u64, u64, AtomicU64);
 
     /// Reads 16 bytes at `addr` as a vector (element 0 at the lowest address).
+    #[inline]
     pub fn read_v128(&self, addr: u32) -> crate::V128 {
+        if addr % 16 == 0 {
+            // The common case (`lvx`): one bounds check, two aligned loads.
+            // An aligned quadword never crosses a view.
+            let p = self.at(addr, 16);
+            // SAFETY: in bounds and aligned (the base is 16-byte aligned).
+            let (hi, lo) = unsafe {
+                (
+                    u64::from_be(AtomicU64::from_ptr(p.cast()).load(Relaxed)),
+                    u64::from_be(AtomicU64::from_ptr(p.add(8).cast()).load(Relaxed)),
+                )
+            };
+            return [(hi >> 32) as u32, hi as u32, (lo >> 32) as u32, lo as u32];
+        }
+        self.read_v128_any(addr)
+    }
+
+    #[inline(never)]
+    fn read_v128_any(&self, addr: u32) -> crate::V128 {
         let mut b = [0u8; 16];
         b[..8].copy_from_slice(&self.read_u64(addr).to_be_bytes());
         b[8..].copy_from_slice(&self.read_u64(addr.wrapping_add(8)).to_be_bytes());
         crate::vmx::from_bytes(b)
     }
 
+    #[inline]
     pub fn write_v128(&self, addr: u32, v: crate::V128) {
+        if addr % 16 == 0 {
+            let p = self.at(addr, 16);
+            let hi = (v[0] as u64) << 32 | v[1] as u64;
+            let lo = (v[2] as u64) << 32 | v[3] as u64;
+            // SAFETY: in bounds and aligned.
+            unsafe {
+                AtomicU64::from_ptr(p.cast()).store(hi.to_be(), Relaxed);
+                AtomicU64::from_ptr(p.add(8).cast()).store(lo.to_be(), Relaxed);
+            }
+            return;
+        }
+        self.write_v128_any(addr, v)
+    }
+
+    #[inline(never)]
+    fn write_v128_any(&self, addr: u32, v: crate::V128) {
         let b = crate::vmx::bytes(v);
         self.write_u64(addr, u64::from_be_bytes(b[..8].try_into().unwrap()));
         self.write_u64(
