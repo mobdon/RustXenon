@@ -115,6 +115,8 @@ struct Span {
     cmds: Vec<Command>,
     written: Option<Vec<(u64, u64)>>,
     watch: std::time::Duration,
+    /// The span's commands by kind, counted on the command processor thread.
+    counts: CommandCounts,
 }
 
 impl Span {
@@ -126,7 +128,43 @@ impl Span {
             cmds,
             written,
             watch: start.elapsed(),
+            counts: CommandCounts::default(),
         }
+    }
+}
+
+/// Ring commands by kind, to tell whether register writes per draw change.
+#[derive(Default, Clone, Copy)]
+struct CommandCounts {
+    reg_writes: u32,
+    reg_dwords: u32,
+    shader_loads: u32,
+    mem_writes: u32,
+    draws: u32,
+    other: u32,
+}
+
+impl CommandCounts {
+    fn add(&mut self, c: &Command) {
+        match c {
+            Command::WriteRegisters { values, .. } => {
+                self.reg_writes += 1;
+                self.reg_dwords += values.len() as u32;
+            }
+            Command::LoadShader { .. } => self.shader_loads += 1,
+            Command::MemWrite { .. } => self.mem_writes += 1,
+            Command::Draw(_) => self.draws += 1,
+            _ => self.other += 1,
+        }
+    }
+
+    fn sum(&mut self, o: &CommandCounts) {
+        self.reg_writes += o.reg_writes;
+        self.reg_dwords += o.reg_dwords;
+        self.shader_loads += o.shader_loads;
+        self.mem_writes += o.mem_writes;
+        self.draws += o.draws;
+        self.other += o.other;
     }
 }
 
@@ -222,7 +260,7 @@ impl DrawSide {
         }
         match replayed {
             Ok(r) => {
-                self.stats.add(&r, busy, span.watch);
+                self.stats.add(&r, busy, span.watch, &span.counts);
                 for u in r.unsupported.iter().chain(&r.warnings) {
                     capture::note(u);
                 }
@@ -260,6 +298,7 @@ struct DrawStats {
     longest: std::time::Duration,
     /// Taking the written ranges, on the command processor thread.
     watch: std::time::Duration,
+    counts: CommandCounts,
     t: xenon_draw::Timings,
 }
 
@@ -271,9 +310,11 @@ impl DrawStats {
         r: &xenon_draw::Report,
         busy: std::time::Duration,
         watch: std::time::Duration,
+        counts: &CommandCounts,
     ) {
         let since = *self.since.get_or_insert_with(std::time::Instant::now);
         self.replays += 1;
+        self.counts.sum(counts);
         self.frames += r.frames.len() as u32;
         self.draws += r.draws;
         self.resolves += r.resolves;
@@ -298,6 +339,7 @@ impl DrawStats {
         let ms = |d: std::time::Duration| d.as_secs_f64() * 1e3 / f64::from(n);
         let mb = |b: u64| b as f64 / 1e6 / f64::from(n);
         let t = &self.t;
+        let c = &self.counts;
         let by = |i: usize| {
             let (count, bytes) = t.uploads_by_format[i];
             format!("{} ({:.1} MB)", count / n, mb(bytes))
@@ -328,6 +370,8 @@ impl DrawStats {
              hashed {:.1} MB (kept resolves {:.1} MB), {} textures uploaded ({:.1} MB, {} evicted before, {:.1} decoded on the gpu), \
              {} evicted, {} from kept resolves, {} pipelines created; guest data {:.1} MB ({} windows reused, {:.1} MB); \
              uploads by format: rgba8 {}, bc {}, f16 {}, f32 {}, other {}; \
+             ring commands per {per}: {} register writes ({} dwords, {:.1} writes per draw), {} shader loads, \
+             {} memory writes, {} draws, {} other; \
              write watch {:.1} ms per {per} on the gpu thread;              texture memo: {} re-hashes found the cached texture ({:.1} MB), {} writes only between levels, {} cap hits, {} restored by hashing written pages",
             window.as_secs_f64(),
             self.frames,
@@ -395,6 +439,13 @@ impl DrawStats {
             by(2),
             by(3),
             by(4),
+            c.reg_writes / n,
+            c.reg_dwords / n,
+            f64::from(c.reg_writes) / f64::from(c.draws.max(1)),
+            c.shader_loads / n,
+            c.mem_writes / n,
+            c.draws / n,
+            c.other / n,
             ms(self.watch),
             t.rehash_hits / n,
             mb(t.rehash_hit_bytes),
@@ -526,13 +577,16 @@ impl Gpu {
                 }
             }
         }
+        let mut counts = CommandCounts::default();
         for c in &cmds {
+            counts.add(c);
             self.apply(rt, c, idle);
         }
         let mut cmds = cmds;
         let going = match &mut self.draw {
             Some(Draw::Inline(d)) => {
                 let mut span = Span::new(rt, std::mem::take(&mut cmds));
+                span.counts = counts;
                 let going = d.replay(rt, &mut span);
                 cmds = span.cmds;
                 going
@@ -548,7 +602,9 @@ impl Gpu {
                 };
                 // Per span, in ring order: each replay sees the writes made
                 // before its span was queued (see [`Span`]).
-                q.push(Span::new(rt, batch), swaps)
+                let mut span = Span::new(rt, batch);
+                span.counts = counts;
+                q.push(span, swaps)
             }
             None => true,
         };
@@ -1063,6 +1119,31 @@ mod tests {
         s.t.windows_reused = 900;
         s.t.reused_bytes = 3_000_000;
         s.t.uploads_by_format = [(600, 200_000_000), (40, 8_000_000), (6, 0), (0, 0), (0, 0)];
+        for c in [
+            Command::WriteRegisters {
+                base: 0,
+                values: vec![0; 6],
+            },
+            Command::WriteRegisters {
+                base: 0,
+                values: vec![0; 2],
+            },
+            Command::WriteRegisters {
+                base: 0,
+                values: vec![0; 4],
+            },
+            Command::MemWrite {
+                addr: 0,
+                endian: xenon_gpu::Endian::None,
+                values: vec![0],
+            },
+            Command::Interrupt { cpu_mask: 1 },
+            Command::Interrupt { cpu_mask: 1 },
+        ] {
+            s.counts.add(&c);
+        }
+        s.counts.draws = 5;
+        s.counts.shader_loads = 2;
         s.t.textures_gpu_decoded = 5;
         let line = s.line(ms(5000));
         assert!(
@@ -1085,6 +1166,9 @@ mod tests {
             "write watch 1.5 ms per frame on the gpu thread",
             "evicted before, 2.5 decoded on the gpu),",
             "rgba8 300 (100.0 MB), bc 20 (4.0 MB), f16 3 (0.0 MB), f32 0 (0.0 MB), other 0",
+            // 3 writes of 12 dwords, 5 draws: per frame, but per draw over the window.
+            "ring commands per frame: 1 register writes (6 dwords, 0.6 writes per draw), 1 shader loads, \
+             0 memory writes, 2 draws, 1 other; write watch",
         ] {
             assert!(line.contains(part), "{part}: {line}");
         }
