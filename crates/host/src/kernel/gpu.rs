@@ -316,7 +316,7 @@ impl DrawStats {
             "[draw] {:.1} s: {} frames, {} replays; ms per {per}: drawer {:.0} = shaders {:.0} (state {:.0}, indices {:.0}, targets {:.0}, pipeline {:.0}), \
              guest data {:.0}, textures {:.0}, submit {:.0} (groups {:.1}, pass {:.1}, record {:.1}, queue {:.0}, upload {:.0}; finish {:.0} and submit {:.0} on the submit thread alongside), gpu wait {:.0}, readback {:.0}, \
              resolve cpu {:.0}, clears {:.0}, swap {:.0} (transfers {:.0}), commands {:.1}, edges {:.1}, other {:.1}; of those, creating \
-             pipelines {:.0}; per {per}: {} draws ({} consts reused, {} indices reused, {} texture sets reused = {:.0}%), {} shader loads, \
+             pipelines {:.0} (and {:.0} on worker threads); per {per}: {} draws ({} more skipped waiting for pipelines,{} consts reused, {} indices reused, {} texture sets reused = {:.0}%), {} shader loads, \
              {} resolves, {} submits ({} resolve, {} transfer, {} decode, {} flush/other), {} transfers ({} passes, {} set up), {} render passes, {} write-backs, readback {:.1} MB, \
              hashed {:.1} MB (kept resolves {:.1} MB), {} textures uploaded ({:.1} MB, {} evicted before, {:.1} decoded on the gpu), \
              {} evicted, {} from kept resolves, {} pipelines created; guest data {:.1} MB ({} windows reused, {:.1} MB); \
@@ -351,7 +351,9 @@ impl DrawStats {
             ms(t.edges),
             ms(other),
             ms(t.pipeline),
+            ms(t.pipeline_workers),
             self.draws / n,
+            t.draws_waiting / n,
             t.consts_reused / n,
             t.indices_reused / n,
             t.texture_sets_reused / n,

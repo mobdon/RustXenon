@@ -198,6 +198,13 @@ pub fn start(rt: std::sync::Arc<Runtime>) {
                         // Frame images come one swap late, so a swap never
                         // waits for the GPU (XENON_LATE_FRAME=0 turns it off).
                         d.late_front_buffer = std::env::var("XENON_LATE_FRAME").as_deref() != Ok("0");
+                        // New shaders and pipelines are made on worker threads and
+                        // their draws skipped until then, so a frame never stalls
+                        // on a compile (XENON_ASYNC_PIPELINES=0 makes them on the
+                        // spot, as captures need for frames that match).
+                        d.async_pipelines = std::env::var("XENON_ASYNC_PIPELINES").as_deref() != Ok("0")
+                            && super::gpu::capture::SETTINGS.get().is_none()
+                            && super::gpu::capture::FRAMES.get().is_none();
                         // Frames at the drawing scale (XENON_SCALE above 1),
                         // but captures keep guest size, which they compare.
                         // Only with a window: nothing else shows the frame,

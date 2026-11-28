@@ -91,6 +91,59 @@ fn triangle_interpolates_vertex_colours() {
     assert_eq!(px(&img, W, 33, 63), CLEAR);
 }
 
+/// With pipelines made on worker threads, a draw whose shaders or pipeline
+/// are not made yet is skipped and counted, and the same draw in a replay
+/// after they are made is drawn.
+#[test]
+fn draw_waits_for_its_pipeline_without_stalling() {
+    let Some(mut d) = drawer() else { return };
+    d.async_pipelines = true;
+    let mut mem = memory();
+    let white = [255, 255, 255, 255];
+    mem.write_words(
+        VERTS,
+        &color_verts(&[
+            (-1.0, 1.0, 0.0, white),
+            (1.0, 1.0, 0.0, white),
+            (-1.0, -1.0, 0.0, white),
+        ]),
+    );
+    let half = (W / 2) as f32;
+    let mut s = Stream::default();
+    s.setup()
+        .resolve(&mut mem, W, H, false, Some((rgba(CLEAR), 0)))
+        .regs(PA_CL_VTE_CNTL, &[0x3F | (1 << 10)])
+        .regs(PA_SU_VTX_CNTL, &[0])
+        .regs(
+            PA_CL_VPORT_XSCALE,
+            &[f(half), f(half), f(-half), f(half), f(1.0), f(0.0)],
+        )
+        .shader(false, &vs_color())
+        .shader(true, &ps_interp())
+        .vertex_fetch(0, VERTS, 12)
+        .draw_auto(PRIM_TRI_LIST, 3);
+    let mut waited = 0;
+    for _ in 0..3 {
+        let report = run(&mut d, &s, &mut mem);
+        assert!(report.unsupported.is_empty(), "{report:?}");
+        let img = d.read_render_target(COLOR_KEY, 0, 0, W, H).unwrap();
+        if report.draws == 0 {
+            // Skipped first for the translations, then for the pipeline.
+            assert_eq!(report.timings.draws_waiting, 1, "{report:?}");
+            assert_eq!(px(&img, W, 8, 8), CLEAR);
+            waited += 1;
+            d.wait_pipelines();
+            continue;
+        }
+        assert_eq!(report.timings.draws_waiting, 0, "{report:?}");
+        assert_eq!(px(&img, W, 8, 8), white);
+        assert_eq!(px(&img, W, 60, 40), CLEAR);
+        assert_eq!(waited, 2, "translations, then the pipeline");
+        return;
+    }
+    panic!("never drawn");
+}
+
 /// A triangle strip from a byte-swapped 16-bit index buffer covers the
 /// 32x32 square at the origin.
 #[test]

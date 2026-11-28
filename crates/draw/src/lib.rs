@@ -506,6 +506,12 @@ pub struct Timings {
     pub pipeline: Duration,
     /// Counts: pipelines and shader modules created, textures uploaded.
     pub pipelines_created: u32,
+    /// Draws skipped because their shader translation or pipeline was
+    /// still being made on the workers ([`Drawer::async_pipelines`]).
+    pub draws_waiting: u32,
+    /// Worker time spent making the pipelines taken in (not part of any
+    /// drawer phase).
+    pub pipeline_workers: Duration,
     pub textures_uploaded: u32,
     /// Submissions made during the replay. Batch flushes count one each,
     /// though the submit thread may merge queued ones into one
@@ -606,6 +612,8 @@ impl std::ops::AddAssign<&Timings> for Timings {
         self.transfer += t.transfer;
         self.pipeline += t.pipeline;
         self.pipelines_created += t.pipelines_created;
+        self.draws_waiting += t.draws_waiting;
+        self.pipeline_workers += t.pipeline_workers;
         self.textures_uploaded += t.textures_uploaded;
         self.submits += t.submits;
         for (a, b) in self.submits_by_site.iter_mut().zip(t.submits_by_site) {
@@ -1319,6 +1327,233 @@ fn module_keys(k: &PipelineKey) -> [ModuleKey; 2] {
     ]
 }
 
+/// Translates shader microcode `words`.
+fn translate_words(words: &[u32], vertex: bool, param_gen: Option<ParamGen>) -> Translation {
+    let s = if vertex {
+        xenon_shader::ShaderStage::Vertex
+    } else {
+        xenon_shader::ShaderStage::Pixel
+    };
+    xenon_shader::translate_with(words, s, param_gen)
+        .map(Arc::new)
+        .map_err(|e| e.to_string())
+}
+
+/// Key of a shader translation: program hash, vertex stage and pixel
+/// parameter generation.
+type TranslationKey = (u64, bool, Option<ParamGen>);
+
+/// A pipeline a worker made, with the shader modules it made for it, its
+/// texture bind group layout and the time it took.
+type Built = (
+    wgpu::RenderPipeline,
+    Vec<(ModuleKey, wgpu::ShaderModule)>,
+    wgpu::BindGroupLayout,
+    Duration,
+);
+
+/// What a pipeline worker sends back.
+enum Made {
+    Translation(TranslationKey, Translation),
+    Pipeline(Box<(PipelineKey, Result<Built, String>)>),
+}
+
+/// Most translations and pipelines queued on the workers at once; a draw
+/// that finds the queue full is skipped and queues its work at a later
+/// replay.
+const COMPILE_QUEUE: usize = 64;
+
+/// A job for the pipeline workers.
+type Job = Box<dyn FnOnce() + Send>;
+
+/// Worker threads that translate shaders and make draw pipelines (wgpu's
+/// device works from any thread), so no replay waits for a driver
+/// compile: see [`Drawer::async_pipelines`].
+struct Compiler {
+    jobs: std::sync::mpsc::Sender<Job>,
+    made: std::sync::mpsc::Sender<Made>,
+    done: std::sync::mpsc::Receiver<Made>,
+    translating: HashSet<TranslationKey>,
+    building: HashSet<PipelineKey>,
+}
+
+impl Compiler {
+    fn start() -> Compiler {
+        let (jobs, rx) = std::sync::mpsc::channel::<Job>();
+        let rx = Arc::new(Mutex::new(rx));
+        // A few threads: a driver compiles one pipeline per thread, and the
+        // guest and drawer threads need the other cores.
+        let n = std::thread::available_parallelism().map_or(2, |n| (n.get() / 4).clamp(1, 4));
+        for _ in 0..n {
+            let rx = rx.clone();
+            let _ = std::thread::Builder::new()
+                .name("pipelines".into())
+                .spawn(move || loop {
+                    // The guard drops at the end of this statement, before
+                    // the job runs.
+                    let job = rx.lock().map(|r| r.recv());
+                    match job {
+                        Ok(Ok(job)) => job(),
+                        _ => return,
+                    }
+                });
+        }
+        let (made, done) = std::sync::mpsc::channel();
+        Compiler {
+            jobs,
+            made,
+            done,
+            translating: HashSet::default(),
+            building: HashSet::default(),
+        }
+    }
+
+    fn full(&self) -> bool {
+        self.translating.len() + self.building.len() >= COMPILE_QUEUE
+    }
+
+    fn queue(&self, job: impl FnOnce() + Send + 'static) {
+        let _ = self.jobs.send(Box::new(job));
+    }
+}
+
+/// Runs `f` inside a validation error scope of this thread (wgpu keeps a
+/// scope stack per thread); a validation error becomes `what: error`.
+fn validated_on<T>(
+    dev: &wgpu::Device,
+    what: &str,
+    f: impl FnOnce(&wgpu::Device) -> T,
+) -> Result<T, String> {
+    let scope = dev.push_error_scope(wgpu::ErrorFilter::Validation);
+    let v = f(dev);
+    match block_on(scope.pop()) {
+        None => Ok(v),
+        Some(e) => Err(format!("{what}: {e}")),
+    }
+}
+
+/// The WGSL of a shader module: translation `t` patched for the module
+/// key's extra outputs and variant.
+fn module_source(
+    vertex: bool,
+    extra: u16,
+    variant: Variant,
+    t: &Translated,
+) -> Result<String, String> {
+    match (vertex, variant) {
+        (true, Variant::RectList) => patch_vertex_wgsl(&t.wgsl, extra)
+            .and_then(|vs| rect_list_wgsl(&vs, t.info.interpolators_written | extra)),
+        (true, _) => patch_vertex_wgsl(&t.wgsl, extra),
+        (false, _) if extra & 1 != 0 => drop_depth_wgsl(&t.wgsl),
+        (false, _) => Ok(t.wgsl.clone()),
+    }
+    .and_then(|src| match vertex {
+        false if extra >> 1 != 0 => alpha_test_wgsl(&src, extra),
+        _ => Ok(src),
+    })
+    .and_then(|src| match variant {
+        Variant::Output(c) if !vertex => {
+            c.iter().enumerate().try_fold(src, |ps, (rt, c)| match c {
+                Some((rgb, a, bias, k)) => output_pixel_wgsl(
+                    &ps,
+                    rt,
+                    *bias,
+                    f32::from_bits(*rgb),
+                    f32::from_bits(*a),
+                    f32::from_bits(*k),
+                ),
+                None => Ok(ps),
+            })
+        }
+        _ => Ok(src),
+    })
+}
+
+fn create_module(
+    dev: &wgpu::Device,
+    vertex: bool,
+    src: String,
+) -> Result<wgpu::ShaderModule, String> {
+    validated_on(dev, "shader module", |d| {
+        d.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some(if vertex { "vertex" } else { "pixel" }),
+            source: wgpu::ShaderSource::Wgsl(src.into()),
+        })
+    })
+}
+
+/// Makes the draw pipeline of `k` from its shader modules, at drawing
+/// scale `scale`.
+fn draw_pipeline(
+    dev: &wgpu::Device,
+    k: &PipelineKey,
+    layout: &wgpu::PipelineLayout,
+    vs_mod: &wgpu::ShaderModule,
+    ps_mod: &wgpu::ShaderModule,
+    scale: u32,
+    cache: Option<&wgpu::PipelineCache>,
+) -> Result<wgpu::RenderPipeline, String> {
+    let topology = k.topology;
+    let strip = matches!(
+        topology,
+        wgpu::PrimitiveTopology::TriangleStrip | wgpu::PrimitiveTopology::LineStrip
+    );
+    // Only a pixel shader with parameter generation declares xe_scale; at
+    // scale 1 its default holds.
+    let scale = [("xe_scale", f64::from(scale))];
+    let ps_constants: &[(&str, f64)] = if k.ps_param_gen.is_some() && scale[0].1 != 1.0 {
+        &scale
+    } else {
+        &[]
+    };
+    validated_on(dev, "render pipeline", |dev| {
+        dev.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("draw"),
+            layout: Some(layout),
+            vertex: wgpu::VertexState {
+                module: vs_mod,
+                entry_point: Some("vs_main"),
+                compilation_options: Default::default(),
+                buffers: &[],
+            },
+            primitive: wgpu::PrimitiveState {
+                topology,
+                strip_index_format: strip.then_some(wgpu::IndexFormat::Uint32),
+                front_face: k.cull.0,
+                cull_mode: k.cull.1,
+                ..Default::default()
+            },
+            depth_stencil: k.depth.clone().map(|(format, write, compare, st)| {
+                wgpu::DepthStencilState {
+                    format,
+                    depth_write_enabled: Some(write),
+                    depth_compare: Some(compare),
+                    stencil: st.unwrap_or_default(),
+                    bias: Default::default(),
+                }
+            }),
+            multisample: Default::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: ps_mod,
+                entry_point: Some("ps_main"),
+                compilation_options: wgpu::PipelineCompilationOptions {
+                    constants: ps_constants,
+                    ..Default::default()
+                },
+                targets: &k.color.map(|c| {
+                    c.map(|(format, blend, write_mask)| wgpu::ColorTargetState {
+                        format,
+                        blend,
+                        write_mask,
+                    })
+                }),
+            }),
+            multiview_mask: None,
+            cache,
+        })
+    })
+}
+
 /// `blend` as the pipeline needs it with colour write mask `mask`: a
 /// component whose channels are not written is left as replace, and a
 /// state that is all replace is no blending.
@@ -1487,7 +1722,7 @@ pub struct Drawer {
     vs: Option<Program>,
     ps: Option<Program>,
     /// Shared, so a draw takes a translation without copying its WGSL.
-    translated: HashMap<(u64, bool, Option<ParamGen>), Translation>,
+    translated: HashMap<TranslationKey, Translation>,
     /// Keyed by program hash, stage, extra vertex outputs, variant (the
     /// rectangle list wrapper or the pixel output bias and clamp) and pixel parameter
     /// generation.
@@ -1705,6 +1940,15 @@ pub struct Drawer {
     /// `XENON_RESOLVE_WRITEBACK=skip` turns it on at [`Drawer::new`]; the
     /// host turns it on unless that variable is `on` or `late`.
     pub skip_resolve_writeback: bool,
+    /// Translate shaders and make draw pipelines on worker threads: a
+    /// draw whose pipeline is not made yet is skipped (counted in
+    /// [`Timings::draws_waiting`]) and drawn from a later replay on, so no
+    /// frame waits for a driver compile. Off, each is made on the spot.
+    /// The host turns it on unless `XENON_ASYNC_PIPELINES` is `0`.
+    pub async_pipelines: bool,
+    compiler: Option<Compiler>,
+    /// Pipelines the workers failed to make, and why.
+    pipeline_errors: HashMap<PipelineKey, String>,
     /// Queue the end-of-replay write-back of kept resolves without waiting
     /// for it, and write it to guest memory when the next replay starts:
     /// the CPU sees resolve output one frame late, in exchange for no GPU
@@ -2917,6 +3161,9 @@ impl Drawer {
             half_luts: HashMap::default(),
             mirrors: Vec::new(),
             decode_pipelines: [None, None, None],
+            async_pipelines: false,
+            compiler: None,
+            pipeline_errors: HashMap::default(),
             skip_resolve_writeback: std::env::var("XENON_RESOLVE_WRITEBACK").as_deref() == Ok("skip"),
             late_writeback: std::env::var("XENON_RESOLVE_WRITEBACK").as_deref() == Ok("late"),
             late_front_buffer: std::env::var("XENON_LATE_FRAME").as_deref() == Ok("1"),
@@ -5186,28 +5433,36 @@ impl Drawer {
         }
     }
 
+    /// The translation of `p`, or None while a worker makes it (with
+    /// [`Drawer::async_pipelines`]).
     fn translate(
         &mut self,
         p: &Program,
         stage: ShaderStage,
         param_gen: Option<ParamGen>,
-    ) -> Result<Arc<Translated>, Skip> {
+    ) -> Result<Option<Arc<Translated>>, Skip> {
         let vertex = stage == ShaderStage::Vertex;
-        let t = self
-            .translated
-            .entry((p.hash, vertex, param_gen))
-            .or_insert_with(|| {
-                let s = if vertex {
-                    xenon_shader::ShaderStage::Vertex
-                } else {
-                    xenon_shader::ShaderStage::Pixel
-                };
-                xenon_shader::translate_with(&p.words, s, param_gen)
-                    .map(Arc::new)
-                    .map_err(|e| e.to_string())
-            });
+        let key = (p.hash, vertex, param_gen);
+        if !self.translated.contains_key(&key) && self.async_pipelines {
+            self.take_made();
+            if !self.translated.contains_key(&key) {
+                let c = self.compiler();
+                if !c.translating.contains(&key) && !c.full() {
+                    c.translating.insert(key);
+                    let (words, made) = (p.words.clone(), c.made.clone());
+                    c.queue(move || {
+                        let t = translate_words(&words, vertex, param_gen);
+                        let _ = made.send(Made::Translation(key, t));
+                    });
+                }
+                return Ok(None);
+            }
+        }
+        let t = (self.translated)
+            .entry(key)
+            .or_insert_with(|| translate_words(&p.words, vertex, param_gen));
         match t {
-            Ok(t) => Ok(t.clone()),
+            Ok(t) => Ok(Some(t.clone())),
             Err(e) => unsupported(format!(
                 "{} shader: {e}",
                 if vertex { "vertex" } else { "pixel" }
@@ -5215,15 +5470,108 @@ impl Drawer {
         }
     }
 
+    /// The pipeline workers, started at first use.
+    fn compiler(&mut self) -> &mut Compiler {
+        self.compiler.get_or_insert_with(Compiler::start)
+    }
+
+    /// Takes in what the pipeline workers finished, without waiting.
+    fn take_made(&mut self) {
+        while let Some(m) = self.compiler.as_ref().and_then(|c| c.done.try_recv().ok()) {
+            self.take(m);
+        }
+    }
+
+    fn take(&mut self, m: Made) {
+        let Some(c) = &mut self.compiler else { return };
+        match m {
+            Made::Translation(key, t) => {
+                c.translating.remove(&key);
+                self.translated.insert(key, t);
+            }
+            Made::Pipeline(b) => {
+                let (key, r) = *b;
+                c.building.remove(&key);
+                match r {
+                    Ok((p, modules, g1, took)) => {
+                        for (k, m) in modules {
+                            self.modules.entry(k).or_insert(m);
+                        }
+                        self.timings.pipeline_workers += took;
+                        self.timings.pipelines_created += 1;
+                        if let Some(c) = &mut self.disk_cache {
+                            c.unsaved += 1;
+                        }
+                        self.pipelines.insert(key, (p, self.pipeline_uses, g1));
+                        self.drop_pipelines();
+                    }
+                    Err(e) => {
+                        if self.pipeline_errors.len() >= PIPELINE_CAP {
+                            self.pipeline_errors.clear();
+                        }
+                        self.pipeline_errors.insert(key, e);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Queues pipeline `key` (and the shader modules it lacks) on the
+    /// workers, unless it is queued already or the queue is full.
+    fn queue_pipeline(&mut self, key: PipelineKey, vs_t: Arc<Translated>, ps_t: Arc<Translated>) {
+        if self.compiler().building.contains(&key) || self.compiler().full() {
+            return;
+        }
+        let keys = module_keys(&key);
+        let have = keys.map(|k| self.modules.get(&k).cloned());
+        let (g1, layout) = self.texture_layout(key.textures);
+        let (dev, scale) = (self.device.clone(), self.scale);
+        let cache = self.pipeline_cache().cloned();
+        let c = self.compiler();
+        c.building.insert(key.clone());
+        let made = c.made.clone();
+        c.queue(move || {
+            let t0 = Instant::now();
+            let mut new = Vec::new();
+            let r = [(&have[0], &vs_t), (&have[1], &ps_t)]
+                .into_iter()
+                .zip(keys)
+                .map(|((m, t), k)| match m {
+                    Some(m) => Ok(m.clone()),
+                    None => {
+                        let m = module_source(k.1, k.2, k.3, t)
+                            .and_then(|src| create_module(&dev, k.1, src))?;
+                        new.push((k, m.clone()));
+                        Ok(m)
+                    }
+                })
+                .collect::<Result<Vec<_>, String>>()
+                .and_then(|m| {
+                    draw_pipeline(&dev, &key, &layout, &m[0], &m[1], scale, cache.as_ref())
+                })
+                .map(|p| (p, new, g1, t0.elapsed()));
+            let _ = made.send(Made::Pipeline(Box::new((key, r))));
+        });
+    }
+
+    /// Waits until the pipeline workers have finished everything queued
+    /// and takes it in; tests use it to make the next replay draw what the
+    /// last one skipped.
+    #[doc(hidden)]
+    pub fn wait_pipelines(&mut self) {
+        while let Some(c) = &self.compiler {
+            if c.translating.is_empty() && c.building.is_empty() {
+                break;
+            }
+            let Ok(m) = c.done.recv() else { break };
+            self.take(m);
+        }
+    }
+
     /// Runs `f` inside a validation error scope; a validation error becomes
     /// `Skip::Unsupported(what: error)`.
     fn validated<T>(&self, what: &str, f: impl FnOnce(&wgpu::Device) -> T) -> Result<T, Skip> {
-        let scope = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
-        let v = f(&self.device);
-        match block_on(scope.pop()) {
-            None => Ok(v),
-            Some(e) => unsupported(format!("{what}: {e}")),
-        }
+        validated_on(&self.device, what, f).map_err(Skip::Unsupported)
     }
 
     fn module(
@@ -5239,40 +5587,9 @@ impl Drawer {
         if let Some(m) = self.modules.get(&key) {
             return Ok(m.clone());
         }
-        let src = match (vertex, variant) {
-            (true, Variant::RectList) => patch_vertex_wgsl(&t.wgsl, extra)
-                .and_then(|vs| rect_list_wgsl(&vs, t.info.interpolators_written | extra)),
-            (true, _) => patch_vertex_wgsl(&t.wgsl, extra),
-            (false, _) if extra & 1 != 0 => drop_depth_wgsl(&t.wgsl),
-            (false, _) => Ok(t.wgsl.clone()),
-        }
-        .and_then(|src| match vertex {
-            false if extra >> 1 != 0 => alpha_test_wgsl(&src, extra),
-            _ => Ok(src),
-        })
-        .and_then(|src| match variant {
-            Variant::Output(c) if !vertex => {
-                c.iter().enumerate().try_fold(src, |ps, (rt, c)| match c {
-                    Some((rgb, a, bias, k)) => output_pixel_wgsl(
-                        &ps,
-                        rt,
-                        *bias,
-                        f32::from_bits(*rgb),
-                        f32::from_bits(*a),
-                        f32::from_bits(*k),
-                    ),
-                    None => Ok(ps),
-                })
-            }
-            _ => Ok(src),
-        })
-        .map_err(Skip::Unsupported)?;
-        let m = self.validated("shader module", |d| {
-            d.create_shader_module(wgpu::ShaderModuleDescriptor {
-                label: Some(if vertex { "vertex" } else { "pixel" }),
-                source: wgpu::ShaderSource::Wgsl(src.into()),
-            })
-        })?;
+        let m = module_source(vertex, extra, variant, t)
+            .and_then(|src| create_module(&self.device, vertex, src))
+            .map_err(Skip::Unsupported)?;
         self.modules.insert(key, m.clone());
         Ok(m)
     }
@@ -6437,8 +6754,14 @@ impl Drawer {
                 wgpu::PrimitiveTopology::TriangleList | wgpu::PrimitiveTopology::TriangleStrip
             );
         let param_gen = self.param_gen(topology, polygonal);
-        let vs_t = self.translate(&vs, ShaderStage::Vertex, None)?;
-        let ps_t = self.translate(&ps, ShaderStage::Pixel, param_gen)?;
+        let (vs_t, ps_t) = (
+            self.translate(&vs, ShaderStage::Vertex, None)?,
+            self.translate(&ps, ShaderStage::Pixel, param_gen)?,
+        );
+        let (Some(vs_t), Some(ps_t)) = (vs_t, ps_t) else {
+            self.timings.draws_waiting += 1;
+            return Ok(false);
+        };
         let surface = self.regs.get(regs::RB_SURFACE_INFO);
         // shortcut: MSAA targets are drawn with one sample per pixel (the
         // resolve then copies that sample); add samples if edges matter.
@@ -6714,72 +7037,31 @@ impl Drawer {
         self.pipeline_uses += 1;
         // The key names the modules and the texture layout: a cached
         // pipeline needs neither looked up.
+        if self.async_pipelines && !self.pipelines.contains_key(&key) {
+            self.take_made();
+            if let Some(e) = self.pipeline_errors.get(&key) {
+                return unsupported(e.clone());
+            }
+        }
         let (pipeline, g1_layout) = match self.pipelines.get_mut(&key) {
             Some((p, used, g1)) => {
                 *used = self.pipeline_uses;
                 (p.clone(), g1.clone())
             }
+            None if self.async_pipelines => {
+                // Drawn from a later replay on, once a worker made it.
+                self.queue_pipeline(key, vs_t, ps_t);
+                self.timings.draws_waiting += 1;
+                return Ok(false);
+            }
             None => {
                 let vs_mod = self.module(vs.hash, true, extra, vs_variant, None, &vs_t)?;
                 let ps_mod = self.module(ps.hash, false, ps_extra, ps_variant, param_gen, &ps_t)?;
                 let (g1_layout, layout) = self.texture_layout(tex_mask);
-                let k = key.clone();
-                // Only a pixel shader with parameter generation declares
-                // xe_scale; at scale 1 its default holds.
-                let scale = [("xe_scale", f64::from(self.scale))];
-                let ps_constants: &[(&str, f64)] = if param_gen.is_some() && self.scale != 1 {
-                    &scale
-                } else {
-                    &[]
-                };
-                let cache = self.pipeline_cache();
+                let (scale, cache) = (self.scale, self.pipeline_cache());
                 let t0 = Instant::now();
-                let p = self.validated("render pipeline", |dev| {
-                    dev.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                        label: Some("draw"),
-                        layout: Some(&layout),
-                        vertex: wgpu::VertexState {
-                            module: &vs_mod,
-                            entry_point: Some("vs_main"),
-                            compilation_options: Default::default(),
-                            buffers: &[],
-                        },
-                        primitive: wgpu::PrimitiveState {
-                            topology,
-                            strip_index_format: strip.then_some(wgpu::IndexFormat::Uint32),
-                            front_face: k.cull.0,
-                            cull_mode: k.cull.1,
-                            ..Default::default()
-                        },
-                        depth_stencil: k.depth.map(|(format, write, compare, st)| {
-                            wgpu::DepthStencilState {
-                                format,
-                                depth_write_enabled: Some(write),
-                                depth_compare: Some(compare),
-                                stencil: st.unwrap_or_default(),
-                                bias: Default::default(),
-                            }
-                        }),
-                        multisample: Default::default(),
-                        fragment: Some(wgpu::FragmentState {
-                            module: &ps_mod,
-                            entry_point: Some("ps_main"),
-                            compilation_options: wgpu::PipelineCompilationOptions {
-                                constants: ps_constants,
-                                ..Default::default()
-                            },
-                            targets: &k.color.map(|c| {
-                                c.map(|(format, blend, write_mask)| wgpu::ColorTargetState {
-                                    format,
-                                    blend,
-                                    write_mask,
-                                })
-                            }),
-                        }),
-                        multiview_mask: None,
-                        cache,
-                    })
-                })?;
+                let p = draw_pipeline(&self.device, &key, &layout, &vs_mod, &ps_mod, scale, cache)
+                    .map_err(Skip::Unsupported)?;
                 self.pipeline_made(t0);
                 let entry = (p.clone(), self.pipeline_uses, g1_layout.clone());
                 self.pipelines.insert(key, entry);
