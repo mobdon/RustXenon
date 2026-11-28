@@ -143,12 +143,18 @@ pub(crate) fn finish(code: u64) {
 }
 
 /// Blocks while the current guest thread is suspended. Called on every
-/// guest call.
+/// guest call, with the caller's context: its `thread` slot (set by
+/// `Runtime::spawn`) saves the thread-local lookup.
 #[inline]
-pub(crate) fn checkpoint() {
-    let t = FAST.with(Cell::get);
-    // SAFETY: non-null only between `enter` and `Exit`, while `CURRENT` on
-    // this same thread holds an `Arc` to it.
+pub(crate) fn checkpoint(ctx: &crate::Context) {
+    let mut t = ctx.thread.get().cast::<GuestThread>();
+    if t.is_null() {
+        t = FAST.with(Cell::get);
+    }
+    // SAFETY: a context's slot is set only by `Runtime::spawn`, whose host
+    // thread holds an `Arc` to the thread for as long as the context lives
+    // (and clones reset it). `FAST` is non-null only between `enter` and
+    // `Exit`, while `CURRENT` on this same thread holds an `Arc` to it.
     if let Some(t) = unsafe { t.as_ref() } {
         t.wait_while_suspended();
     }
@@ -172,8 +178,15 @@ mod tests {
         let h = std::thread::spawn(move || {
             let _exit = enter(t2.clone());
             assert_eq!(current_id(), Some(7));
-            for _ in 0..200_000 {
-                checkpoint();
+            let mut c = crate::Context::new();
+            for i in 0..200_000 {
+                // Half through the context's slot, half through the lookup.
+                c.thread = crate::cpu::ThreadSlot::new(if i % 2 == 0 {
+                    Arc::as_ptr(&t2).cast()
+                } else {
+                    std::ptr::null()
+                });
+                checkpoint(&c);
             }
             let again = std::panic::catch_unwind(|| drop(enter(t2)));
             assert!(again.is_err());

@@ -314,7 +314,7 @@ fn each_thread_knows_its_id_and_returns_r3() {
 #[test]
 fn trace_sees_calls_from_every_thread() {
     static CALLS: AtomicU64 = AtomicU64::new(0);
-    fn trace(_: &Context, addr: u32) {
+    fn trace(_: &mut Context, addr: u32) {
         if addr == CS_ENTER {
             CALLS.fetch_add(1, Ordering::Relaxed);
         }
